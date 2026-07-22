@@ -1,0 +1,498 @@
+.highlight-search-result {
+    position: absolute;
+    top: 36px;
+    right: 70px;
+}
+
+.highlight-search-result--mobile {
+    top: 30px;
+    right: unset;
+    align-self: center;
+}
+
+.highlight-search-result .search-dialog {
+    position: relative;
+    z-index: 8;
+    box-sizing: border-box;
+    margin-top: 0;
+    background-color: var(--b3-theme-surface);
+    border: 1px solid var(--b3-theme-surface);
+    box-shadow: 1px 2px 6px 1px rgba(0, 0, 0, 0.2);
+    border-radius: 5px;
+    padding: 8px 10px;
+    cursor: move;
+    width: min(420px, calc(100vw - 32px));
+}
+
+.highlight-search-result--mobile .search-dialog {
+    z-index: 7;
+    cursor: default;
+    width: auto;
+    max-width: calc(100vw - 24px);
+}
+
+.highlight-search-result .search-resize-handle {
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    left: -6px;
+    width: 12px;
+    cursor: ew-resize;
+    z-index: 2;
+}
+
+.highlight-search-result .search-resize-handle::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 3px;
+    height: 36px;
+    border-radius: 999px;
+    background: var(--b3-border-color);
+    opacity: 0.72;
+    transform: translate(-50%, -50%);
+    transition: background-color 120ms ease, opacity 120ms ease;
+}
+
+.highlight-search-result .search-resize-handle:hover::after {
+    background: var(--b3-theme-primary);
+    opacity: 1;
+}
+
+.highlight-search-result .search-dialog__rows {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.highlight-search-result .search-row {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 4px;
+    min-width: 0;
+}
+
+.highlight-search-result .search-row__trailing {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px;
+    flex-shrink: 0;
+    /* 与查找行「计数 + 4 个工具按钮」同宽，保证两行输入框左右对齐、等宽 */
+    box-sizing: border-box;
+    min-width: calc(35px + 4px + 26px * 4 + 1px * 3);
+}
+
+/* 替换/全部替换紧挨输入框；齿轮靠右对齐叉号 */
+.highlight-search-result .search-row__trailing--replace {
+    justify-content: flex-start;
+}
+
+.highlight-search-result .search-trailing-flex {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+/* 复合输入框：对齐思源 b3-form__img / b3-form__icona（共享边框 + 右侧内嵌控件） */
+.highlight-search-result .search-field {
+    display: flex;
+    align-items: center;
+    flex: 1 1 auto;
+    min-width: 96px;
+    max-width: none;
+    width: auto;
+    overflow: hidden;
+    border-radius: var(--b3-border-radius);
+    background-color: var(--b3-theme-background);
+    box-shadow: inset 0 0 0 1px var(--b3-border-color);
+    transition: box-shadow 120ms 0ms cubic-bezier(0, 0, .2, 1);
+    cursor: text;
+}
+
+.highlight-search-result .search-field:hover {
+    box-shadow: inset 0 0 0 1px var(--b3-border-color), 0 0 0 .6px var(--b3-border-color);
+}
+
+.highlight-search-result .search-field:focus-within {
+    box-shadow: inset 0 0 0 1px var(--b3-theme-primary-light), 0 0 0 .6px var(--b3-theme-primary-lighter);
+}
+
+.highlight-search-result .search-field .b3-text-field {
+    flex: 1 1 auto;
+    width: 0;
+    min-width: 0;
+    max-width: none;
+    border-radius: 0;
+    box-shadow: none !important;
+    background-color: transparent;
+    cursor: text;
+}
+
+.highlight-search-result .search-field .b3-text-field:hover,
+.highlight-search-result .search-field .b3-text-field:focus {
+    box-shadow: none !important;
+}
+
+.highlight-search-result .search-field__toggles {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 3px;
+    /* 整体略向左：与右边缘留出空隙 */
+    padding: 1px 5px 1px 0;
+    margin-right: 2px;
+    cursor: default;
+}
+
+.highlight-search-result .search-count {
+    min-width: 35px;
+    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    align-self: stretch;
+    margin: 0;
+    flex-shrink: 0;
+    color: var(--b3-theme-on-surface);
+}
+
+.highlight-search-result .search-tools {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 1px;
+    cursor: default;
+}
+
+/* 查找 / 替换工具按钮统一样式与颜色 */
+.highlight-search-result .search-option,
+.highlight-search-result .search-tools > div {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    border: none;
+    border-radius: var(--b3-border-radius);
+    text-align: center;
+    cursor: default;
+    background-color: transparent;
+    transition: background-color 0.15s, color 0.15s, opacity 0.15s;
+    width: 26px;
+    height: 26px;
+    min-width: 26px;
+    min-height: 26px;
+    margin: 0;
+    padding: 0;
+    font-size: 11px;
+    line-height: 1;
+    color: var(--b3-theme-on-surface);
+    user-select: none;
+    opacity: 0.78;
+}
+
+.highlight-search-result .search-tools > div,
+.highlight-search-result .search-tools > .search-option {
+    background-color: transparent;
+    color: var(--b3-theme-on-surface);
+    opacity: 1;
+}
+
+.highlight-search-result .search-tools > div svg {
+    color: inherit;
+}
+
+.highlight-search-result .search-tools > [data-action="replace"] svg,
+.highlight-search-result .search-tools > [data-action="replace-all"] svg {
+    fill: currentColor;
+}
+
+.highlight-search-result .search-field__toggles .search-option {
+    width: 20px;
+    height: 20px;
+    min-width: 20px;
+    min-height: 20px;
+    border-radius: calc(var(--b3-border-radius) - 1px);
+}
+
+.highlight-search-result .search-replace-help {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    width: 18px;
+    height: 18px;
+    min-width: 18px;
+    min-height: 18px;
+    margin: 0;
+    padding: 0;
+    border-radius: 50%;
+    color: var(--b3-theme-on-surface);
+    opacity: 0.55;
+    cursor: help;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.highlight-search-result .search-replace-help:hover {
+    opacity: 0.95;
+    background-color: var(--b3-list-icon-hover, var(--b3-theme-surface-lighter));
+}
+
+.highlight-search-result .search-replace-help svg {
+    width: 14px;
+    height: 14px;
+}
+
+/* 覆盖思源全局 svg { fill: currentColor }，否则空心圆会变成实心黑点 */
+.highlight-search-result .search-replace-help svg.icon--help-q,
+.highlight-search-result .search-replace-help svg.icon--help-q .help-ring,
+.highlight-search-result .search-replace-help svg.icon--help-q .help-stem {
+    fill: none;
+    stroke: currentColor;
+}
+
+.highlight-search-result .search-replace-help svg.icon--help-q .help-dot {
+    fill: currentColor;
+    stroke: none;
+}
+
+.highlight-search-result .search-option:hover,
+.highlight-search-result .search-tools > div:hover {
+    background-color: var(--b3-list-icon-hover, var(--b3-theme-surface-lighter));
+    color: var(--b3-theme-on-surface);
+    opacity: 1;
+}
+
+.highlight-search-result .search-option:active,
+.highlight-search-result .search-tools > div:active {
+    background-color: var(--b3-theme-on-surface-light);
+    transition: background-color 0.1s;
+}
+
+.highlight-search-result .search-option.is-active {
+    background-color: var(--b3-theme-primary-lightest, var(--b3-theme-surface-lighter));
+    color: var(--b3-theme-primary);
+    opacity: 1;
+}
+
+.highlight-search-result .search-tools > div.is-disabled {
+    opacity: 0.45;
+    color: var(--b3-theme-on-surface);
+    pointer-events: auto;
+    cursor: not-allowed;
+}
+
+.highlight-search-result .search-tools > div.is-disabled:hover {
+    background-color: transparent;
+    color: var(--b3-theme-on-surface);
+}
+
+.highlight-search-result .search-tools--replace {
+    margin-left: 0;
+}
+
+.highlight-search-result .search-row--replace[hidden] {
+    display: none !important;
+}
+
+.highlight-search-result .search-replace-toggle,
+.highlight-search-result .search-replace-spacer {
+    flex-shrink: 0;
+    box-sizing: border-box;
+    width: 32px;
+    min-width: 32px;
+    height: 32px;
+    margin: 0;
+    cursor: pointer;
+}
+
+.highlight-search-result .search-replace-spacer {
+    height: auto;
+    min-height: 0;
+    cursor: default;
+    pointer-events: none;
+}
+
+.highlight-search-result .search-replace-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--b3-border-radius);
+    color: var(--b3-theme-on-surface);
+}
+
+.highlight-search-result .search-replace-toggle:hover {
+    background-color: var(--b3-list-icon-hover, var(--b3-theme-surface-lighter));
+    color: var(--b3-theme-on-background);
+}
+
+.highlight-search-result .search-chevron {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin: 0 4px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform 0.15s ease;
+}
+
+.highlight-search-result .search-replace-toggle.is-expanded .search-chevron,
+.highlight-search-result .search-dialog--replace-visible .search-replace-toggle .search-chevron {
+    transform: rotate(45deg);
+}
+
+.highlight-search-result .icon--14_14 {
+    width: 14px;
+    height: 14px;
+    margin: 0;
+}
+
+.highlight-search-result .search-tools .icon--14_14 {
+    width: 16px;
+    height: 16px;
+}
+
+.highlight-search-result .icon--whole-word {
+    width: 16px;
+    height: 12px;
+    margin: 0;
+}
+
+.highlight-search-result--mobile .search-row {
+    grid-template-columns: 32px minmax(0, 1fr);
+}
+
+.highlight-search-result--mobile .search-row__trailing {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+    min-width: 0;
+}
+
+.highlight-search-result--mobile .search-field {
+    min-width: 120px;
+}
+
+.block__edit.protyle > .highlight-search-result {
+    top: 25px;
+    right: 0;
+}
+
+body.page-search-dragging,
+body.page-search-dragging * {
+    cursor: move !important;
+}
+
+body.page-search-resizing,
+body.page-search-resizing * {
+    cursor: ew-resize !important;
+}
+
+::highlight(search-results) {
+    background-color: rgb(235 235 5);
+    color: rgb(0, 0, 0);
+}
+
+::highlight(search-focus) {
+    background-color: rgb(255, 150, 50);
+    color: rgb(0, 0, 0);
+}
+
+/**
+ * 行内备注命中虚线下划线：挂在 .protyle-content，不进内容块。
+ * 颜色对齐 search-results / search-focus；位置下沉以区别思源 u / inline-memo 的 border-bottom。
+ * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/assets/scss/component/_typography.scss
+ */
+.protyle-content.page-search-memo-underline-host {
+    position: relative;
+}
+
+.protyle-content > .page-search-memo-underline-layer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 0;
+    height: 0;
+    overflow: visible;
+    pointer-events: none;
+    z-index: 5;
+}
+
+.page-search-memo-underline {
+    position: absolute;
+    pointer-events: none;
+    box-sizing: border-box;
+    height: 0;
+    border: none;
+    border-bottom: 2px dashed rgb(235, 235, 5);
+    background: transparent;
+}
+
+.page-search-memo-underline.is-focus {
+    border-bottom-color: rgb(255, 150, 50);
+}
+
+/**
+ * 「仅在选区内查找」冻结选区提示。
+ * 块选底色 / 行内色块 / 竖线：全部叠加在 .protyle-content（不改内容块 DOM）。
+ * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/assets/scss/protyle/_wysiwyg.scss
+ * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/ui/initUI.ts
+ */
+.protyle-content.page-search-sel-scope-rail-host {
+    position: relative;
+}
+
+.protyle-content > .page-search-sel-scope-wash-layer,
+.protyle-content > .page-search-sel-scope-rail-layer,
+.protyle-content > .page-search-sel-scope-layer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 0;
+    height: 0;
+    overflow: visible;
+    pointer-events: none;
+    z-index: 4;
+}
+
+.page-search-sel-scope-inline {
+    position: absolute;
+    pointer-events: none;
+    box-sizing: border-box;
+    background-color: var(--page-search-inline-sel-bg, Highlight);
+}
+
+.page-search-sel-scope-wash {
+    position: absolute;
+    box-sizing: border-box;
+    pointer-events: none;
+    background-color: var(--b3-theme-primary-lightest);
+    border-radius: var(--b3-border-radius);
+}
+
+.page-search-sel-scope-rail {
+    position: absolute;
+    box-sizing: border-box;
+    border-radius: 1px;
+    background-color: var(--b3-theme-primary, #3573f0);
+    opacity: 0.85;
+    pointer-events: none;
+}
+
+/* 查询范围菜单：折叠块说明问号（菜单挂在 document，用 data-name 限定） */
+.b3-menu[data-name="page-search-settings"] .page-search-menu-help {
+    width: 14px;
+    height: 14px;
+    margin-left: 4px;
+    padding: 0;
+    flex: none;
+    opacity: 0.55;
+    cursor: help;
+    color: var(--b3-theme-on-surface);
+}
+
+.b3-menu[data-name="page-search-settings"] .page-search-menu-help:hover {
+    opacity: 0.9;
+}

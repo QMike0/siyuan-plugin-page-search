@@ -1,0 +1,47 @@
+{
+  "name": "siyuan-plugin-page-search",
+  "author": "QMike0",
+  "url": "https://github.com/QMike0/siyuan-plugin-page-search",
+  "version": "1.0.0",
+  "minAppVersion": "3.7.0",
+  "kernels": [
+    "windows",
+    "linux",
+    "darwin",
+    "ios",
+    "android",
+    "harmony",
+    "docker",
+    "all"
+  ],
+  "backends": [
+    "all"
+  ],
+  "frontends": [
+    "all"
+  ],
+  "disabledInPublish": false,
+  "displayName": {
+    "default": "In-Page Find & Replace",
+    "zh-CN": "页内查找替换"
+  },
+  "description": {
+    "default": "Provides in-document find and replace for SiYuan (supports undoable writes)",
+    "zh-CN": "为思源笔记提供文档页面内的查找、替换功能（支持撤销写回）"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh-CN": "README.zh-CN.md"
+  },
+  "keywords": [
+    "Ctrl+F",
+    "Ctrl+H",
+    "highlight",
+    "search",
+    "replace",
+    "页内查找",
+    "查找替换",
+    "高亮",
+    "替换"
+  ]
+}
