@@ -1,17 +1,10 @@
-import {isInlineMemoSearchUnit} from "./blocks";
+import {isInlineMemoSearchUnit, isInlineMathSearchUnit} from "./blocks";
 import type {SearchableBlock} from "./dom-types";
 import {isElementVisible, type ElementVisibilityOptions} from "./visibility";
 
 interface TextPoint {
   node: Text
   offset: number
-}
-
-/**
- * 判断块内 [start, end) 是否落在同一 Text 节点（后续替换前置条件）
- */
-export function isRangeReplaceable(block: SearchableBlock, start: number, end: number): boolean {
-  return Boolean(locateRangeInSingleTextNode(block, start, end))
 }
 
 export function locateRangeInSingleTextNode(
@@ -38,7 +31,7 @@ export function locateRangeInSingleTextNode(
 /**
  * 行内备注命中：备注正文在属性里，Range 对准宿主 span（整段高亮，不打开浮层）。
  */
-export function createRangeFromInlineMemo(
+function createRangeFromInlineMemo(
   block: SearchableBlock,
   start: number,
   end: number,
@@ -47,6 +40,30 @@ export function createRangeFromInlineMemo(
   if (!isInlineMemoSearchUnit(block)) {
     return null
   }
+  return createRangeFromAttributeHost(block, start, end, visibility)
+}
+
+/**
+ * 行内公式命中：优先按渲染 Text 节点建 Range；无 Text 时回退整段宿主。
+ */
+function createRangeFromInlineMath(
+  block: SearchableBlock,
+  start: number,
+  end: number,
+  visibility: ElementVisibilityOptions = {},
+): Range | null {
+  if (!isInlineMathSearchUnit(block)) {
+    return null
+  }
+  return createRangeFromAttributeHost(block, start, end, visibility)
+}
+
+function createRangeFromAttributeHost(
+  block: SearchableBlock,
+  start: number,
+  end: number,
+  visibility: ElementVisibilityOptions = {},
+): Range | null {
   if (start < 0 || end < start || end > block.text.length) {
     return null
   }
@@ -65,7 +82,7 @@ export function createRangeFromInlineMemo(
 /**
  * 由块内偏移创建 DOM Range；不可见则返回 null。
  * allowFoldedHidden：计入非标题 CSS 折叠内的命中（匹配阶段不展开）。
- * 行内备注走 createRangeFromInlineMemo。
+ * 行内备注：宿主 span；行内公式：有渲染 Text 时按偏移（更精确），否则整段宿主。
  */
 export function createRangeFromBlockOffsets(
   block: SearchableBlock,
@@ -75,6 +92,10 @@ export function createRangeFromBlockOffsets(
 ): Range | null {
   if (isInlineMemoSearchUnit(block)) {
     return createRangeFromInlineMemo(block, start, end, visibility)
+  }
+  // 公式已采到 katex-html Text 时走普通偏移，高亮对准可见字形而非整段源码壳
+  if (isInlineMathSearchUnit(block) && !block.textNodes.length) {
+    return createRangeFromInlineMath(block, start, end, visibility)
   }
   if (!block.textNodes.length || start < 0 || end < start || end > block.text.length) {
     return null

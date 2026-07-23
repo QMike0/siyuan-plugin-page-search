@@ -12,7 +12,7 @@ import {
 import {SearchBar, type SearchBarHost, type SearchBarI18n} from "./frontend/search-bar";
 import {isEditorReplaceModeBlocked} from "./frontend/editor-mode";
 import {scrubSelectionScopePollution, clearAllSelectionScopeSessionOverlays} from "./frontend/selection-scope-visual";
-import type {SearchStateEvent} from "./shared";
+import type {RestrictInlineType, SearchStateEvent} from "./shared";
 
 export {
     findOffsetMatchesInText,
@@ -37,7 +37,7 @@ export const isMobileFrontend = (): boolean => {
 };
 
 /**
- * 页内查找替换 — 前端插件（Phase 4：偏好 / 跨窗口同步 / i18n）
+ * 页内查找替换 — 前端插件（偏好 / 跨窗口同步 / i18n）
  */
 export default class PluginPageSearch extends Plugin implements SearchBarHost {
     private isMobile = false;
@@ -295,14 +295,41 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             selectionOnlyNoScope: t.selectionOnlyNoScope
                 || "Selection-only mode is on, but there is no usable selection",
             settingsTitle: t.settingsTitle || "Search scope",
+            settingsRestrictInline: t.settingsRestrictInline || "Limit find",
+            settingsRestrictInlineHint: t.settingsRestrictInlineHint
+                || "When enabled, search only within the selected inline elements (multi-select). With an empty find box, preview all matching inline elements of the selected types. Limit-find choices reset when the search UI closes",
+            settingsIncludeScope: t.settingsIncludeScope || "Include in find",
+            settingsIncludeScopeHint: t.settingsIncludeScopeHint
+                || "Controls which block-level types (and inline memos) may be searched",
             settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database",
+            settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
             settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
             settingsIncludeFoldedBlocks: t.settingsIncludeFoldedBlocks || "Folded block content",
             settingsIncludeFoldedBlocksHint: t.settingsIncludeFoldedBlocksHint
-                || "Content inside folded headings cannot be searched",
+                || "Controls whether to search hidden content inside folded blocks (excluding folded headings)",
             settingsIncludeInlineMemo: t.settingsIncludeInlineMemo || "Inline memos",
             settingsIncludeInlineMemoHint: t.settingsIncludeInlineMemoHint
-                || "Matches underline the host text with a yellow/orange dashed line",
+                || "Matches show a yellow/orange dashed underline under the corresponding text",
+            settingsRestrictBlockRef: t.settingsRestrictBlockRef || "Block ref",
+            settingsRestrictLink: t.settingsRestrictLink || "Link",
+            settingsRestrictStrong: t.settingsRestrictStrong || "Bold",
+            settingsRestrictEm: t.settingsRestrictEm || "Italic",
+            settingsRestrictU: t.settingsRestrictU || "Underline",
+            settingsRestrictS: t.settingsRestrictS || "Strikethrough",
+            settingsRestrictMark: t.settingsRestrictMark || "Highlight",
+            settingsRestrictSup: t.settingsRestrictSup || "Superscript",
+            settingsRestrictSub: t.settingsRestrictSub || "Subscript",
+            settingsRestrictCode: t.settingsRestrictCode || "Inline code",
+            settingsRestrictKbd: t.settingsRestrictKbd || "Keyboard",
+            settingsRestrictTag: t.settingsRestrictTag || "Tag",
+            settingsRestrictInlineMath: t.settingsRestrictInlineMath || "Inline math",
+            settingsRestrictInlineMathHint: t.settingsRestrictInlineMathHint
+                || "Match visible rendered formula text (not LaTeX source); not replaceable",
+            settingsRestrictInlineMemo: t.settingsRestrictInlineMemo || "Inline memo",
+            settingsRestrictInlineMemoHint: t.settingsRestrictInlineMemoHint
+                || "Turn on Include in find → Inline memos first; not replaceable",
+            settingsRestrictInlineMemoOnHint: t.settingsRestrictInlineMemoOnHint
+                || "Turn on Include in find → Inline memos first; not replaceable",
             invalidRegex: t.invalidRegex || "Invalid regex: {error}",
         };
     }
@@ -314,6 +341,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeAttributeView(value);
+        });
+    }
+
+    /** 将代码块匹配开关同步到其它已打开面板 */
+    syncIncludeCodeBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeCodeBlock(value);
         });
     }
 
@@ -344,6 +381,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeInlineMemo(value);
+        });
+    }
+
+    /** 将限制查找类型同步到其它已打开面板 */
+    syncRestrictInlineTypes(value: RestrictInlineType[], source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyRestrictInlineTypes(value);
         });
     }
 
@@ -495,7 +542,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             }
         });
         this.lastHighlightComponent = null;
-        void rpcSetPrefs(this, {lastQuery: ""});
+        // 限制查找不持久化：关闭时清回默认空，避免下次打开带回旧勾选
+        void rpcSetPrefs(this, {lastQuery: "", restrictInlineTypes: []});
     }
 
     closeCurrentSearchDialog(element: Element, options?: {broadcast?: boolean}) {
@@ -515,7 +563,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             }
         }
 
-        void rpcSetPrefs(this, {lastQuery: ""});
+        void rpcSetPrefs(this, {lastQuery: "", restrictInlineTypes: []});
 
         if (options?.broadcast) {
             void rpcEmitSearchState(this, {
@@ -603,9 +651,12 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     presetText: initialQuery || undefined,
                     replaceVisible: replaceVisibleOnCreate,
                     includeAttributeView: prefs.includeAttributeView !== false,
+                    includeCodeBlock: prefs.includeCodeBlock !== false,
                     includeMermaid: prefs.includeMermaid !== false,
                     includeFoldedBlocks: prefs.includeFoldedBlocks === true,
                     includeInlineMemo: prefs.includeInlineMemo === true,
+                    // 限制查找仅会话内有效，打开时始终不限制
+                    restrictInlineTypes: [],
                 });
                 this.searchBars.set(element, bar);
 

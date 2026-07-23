@@ -1,5 +1,18 @@
-import {ATTRIBUTE_VIEW_TYPE} from "../shared";
-import type {Plugin} from "siyuan";
+import {
+    ATTRIBUTE_VIEW_TYPE,
+    INLINE_MATH_TYPE,
+    INLINE_MEMO_TYPE,
+    RESTRICT_INLINE_TYPE_ALLOWLIST,
+    canRestrictInlineMemo,
+    formatSearchCountLabel,
+    hasRestrictInlineType,
+    isRestrictInlineActive,
+    normalizeRestrictInlineTypes,
+    toggleRestrictInlineType,
+    shouldEnumerateRestrictInline,
+    type RestrictInlineType,
+} from "../shared";
+import type {IMenu, Plugin} from "siyuan";
 import {confirm, Menu, showMessage} from "siyuan";
 import {rpcEmitSearchState, rpcSetPrefs} from "./kernel-client";
 import {collectSearchableBlocks, MERMAID_UNIT_ID} from "./blocks";
@@ -42,6 +55,24 @@ import {
 } from "./fold";
 import type {SearchMatch} from "./dom-types";
 
+/** 限制查找菜单：类型 → 图标（对齐思源 hint/工具栏符号 id） */
+const RESTRICT_INLINE_ICONS: Record<RestrictInlineType, string> = {
+    "block-ref": "iconRef",
+    a: "iconLink",
+    strong: "iconBold",
+    em: "iconItalic",
+    u: "iconUnderline",
+    s: "iconStrike",
+    mark: "iconMark",
+    sup: "iconSup",
+    sub: "iconSub",
+    code: "iconInlineCode",
+    kbd: "iconKeymap",
+    tag: "iconTag",
+    "inline-math": "iconMath",
+    "inline-memo": "iconM",
+};
+
 const DONE_TYPING_MS = 400;
 
 export interface SearchBarI18n {
@@ -70,12 +101,34 @@ export interface SearchBarI18n {
     replaceProtyleMissing: string;
     selectionOnlyNoScope: string;
     settingsTitle: string;
+    settingsRestrictInline: string;
+    settingsRestrictInlineHint: string;
+    settingsIncludeScope: string;
+    settingsIncludeScopeHint: string;
     settingsIncludeAttributeView: string;
+    settingsIncludeCodeBlock: string;
     settingsIncludeMermaid: string;
     settingsIncludeFoldedBlocks: string;
     settingsIncludeFoldedBlocksHint: string;
     settingsIncludeInlineMemo: string;
     settingsIncludeInlineMemoHint: string;
+    settingsRestrictMark: string;
+    settingsRestrictStrong: string;
+    settingsRestrictEm: string;
+    settingsRestrictU: string;
+    settingsRestrictS: string;
+    settingsRestrictCode: string;
+    settingsRestrictKbd: string;
+    settingsRestrictTag: string;
+    settingsRestrictSup: string;
+    settingsRestrictSub: string;
+    settingsRestrictLink: string;
+    settingsRestrictBlockRef: string;
+    settingsRestrictInlineMath: string;
+    settingsRestrictInlineMathHint: string;
+    settingsRestrictInlineMemo: string;
+    settingsRestrictInlineMemoHint: string;
+    settingsRestrictInlineMemoOnHint: string;
     invalidRegex: string;
 }
 
@@ -89,12 +142,16 @@ export interface SearchBarHost {
     onSearchComponentUnmounted(callback?: (event: CustomEvent) => void): void;
     /** 将数据库匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeAttributeView?(value: boolean, source?: SearchBar): void;
+    /** 将代码块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeCodeBlock?(value: boolean, source?: SearchBar): void;
     /** 将 Mermaid 匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeMermaid?(value: boolean, source?: SearchBar): void;
     /** 将折叠块内容匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeFoldedBlocks?(value: boolean, source?: SearchBar): void;
     /** 将行内备注匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeInlineMemo?(value: boolean, source?: SearchBar): void;
+    /** 将限制查找类型同步到其它已打开的搜索面板（不写 prefs） */
+    syncRestrictInlineTypes?(value: RestrictInlineType[], source?: SearchBar): void;
 }
 
 type MatchOptionKey = "caseSensitive" | "wholeWord" | "regex" | "preserveCase" | "selectionOnly";
@@ -125,12 +182,16 @@ export class SearchBar {
     private selectionOnly = false;
     /** 是否匹配数据库；全局 prefs，默认 true */
     private includeAttributeView = true;
+    /** 是否匹配代码块（非 Mermaid）；全局 prefs，默认 true */
+    private includeCodeBlock = true;
     /** 是否匹配 Mermaid；全局 prefs，默认 true */
     private includeMermaid = true;
     /** 是否匹配非标题折叠块内隐藏内容；全局 prefs，默认 false */
     private includeFoldedBlocks = false;
     /** 是否匹配行内备注；全局 prefs，默认 false */
     private includeInlineMemo = false;
+    /** 限制查找的行内类型；空 = 不限制 */
+    private restrictInlineTypes: RestrictInlineType[] = [];
     /** 替换行默认折叠（对齐 sou-easy defaultReplaceVisible=false） */
     private replaceVisible = false;
     private rememberedSelectionScope: SelectionScope = new Map();
@@ -173,12 +234,16 @@ export class SearchBar {
         replaceVisible?: boolean;
         /** 是否匹配数据库（来自全局 prefs） */
         includeAttributeView?: boolean;
+        /** 是否匹配代码块（来自全局 prefs） */
+        includeCodeBlock?: boolean;
         /** 是否匹配 Mermaid（来自全局 prefs） */
         includeMermaid?: boolean;
         /** 是否匹配折叠块内容（来自全局 prefs） */
         includeFoldedBlocks?: boolean;
         /** 是否匹配行内备注（来自全局 prefs） */
         includeInlineMemo?: boolean;
+        /** 限制查找行内类型（来自全局 prefs） */
+        restrictInlineTypes?: RestrictInlineType[];
     }) {
         this.edit = options.edit;
         this.root = options.root;
@@ -186,9 +251,14 @@ export class SearchBar {
         this.i18n = options.i18n;
         this.replaceVisible = Boolean(options.replaceVisible);
         this.includeAttributeView = options.includeAttributeView !== false;
+        this.includeCodeBlock = options.includeCodeBlock !== false;
         this.includeMermaid = options.includeMermaid !== false;
         this.includeFoldedBlocks = options.includeFoldedBlocks === true;
         this.includeInlineMemo = options.includeInlineMemo === true;
+        this.restrictInlineTypes = normalizeRestrictInlineTypes(
+            options.restrictInlineTypes,
+            {includeInlineMemo: this.includeInlineMemo},
+        );
         this.eventBusHandle = (event) => this.onEventBus(event);
 
         this.root.innerHTML = this.buildMarkup(this.plugin.isMobileView());
@@ -249,6 +319,10 @@ export class SearchBar {
         } else {
             this.input.focus();
             this.input.select();
+            // 限制已开 + 空查询：打开即枚举行内宿主
+            if (isRestrictInlineActive(this.restrictInlineTypes)) {
+                void this.highlightHitResult("", true);
+            }
         }
     }
 
@@ -618,8 +692,10 @@ export class SearchBar {
     private captureSelectionScope() {
         const {scope, kind, visualBlockIds, tableCellRefs} = captureSelectionScopeWithKind(this.edit, {
             includeAttributeView: this.includeAttributeView,
+            includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
             includeInlineMemo: this.includeInlineMemo,
+            restrictInlineTypes: this.restrictInlineTypes,
         });
         this.rememberedSelectionScope = cloneSelectionScope(scope);
         this.selectionScopeVisualKind = kind;
@@ -633,16 +709,20 @@ export class SearchBar {
         }
         const blocks = collectSearchableBlocks(this.edit, {
             includeAttributeView: this.includeAttributeView,
+            includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
             includeInlineMemo: this.includeInlineMemo,
+            restrictInlineTypes: this.restrictInlineTypes,
         });
         const live = getSelectionScope(this.edit, blocks);
         if (live.size > 0) {
             // 仍有现场选区时同步提示（用户改选了范围）；光标挪走后 live 为空则保持冻结提示
             const captured = captureSelectionScopeWithKind(this.edit, {
                 includeAttributeView: this.includeAttributeView,
+                includeCodeBlock: this.includeCodeBlock,
                 includeMermaid: this.includeMermaid,
                 includeInlineMemo: this.includeInlineMemo,
+                restrictInlineTypes: this.restrictInlineTypes,
             });
             this.selectionScopeVisualKind = captured.kind ?? this.selectionScopeVisualKind;
             this.rememberedVisualBlockIds = captured.visualBlockIds;
@@ -786,14 +866,24 @@ export class SearchBar {
     }
 
     private syncReplaceButtons() {
+        const enumerateMode = this.isRestrictEnumerateMode();
         const modeBlocked = isEditorReplaceModeBlocked(this.edit);
         const current = this.getCurrentMatch();
-        const canReplaceCurrent = !modeBlocked && Boolean(current && isMatchWritable(this.edit, current));
-        const hasWritable = !modeBlocked && this.resultMatches.some((match) => isMatchWritable(this.edit, match));
+        const canReplaceCurrent = !enumerateMode
+            && !modeBlocked
+            && Boolean(current && isMatchWritable(this.edit, current));
+        const hasWritable = !enumerateMode
+            && !modeBlocked
+            && this.resultMatches.some((match) => isMatchWritable(this.edit, match));
         this.replaceBtn?.classList.toggle("is-disabled", !canReplaceCurrent);
         this.replaceAllBtn?.classList.toggle("is-disabled", !hasWritable);
         this.replaceBtn?.setAttribute("aria-disabled", canReplaceCurrent ? "false" : "true");
         this.replaceAllBtn?.setAttribute("aria-disabled", hasWritable ? "false" : "true");
+    }
+
+    /** 空查询 + 限制激活：枚举行内宿主，禁用替换（仍可展开替换栏） */
+    private isRestrictEnumerateMode(): boolean {
+        return shouldEnumerateRestrictInline(this.searchText, this.restrictInlineTypes);
     }
 
     private toggleReplaceVisible() {
@@ -824,12 +914,12 @@ export class SearchBar {
     }
 
     private updateCountLabel() {
-        this.countEl.textContent = `${this.resultIndex}/${this.resultCount}`;
+        this.countEl.textContent = formatSearchCountLabel(this.resultIndex, this.resultCount);
     }
 
     private async calculateSearchResults(value: string, change: boolean): Promise<SearchMatch[]> {
         const keyword = value.trim();
-        if (!keyword) {
+        if (!keyword && !isRestrictInlineActive(this.restrictInlineTypes)) {
             this.clearHighlight();
             this.resultMatches = [];
             this.resultCount = 0;
@@ -853,9 +943,11 @@ export class SearchBar {
             selectionOnly: this.selectionOnly,
             selectionScope: this.resolveScopeForSearch(),
             includeAttributeView: this.includeAttributeView,
+            includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
             includeFoldedBlocks: this.includeFoldedBlocks,
             includeInlineMemo: this.includeInlineMemo,
+            restrictInlineTypes: this.restrictInlineTypes,
         });
         if (generation !== this.searchGeneration) {
             return this.resultMatches;
@@ -892,7 +984,8 @@ export class SearchBar {
         const matches = await this.calculateSearchResults(value, change);
         const trimmed = value.trim();
 
-        if (!trimmed) {
+        // 空查询且未限制：清空高亮（旧行为）。限制激活的空查询走下方枚举高亮。
+        if (!trimmed && !shouldEnumerateRestrictInline(value, this.restrictInlineTypes)) {
             this.clearHighlight();
             void rpcEmitSearchState(this.plugin, {
                 type: "clear",
@@ -912,6 +1005,7 @@ export class SearchBar {
         const HighlightCtor = (window as any).Highlight as {
             new (...ranges: Range[]): Highlight;
         };
+        // 正文与行内公式统一黄/橙 CSS Highlight；备注仍用虚线下划线
         const textRanges: Range[] = [];
         for (const match of matches) {
             if (!match.range || match.highlightKind === "inline-memo") {
@@ -940,6 +1034,9 @@ export class SearchBar {
         if (highlights) {
             highlights.delete("search-results");
             highlights.delete("search-focus");
+            // 旧版曾用独立 math/memo Highlight 名；清理以免残留底色
+            highlights.delete("search-math-results");
+            highlights.delete("search-math-focus");
             highlights.delete("search-memo-results");
             highlights.delete("search-memo-focus");
         }
@@ -1205,6 +1302,7 @@ export class SearchBar {
         if (typeof HighlightCtor === "function" && (CSS as any).highlights) {
             const highlights = (CSS as any).highlights;
             highlights.delete("search-focus");
+            highlights.delete("search-math-focus"); // 旧版独立公式焦点名
             if (match.highlightKind !== "inline-memo") {
                 highlights.set("search-focus", new HighlightCtor(range));
             }
@@ -1240,7 +1338,6 @@ export class SearchBar {
 
     private clickClose() {
         this.clearHighlight();
-        void rpcSetPrefs(this.plugin, {lastQuery: ""});
         this.plugin.closeCurrentSearchDialog(this.root, {broadcast: true});
     }
 
@@ -1370,7 +1467,7 @@ export class SearchBar {
      * 替换当前：不可替则提示并跳到下一项；可替走 Protyle transaction。
      */
     private async clickReplace() {
-        if (this.replaceBusy || this.resultCount === 0) {
+        if (this.replaceBusy || this.resultCount === 0 || this.isRestrictEnumerateMode()) {
             return;
         }
         if (isEditorReplaceModeBlocked(this.edit)) {
@@ -1438,7 +1535,7 @@ export class SearchBar {
     }
 
     private async clickReplaceAll() {
-        if (this.replaceBusy || this.resultCount === 0) {
+        if (this.replaceBusy || this.resultCount === 0 || this.isRestrictEnumerateMode()) {
             return;
         }
         if (isEditorReplaceModeBlocked(this.edit)) {
@@ -1495,6 +1592,7 @@ export class SearchBar {
 
     /**
      * 思源原生 Menu + b3-switch：匹配范围设置（全局持久化）。
+     * 一级：限制查找 ▸ / 是否查找 ▸ / 折叠块内容
      * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/plugin/Menu.ts
      */
     private openSettingsMenu(anchor: HTMLElement) {
@@ -1505,35 +1603,65 @@ export class SearchBar {
             }
         });
         this.settingsMenu = menu;
-        this.appendMatchSwitchMenuItem(menu, {
-            id: "page-search-include-inline-memo",
-            icon: "iconM",
-            label: this.i18n.settingsIncludeInlineMemo,
-            checked: this.includeInlineMemo,
-            helpTip: this.i18n.settingsIncludeInlineMemoHint,
-            onChange: (checked) => {
-                void this.setIncludeInlineMemo(checked);
+        menu.addItem({
+            id: "page-search-restrict-inline",
+            icon: "iconFilter",
+            label: this.i18n.settingsRestrictInline,
+            type: "submenu",
+            submenu: this.buildRestrictInlineSubmenuItems(),
+            bind: (element) => {
+                this.attachMenuHelpTip(element, this.i18n.settingsRestrictInlineHint);
             },
         });
-        this.appendMatchSwitchMenuItem(menu, {
-            id: "page-search-include-attribute-view",
-            icon: "iconDatabase",
-            label: this.i18n.settingsIncludeAttributeView,
-            checked: this.includeAttributeView,
-            onChange: (checked) => {
-                void this.setIncludeAttributeView(checked);
+        menu.addItem({
+            id: "page-search-include-scope",
+            icon: "iconList",
+            label: this.i18n.settingsIncludeScope,
+            type: "submenu",
+            submenu: [
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-inline-memo",
+                    icon: "iconM",
+                    label: this.i18n.settingsIncludeInlineMemo,
+                    checked: this.includeInlineMemo,
+                    helpTip: this.i18n.settingsIncludeInlineMemoHint,
+                    onChange: (checked) => {
+                        void this.setIncludeInlineMemo(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-attribute-view",
+                    icon: "iconDatabase",
+                    label: this.i18n.settingsIncludeAttributeView,
+                    checked: this.includeAttributeView,
+                    onChange: (checked) => {
+                        void this.setIncludeAttributeView(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-code-block",
+                    icon: "iconCode",
+                    label: this.i18n.settingsIncludeCodeBlock,
+                    checked: this.includeCodeBlock,
+                    onChange: (checked) => {
+                        void this.setIncludeCodeBlock(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-mermaid",
+                    icon: "iconCode",
+                    label: this.i18n.settingsIncludeMermaid,
+                    checked: this.includeMermaid,
+                    onChange: (checked) => {
+                        void this.setIncludeMermaid(checked);
+                    },
+                }),
+            ],
+            bind: (element) => {
+                this.attachMenuHelpTip(element, this.i18n.settingsIncludeScopeHint);
             },
         });
-        this.appendMatchSwitchMenuItem(menu, {
-            id: "page-search-include-mermaid",
-            icon: "iconCode",
-            label: this.i18n.settingsIncludeMermaid,
-            checked: this.includeMermaid,
-            onChange: (checked) => {
-                void this.setIncludeMermaid(checked);
-            },
-        });
-        this.appendMatchSwitchMenuItem(menu, {
+        menu.addItem(this.buildMatchSwitchMenuItem({
             id: "page-search-include-folded-blocks",
             icon: "iconContract",
             label: this.i18n.settingsIncludeFoldedBlocks,
@@ -1542,7 +1670,7 @@ export class SearchBar {
             onChange: (checked) => {
                 void this.setIncludeFoldedBlocks(checked);
             },
-        });
+        }));
         const rect = anchor.getBoundingClientRect();
         menu.open({
             x: rect.left,
@@ -1577,44 +1705,113 @@ export class SearchBar {
         }
     }
 
-    private appendMatchSwitchMenuItem(
-        menu: Menu,
-        options: {
-            id: string;
-            icon: string;
-            label: string;
-            checked: boolean;
-            onChange: (checked: boolean) => void;
-            /** 标签旁圆圈问号，悬浮显示说明（思源 ariaLabel 提示） */
-            helpTip?: string;
-        },
-    ) {
-        const {id, icon, label, checked, onChange, helpTip} = options;
-        menu.addItem({
+    private buildRestrictInlineSubmenuItems(): IMenu[] {
+        return RESTRICT_INLINE_TYPE_ALLOWLIST.map((type) => {
+            const isMemo = type === INLINE_MEMO_TYPE;
+            const isMath = type === INLINE_MATH_TYPE;
+            const memoLocked = isMemo && !canRestrictInlineMemo(this.includeInlineMemo);
+            let helpTip: string | undefined;
+            if (memoLocked) {
+                helpTip = this.i18n.settingsRestrictInlineMemoHint;
+            } else if (isMemo) {
+                helpTip = this.i18n.settingsRestrictInlineMemoOnHint;
+            } else if (isMath) {
+                helpTip = this.i18n.settingsRestrictInlineMathHint;
+            }
+            return this.buildMatchSwitchMenuItem({
+                id: `page-search-restrict-${type}`,
+                icon: RESTRICT_INLINE_ICONS[type],
+                label: this.restrictInlineTypeLabel(type),
+                checked: !memoLocked && hasRestrictInlineType(this.restrictInlineTypes, type),
+                disabled: memoLocked,
+                helpTip,
+                onChange: (checked) => {
+                    void this.setRestrictInlineType(type, checked);
+                },
+            });
+        });
+    }
+
+    private restrictInlineTypeLabel(type: RestrictInlineType): string {
+        switch (type) {
+            case "block-ref":
+                return this.i18n.settingsRestrictBlockRef;
+            case "a":
+                return this.i18n.settingsRestrictLink;
+            case "strong":
+                return this.i18n.settingsRestrictStrong;
+            case "em":
+                return this.i18n.settingsRestrictEm;
+            case "u":
+                return this.i18n.settingsRestrictU;
+            case "s":
+                return this.i18n.settingsRestrictS;
+            case "mark":
+                return this.i18n.settingsRestrictMark;
+            case "sup":
+                return this.i18n.settingsRestrictSup;
+            case "sub":
+                return this.i18n.settingsRestrictSub;
+            case "code":
+                return this.i18n.settingsRestrictCode;
+            case "kbd":
+                return this.i18n.settingsRestrictKbd;
+            case "tag":
+                return this.i18n.settingsRestrictTag;
+            case "inline-math":
+                return this.i18n.settingsRestrictInlineMath;
+            case "inline-memo":
+                return this.i18n.settingsRestrictInlineMemo;
+            default: {
+                const _exhaustive: never = type;
+                return _exhaustive;
+            }
+        }
+    }
+
+    private attachMenuHelpTip(element: HTMLElement, helpTip: string) {
+        const labelEl = element.querySelector(".b3-menu__label");
+        const helpHtml = `<svg class="b3-menu__icon page-search-menu-help ariaLabel" data-position="north"`
+            + ` aria-label="${escapeAttr(helpTip)}">`
+            + `<use xlink:href="#iconHelp"></use></svg>`;
+        if (labelEl) {
+            labelEl.insertAdjacentHTML("afterend", helpHtml);
+        } else {
+            element.insertAdjacentHTML("beforeend", helpHtml);
+        }
+        element.querySelector(".page-search-menu-help")?.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+    }
+
+    private buildMatchSwitchMenuItem(options: {
+        id: string;
+        icon: string;
+        label: string;
+        checked: boolean;
+        onChange: (checked: boolean) => void;
+        /** 标签旁圆圈问号，悬浮显示说明（思源 ariaLabel 提示） */
+        helpTip?: string;
+        /** 灰显且不可切换（备注限制门闩）；运行期可改 DOM disabled */
+        disabled?: boolean;
+    }): IMenu {
+        const {id, icon, label, checked, onChange, helpTip, disabled} = options;
+        return {
             id,
             icon,
             label,
+            disabled: Boolean(disabled),
             bind: (element) => {
                 if (helpTip) {
-                    const labelEl = element.querySelector(".b3-menu__label");
-                    const helpHtml = `<svg class="b3-menu__icon page-search-menu-help ariaLabel" data-position="north"`
-                        + ` aria-label="${escapeAttr(helpTip)}">`
-                        + `<use xlink:href="#iconHelp"></use></svg>`;
-                    if (labelEl) {
-                        labelEl.insertAdjacentHTML("afterend", helpHtml);
-                    } else {
-                        element.insertAdjacentHTML("beforeend", helpHtml);
-                    }
-                    element.querySelector(".page-search-menu-help")?.addEventListener("click", (event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                    });
+                    this.attachMenuHelpTip(element, helpTip);
                 }
                 element.insertAdjacentHTML(
                     "beforeend",
                     `<span class="fn__flex-1"></span>`
                     + `<input class="b3-switch fn__flex-center" type="checkbox"`
-                    + `${checked ? " checked" : ""}>`,
+                    + `${checked ? " checked" : ""}`
+                    + `${disabled ? " disabled" : ""}>`,
                 );
                 const input = element.querySelector(".b3-switch") as HTMLInputElement | null;
                 if (!input) {
@@ -1623,24 +1820,78 @@ export class SearchBar {
                 input.addEventListener("click", (event) => {
                     event.stopPropagation();
                 });
+                // 始终绑定：门闩可能在菜单打开后因「是否·备注」切换而变化，勿捕获初始 disabled
                 input.addEventListener("change", () => {
+                    if (isMenuItemDisabled(element) || input.disabled) {
+                        return;
+                    }
                     onChange(input.checked);
                 });
             },
             click: (element, event) => {
+                // 与思源 MenuItem 一致：读当前 disabled 属性（可被 syncRestrictInlineMemoMenuGate 更新）
+                if (isMenuItemDisabled(element)) {
+                    return true;
+                }
                 const target = event.target as HTMLElement | null;
                 if (target?.closest(".b3-switch, .page-search-menu-help")) {
                     return true;
                 }
                 const input = element.querySelector(".b3-switch") as HTMLInputElement | null;
-                if (!input) {
-                    return false;
+                if (!input || input.disabled) {
+                    return true;
                 }
                 input.checked = !input.checked;
                 input.dispatchEvent(new Event("change"));
                 return true;
             },
-        });
+        };
+    }
+
+    /**
+     * 菜单仍打开时，同步「限制查找 · 行内备注」门闩 UI。
+     * 思源 Menu 无 updateItem：子项在 open 时一次性构建，须直接改 DOM。
+     * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/menus/Menu.ts MenuItem
+     */
+    private syncRestrictInlineMemoMenuGate() {
+        const root = this.getOpenSettingsMenuElement();
+        if (!root) {
+            return;
+        }
+        const item = root.querySelector<HTMLElement>(
+            `[data-id="page-search-restrict-${INLINE_MEMO_TYPE}"]`,
+        );
+        if (!item) {
+            return;
+        }
+        const locked = !canRestrictInlineMemo(this.includeInlineMemo);
+        const input = item.querySelector(".b3-switch") as HTMLInputElement | null;
+        const help = item.querySelector(".page-search-menu-help");
+
+        if (locked) {
+            item.setAttribute("disabled", "disabled");
+            if (input) {
+                input.checked = false;
+                input.disabled = true;
+            }
+            help?.setAttribute("aria-label", this.i18n.settingsRestrictInlineMemoHint);
+            return;
+        }
+
+        item.removeAttribute("disabled");
+        if (input) {
+            input.disabled = false;
+            input.checked = hasRestrictInlineType(this.restrictInlineTypes, INLINE_MEMO_TYPE);
+        }
+        help?.setAttribute("aria-label", this.i18n.settingsRestrictInlineMemoOnHint);
+    }
+
+    private getOpenSettingsMenuElement(): HTMLElement | null {
+        const fromRef = this.settingsMenu?.element;
+        if (fromRef?.getAttribute("data-name") === "page-search-settings") {
+            return fromRef;
+        }
+        return document.querySelector<HTMLElement>('.b3-menu[data-name="page-search-settings"]');
     }
 
     /** 用户切换：写 prefs + 同步其它面板 + 重搜 */
@@ -1651,6 +1902,16 @@ export class SearchBar {
         this.includeAttributeView = value;
         await rpcSetPrefs(this.plugin, {includeAttributeView: value});
         this.plugin.syncIncludeAttributeView?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeCodeBlock(value: boolean) {
+        if (this.includeCodeBlock === value) {
+            return;
+        }
+        this.includeCodeBlock = value;
+        await rpcSetPrefs(this.plugin, {includeCodeBlock: value});
+        this.plugin.syncIncludeCodeBlock?.(value, this);
         void this.highlightHitResult(this.searchText, true);
     }
 
@@ -1679,8 +1940,34 @@ export class SearchBar {
             return;
         }
         this.includeInlineMemo = value;
+        // 关「是否·备注」时踢掉限制里的 inline-memo（与 coerce 一致）
+        const restrictInlineTypes = normalizeRestrictInlineTypes(this.restrictInlineTypes, {
+            includeInlineMemo: value,
+        });
+        this.restrictInlineTypes = restrictInlineTypes;
         await rpcSetPrefs(this.plugin, {includeInlineMemo: value});
         this.plugin.syncIncludeInlineMemo?.(value, this);
+        this.plugin.syncRestrictInlineTypes?.(restrictInlineTypes, this);
+        this.syncRestrictInlineMemoMenuGate();
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private setRestrictInlineType(type: RestrictInlineType, enabled: boolean) {
+        const next = toggleRestrictInlineType(
+            this.restrictInlineTypes,
+            type,
+            enabled,
+            {includeInlineMemo: this.includeInlineMemo},
+        );
+        if (
+            next.length === this.restrictInlineTypes.length
+            && next.every((token, i) => token === this.restrictInlineTypes[i])
+        ) {
+            return;
+        }
+        this.restrictInlineTypes = next;
+        // 限制查找仅会话内生效，不写入 prefs
+        this.plugin.syncRestrictInlineTypes?.(next, this);
         void this.highlightHitResult(this.searchText, true);
     }
 
@@ -1693,6 +1980,14 @@ export class SearchBar {
             return;
         }
         this.includeAttributeView = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeCodeBlock(value: boolean) {
+        if (this.includeCodeBlock === value) {
+            return;
+        }
+        this.includeCodeBlock = value;
         void this.highlightHitResult(this.searchText, true);
     }
 
@@ -1717,6 +2012,24 @@ export class SearchBar {
             return;
         }
         this.includeInlineMemo = value;
+        this.restrictInlineTypes = normalizeRestrictInlineTypes(this.restrictInlineTypes, {
+            includeInlineMemo: value,
+        });
+        this.syncRestrictInlineMemoMenuGate();
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyRestrictInlineTypes(value: RestrictInlineType[]) {
+        const next = normalizeRestrictInlineTypes(value, {
+            includeInlineMemo: this.includeInlineMemo,
+        });
+        if (
+            next.length === this.restrictInlineTypes.length
+            && next.every((token, i) => token === this.restrictInlineTypes[i])
+        ) {
+            return;
+        }
+        this.restrictInlineTypes = next;
         void this.highlightHitResult(this.searchText, true);
     }
 }
@@ -1738,6 +2051,11 @@ function confirmDialog(title: string, text: string): Promise<boolean> {
 
 function iconUse(href: string): string {
     return `<svg class="icon--14_14"><use href="${href}"></use></svg>`;
+}
+
+/** 与思源 MenuItem 一致：button[disabled] 表示不可点 */
+function isMenuItemDisabled(element: HTMLElement): boolean {
+    return element.getAttribute("disabled") != null;
 }
 
 /** 展开/折叠替换行：chevron */

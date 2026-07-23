@@ -1,20 +1,35 @@
 /**
- * Phase 1–4 冒烟：shared 匹配核 + 选区纯函数 + preserve-case + RPC 规范化
+ * Shared 冒烟：匹配核 + 限制查找门闩 + 选区纯函数 + preserve-case + RPC 规范化
  */
 import {
     ATTRIBUTE_VIEW_TYPE,
     DEFAULT_PREFS,
     PREFS_STORAGE_PATH,
+    SEARCH_COUNT_SOFT_CAP,
+    canRestrictInlineMemo,
+    coercePluginPrefs,
     findOffsetMatchesInText,
+    formatSearchCountLabel,
     generateSearchVariants,
+    hasRestrictInlineType,
     isHitReplaceableByUnit,
     isOffsetReplaceable,
+    isRestrictInlineActive,
+    matchPassesRestrictInline,
     matchTextUnits,
     matchTextUnitsDetailed,
     mergePrefs,
     normalizeMatchRequest,
     normalizePrefsPatch,
+    normalizeRestrictInlineTypes,
     normalizeSearchStateEvent,
+    parseDataTypeTokens,
+    rangeRestrictTokens,
+    shouldCollectBodyTextForRestrict,
+    shouldCollectInlineMathUnits,
+    shouldCollectInlineMemoUnits,
+    shouldEnumerateRestrictInline,
+    toggleRestrictInlineType,
 } from "../src/shared";
 import {preserveReplacementCase} from "../src/frontend/preserve-case";
 
@@ -166,14 +181,214 @@ assert(positional.query === "ab" && positional.units.length === 1, "positional m
 
 const prefs = mergePrefs(DEFAULT_PREFS, {lastQuery: "hi", dialogLeft: 10});
 assert(prefs.lastQuery === "hi" && prefs.dialogLeft === 10, "merge prefs");
+assert(Array.isArray(prefs.restrictInlineTypes) && prefs.restrictInlineTypes.length === 0, "default restrict empty");
 assert(PREFS_STORAGE_PATH === "prefs.json", "prefs path");
 assert(normalizePrefsPatch([{lastQuery: "x"}]).lastQuery === "x", "prefs patch");
+
+assert(!isRestrictInlineActive([]), "empty restrict inactive");
+assert(isRestrictInlineActive(["mark"]), "non-empty restrict active");
+assert(!canRestrictInlineMemo(false), "memo gate closed");
+assert(canRestrictInlineMemo(true), "memo gate open");
+
+const stripped = normalizeRestrictInlineTypes(
+    ["mark", "inline-memo", "bogus", "strong"],
+    {includeInlineMemo: false},
+);
+assert(stripped.join(",") === "strong,mark", "normalize strips memo+bogus when include off");
+
+const withMemo = normalizeRestrictInlineTypes(
+    ["inline-memo", "mark"],
+    {includeInlineMemo: true},
+);
+assert(withMemo.join(",") === "mark,inline-memo", "normalize allowlist order");
+
+assert(
+    normalizeRestrictInlineTypes(["a", "block-ref", "code"], {includeInlineMemo: true}).join(",")
+        === "block-ref,a,code",
+    "block-ref sorts before link and code",
+);
+
+const blocked = toggleRestrictInlineType([], "inline-memo", true, {includeInlineMemo: false});
+assert(blocked.length === 0, "cannot enable restrict memo when include off");
+
+const gatedOff = coercePluginPrefs({
+    includeInlineMemo: false,
+    restrictInlineTypes: ["mark", "inline-memo"] as any,
+});
+assert(gatedOff.includeInlineMemo === false, "coerce include memo false");
+assert(gatedOff.restrictInlineTypes.join(",") === "mark", "coerce strips restrict memo");
+assert(hasRestrictInlineType(gatedOff.restrictInlineTypes, "mark"), "has mark");
+assert(!hasRestrictInlineType(gatedOff.restrictInlineTypes, "inline-memo"), "no memo after gate");
+
+const includeOffClears = mergePrefs(
+    coercePluginPrefs({includeInlineMemo: true, restrictInlineTypes: ["inline-memo", "em"] as any}),
+    {includeInlineMemo: false},
+);
+assert(includeOffClears.restrictInlineTypes.join(",") === "em", "closing include clears restrict memo");
+
+assert(parseDataTypeTokens("strong em mark").join(",") === "strong,em,mark", "parse data-type tokens");
+assert(
+    rangeRestrictTokens(["mark", "inline-memo", "inline-math", "strong"]).join(",") === "mark,strong",
+    "range tokens drop memo+math",
+);
+assert(
+    matchPassesRestrictInline({restrictTypes: [], attributeKind: null, hostDataTypes: []}),
+    "inactive restrict keeps text",
+);
+assert(
+    matchPassesRestrictInline({
+        restrictTypes: ["mark"],
+        attributeKind: null,
+        hostDataTypes: ["strong", "mark"],
+    }),
+    "OR: mark host kept",
+);
+assert(
+    !matchPassesRestrictInline({
+        restrictTypes: ["mark"],
+        attributeKind: null,
+        hostDataTypes: ["strong"],
+    }),
+    "OR: strong-only rejected when only mark",
+);
+assert(
+    !matchPassesRestrictInline({
+        restrictTypes: ["mark"],
+        attributeKind: null,
+        hostDataTypes: [],
+    }),
+    "no host rejected when restrict on",
+);
+assert(
+    !matchPassesRestrictInline({
+        restrictTypes: ["inline-memo"],
+        attributeKind: null,
+        hostDataTypes: ["inline-memo"],
+    }),
+    "memo-only restrict rejects body text even on memo host",
+);
+assert(
+    matchPassesRestrictInline({
+        restrictTypes: ["inline-memo"],
+        attributeKind: "inline-memo",
+        hostDataTypes: [],
+    }),
+    "memo unit kept when memo in restrict",
+);
+assert(
+    !matchPassesRestrictInline({
+        restrictTypes: ["mark"],
+        attributeKind: "inline-memo",
+        hostDataTypes: [],
+    }),
+    "memo unit dropped when memo not in restrict",
+);
+
+// --- 限制侧备注采集门闩（双开关四种组合）---
+assert(shouldCollectBodyTextForRestrict([]), "no restrict → collect body");
+assert(shouldCollectBodyTextForRestrict(["mark"]), "mark restrict → collect body");
+assert(!shouldCollectBodyTextForRestrict(["inline-memo"]), "memo-only restrict → skip body");
+assert(!shouldCollectBodyTextForRestrict(["inline-math"]), "math-only restrict → skip body");
+assert(
+    shouldCollectBodyTextForRestrict(["strong", "inline-memo"]),
+    "memo+strong → collect body",
+);
+assert(
+    shouldCollectInlineMemoUnits({includeInlineMemo: true, restrictTypes: []}),
+    "include on + no restrict → collect memo",
+);
+assert(
+    shouldCollectInlineMemoUnits({includeInlineMemo: true, restrictTypes: ["inline-memo"]}),
+    "include on + restrict memo → collect memo",
+);
+assert(
+    !shouldCollectInlineMemoUnits({includeInlineMemo: true, restrictTypes: ["mark"]}),
+    "include on + restrict mark only → skip memo",
+);
+assert(
+    !shouldCollectInlineMemoUnits({includeInlineMemo: false, restrictTypes: ["inline-memo"]}),
+    "include off → skip memo even if restrict lists it",
+);
+assert(
+    shouldCollectInlineMemoUnits({
+        includeInlineMemo: true,
+        restrictTypes: ["strong", "inline-memo"],
+    }),
+    "include on + restrict memo∪strong → collect memo",
+);
+
+// --- 行内公式渲染文本 unit（全文也采；限制时仅含 math 才采）---
+assert(shouldCollectInlineMathUnits([]), "no restrict → collect rendered math units");
+assert(shouldCollectInlineMathUnits(["inline-math"]), "restrict math → collect math");
+assert(!shouldCollectInlineMathUnits(["mark"]), "restrict mark only → skip math units");
+assert(
+    shouldCollectInlineMathUnits(["strong", "inline-math"]),
+    "restrict math∪strong → collect math",
+);
+assert(
+    matchPassesRestrictInline({
+        restrictTypes: ["inline-math"],
+        attributeKind: "inline-math",
+        hostDataTypes: [],
+    }),
+    "math unit kept when math in restrict",
+);
+assert(
+    !matchPassesRestrictInline({
+        restrictTypes: ["mark"],
+        attributeKind: "inline-math",
+        hostDataTypes: [],
+    }),
+    "math unit dropped when math not in restrict",
+);
+assert(
+    !matchPassesRestrictInline({
+        restrictTypes: ["inline-math"],
+        attributeKind: null,
+        hostDataTypes: ["inline-math"],
+    }),
+    "math-only restrict rejects body text on math host",
+);
+
+// --- 回归契约（限制关 = 旧行为门闩）---
+assert(!isRestrictInlineActive(undefined as any), "undefined restrict inactive");
+assert(!isRestrictInlineActive(null as any), "null restrict inactive");
+assert(
+    matchPassesRestrictInline({
+        restrictTypes: [],
+        attributeKind: "inline-math",
+        hostDataTypes: [],
+    }),
+    "restrict off: filter keeps any hit",
+);
+assert(
+    shouldCollectBodyTextForRestrict([]) && shouldCollectInlineMathUnits([]),
+    "restrict off: body + rendered math units",
+);
+assert(
+    !shouldCollectInlineMemoUnits({includeInlineMemo: false, restrictTypes: []}),
+    "restrict off: memo still gated by include",
+);
+assert(
+    shouldCollectInlineMemoUnits({includeInlineMemo: true, restrictTypes: []}),
+    "restrict off: include on collects memo",
+);
+
+assert(!shouldEnumerateRestrictInline("", []), "empty query without restrict → no enumerate");
+assert(!shouldEnumerateRestrictInline("", undefined), "undefined restrict → no enumerate");
+assert(shouldEnumerateRestrictInline("", ["strong"]), "empty + restrict → enumerate");
+assert(shouldEnumerateRestrictInline("  ", ["mark"]), "whitespace-only query → enumerate");
+assert(!shouldEnumerateRestrictInline("foo", ["strong"]), "keyword + restrict → keyword mode");
+assert(SEARCH_COUNT_SOFT_CAP === 999, "soft cap 999");
+assert(formatSearchCountLabel(1, 10) === "1/10", "count below soft cap");
+assert(formatSearchCountLabel(3, 1000) === "3/999+", "count above soft cap shows N+");
+assert(formatSearchCountLabel(1200, 1500) === "1200/999+", "index can exceed soft cap display");
 
 const state = normalizeSearchStateEvent([{type: "close", clientId: "c1"}]);
 assert(state?.type === "close" && state.clientId === "c1", "search-state event");
 assert(normalizeSearchStateEvent([{type: "nope"}]) === null, "rejects bad search-state");
 
-// --- Phase 2: selection scope helpers（无 DOM）---
+// --- selection scope helpers（无 DOM）---
 import {
     isMatchWithinSelection,
     isRangeContained,
@@ -210,10 +425,10 @@ assert(
     "merge overlapping offset ranges",
 );
 
-// --- Phase 4: preserve-case ---
+// --- preserve-case ---
 assert(preserveReplacementCase("bar", "FOO") === "BAR", "preserve upper");
 assert(preserveReplacementCase("BAR", "foo") === "bar", "preserve lower");
 assert(preserveReplacementCase("bar", "Foo") === "Bar", "preserve title");
 assert(preserveReplacementCase("baz", "传感器") === "baz", "cjk unchanged");
 
-console.log("smoke:shared OK (Phase 1–4: match + selection + preserve-case)");
+console.log("smoke:shared OK (match + restrict + selection + preserve-case)");

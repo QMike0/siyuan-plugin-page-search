@@ -1,4 +1,8 @@
 import type {MatchHit, MatchOptions, MatchTextUnitsOptions, SearchableUnit} from "./types";
+import {
+    normalizeRestrictInlineTypes,
+    type RestrictInlineType,
+} from "./restrict-inline";
 
 /** 内核 / 前端约定的搜索请求 */
 export interface MatchRequest {
@@ -24,13 +28,20 @@ export interface MatchResponse {
     error?: string;
 }
 
-/** 插件偏好（对话框位置、最近关键词、匹配范围等） */
+/**
+ * 插件偏好（对话框位置、最近关键词、匹配范围等）。
+ *
+ * 「是否查找」：include*；「限制查找」：restrictInlineTypes（空=不限制）。
+ * 详见 shared/restrict-inline.ts 契约说明。
+ */
 export interface PluginPrefs {
     dialogLeft: number | null;
     dialogTop: number | null;
     lastQuery: string;
     /** 是否匹配文档内数据库（Attribute View）；默认 true */
     includeAttributeView: boolean;
+    /** 是否匹配代码块（不含 Mermaid，由 includeMermaid 单独控制）；默认 true */
+    includeCodeBlock: boolean;
     /** 是否匹配 Mermaid 图；默认 true */
     includeMermaid: boolean;
     /**
@@ -38,8 +49,17 @@ export interface PluginPrefs {
      * 不含折叠标题（子块已不在 DOM）。
      */
     includeFoldedBlocks: boolean;
-    /** 是否匹配行内备注；默认 false */
+    /**
+     * 「是否查找 · 行内备注」：正常搜时是否纳入备注属性；默认 false。
+     * 为 false 时不得保留 restrictInlineTypes 中的 inline-memo。
+     */
     includeInlineMemo: boolean;
+    /**
+     * 「限制查找」所选行内类型；默认 []（不限制）。
+     * 仅当前搜索会话内有效：关闭搜索窗时清回 []，不跨次打开恢复。
+     * 非空时仅在这些类型中搜索（OR）；空查询时枚举行内宿主。
+     */
+    restrictInlineTypes: RestrictInlineType[];
 }
 
 /** 跨窗口搜索状态同步（内核 broadcast → 前端 bind） */
@@ -61,27 +81,53 @@ export const DEFAULT_PREFS: PluginPrefs = {
     dialogTop: null,
     lastQuery: "",
     includeAttributeView: true,
+    includeCodeBlock: true,
     includeMermaid: true,
     includeFoldedBlocks: false,
     includeInlineMemo: false,
+    restrictInlineTypes: [],
 };
 
 export const PREFS_STORAGE_PATH = "prefs.json";
+
+/** 将任意 prefs 形态收成合法 PluginPrefs（含备注门闩） */
+export function coercePluginPrefs(
+    raw: Partial<PluginPrefs> | null | undefined,
+): PluginPrefs {
+    const base = {...DEFAULT_PREFS, ...(raw ?? {})};
+    const includeInlineMemo = base.includeInlineMemo === true;
+    return {
+        dialogLeft: typeof base.dialogLeft === "number" ? base.dialogLeft : null,
+        dialogTop: typeof base.dialogTop === "number" ? base.dialogTop : null,
+        lastQuery: typeof base.lastQuery === "string" ? base.lastQuery : "",
+        includeAttributeView: base.includeAttributeView !== false,
+        includeCodeBlock: base.includeCodeBlock !== false,
+        includeMermaid: base.includeMermaid !== false,
+        includeFoldedBlocks: base.includeFoldedBlocks === true,
+        includeInlineMemo,
+        restrictInlineTypes: normalizeRestrictInlineTypes(base.restrictInlineTypes, {
+            includeInlineMemo,
+        }),
+    };
+}
 
 export function mergePrefs(
     base: PluginPrefs,
     patch: Partial<PluginPrefs> | null | undefined,
 ): PluginPrefs {
     if (!patch) {
-        return {...base};
+        return coercePluginPrefs(base);
     }
-    return {
+    return coercePluginPrefs({
         dialogLeft: patch.dialogLeft !== undefined ? patch.dialogLeft : base.dialogLeft,
         dialogTop: patch.dialogTop !== undefined ? patch.dialogTop : base.dialogTop,
         lastQuery: patch.lastQuery !== undefined ? patch.lastQuery : base.lastQuery,
         includeAttributeView: patch.includeAttributeView !== undefined
             ? patch.includeAttributeView
             : base.includeAttributeView,
+        includeCodeBlock: patch.includeCodeBlock !== undefined
+            ? patch.includeCodeBlock
+            : base.includeCodeBlock,
         includeMermaid: patch.includeMermaid !== undefined
             ? patch.includeMermaid
             : base.includeMermaid,
@@ -91,7 +137,10 @@ export function mergePrefs(
         includeInlineMemo: patch.includeInlineMemo !== undefined
             ? patch.includeInlineMemo
             : base.includeInlineMemo,
-    };
+        restrictInlineTypes: patch.restrictInlineTypes !== undefined
+            ? patch.restrictInlineTypes
+            : base.restrictInlineTypes,
+    });
 }
 
 export function normalizeMatchRequest(args: any[]): MatchRequest {

@@ -21,7 +21,7 @@ export interface ApplyReplacementOutcome {
 /**
  * 在已定位的 textNodes 上从后往前替换（同一单元内）。
  */
-export function applyReplacementsToTextNodes(
+function applyReplacementsToTextNodes(
     textNodes: Text[],
     replacements: ReplacementSpec[],
     replacementText: string,
@@ -73,7 +73,7 @@ export function applyReplacementsToTextNodes(
 /**
  * 将 live 子树中的 Text 节点映射到 clone 子树上的对应 Text。
  */
-export function mapTextNodesToClone(
+function mapTextNodesToClone(
     liveRoot: Node,
     cloneRoot: Node,
     liveTextNodes: Text[],
@@ -92,7 +92,7 @@ export function mapTextNodesToClone(
     return mapped;
 }
 
-export function getNodePath(root: Node, target: Node): number[] | null {
+function getNodePath(root: Node, target: Node): number[] | null {
     const path: number[] = [];
     let current: Node | null = target;
     while (current && current !== root) {
@@ -110,7 +110,7 @@ export function getNodePath(root: Node, target: Node): number[] | null {
     return current === root ? path : null;
 }
 
-export function followNodePath(root: Node, path: number[]): Node | null {
+function followNodePath(root: Node, path: number[]): Node | null {
     let current: Node = root;
     for (const index of path) {
         const next = current.childNodes[index];

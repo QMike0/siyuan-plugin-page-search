@@ -1,3 +1,4 @@
+import type {RestrictInlineType} from "../shared";
 import {collectSearchableBlocks} from "./blocks";
 import {createRangeFromBlockOffsets} from "./ranges";
 import {
@@ -9,15 +10,15 @@ import {
 } from "./selection";
 
 /** 与思源 .protyle-wysiwyg--select 对齐的冻结选区提示（仅用于清扫历史污染 class，不再写入内容块） */
-export const SELECTION_SCOPE_BLOCK_CLASS = "page-search-sel-scope";
+const SELECTION_SCOPE_BLOCK_CLASS = "page-search-sel-scope";
 
 /**
  * 行内选区叠加层。
  * 现行：挂在 .protyle-content（与 wash/rail 同级）。
  * 历史：曾插入 [data-node-id] 首子节点，会被 updateTransaction 的 outerHTML 写进文档。
  */
-export const SELECTION_SCOPE_INLINE_LAYER = "page-search-sel-scope-layer";
-export const SELECTION_SCOPE_INLINE_RECT = "page-search-sel-scope-inline";
+const SELECTION_SCOPE_INLINE_LAYER = "page-search-sel-scope-layer";
+const SELECTION_SCOPE_INLINE_RECT = "page-search-sel-scope-inline";
 
 /**
  * 块级底色 / 行内色块 / 右侧蓝竖线：均挂在 .protyle-content 上，
@@ -25,12 +26,11 @@ export const SELECTION_SCOPE_INLINE_RECT = "page-search-sel-scope-inline";
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/ui/initUI.ts
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/util/table.ts
  */
-export const SELECTION_SCOPE_OVERLAY_HOST = "page-search-sel-scope-rail-host";
-export const SELECTION_SCOPE_RAIL_HOST = SELECTION_SCOPE_OVERLAY_HOST;
-export const SELECTION_SCOPE_RAIL_LAYER = "page-search-sel-scope-rail-layer";
-export const SELECTION_SCOPE_RAIL = "page-search-sel-scope-rail";
-export const SELECTION_SCOPE_WASH_LAYER = "page-search-sel-scope-wash-layer";
-export const SELECTION_SCOPE_WASH = "page-search-sel-scope-wash";
+const SELECTION_SCOPE_OVERLAY_HOST = "page-search-sel-scope-rail-host";
+const SELECTION_SCOPE_RAIL_LAYER = "page-search-sel-scope-rail-layer";
+const SELECTION_SCOPE_RAIL = "page-search-sel-scope-rail";
+const SELECTION_SCOPE_WASH_LAYER = "page-search-sel-scope-wash-layer";
+const SELECTION_SCOPE_WASH = "page-search-sel-scope-wash";
 
 /** 连续块竖线合并：允许的纵向间隙（覆盖块间距） */
 const RAIL_MERGE_Y_GAP = 8;
@@ -57,7 +57,7 @@ export interface TableCellVisualRef {
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/assets/scss/protyle/_wysiwyg.scss
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/util/table.ts
  */
-export function detectSelectionScopeKind(edit: Element): SelectionScopeVisualKind | null {
+function detectSelectionScopeKind(edit: Element): SelectionScopeVisualKind | null {
     const selection = window.getSelection();
     if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
         const text = selection.toString();
@@ -198,7 +198,7 @@ function applyTableCellScopeVisual(
 }
 
 /** 捕获当前 `.table__select` 命中的单元格位置，供光标移动后重建视觉提示。 */
-export function captureTableCellVisualRefs(edit: Element): TableCellVisualRef[] {
+function captureTableCellVisualRefs(edit: Element): TableCellVisualRef[] {
     const refs: TableCellVisualRef[] = [];
     const seen = new Set<string>();
 
@@ -301,7 +301,7 @@ function getOwnedRowCells(row: HTMLElement): HTMLElement[] {
  * 捕获当前块选的 data-node-id（含空块、容器、数据库），供冻结后重绘。
  * 不读/写内容，仅记录 id。
  */
-export function captureSelectedBlockIds(edit: Element): string[] {
+function captureSelectedBlockIds(edit: Element): string[] {
     const ids: string[] = [];
     const seen = new Set<string>();
     edit.querySelectorAll<HTMLElement>(".protyle-wysiwyg .protyle-wysiwyg--select").forEach((el) => {
@@ -815,34 +815,30 @@ function expandRectToLineBox(
 }
 
 /** 采样结果缓存，避免每次画行内提示都改动 window.getSelection() */
-let cachedNativeSelectionColors: {backgroundColor: string; color: string} | null | undefined;
+let cachedNativeSelectionBackground: string | null | undefined;
 
 /**
- * 采样浏览器原生 ::selection 颜色，写入 CSS 变量。
+ * 采样浏览器原生 ::selection 背景色，写入 CSS 变量。
  * 思源主题通常不覆盖 ::selection，默认即系统 Highlight。
  */
 function applyNativeSelectionColorsToRoot(): void {
     const root = document.documentElement;
-    if (cachedNativeSelectionColors === undefined) {
-        cachedNativeSelectionColors = sampleNativeSelectionColors();
+    if (cachedNativeSelectionBackground === undefined) {
+        cachedNativeSelectionBackground = sampleNativeSelectionBackground();
     }
-    const sampled = cachedNativeSelectionColors;
+    const sampled = cachedNativeSelectionBackground;
     if (sampled) {
-        root.style.setProperty("--page-search-inline-sel-bg", sampled.backgroundColor);
-        root.style.setProperty("--page-search-inline-sel-fg", sampled.color);
+        root.style.setProperty("--page-search-inline-sel-bg", sampled);
         return;
     }
     root.style.setProperty("--page-search-inline-sel-bg", "Highlight");
-    root.style.setProperty("--page-search-inline-sel-fg", "HighlightText");
 }
 
 function clearNativeSelectionColorVars(): void {
-    const root = document.documentElement;
-    root.style.removeProperty("--page-search-inline-sel-bg");
-    root.style.removeProperty("--page-search-inline-sel-fg");
+    document.documentElement.style.removeProperty("--page-search-inline-sel-bg");
 }
 
-function sampleNativeSelectionColors(): {backgroundColor: string; color: string} | null {
+function sampleNativeSelectionBackground(): string | null {
     const host = document.createElement("div");
     host.setAttribute("aria-hidden", "true");
     host.style.cssText = "position:fixed;left:-99999px;top:0;opacity:0;pointer-events:none;";
@@ -868,9 +864,7 @@ function sampleNativeSelectionColors(): {backgroundColor: string; color: string}
         range.selectNodeContents(span);
         selection?.removeAllRanges();
         selection?.addRange(range);
-        const style = getComputedStyle(span, "::selection");
-        const backgroundColor = style.backgroundColor;
-        const color = style.color;
+        const backgroundColor = getComputedStyle(span, "::selection").backgroundColor;
         if (
             !backgroundColor
             || backgroundColor === "transparent"
@@ -878,7 +872,7 @@ function sampleNativeSelectionColors(): {backgroundColor: string; color: string}
         ) {
             return null;
         }
-        return {backgroundColor, color: color || "HighlightText"};
+        return backgroundColor;
     } catch {
         return null;
     } finally {
@@ -918,8 +912,10 @@ export function captureSelectionScopeWithKind(
     edit: Element,
     options?: {
         includeAttributeView?: boolean;
+        includeCodeBlock?: boolean;
         includeMermaid?: boolean;
         includeInlineMemo?: boolean;
+        restrictInlineTypes?: RestrictInlineType[];
     },
 ): {
     scope: SelectionScope;
@@ -929,8 +925,10 @@ export function captureSelectionScopeWithKind(
 } {
     const blocks = collectSearchableBlocks(edit, {
         includeAttributeView: options?.includeAttributeView !== false,
+        includeCodeBlock: options?.includeCodeBlock !== false,
         includeMermaid: options?.includeMermaid !== false,
         includeInlineMemo: options?.includeInlineMemo === true,
+        restrictInlineTypes: options?.restrictInlineTypes,
     });
     const kind = detectSelectionScopeKind(edit);
     const scope = getSelectionScope(edit, blocks);

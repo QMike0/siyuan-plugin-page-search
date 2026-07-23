@@ -1,3 +1,10 @@
+import {
+  normalizeRestrictInlineTypes,
+  shouldCollectBodyTextForRestrict,
+  shouldCollectInlineMathUnits,
+  shouldCollectInlineMemoUnits,
+  type RestrictInlineType,
+} from "../shared";
 import type {SearchableBlock} from "./dom-types";
 
 const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/
@@ -8,12 +15,19 @@ const CALLOUT_TYPE = 'NodeCallout'
 const TABLE_TYPE = 'NodeTable'
 const CODE_BLOCK_TYPE = 'NodeCodeBlock'
 const MERMAID_SUBTYPE = 'mermaid'
+/** 正文 TreeWalker 排除：属性区 / 矢量 / 公式源码区；行内公式可见字形由独立 unit 采集 */
+const TEXT_NODE_EXCLUDED_CLOSEST =
+  '.protyle-attr, svg, style, script, .katex-mathml, span[data-type~="inline-math"]'
 /** Mermaid 搜索单元：源码在 data-content，无可替换 Text 节点 */
 export const MERMAID_UNIT_ID = 'mermaid-source'
 /** 行内备注 unitId 前缀；text 来自 data-inline-memo-content */
-export const INLINE_MEMO_UNIT_PREFIX = 'inline-memo:'
+const INLINE_MEMO_UNIT_PREFIX = 'inline-memo:'
 /** 合成块类型，便于 replaceable / 高亮分流 */
-export const INLINE_MEMO_BLOCK_TYPE = 'inline-memo'
+const INLINE_MEMO_BLOCK_TYPE = 'inline-memo'
+/** 行内公式 unitId 前缀；text 来自 KaTeX 渲染可见文字 */
+const INLINE_MATH_UNIT_PREFIX = 'inline-math:'
+/** 合成块类型，便于 replaceable / 高亮分流 */
+const INLINE_MATH_BLOCK_TYPE = 'inline-math'
 const DOC_TITLE_BLOCK_ID = '__doc-title__'
 const DOC_TITLE_BLOCK_TYPE = 'doc-title'
 const TABLE_CELL_SELECTOR = '[data-type="NodeTableCell"], .table__cell, td, th'
@@ -35,7 +49,7 @@ const AV_EXCLUDED_CLOSEST = [
 /**
  * 解析当前编辑器内的可搜索文档根（编辑态 wysiwyg / 预览态 b3-typography）
  */
-export function resolveDocRoot(edit: Element): HTMLElement | null {
+function resolveDocRoot(edit: Element): HTMLElement | null {
   let docRoot = edit.querySelector(
     ':scope > .protyle:not(.fn__none) :is(.protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography)',
   ) as HTMLElement | null
@@ -54,7 +68,7 @@ export function resolveDocRoot(edit: Element): HTMLElement | null {
  * 思源标题在 .protyle-wysiwyg 之外：.protyle-title > .protyle-title__input
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/header/Title.ts
  */
-export function resolveDocTitleInput(edit: Element): HTMLElement | null {
+function resolveDocTitleInput(edit: Element): HTMLElement | null {
   let titleInput = edit.querySelector(
     ':scope > .protyle:not(.fn__none) .protyle-title .protyle-title__input',
   ) as HTMLElement | null
@@ -108,10 +122,17 @@ function collectDocTitleUnit(edit: Element): SearchableBlock | null {
 export interface CollectSearchableBlocksOptions {
   /** 是否采集数据库（Attribute View）；默认 true */
   includeAttributeView?: boolean;
+  /** 是否采集代码块（非 Mermaid）；默认 true */
+  includeCodeBlock?: boolean;
   /** 是否采集 Mermaid 图；默认 true */
   includeMermaid?: boolean;
   /** 是否采集行内备注（data-inline-memo-content）；默认 false */
   includeInlineMemo?: boolean;
+  /**
+   * 限制查找行内类型；空 / 省略 = 不限制。
+   * 与 includeInlineMemo 共同决定是否采备注；仅限制备注/公式等属性类型时跳过正文。
+   */
+  restrictInlineTypes?: RestrictInlineType[];
 }
 
 export function collectSearchableBlocks(
@@ -119,21 +140,35 @@ export function collectSearchableBlocks(
   options: CollectSearchableBlocksOptions = {},
 ): SearchableBlock[] {
   const includeAttributeView = options.includeAttributeView !== false;
+  const includeCodeBlock = options.includeCodeBlock !== false;
   const includeMermaid = options.includeMermaid !== false;
   const includeInlineMemo = options.includeInlineMemo === true;
+  // 限制未传 / 空数组：保持旧行为；非空才 normalize（含备注门闩）
+  const rawRestrict = options.restrictInlineTypes;
+  const restrictInlineTypes = Array.isArray(rawRestrict) && rawRestrict.length > 0
+    ? normalizeRestrictInlineTypes(rawRestrict, {includeInlineMemo})
+    : [];
+  const collectBodyText = shouldCollectBodyTextForRestrict(restrictInlineTypes);
+  const collectMemo = shouldCollectInlineMemoUnits({
+    includeInlineMemo,
+    restrictTypes: restrictInlineTypes,
+  });
+  const collectMath = shouldCollectInlineMathUnits(restrictInlineTypes);
   const docRoot = resolveDocRoot(edit)
   if (!docRoot) {
     return []
   }
 
   const blocks: SearchableBlock[] = []
-  const titleUnit = collectDocTitleUnit(edit)
-  if (titleUnit) {
-    blocks.push(titleUnit)
+  if (collectBodyText) {
+    const titleUnit = collectDocTitleUnit(edit)
+    if (titleUnit) {
+      blocks.push(titleUnit)
+    }
   }
 
-  const blockElements = getUniqueBlockElements(docRoot)
-  if (blockElements.length === 0) {
+  const blockElements = collectBodyText ? getUniqueBlockElements(docRoot) : []
+  if (collectBodyText && blockElements.length === 0) {
     const textNodes = collectTextNodes(docRoot, null)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     if (text) {
@@ -146,8 +181,11 @@ export function collectSearchableBlocks(
         textNodes,
       })
     }
-    if (includeInlineMemo) {
+    if (collectMemo) {
       blocks.push(...collectInlineMemoSearchUnits(docRoot))
+    }
+    if (collectMath) {
+      blocks.push(...collectInlineMathSearchUnits(docRoot))
     }
     return blocks
   }
@@ -200,6 +238,11 @@ export function collectSearchableBlocks(
       return
     }
 
+    // 普通代码块（非 Mermaid）由 includeCodeBlock 控制
+    if (blockType === CODE_BLOCK_TYPE && !includeCodeBlock) {
+      return
+    }
+
     if (blockType === CALLOUT_TYPE || element.classList.contains('callout')) {
       // Callout 标题在 .callout-title（非 contenteditable 子块），需单独采集
       // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts getCalloutInfo
@@ -223,8 +266,11 @@ export function collectSearchableBlocks(
     })
   })
 
-  if (includeInlineMemo) {
+  if (collectMemo) {
     blocks.push(...collectInlineMemoSearchUnits(docRoot))
+  }
+  if (collectMath) {
+    blocks.push(...collectInlineMathSearchUnits(docRoot))
   }
 
   return blocks
@@ -377,7 +423,7 @@ function collectDescendantTextNodes(container: HTMLElement): Text[] {
         return NodeFilter.FILTER_REJECT
       }
       const parentElement = node.parentElement
-      if (!parentElement || parentElement.closest('.protyle-attr, svg, style, script')) {
+      if (!parentElement || parentElement.closest(TEXT_NODE_EXCLUDED_CLOSEST)) {
         return NodeFilter.FILTER_REJECT
       }
       return NodeFilter.FILTER_ACCEPT
@@ -671,7 +717,7 @@ function collectTextNodes(root: HTMLElement, ownerBlock: HTMLElement | null): Te
         return NodeFilter.FILTER_REJECT
       }
 
-      if (parentElement.closest('.protyle-attr, svg, style, script')) {
+      if (parentElement.closest(TEXT_NODE_EXCLUDED_CLOSEST)) {
         return NodeFilter.FILTER_REJECT
       }
 
@@ -789,4 +835,98 @@ export function isInlineMemoSearchUnit(block: Pick<SearchableBlock, 'matchSource
     || Boolean(block.unitId?.startsWith(INLINE_MEMO_UNIT_PREFIX))
 }
 
-export { ZERO_WIDTH_RE, ATTRIBUTE_VIEW_TYPE, CALLOUT_TYPE, TABLE_TYPE, CODE_BLOCK_TYPE }
+/**
+ * 采集行内公式：匹配 KaTeX **渲染可见文本**（`.katex-html`），不搜 `data-content` LaTeX 源。
+ * 否则搜 “d” 会命中 `\delta` / `\lambda` 等源码字母。
+ * 正文/表格 TreeWalker 仍排除整段 inline-math，避免与独立 unit 重复计数；表格内公式靠本函数扫到。
+ *
+ * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
+ *   `output: "html"` → 可见在 `.katex-html`；`.katex-mathml` 含源码 annotation，必须排除
+ */
+function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
+  const units: SearchableBlock[] = []
+  const spans = Array.from(
+    docRoot.querySelectorAll<HTMLElement>('span[data-type~="inline-math"]'),
+  )
+  const ownerIndexById = new Map<string, number>()
+  Array.from(docRoot.querySelectorAll<HTMLElement>('[data-node-id][data-type]')).forEach((el, index) => {
+    const id = el.dataset.nodeId?.trim()
+    if (id && !ownerIndexById.has(id)) {
+      ownerIndexById.set(id, index)
+    }
+  })
+  let mathIndex = 0
+
+  for (const span of spans) {
+    if (span.closest('.protyle-attr, .fn__none')) {
+      continue
+    }
+
+    const textNodes = collectInlineMathRenderedTextNodes(span)
+    const text = textNodes.map((node) => node.nodeValue ?? '').join('')
+    // 仅零宽占位则跳过（思源在公式旁插入 ZWSP）
+    if (!text.replace(ZERO_WIDTH_RE, '').length) {
+      continue
+    }
+
+    const owner = getOwnerBlock(span)
+    const blockId = owner?.dataset.nodeId?.trim()
+      || `${PREVIEW_BLOCK_ID}-math-${mathIndex}`
+    const blockType = owner?.dataset.type?.trim() || INLINE_MATH_BLOCK_TYPE
+    const blockIndex = owner?.dataset.nodeId
+      ? (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? mathIndex)
+      : mathIndex
+
+    units.push({
+      blockId,
+      blockType,
+      blockIndex,
+      element: span,
+      text,
+      textNodes,
+      unitId: `${INLINE_MATH_UNIT_PREFIX}${mathIndex}`,
+      matchSource: 'inline-math',
+    })
+    mathIndex += 1
+  }
+
+  return units
+}
+
+/**
+ * 只取渲染层文字；排除 MathML / annotation（其中含 TeX 源码）。
+ */
+function collectInlineMathRenderedTextNodes(span: HTMLElement): Text[] {
+  const htmlRoot = span.querySelector<HTMLElement>('.katex-html')
+  const root = htmlRoot ?? span
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!(node instanceof Text) || !node.nodeValue?.length) {
+        return NodeFilter.FILTER_REJECT
+      }
+      const parentElement = node.parentElement
+      if (
+        !parentElement
+        || parentElement.closest('.katex-mathml, annotation, svg, style, script')
+      ) {
+        return NodeFilter.FILTER_REJECT
+      }
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+  return collectWalkerTextNodes(walker)
+}
+
+export function isInlineMathSearchUnit(block: Pick<SearchableBlock, 'matchSource' | 'unitId'>): boolean {
+  return block.matchSource === 'inline-math'
+    || Boolean(block.unitId?.startsWith(INLINE_MATH_UNIT_PREFIX))
+}
+
+/** 备注或公式等属性型 unit（Range 对准宿主、默认不可替） */
+export function isAttributeInlineSearchUnit(
+  block: Pick<SearchableBlock, 'matchSource' | 'unitId'>,
+): boolean {
+  return isInlineMemoSearchUnit(block) || isInlineMathSearchUnit(block)
+}
+
+export { ATTRIBUTE_VIEW_TYPE, CALLOUT_TYPE, TABLE_TYPE }

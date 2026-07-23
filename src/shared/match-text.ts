@@ -99,7 +99,7 @@ function usesAdvancedOptions(options: MatchOptions): boolean {
 }
 
 /**
- * 历史默认：小写 + 变体 indexOf（含去空白变体）。
+ * 无高级选项时的默认路径：小写 + 变体 indexOf（含去空白变体）。
  */
 export function findOffsetMatchesInText(
     blockText: string,

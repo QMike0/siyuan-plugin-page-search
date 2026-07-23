@@ -1,4 +1,4 @@
-import {ATTRIBUTE_VIEW_TYPE} from "./blocks";
+import {ATTRIBUTE_VIEW_TYPE, isAttributeInlineSearchUnit} from "./blocks";
 import type {SearchableBlock} from "./dom-types";
 
 /** 单元内文本偏移区间 [start, end) */
@@ -86,10 +86,6 @@ function collectWholeSelectedAttributeViewIds(
         }
     }
     return ids;
-}
-
-export function getCurrentSelectionText(): string {
-    return window.getSelection()?.toString() ?? "";
 }
 
 /**
@@ -349,6 +345,10 @@ function getSelectionRangesWithinUnit(
     block: SearchableBlock,
     selection: Selection,
 ): TextOffsetRange[] {
+    // 备注 / 公式：text 在属性里，无 textNodes；选区与宿主 span 相交则整段属性文本入选
+    if (isAttributeInlineSearchUnit(block)) {
+        return getSelectionRangesForAttributeHost(block, selection);
+    }
     if (!block.textNodes.length) {
         return [];
     }
@@ -358,6 +358,46 @@ function getSelectionRangesWithinUnit(
         ranges.push(...getIntersectedTextRanges(block.textNodes, selection.getRangeAt(index)));
     }
     return mergeTextOffsetRanges(ranges);
+}
+
+/**
+ * 属性型 unit：选区与宿主元素相交 → 纳入完整属性文本偏移。
+ * 与限制过滤叠加：pipeline 先 scope 再 restrict。
+ */
+function getSelectionRangesForAttributeHost(
+    block: SearchableBlock,
+    selection: Selection,
+): TextOffsetRange[] {
+    if (block.text.length <= 0) {
+        return [];
+    }
+    for (let index = 0; index < selection.rangeCount; index += 1) {
+        const range = selection.getRangeAt(index);
+        if (selectionRangeIntersectsElement(range, block.element)) {
+            return [{start: 0, end: block.text.length}];
+        }
+    }
+    return [];
+}
+
+function selectionRangeIntersectsElement(range: Range, element: Element): boolean {
+    try {
+        if (typeof range.intersectsNode === "function") {
+            return range.intersectsNode(element);
+        }
+    } catch {
+        // fall through
+    }
+    try {
+        const hostRange = range.ownerDocument?.createRange() ?? document.createRange();
+        hostRange.selectNodeContents(element);
+        return (
+            range.compareBoundaryPoints(Range.END_TO_START, hostRange) < 0
+            && range.compareBoundaryPoints(Range.START_TO_END, hostRange) > 0
+        );
+    } catch {
+        return false;
+    }
 }
 
 function getIntersectedTextRanges(textNodes: Text[], selectionRange: Range): TextOffsetRange[] {

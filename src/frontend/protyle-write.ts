@@ -28,7 +28,7 @@ export interface ReplaceWriteResult {
  * 从搜索条挂载的 edit 容器解析对应 Protyle 实例。
  * 拿不到则拒绝写回（不静默 updateBlock）。
  */
-export function resolveProtyleFromEdit(edit: Element): Protyle | null {
+function resolveProtyleFromEdit(edit: Element): Protyle | null {
     const protyleElement = edit.classList.contains("protyle")
         ? edit as HTMLElement
         : edit.querySelector<HTMLElement>(".protyle:not(.fn__none)")
@@ -48,7 +48,7 @@ export function resolveProtyleFromEdit(edit: Element): Protyle | null {
     return matched ?? null;
 }
 
-export function resolveSubmitBlockElement(
+function resolveSubmitBlockElement(
     edit: Element,
     blockId: string,
 ): HTMLElement | null {

@@ -37,6 +37,20 @@ Opening the bar with a selection only prefills the query; it does **not** turn o
 
 Paragraphs, document title, table cells, attribute views (search/highlight), callout titles, preview mode, popovers, and multi-tab.
 
+Gear menu:
+
+| Group | Role |
+|------|------|
+| **Limit find** | Search only within selected inline types (OR; all off = no limit). Empty find box previews all hosts of selected types (not replaceable; counts over 999 show as `999+` while still highlighting all). Order: block ref, link, bold, italic, underline, strike, highlight, superscript, subscript, inline code, keyboard, tag, inline math, inline memo. Stacks with Find in selection |
+| **Include in find** | Whether to include inline memos, databases, code blocks, Mermaid |
+| **Folded block content** | Match hidden content in non-heading folded blocks (independent of Limit find) |
+
+Notes:
+
+- **Inline memos**: Include = search memo attributes in full-document mode; Limit find → Inline memo = include them in the OR set (requires Include first)
+- **Inline math**: matches KaTeX **rendered visible text** (not `data-content` LaTeX, so “d” won’t hit `\delta`); separate units cover body and table formulas; yellow/orange highlight; not replaceable
+- With Limit find off, behavior matches the previous release (AV / code / Mermaid / fold / memo underlines unchanged)
+
 ## Replace and undo
 
 Writes go through the current document’s **Protyle transaction** (`updateTransactionElement` / batched `transaction`), so **Ctrl+Z / Ctrl+Y** work when a Protyle instance is available.
@@ -71,6 +85,9 @@ Stored in `prefs.json`:
 | Field | Meaning |
 |------|---------|
 | `dialogLeft` / `dialogTop` | Dragged position (cleared when resetting via top bar) |
+| `includeAttributeView` / `includeCodeBlock` / `includeMermaid` | Include in find (default on) |
+| `includeFoldedBlocks` / `includeInlineMemo` | Folded blocks / inline memos (default off) |
+| `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |
 
 Closing the search bar clears the query; reopening only prefills from the current selection.
 

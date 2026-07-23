@@ -7,19 +7,19 @@ import type {
     PluginPrefs,
     SearchableUnit,
     SearchStateEvent,
-    SearchStateType,
 } from "../shared";
 import {
     DEFAULT_PREFS,
     SEARCH_EMIT_METHOD,
     SEARCH_STATE_METHOD,
+    coercePluginPrefs,
     matchOptionsFromRequest,
     matchTextUnitsDetailed,
     normalizeSearchStateEvent,
 } from "../shared";
 
 /** 内核 running 状态码（见 IKernelPluginState） */
-export const KERNEL_STATE_RUNNING = 2;
+const KERNEL_STATE_RUNNING = 2;
 
 export function isKernelRunning(plugin: Plugin): boolean {
     return plugin.kernel?.state?.code === KERNEL_STATE_RUNNING;
@@ -75,15 +75,7 @@ export async function rpcGetPrefs(plugin: Plugin): Promise<PluginPrefs> {
     }
     try {
         const prefs = await plugin.kernel.rpc.call["prefs.get"]() as PluginPrefs;
-        return {
-            dialogLeft: prefs?.dialogLeft ?? null,
-            dialogTop: prefs?.dialogTop ?? null,
-            lastQuery: prefs?.lastQuery ?? "",
-            includeAttributeView: prefs?.includeAttributeView !== false,
-            includeMermaid: prefs?.includeMermaid !== false,
-            includeFoldedBlocks: prefs?.includeFoldedBlocks === true,
-            includeInlineMemo: prefs?.includeInlineMemo === true,
-        };
+        return coercePluginPrefs(prefs);
     } catch (error) {
         console.warn("[page-search] prefs.get failed", error);
         return {...DEFAULT_PREFS};
@@ -95,22 +87,14 @@ export async function rpcSetPrefs(
     patch: Partial<PluginPrefs>,
 ): Promise<PluginPrefs> {
     if (!isKernelRunning(plugin)) {
-        return {...DEFAULT_PREFS, ...patch};
+        return coercePluginPrefs({...DEFAULT_PREFS, ...patch});
     }
     try {
         const prefs = await plugin.kernel.rpc.call["prefs.set"](patch) as PluginPrefs;
-        return {
-            dialogLeft: prefs?.dialogLeft ?? null,
-            dialogTop: prefs?.dialogTop ?? null,
-            lastQuery: prefs?.lastQuery ?? "",
-            includeAttributeView: prefs?.includeAttributeView !== false,
-            includeMermaid: prefs?.includeMermaid !== false,
-            includeFoldedBlocks: prefs?.includeFoldedBlocks === true,
-            includeInlineMemo: prefs?.includeInlineMemo === true,
-        };
+        return coercePluginPrefs(prefs);
     } catch (error) {
         console.warn("[page-search] prefs.set failed", error);
-        return {...DEFAULT_PREFS, ...patch};
+        return coercePluginPrefs({...DEFAULT_PREFS, ...patch});
     }
 }
 
@@ -168,6 +152,3 @@ export async function matchUnitsViaKernel(
     });
     return response.hits;
 }
-
-export type {MatchRequest, MatchResponse, PluginPrefs, SearchStateEvent, SearchStateType};
-export {SEARCH_EMIT_METHOD, SEARCH_STATE_METHOD};

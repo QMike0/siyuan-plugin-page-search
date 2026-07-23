@@ -424,14 +424,29 @@ body.page-search-resizing * {
     position: absolute;
     pointer-events: none;
     box-sizing: border-box;
-    height: 0;
+    height: 2px;
     border: none;
-    border-bottom: 2px dashed rgb(235, 235, 5);
-    background: transparent;
+    /* 长虚线：dash 12px / gap 6px（border dashed 段太短且不可控） */
+    background-image: repeating-linear-gradient(
+        to right,
+        rgb(235, 235, 5) 0,
+        rgb(235, 235, 5) 12px,
+        transparent 12px,
+        transparent 18px
+    );
+    background-repeat: repeat-x;
+    background-position: left center;
+    background-size: 18px 2px;
 }
 
 .page-search-memo-underline.is-focus {
-    border-bottom-color: rgb(255, 150, 50);
+    background-image: repeating-linear-gradient(
+        to right,
+        rgb(255, 150, 50) 0,
+        rgb(255, 150, 50) 12px,
+        transparent 12px,
+        transparent 18px
+    );
 }
 
 /**
@@ -481,8 +496,9 @@ body.page-search-resizing * {
     pointer-events: none;
 }
 
-/* 查询范围菜单：折叠块说明问号（菜单挂在 document，用 data-name 限定） */
-.b3-menu[data-name="page-search-settings"] .page-search-menu-help {
+/* 查询范围菜单：说明问号（含子菜单；菜单挂在 document） */
+.b3-menu[data-name="page-search-settings"] .page-search-menu-help,
+.b3-menu .b3-menu__submenu .page-search-menu-help {
     width: 14px;
     height: 14px;
     margin-left: 4px;
@@ -493,6 +509,14 @@ body.page-search-resizing * {
     color: var(--b3-theme-on-surface);
 }
 
-.b3-menu[data-name="page-search-settings"] .page-search-menu-help:hover {
+.b3-menu[data-name="page-search-settings"] .page-search-menu-help:hover,
+.b3-menu .b3-menu__submenu .page-search-menu-help:hover {
     opacity: 0.9;
+}
+
+/* 限制查找 · 行内备注：门闩关闭时灰显（思源 MenuItem 用 disabled 属性） */
+.b3-menu[data-name="page-search-settings"] .b3-menu__item[disabled] .b3-switch,
+.b3-menu .b3-menu__submenu .b3-menu__item[disabled] .b3-switch {
+    opacity: 0.45;
+    pointer-events: none;
 }

@@ -2,7 +2,7 @@
 export const ATTRIBUTE_VIEW_TYPE = "NodeAttributeView";
 
 /** Mermaid 等图表代码块：仅搜索 data-content，不可替换 */
-export const MERMAID_DOM_CLOSEST = '[data-subtype="mermaid"]';
+const MERMAID_DOM_CLOSEST = '[data-subtype="mermaid"]';
 
 /**
  * 命中 Text 若落在这些祖先内则不可替换（前端 DOM 校验）。

@@ -3,7 +3,7 @@ import {getAllEditor} from "siyuan";
 /**
  * 解析 edit 容器对应的 .protyle 元素（不含已隐藏实例）。
  */
-export function resolveProtyleElement(edit: Element): HTMLElement | null {
+function resolveProtyleElement(edit: Element): HTMLElement | null {
     if (edit.classList.contains("protyle")) {
         return edit as HTMLElement;
     }
@@ -15,7 +15,7 @@ export function resolveProtyleElement(edit: Element): HTMLElement | null {
 /**
  * 导出预览：.protyle-preview 可见时不可替换。
  */
-export function isEditorPreviewMode(edit: Element): boolean {
+function isEditorPreviewMode(edit: Element): boolean {
     const protyleElement = resolveProtyleElement(edit);
     if (!protyleElement) {
         return false;
@@ -27,7 +27,7 @@ export function isEditorPreviewMode(edit: Element): boolean {
  * 只读：优先看当前 Protyle 实况（含临时解锁），再看永久禁用 / 全局只读。
  * 不单独信任 config.editor.readOnly（可被文档级临时解锁覆盖）。
  */
-export function isEditorReadonlyMode(edit: Element): boolean {
+function isEditorReadonlyMode(edit: Element): boolean {
     const protyleElement = resolveProtyleElement(edit);
     if (protyleElement?.getAttribute("disabled-forever") === "true") {
         return true;
@@ -60,9 +60,9 @@ export function isEditorReadonlyMode(edit: Element): boolean {
 }
 
 /** 模式级拦截：先于数据库 / 公式 / 标题等元素级判断 */
-export type EditorReplaceModeBlock = "preview" | "readonly";
+type EditorReplaceModeBlock = "preview" | "readonly";
 
-export function getEditorReplaceModeBlock(edit: Element): EditorReplaceModeBlock | null {
+function getEditorReplaceModeBlock(edit: Element): EditorReplaceModeBlock | null {
     if (isEditorPreviewMode(edit)) {
         return "preview";
     }

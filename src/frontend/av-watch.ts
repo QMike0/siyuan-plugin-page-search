@@ -137,7 +137,7 @@ export function watchAttributeViewDom(
  * 是否为需要全量重搜的结构性变更（切视图/布局/整表重渲），
  * 而非虚拟滚动在 body 内增删行。
  */
-export function isStructuralAttributeViewMutation(mutation: MutationRecord): boolean {
+function isStructuralAttributeViewMutation(mutation: MutationRecord): boolean {
     if (mutation.type === "attributes") {
         const el = mutation.target as Element;
         // 只关心 AV 根节点的渲染标记，避免 body 上属性抖动

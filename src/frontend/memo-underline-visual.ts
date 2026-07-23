@@ -8,9 +8,9 @@
  * 本叠加层再下沉一点并用虚线，与 Ctrl+U / 备注固有下划线区分。
  */
 
-export const MEMO_UNDERLINE_HOST = "page-search-memo-underline-host";
-export const MEMO_UNDERLINE_LAYER = "page-search-memo-underline-layer";
-export const MEMO_UNDERLINE = "page-search-memo-underline";
+const MEMO_UNDERLINE_HOST = "page-search-memo-underline-host";
+const MEMO_UNDERLINE_LAYER = "page-search-memo-underline-layer";
+const MEMO_UNDERLINE = "page-search-memo-underline";
 
 /** 相对 clientRect.bottom 再下沉的像素，避开思源 u / inline-memo 的 border-bottom */
 const UNDERLINE_OFFSET_PX = 4;
