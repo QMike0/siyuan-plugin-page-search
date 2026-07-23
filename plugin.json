@@ -2,7 +2,7 @@
   "name": "siyuan-plugin-page-search",
   "author": "QMike0",
   "url": "https://github.com/QMike0/siyuan-plugin-page-search",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "3.7.0",
   "kernels": [
     "windows",
@@ -26,8 +26,8 @@
     "zh-CN": "页内查找替换"
   },
   "description": {
-    "default": "Provides in-document find and replace for SiYuan (supports undoable writes)",
-    "zh-CN": "为思源笔记提供文档页面内的查找、替换功能（支持撤销写回）"
+    "default": "Implement in-document find and replace for SiYuan, featuring undo/redo with write-back, block-type filtering, and the ability to search inline elements independently",
+    "zh-CN": "为思源笔记提供文档页面内的查找、替换功能（支持撤销&重做），并支持块级类型的控制与行内元素的单独搜索"
   },
   "readme": {
     "default": "README.md",
