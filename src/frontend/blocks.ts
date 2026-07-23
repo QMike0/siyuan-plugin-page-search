@@ -17,6 +17,8 @@ const MATH_BLOCK_TYPE = 'NodeMathBlock'
 /** 嵌入块：内含 .protyle-wysiwyg__embed 渲染的源块副本 */
 const EMBED_BLOCK_TYPE = 'NodeBlockQueryEmbed'
 const WIDGET_TYPE = 'NodeWidget'
+/** HTML 块：可见字在 protyle-html open Shadow，非 light DOM */
+const HTML_BLOCK_TYPE = 'NodeHTMLBlock'
 const TABLE_TYPE = 'NodeTable'
 const CODE_BLOCK_TYPE = 'NodeCodeBlock'
 const MERMAID_SUBTYPE = 'mermaid'
@@ -25,6 +27,11 @@ const TEXT_NODE_EXCLUDED_CLOSEST =
   '.protyle-attr, svg, style, script, .katex-mathml, span[data-type~="inline-math"]'
 /** Mermaid 搜索单元：源码在 data-content，无可替换 Text 节点 */
 export const MERMAID_UNIT_ID = 'mermaid-source'
+/**
+ * HTML 块搜索单元：text 来自 protyle-html.shadowRoot 渲染可见字（非 data-content 源码）。
+ * @see https://github.com/siyuan-note/siyuan/blob/master/app/stage/protyle/js/protyle-html.js
+ */
+export const HTML_BLOCK_UNIT_ID = 'html-block-rendered'
 /** 行内备注 unitId 前缀；text 来自 data-inline-memo-content */
 const INLINE_MEMO_UNIT_PREFIX = 'inline-memo:'
 /** 合成块类型，便于 replaceable / 高亮分流 */
@@ -143,6 +150,11 @@ export interface CollectSearchableBlocksOptions {
   includeCodeBlock?: boolean;
   /** 是否采集 Mermaid 图；默认 true */
   includeMermaid?: boolean;
+  /**
+   * 是否采集 HTML 块（NodeHTMLBlock）Shadow 内渲染可见文字；默认 true。
+   * 不搜 data-content 源码；不可替换。
+   */
+  includeHtmlBlock?: boolean;
   /** 是否采集行内备注（data-inline-memo-content）；默认 false */
   includeInlineMemo?: boolean;
   /**
@@ -165,6 +177,7 @@ export function collectSearchableBlocks(
   const includeWidget = options.includeWidget !== false;
   const includeCodeBlock = options.includeCodeBlock !== false;
   const includeMermaid = options.includeMermaid !== false;
+  const includeHtmlBlock = options.includeHtmlBlock !== false;
   const includeInlineMemo = options.includeInlineMemo === true;
   // 限制未传 / 空数组：保持旧行为；非空才 normalize（含备注门闩）
   const rawRestrict = options.restrictInlineTypes;
@@ -191,6 +204,7 @@ export function collectSearchableBlocks(
     includeWidget,
     includeCodeBlock,
     includeMermaid,
+    includeHtmlBlock,
   }
 
   const blocks: SearchableBlock[] = []
@@ -329,6 +343,21 @@ export function collectSearchableBlocks(
       return
     }
 
+    // HTML 块：渲染结果在 protyle-html open Shadow，light DOM TreeWalker 采不到。
+    // 专项穿透 shadowRoot；标记 HTML_BLOCK_UNIT_ID，禁止替换。
+    // @see https://github.com/siyuan-note/siyuan/blob/master/app/stage/protyle/js/protyle-html.js
+    // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/htmlRender.ts
+    if (blockType === HTML_BLOCK_TYPE) {
+      if (!includeHtmlBlock) {
+        return
+      }
+      const htmlUnit = collectHtmlBlockSearchUnit(element, blockId, blockIndex)
+      if (htmlUnit) {
+        blocks.push(htmlUnit)
+      }
+      return
+    }
+
     if (blockType === CALLOUT_TYPE || element.classList.contains('callout')) {
       // Callout 标题在 .callout-title（非 contenteditable 子块），需单独采集
       // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts getCalloutInfo
@@ -378,6 +407,7 @@ interface IncludeGates {
   includeWidget: boolean
   includeCodeBlock: boolean
   includeMermaid: boolean
+  includeHtmlBlock: boolean
 }
 
 /**
@@ -418,6 +448,12 @@ function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeG
   if (
     !gates.includeWidget
     && Boolean(element.closest(`[data-type="${WIDGET_TYPE}"]`))
+  ) {
+    return true
+  }
+  if (
+    !gates.includeHtmlBlock
+    && Boolean(element.closest(`[data-type="${HTML_BLOCK_TYPE}"]`))
   ) {
     return true
   }
@@ -485,6 +521,66 @@ function shouldPreferBlockElement(candidate: HTMLElement, existing: HTMLElement)
   }
 
   return (candidate.textContent?.length ?? 0) > (existing.textContent?.length ?? 0)
+}
+
+/**
+ * HTML 块：可见文字在 protyle-html 的 open Shadow 内。
+ * 只读采集 Text，排除 script/style；不读 data-content（那是源码而非渲染结果）。
+ * 标记 HTML_BLOCK_UNIT_ID，禁止替换。
+ * @see https://github.com/siyuan-note/siyuan/blob/master/app/stage/protyle/js/protyle-html.js
+ */
+function collectHtmlBlockSearchUnit(
+  htmlBlock: HTMLElement,
+  blockId: string,
+  blockIndex: number,
+): SearchableBlock | null {
+  const host = htmlBlock.querySelector('protyle-html') as HTMLElement & {
+    shadowRoot?: ShadowRoot | null
+  } | null
+  const shadowRoot = host?.shadowRoot
+  if (!shadowRoot) {
+    return null
+  }
+  const textNodes = collectHtmlBlockRenderedTextNodes(shadowRoot)
+  const text = textNodes.map((node) => node.nodeValue ?? '').join('')
+  if (!text.replace(ZERO_WIDTH_RE, '').trim()) {
+    return null
+  }
+  return {
+    blockId,
+    blockType: HTML_BLOCK_TYPE,
+    blockIndex,
+    element: htmlBlock,
+    text,
+    textNodes,
+    unitId: HTML_BLOCK_UNIT_ID,
+  }
+}
+
+/**
+ * 在 protyle-html.shadowRoot 内采 Text；不进入嵌套 closed Shadow；排除 script/style。
+ * 只读，不修改 Shadow DOM（避免触发脚本型 HTML 块副作用）。
+ */
+function collectHtmlBlockRenderedTextNodes(shadowRoot: ShadowRoot): Text[] {
+  const walker = document.createTreeWalker(shadowRoot, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!(node instanceof Text) || !node.nodeValue?.length) {
+        return NodeFilter.FILTER_REJECT
+      }
+      const parentElement = node.parentElement
+      if (
+        !parentElement
+        || parentElement.closest('style, script, textarea, noscript')
+      ) {
+        return NodeFilter.FILTER_REJECT
+      }
+      if (!node.nodeValue.replace(ZERO_WIDTH_RE, '').length) {
+        return NodeFilter.FILTER_REJECT
+      }
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+  return collectWalkerTextNodes(walker)
 }
 
 /**

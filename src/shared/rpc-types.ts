@@ -57,6 +57,11 @@ export interface PluginPrefs {
     /** 是否匹配 Mermaid 图；默认 true */
     includeMermaid: boolean;
     /**
+     * 是否匹配 HTML 块（NodeHTMLBlock）Shadow 内渲染可见文字；默认 true。
+     * 匹配渲染结果而非 data-content 源码；不可替换。
+     */
+    includeHtmlBlock: boolean;
+    /**
      * 是否匹配非标题 CSS 折叠块内隐藏内容；默认 false。
      * 不含折叠标题（子块已不在 DOM）。
      */
@@ -101,6 +106,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeWidget: true,
     includeCodeBlock: true,
     includeMermaid: true,
+    includeHtmlBlock: true,
     includeFoldedBlocks: false,
     includeInlineMemo: false,
     restrictInlineTypes: [],
@@ -127,6 +133,7 @@ export function coercePluginPrefs(
         includeWidget: base.includeWidget !== false,
         includeCodeBlock: base.includeCodeBlock !== false,
         includeMermaid: base.includeMermaid !== false,
+        includeHtmlBlock: base.includeHtmlBlock !== false,
         includeFoldedBlocks: base.includeFoldedBlocks === true,
         includeInlineMemo,
         restrictInlineTypes: normalizeRestrictInlineTypes(base.restrictInlineTypes, {
@@ -173,6 +180,9 @@ export function mergePrefs(
         includeMermaid: patch.includeMermaid !== undefined
             ? patch.includeMermaid
             : base.includeMermaid,
+        includeHtmlBlock: patch.includeHtmlBlock !== undefined
+            ? patch.includeHtmlBlock
+            : base.includeHtmlBlock,
         includeFoldedBlocks: patch.includeFoldedBlocks !== undefined
             ? patch.includeFoldedBlocks
             : base.includeFoldedBlocks,

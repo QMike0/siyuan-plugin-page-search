@@ -1,4 +1,5 @@
 import {fetchSyncPost} from "siyuan";
+import {parentElementCrossingShadow} from "./dom-parent";
 
 /**
  * 思源非标题折叠：块保留在 DOM，仅 CSS 隐藏（list / callout / bq / sb 等）。
@@ -18,6 +19,7 @@ export function isUnderNonHeadingCssFold(element: Element | null): boolean {
 /**
  * 自内向外收集需展开的非标题折叠祖先 id（数组末项为最外层）。
  * 跳转时从外到内展开更稳。
+ * 祖先遍历穿透 open Shadow（HTML 块 protyle-html），否则折叠容器检测会断在边界。
  */
 export function collectNonHeadingFoldedAncestorIds(element: Element | null): string[] {
     const ids: string[] = [];
@@ -32,7 +34,7 @@ export function collectNonHeadingFoldedAncestorIds(element: Element | null): str
                 ids.push(id);
             }
         }
-        current = current.parentElement;
+        current = parentElementCrossingShadow(current);
     }
     return ids.reverse();
 }
@@ -46,7 +48,7 @@ function findNearestNonHeadingFoldedAncestor(element: Element | null): HTMLEleme
         ) {
             return current as HTMLElement;
         }
-        current = current.parentElement;
+        current = parentElementCrossingShadow(current);
     }
     return null;
 }

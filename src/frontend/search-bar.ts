@@ -15,7 +15,8 @@ import {
 import type {IMenu, Plugin} from "siyuan";
 import {confirm, Menu, showMessage} from "siyuan";
 import {rpcEmitSearchState, rpcSetPrefs} from "./kernel-client";
-import {collectSearchableBlocks, MERMAID_UNIT_ID} from "./blocks";
+import {collectSearchableBlocks, HTML_BLOCK_UNIT_ID, MERMAID_UNIT_ID} from "./blocks";
+import {parentElementCrossingShadow} from "./dom-parent";
 import {calculateSearchMatches} from "./pipeline";
 import {
     isMatchWritable,
@@ -30,6 +31,7 @@ import {
     type SelectionScope,
 } from "./selection";
 import {SearchPanelFrame} from "./panel-frame";
+import {resolveSettingsMenuZIndex} from "./panel-layer";
 import {
     AV_REFRESH_DEBOUNCE_MS,
     isAttrViewRelevantToEdit,
@@ -93,6 +95,7 @@ export interface SearchBarI18n {
     replaceCurrentUnsupported: string;
     replaceAttributeViewUnsupported: string;
     replaceMermaidUnsupported: string;
+    replaceHtmlBlockUnsupported: string;
     replaceModeUnsupported: string;
     replaceAllConfirm: string;
     replaceAllConfirmTitle: string;
@@ -114,6 +117,8 @@ export interface SearchBarI18n {
     settingsIncludeWidget: string;
     settingsIncludeCodeBlock: string;
     settingsIncludeMermaid: string;
+    settingsIncludeHtmlBlock: string;
+    settingsIncludeHtmlBlockHint: string;
     settingsIncludeFoldedBlocks: string;
     settingsIncludeFoldedBlocksHint: string;
     settingsIncludeInlineMemo: string;
@@ -164,6 +169,8 @@ export interface SearchBarHost {
     syncIncludeCodeBlock?(value: boolean, source?: SearchBar): void;
     /** 将 Mermaid 匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeMermaid?(value: boolean, source?: SearchBar): void;
+    /** 将 HTML 块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeHtmlBlock?(value: boolean, source?: SearchBar): void;
     /** 将折叠块内容匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeFoldedBlocks?(value: boolean, source?: SearchBar): void;
     /** 将行内备注匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -216,6 +223,8 @@ export class SearchBar {
     private includeCodeBlock = true;
     /** 是否匹配 Mermaid；全局 prefs，默认 true */
     private includeMermaid = true;
+    /** 是否匹配 HTML 块渲染可见文字；全局 prefs，默认 true */
+    private includeHtmlBlock = true;
     /** 是否匹配非标题折叠块内隐藏内容；全局 prefs，默认 false */
     private includeFoldedBlocks = false;
     /** 是否匹配行内备注；全局 prefs，默认 false */
@@ -280,6 +289,8 @@ export class SearchBar {
         includeCodeBlock?: boolean;
         /** 是否匹配 Mermaid（来自全局 prefs） */
         includeMermaid?: boolean;
+        /** 是否匹配 HTML 块渲染可见文字（来自全局 prefs） */
+        includeHtmlBlock?: boolean;
         /** 是否匹配折叠块内容（来自全局 prefs） */
         includeFoldedBlocks?: boolean;
         /** 是否匹配行内备注（来自全局 prefs） */
@@ -301,6 +312,7 @@ export class SearchBar {
         this.includeWidget = options.includeWidget !== false;
         this.includeCodeBlock = options.includeCodeBlock !== false;
         this.includeMermaid = options.includeMermaid !== false;
+        this.includeHtmlBlock = options.includeHtmlBlock !== false;
         this.includeFoldedBlocks = options.includeFoldedBlocks === true;
         this.includeInlineMemo = options.includeInlineMemo === true;
         this.restrictInlineTypes = normalizeRestrictInlineTypes(
@@ -345,6 +357,12 @@ export class SearchBar {
                     dialogLeft: position.left,
                     dialogTop: position.top,
                 });
+            },
+            onSiyuanDialogLayerChange: (hasOpenDialog) => {
+                // 原生搜索/设置等 Dialog 打开时收起齿轮菜单，避免压在 Dialog 上
+                if (hasOpenDialog) {
+                    this.closeSettingsMenu();
+                }
             },
         });
         this.stopAvDomWatch = watchAttributeViewDom(this.edit, () => {
@@ -748,6 +766,7 @@ export class SearchBar {
             includeWidget: this.includeWidget,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
+            includeHtmlBlock: this.includeHtmlBlock,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
         });
@@ -771,6 +790,7 @@ export class SearchBar {
             includeWidget: this.includeWidget,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
+            includeHtmlBlock: this.includeHtmlBlock,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
         });
@@ -787,6 +807,7 @@ export class SearchBar {
                 includeWidget: this.includeWidget,
                 includeCodeBlock: this.includeCodeBlock,
                 includeMermaid: this.includeMermaid,
+            includeHtmlBlock: this.includeHtmlBlock,
                 includeInlineMemo: this.includeInlineMemo,
                 restrictInlineTypes: this.restrictInlineTypes,
             });
@@ -1017,6 +1038,7 @@ export class SearchBar {
             includeWidget: this.includeWidget,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
+            includeHtmlBlock: this.includeHtmlBlock,
             includeFoldedBlocks: this.includeFoldedBlocks,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
@@ -1558,7 +1580,9 @@ export class SearchBar {
                 ? this.i18n.replaceAttributeViewUnsupported
                 : match.unitId === MERMAID_UNIT_ID
                     ? this.i18n.replaceMermaidUnsupported
-                    : this.i18n.replaceCurrentUnsupported;
+                    : match.unitId === HTML_BLOCK_UNIT_ID
+                        ? this.i18n.replaceHtmlBlockUnsupported
+                        : this.i18n.replaceCurrentUnsupported;
             showMessage(msg, 3000, "info");
             this.clickNext();
             return;
@@ -1738,15 +1762,6 @@ export class SearchBar {
                     },
                 }),
                 this.buildMatchSwitchMenuItem({
-                    id: "page-search-include-embed-block",
-                    icon: "iconSQL",
-                    label: this.i18n.settingsIncludeEmbedBlock,
-                    checked: this.includeEmbedBlock,
-                    onChange: (checked) => {
-                        void this.setIncludeEmbedBlock(checked);
-                    },
-                }),
-                this.buildMatchSwitchMenuItem({
                     id: "page-search-include-blockquote",
                     icon: "iconQuote",
                     label: this.i18n.settingsIncludeBlockquote,
@@ -1762,6 +1777,25 @@ export class SearchBar {
                     checked: this.includeCallout,
                     onChange: (checked) => {
                         void this.setIncludeCallout(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-embed-block",
+                    icon: "iconSQL",
+                    label: this.i18n.settingsIncludeEmbedBlock,
+                    checked: this.includeEmbedBlock,
+                    onChange: (checked) => {
+                        void this.setIncludeEmbedBlock(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-html-block",
+                    icon: "iconHTML5",
+                    label: this.i18n.settingsIncludeHtmlBlock,
+                    checked: this.includeHtmlBlock,
+                    helpTip: this.i18n.settingsIncludeHtmlBlockHint,
+                    onChange: (checked) => {
+                        void this.setIncludeHtmlBlock(checked);
                     },
                 }),
                 this.buildMatchSwitchMenuItem({
@@ -1803,10 +1837,10 @@ export class SearchBar {
             y: rect.bottom,
             isLeft: true,
         });
-        // 面板拖动后会设 z-index:9999，需抬高原生菜单，避免被搜索窗盖住
-        const panelZ = Number.parseInt(getComputedStyle(this.dialog).zIndex || "0", 10);
-        const menuZ = Number.isFinite(panelZ) && panelZ > 0 ? panelZ + 1 : 10000;
-        menu.element.style.zIndex = String(menuZ);
+        // 仅保证菜单高于搜索窗；保留思源为 Menu 分配的层级，且不超过已打开 Dialog
+        menu.element.style.zIndex = String(
+            resolveSettingsMenuZIndex(this.dialog, menu.element),
+        );
         // 菜单挂在 document，用 data-name 标记便于样式与关闭兜底
         menu.element.setAttribute("data-name", "page-search-settings");
     }
@@ -2111,6 +2145,16 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setIncludeHtmlBlock(value: boolean) {
+        if (this.includeHtmlBlock === value) {
+            return;
+        }
+        this.includeHtmlBlock = value;
+        await rpcSetPrefs(this.plugin, {includeHtmlBlock: value});
+        this.plugin.syncIncludeHtmlBlock?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeFoldedBlocks(value: boolean) {
         if (this.includeFoldedBlocks === value) {
             return;
@@ -2230,6 +2274,14 @@ export class SearchBar {
             return;
         }
         this.includeMermaid = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeHtmlBlock(value: boolean) {
+        if (this.includeHtmlBlock === value) {
+            return;
+        }
+        this.includeHtmlBlock = value;
         void this.highlightHitResult(this.searchText, true);
     }
 
@@ -2368,7 +2420,7 @@ function findScrollContainers(element: Element): HTMLElement[] {
         if (canScrollY || canScrollX) {
             containers.push(htmlElement);
         }
-        current = current.parentElement;
+        current = parentElementCrossingShadow(current);
     }
 
     return containers;

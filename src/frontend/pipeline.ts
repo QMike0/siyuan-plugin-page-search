@@ -55,6 +55,8 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeCodeBlock?: boolean;
     /** 是否匹配 Mermaid；默认 true */
     includeMermaid?: boolean;
+    /** 是否匹配 HTML 块渲染可见文字；默认 true；不可替换 */
+    includeHtmlBlock?: boolean;
     /**
      * 是否匹配非标题 CSS 折叠块内的隐藏内容；默认 false（与历史行为一致）。
      * 匹配时不展开；跳转时再展开。
@@ -147,6 +149,9 @@ function isDomReplaceable(
     if (blockType === ATTRIBUTE_VIEW_TYPE) {
         return false;
     }
+    if (blockType === "NodeHTMLBlock") {
+        return false;
+    }
     if (
         blockType === PREVIEW_BLOCK_TYPE
         || blockId === PREVIEW_BLOCK_ID
@@ -166,8 +171,11 @@ function isDomReplaceable(
     if (element.closest(NON_REPLACEABLE_DOM_CLOSEST)) {
         return false;
     }
-    // 兜底：Range 落在 Mermaid 渲染壳上时（无 Text 命中路径）
+    // 兜底：Range 落在 Mermaid / HTML 块壳上时（Shadow 内 closest 可能穿不出）
     if (element.closest(`[data-type="NodeCodeBlock"][data-subtype="mermaid"]`)) {
+        return false;
+    }
+    if (element.closest(`[data-type="NodeHTMLBlock"], protyle-html`)) {
         return false;
     }
     if (isStructurallyWritableDespiteFalseAncestor(element, blockType)) {
@@ -233,6 +241,7 @@ export async function calculateSearchMatches(
                 includeWidget: options.includeWidget,
                 includeCodeBlock: options.includeCodeBlock,
                 includeMermaid: options.includeMermaid,
+                includeHtmlBlock: options.includeHtmlBlock,
                 includeFoldedBlocks: options.includeFoldedBlocks,
                 includeInlineMemo: options.includeInlineMemo,
                 restrictInlineTypes,
@@ -251,6 +260,7 @@ export async function calculateSearchMatches(
         includeWidget: options.includeWidget !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeMermaid: options.includeMermaid !== false,
+        includeHtmlBlock: options.includeHtmlBlock !== false,
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,
     });

@@ -1,8 +1,9 @@
 import {ZERO_WIDTH_GLOBAL_RE, ZERO_WIDTH_RE} from "./constants";
 import {ATTRIBUTE_VIEW_TYPE} from "./replaceable";
 
-/** 与 frontend/blocks MERMAID_UNIT_ID 对齐 */
+/** 与 frontend/blocks MERMAID_UNIT_ID / HTML_BLOCK_UNIT_ID 对齐 */
 const MERMAID_UNIT_ID = "mermaid-source";
+const HTML_BLOCK_UNIT_ID = "html-block-rendered";
 import type {
     MatchHit,
     MatchOptions,
@@ -79,7 +80,7 @@ export function isHitReplaceableByUnit(
     if (unit.blockType === ATTRIBUTE_VIEW_TYPE) {
         return false;
     }
-    if (unit.unitId === MERMAID_UNIT_ID) {
+    if (unit.unitId === MERMAID_UNIT_ID || unit.unitId === HTML_BLOCK_UNIT_ID) {
         return false;
     }
     return isOffsetReplaceable(unit.segmentLengths, start, end);

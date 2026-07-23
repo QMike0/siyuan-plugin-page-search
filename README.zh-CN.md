@@ -64,6 +64,7 @@
 | 类型 | 说明 |
 |------|------|
 | 数据库（AV） | 永不替换 |
+| Mermaid / HTML 块 | 仅搜渲染可见文字并高亮 |
 | 跨 Text / 复杂格式 | 如普通字 + **加粗** 拼成一词 → `replaceable=false` |
 | 公式 / 只读渲染 | 行内公式、块公式等 |
 | 文档标题区 | 当前不走块 transaction 写回 |
@@ -85,7 +86,7 @@
 | 字段 | 说明 |
 |------|------|
 | `dialogLeft` / `dialogTop` | 拖拽后的固定位置（点顶栏复位会清空） |
-| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` | 是否查找（默认开） |
+| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | 是否查找（默认开） |
 | `includeFoldedBlocks` / `includeInlineMemo` | 折叠块 / 行内备注（默认关） |
 | `restrictInlineTypes` | 限制查找类型（会话内；关闭搜索窗后清回空） |
 

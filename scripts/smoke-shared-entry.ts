@@ -158,6 +158,22 @@ assert(!isHitReplaceableByUnit(avUnit, 0, 4), "AV unit not replaceable by helper
 const avHits = matchTextUnits([avUnit], "cell");
 assert(avHits.length === 1 && avHits[0].replaceable === false, "AV hit replaceable=false");
 
+// --- HTML block unit never replaceable ---
+const htmlUnit = {
+    blockId: "html1",
+    blockType: "NodeHTMLBlock",
+    blockIndex: 0,
+    text: "hello html",
+    unitId: "html-block-rendered",
+    segmentLengths: [10],
+};
+assert(!isHitReplaceableByUnit(htmlUnit, 0, 5), "HTML block unit not replaceable");
+const htmlHits = matchTextUnits([htmlUnit], "hello");
+assert(htmlHits.length === 1 && htmlHits[0].replaceable === false, "HTML hit replaceable=false");
+assert(DEFAULT_PREFS.includeHtmlBlock === true, "includeHtmlBlock defaults on");
+assert(coercePluginPrefs({}).includeHtmlBlock === true, "coerce includeHtmlBlock default on");
+assert(coercePluginPrefs({includeHtmlBlock: false}).includeHtmlBlock === false, "coerce includeHtmlBlock off");
+
 const named = normalizeMatchRequest([{
     query: "传感器",
     units: [units[1]],

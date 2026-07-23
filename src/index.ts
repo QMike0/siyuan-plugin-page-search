@@ -273,7 +273,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             useRegex: t.useRegex || "Use regex (search only)",
             preserveCase: t.preserveCase || "Preserve case",
             replaceUnsupportedHelp: t.replaceUnsupportedHelp
-                || "Replacement is unavailable in export preview or read-only mode; databases, Mermaid diagrams, math formulas, the document title, and text with complex formatting also cannot be replaced",
+                || "Replacement is unavailable in export preview or read-only mode; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced",
             replaceAction: t.replaceAction || "Replace (Enter)",
             replaceAllAction: t.replaceAllAction || "Replace all (Ctrl+Alt+Enter)",
             replaceToggle: t.replaceToggle || "Expand or collapse replace row",
@@ -283,6 +283,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 || "Database results cannot be replaced",
             replaceMermaidUnsupported: t.replaceMermaidUnsupported
                 || "Mermaid diagrams support search and highlight only, not replace",
+            replaceHtmlBlockUnsupported: t.replaceHtmlBlockUnsupported
+                || "HTML blocks support search and highlight of rendered text only; replacement is not supported",
             replaceModeUnsupported: t.replaceModeUnsupported
                 || "Replacement is unavailable in export preview or read-only mode",
             replaceAllConfirm: t.replaceAllConfirm || "Replace {count} matches?",
@@ -310,6 +312,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeWidget: t.settingsIncludeWidget || "Widget",
             settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
             settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
+            settingsIncludeHtmlBlock: t.settingsIncludeHtmlBlock || "HTML block",
+            settingsIncludeHtmlBlockHint: t.settingsIncludeHtmlBlockHint
+                || "Match visible rendered text inside HTML blocks, not the HTML source",
             settingsIncludeFoldedBlocks: t.settingsIncludeFoldedBlocks || "Folded block content",
             settingsIncludeFoldedBlocksHint: t.settingsIncludeFoldedBlocksHint
                 || "Controls whether to search hidden content inside folded blocks (excluding folded headings)",
@@ -427,6 +432,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeMermaid(value);
+        });
+    }
+
+    /** 将 HTML 块匹配开关同步到其它已打开面板 */
+    syncIncludeHtmlBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeHtmlBlock(value);
         });
     }
 
@@ -725,6 +740,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeWidget: prefs.includeWidget !== false,
                     includeCodeBlock: prefs.includeCodeBlock !== false,
                     includeMermaid: prefs.includeMermaid !== false,
+                    includeHtmlBlock: prefs.includeHtmlBlock !== false,
                     includeFoldedBlocks: prefs.includeFoldedBlocks === true,
                     includeInlineMemo: prefs.includeInlineMemo === true,
                     // 限制查找仅会话内有效，打开时始终不限制

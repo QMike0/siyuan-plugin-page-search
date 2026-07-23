@@ -64,6 +64,7 @@ Writes go through the current document’s **Protyle transaction** (`updateTrans
 | Kind | Notes |
 |------|-------|
 | Attribute view (AV) | Never replaced |
+| Mermaid / HTML block | Search & highlight rendered text only |
 | Cross-Text / complex marks | e.g. plain + **bold** spanning one word → `replaceable=false` |
 | Math / render-only | Inline math, block math, etc. |
 | Document title field | Not written via block transactions yet |
@@ -85,7 +86,7 @@ Stored in `prefs.json`:
 | Field | Meaning |
 |------|---------|
 | `dialogLeft` / `dialogTop` | Dragged position (cleared when resetting via top bar) |
-| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` | Include in find (default on) |
+| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in find (default on) |
 | `includeFoldedBlocks` / `includeInlineMemo` | Folded blocks / inline memos (default off) |
 | `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |
 

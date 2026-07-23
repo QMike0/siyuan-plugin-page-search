@@ -3,6 +3,8 @@
  * 位置可持久化；宽度仅会话内有效。
  */
 
+import {resolveFixedPanelZIndex} from "./panel-layer";
+
 export interface PanelPosition {
     left: number;
     top: number;
@@ -35,15 +37,21 @@ export interface SearchPanelFrameOptions {
     persistPosition: (position: PanelPosition | null) => void;
     /** 移动端禁用拖拽与改宽 */
     enabled: boolean;
+    /** 思源 Dialog 打开/关闭时回调（用于收起齿轮菜单等） */
+    onSiyuanDialogLayerChange?: (hasOpenDialog: boolean) => void;
 }
 
 export class SearchPanelFrame {
     private readonly panel: HTMLElement;
     private readonly persistPosition: (position: PanelPosition | null) => void;
     private readonly enabled: boolean;
+    private readonly onSiyuanDialogLayerChange?: (hasOpenDialog: boolean) => void;
 
     private panelWidth = resolveDefaultPanelWidth();
     private panelPosition: PanelPosition | null = null;
+    private lastDialogOpen = false;
+    private dialogLayerObserver: MutationObserver | null = null;
+    private dialogLayerRaf = 0;
 
     private dragState: {
         pointerId: number;
@@ -68,6 +76,7 @@ export class SearchPanelFrame {
         this.panel = options.panel;
         this.persistPosition = options.persistPosition;
         this.enabled = options.enabled;
+        this.onSiyuanDialogLayerChange = options.onSiyuanDialogLayerChange;
 
         this.onPanelPointerDown = (event) => this.handlePanelPointerDown(event);
         this.onResizePointerDown = (event) => this.handleResizePointerDown(event);
@@ -75,6 +84,7 @@ export class SearchPanelFrame {
         this.onViewportResize = () => this.syncPanelBoundsToViewport();
 
         this.applyStyle();
+        this.startDialogLayerWatch();
 
         if (!this.enabled) {
             return;
@@ -88,6 +98,7 @@ export class SearchPanelFrame {
     }
 
     destroy() {
+        this.stopDialogLayerWatch();
         this.stopPanelInteractions();
         if (!this.enabled) {
             return;
@@ -98,6 +109,14 @@ export class SearchPanelFrame {
             ?.removeEventListener("pointerdown", this.onResizePointerDown as EventListener);
         window.removeEventListener("resize", this.onViewportResize);
         document.body.classList.remove("page-search-dragging", "page-search-resizing");
+    }
+
+    /** 按当前思源 Dialog 层级重算固定面板 z-index */
+    syncLayering() {
+        if (!this.panelPosition) {
+            return;
+        }
+        this.applyStyle();
     }
 
     /** 恢复已保存的位置 */
@@ -128,7 +147,53 @@ export class SearchPanelFrame {
         this.panel.style.left = `${this.panelPosition.left}px`;
         this.panel.style.top = `${this.panelPosition.top}px`;
         this.panel.style.transform = "none";
-        this.panel.style.zIndex = "9999";
+        // 勿用 9999：会盖住思源全局搜索等 Dialog
+        this.panel.style.zIndex = String(resolveFixedPanelZIndex());
+    }
+
+    private startDialogLayerWatch() {
+        if (typeof MutationObserver !== "function") {
+            return;
+        }
+        this.lastDialogOpen = Boolean(document.querySelector(".b3-dialog--open"));
+        this.dialogLayerObserver = new MutationObserver(() => {
+            // Dialog 挂在 body；class/z-index 变更较频繁，合并到一帧
+            if (this.dialogLayerRaf) {
+                return;
+            }
+            this.dialogLayerRaf = window.requestAnimationFrame(() => {
+                this.dialogLayerRaf = 0;
+                this.onDialogLayerMutation();
+            });
+        });
+        // 思源 Dialog：body.append 后异步加 b3-dialog--open，并写入 style.zIndex
+        this.dialogLayerObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["class", "style"],
+        });
+    }
+
+    private stopDialogLayerWatch() {
+        this.dialogLayerObserver?.disconnect();
+        this.dialogLayerObserver = null;
+        if (this.dialogLayerRaf) {
+            window.cancelAnimationFrame(this.dialogLayerRaf);
+            this.dialogLayerRaf = 0;
+        }
+    }
+
+    private onDialogLayerMutation() {
+        const hasOpen = Boolean(document.querySelector(".b3-dialog--open"));
+        if (this.panelPosition) {
+            this.applyStyle();
+        }
+        if (hasOpen === this.lastDialogOpen) {
+            return;
+        }
+        this.lastDialogOpen = hasOpen;
+        this.onSiyuanDialogLayerChange?.(hasOpen);
     }
 
     private handlePanelPointerDown(event: PointerEvent) {

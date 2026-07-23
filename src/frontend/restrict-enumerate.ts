@@ -37,6 +37,7 @@ const CALLOUT_TYPE = "NodeCallout";
 const MATH_BLOCK_TYPE = "NodeMathBlock";
 const EMBED_BLOCK_TYPE = "NodeBlockQueryEmbed";
 const WIDGET_TYPE = "NodeWidget";
+const HTML_BLOCK_TYPE = "NodeHTMLBlock";
 const CODE_BLOCK_TYPE = "NodeCodeBlock";
 const MERMAID_SUBTYPE = "mermaid";
 const HOST_EXCLUDED_CLOSEST = ".protyle-attr, .fn__none, svg, style, script";
@@ -86,6 +87,7 @@ export function enumerateRestrictInlineMatches(
     const includeWidget = options.includeWidget !== false;
     const includeCodeBlock = options.includeCodeBlock !== false;
     const includeMermaid = options.includeMermaid !== false;
+    const includeHtmlBlock = options.includeHtmlBlock !== false;
     const allowFoldedHidden = options.includeFoldedBlocks === true;
     const selectionOnly = options.selectionOnly === true;
 
@@ -100,6 +102,7 @@ export function enumerateRestrictInlineMatches(
         includeWidget,
         includeCodeBlock,
         includeMermaid,
+        includeHtmlBlock,
         includeInlineMemo,
         restrictInlineTypes: [],
     });
@@ -149,6 +152,7 @@ export function enumerateRestrictInlineMatches(
                     includeWidget,
                     includeCodeBlock,
                     includeMermaid,
+                    includeHtmlBlock,
                 })) {
                     continue;
                 }
@@ -371,6 +375,7 @@ function shouldSkipHostByIncludeGates(
         includeWidget: boolean;
         includeCodeBlock: boolean;
         includeMermaid: boolean;
+        includeHtmlBlock: boolean;
     },
 ): boolean {
     const owner = host.closest<HTMLElement>("[data-node-id][data-type]");
@@ -417,6 +422,12 @@ function shouldSkipHostByIncludeGates(
     if (
         !options.includeWidget
         && Boolean(host.closest(`[data-type="${WIDGET_TYPE}"]`))
+    ) {
+        return true;
+    }
+    if (
+        !options.includeHtmlBlock
+        && Boolean(host.closest(`[data-type="${HTML_BLOCK_TYPE}"]`))
     ) {
         return true;
     }

@@ -1,3 +1,4 @@
+import {parentElementCrossingShadow} from "./dom-parent";
 import {isUnderNonHeadingCssFold} from "./fold";
 
 export interface ElementVisibilityOptions {
@@ -36,10 +37,14 @@ export function isElementVisible(
         return false;
     }
 
-    // 思源数据库 / Callout / 文档标题 / Mermaid(SVG)：半透明与非标准盒模型较多，避免 checkVisibility+opacity 误杀
-    if (htmlElement.closest(
-        '.av, .callout, .callout-title, .callout-info, .protyle-title, .protyle-title__input, [data-subtype="mermaid"], svg, foreignObject',
-    )) {
+    // 思源数据库 / Callout / 文档标题 / Mermaid(SVG) / HTML 块 Shadow：半透明与非标准盒模型较多，避免 checkVisibility+opacity 误杀
+    // protyle-html：渲染字在 open shadow；Element.closest 不穿 Shadow，故另判 host
+    if (
+        isInsideProtyleHtmlShadow(htmlElement)
+        || htmlElement.closest(
+            '.av, .callout, .callout-title, .callout-info, .protyle-title, .protyle-title__input, [data-subtype="mermaid"], svg, foreignObject, protyle-html, [data-type="NodeHTMLBlock"]',
+        )
+    ) {
         if (isLooseUiElementVisible(htmlElement)) {
             return true;
         }
@@ -72,6 +77,14 @@ function isKatexDecorativeAriaHidden(element: HTMLElement): boolean {
         || Boolean(element.closest(".katex-html"));
 }
 
+/** 是否落在思源 HTML 块 `protyle-html` 的 open shadow 内（closest 穿不出） */
+function isInsideProtyleHtmlShadow(element: Element): boolean {
+    const root = element.getRootNode();
+    return root instanceof ShadowRoot
+        && root.host instanceof HTMLElement
+        && root.host.tagName.toLowerCase() === "protyle-html";
+}
+
 /** 对页内搜索而言应视为「硬隐藏」的 aria-hidden（排除 KaTeX 装饰层） */
 function isSearchBlockingAriaHidden(element: HTMLElement): boolean {
     return element.getAttribute("aria-hidden") === "true"
@@ -89,7 +102,7 @@ function isHardHiddenShell(element: HTMLElement): boolean {
         ) {
             return true;
         }
-        current = current.parentElement;
+        current = parentElementCrossingShadow(current);
     }
     return false;
 }
@@ -111,7 +124,7 @@ function isStrictlyVisible(htmlElement: HTMLElement): boolean {
         if ((current as HTMLElement).classList?.contains("fn__none")) {
             return false;
         }
-        current = current.parentElement;
+        current = parentElementCrossingShadow(current);
     }
 
     if (typeof htmlElement.checkVisibility === "function") {
@@ -126,7 +139,7 @@ function isStrictlyVisible(htmlElement: HTMLElement): boolean {
         return false;
     }
 
-    return isElementVisible(htmlElement.parentElement);
+    return isElementVisible(parentElementCrossingShadow(htmlElement));
 }
 
 function isLooseUiElementVisible(element: HTMLElement): boolean {
@@ -145,7 +158,7 @@ function isLooseUiElementVisible(element: HTMLElement): boolean {
             return false;
         }
 
-        current = current.parentElement;
+        current = parentElementCrossingShadow(current);
     }
 
     return true;
