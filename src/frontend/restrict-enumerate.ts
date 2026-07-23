@@ -31,6 +31,12 @@ import {
 import {isElementVisible} from "./visibility";
 
 const ATTRIBUTE_VIEW_TYPE = "NodeAttributeView";
+const TABLE_TYPE = "NodeTable";
+const BLOCKQUOTE_TYPE = "NodeBlockquote";
+const CALLOUT_TYPE = "NodeCallout";
+const MATH_BLOCK_TYPE = "NodeMathBlock";
+const EMBED_BLOCK_TYPE = "NodeBlockQueryEmbed";
+const WIDGET_TYPE = "NodeWidget";
 const CODE_BLOCK_TYPE = "NodeCodeBlock";
 const MERMAID_SUBTYPE = "mermaid";
 const HOST_EXCLUDED_CLOSEST = ".protyle-attr, .fn__none, svg, style, script";
@@ -72,6 +78,12 @@ export function enumerateRestrictInlineMatches(
     }
 
     const includeAttributeView = options.includeAttributeView !== false;
+    const includeTable = options.includeTable !== false;
+    const includeBlockquote = options.includeBlockquote !== false;
+    const includeCallout = options.includeCallout !== false;
+    const includeMathBlock = options.includeMathBlock !== false;
+    const includeEmbedBlock = options.includeEmbedBlock !== false;
+    const includeWidget = options.includeWidget !== false;
     const includeCodeBlock = options.includeCodeBlock !== false;
     const includeMermaid = options.includeMermaid !== false;
     const allowFoldedHidden = options.includeFoldedBlocks === true;
@@ -80,6 +92,12 @@ export function enumerateRestrictInlineMatches(
     // 选区偏移与 blockIndex：用「不限制」采集，保证正文块完整
     const scopeBlocks = collectSearchableBlocks(edit, {
         includeAttributeView,
+        includeTable,
+        includeBlockquote,
+        includeCallout,
+        includeMathBlock,
+        includeEmbedBlock,
+        includeWidget,
         includeCodeBlock,
         includeMermaid,
         includeInlineMemo,
@@ -123,6 +141,12 @@ export function enumerateRestrictInlineMatches(
                 }
                 if (shouldSkipHostByIncludeGates(span, {
                     includeAttributeView,
+                    includeTable,
+                    includeBlockquote,
+                    includeCallout,
+                    includeMathBlock,
+                    includeEmbedBlock,
+                    includeWidget,
                     includeCodeBlock,
                     includeMermaid,
                 })) {
@@ -339,6 +363,12 @@ function shouldSkipHostByIncludeGates(
     host: Element,
     options: {
         includeAttributeView: boolean;
+        includeTable: boolean;
+        includeBlockquote: boolean;
+        includeCallout: boolean;
+        includeMathBlock: boolean;
+        includeEmbedBlock: boolean;
+        includeWidget: boolean;
         includeCodeBlock: boolean;
         includeMermaid: boolean;
     },
@@ -349,6 +379,45 @@ function shouldSkipHostByIncludeGates(
     }
     const blockType = owner.dataset.type?.trim() || "";
     if (blockType === ATTRIBUTE_VIEW_TYPE && !options.includeAttributeView) {
+        return true;
+    }
+    if (
+        !options.includeTable
+        && (blockType === TABLE_TYPE
+            || owner.classList.contains("table")
+            || Boolean(host.closest(`[data-type="${TABLE_TYPE}"], .table`)))
+    ) {
+        return true;
+    }
+    if (
+        !options.includeBlockquote
+        && Boolean(host.closest(`[data-type="${BLOCKQUOTE_TYPE}"], .bq`))
+    ) {
+        return true;
+    }
+    if (
+        !options.includeCallout
+        && Boolean(host.closest(`[data-type="${CALLOUT_TYPE}"], .callout`))
+    ) {
+        return true;
+    }
+    // 仅公式块；勿用 data-subtype="math"（行内公式亦有该属性）
+    if (
+        !options.includeMathBlock
+        && Boolean(host.closest(`[data-type="${MATH_BLOCK_TYPE}"]`))
+    ) {
+        return true;
+    }
+    if (
+        !options.includeEmbedBlock
+        && Boolean(host.closest(`[data-type="${EMBED_BLOCK_TYPE}"]`))
+    ) {
+        return true;
+    }
+    if (
+        !options.includeWidget
+        && Boolean(host.closest(`[data-type="${WIDGET_TYPE}"]`))
+    ) {
         return true;
     }
     if (blockType === CODE_BLOCK_TYPE) {

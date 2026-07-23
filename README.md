@@ -42,7 +42,7 @@ Gear menu:
 | Group | Role |
 |------|------|
 | **Limit find** | Search only within selected inline types (OR; all off = no limit). Empty find box previews all hosts of selected types (not replaceable; counts over 999 show as `999+` while still highlighting all). Order: block ref, link, bold, italic, underline, strike, highlight, superscript, subscript, inline code, keyboard, tag, inline math, inline memo. Stacks with Find in selection |
-| **Include in find** | Whether to include inline memos, databases, code blocks, Mermaid |
+| **Include in find** | Whether to include inline memos, databases, tables, blockquotes, callouts, math blocks, embed blocks, widgets, code blocks, Mermaid |
 | **Folded block content** | Match hidden content in non-heading folded blocks (independent of Limit find) |
 
 Notes:
@@ -85,7 +85,7 @@ Stored in `prefs.json`:
 | Field | Meaning |
 |------|---------|
 | `dialogLeft` / `dialogTop` | Dragged position (cleared when resetting via top bar) |
-| `includeAttributeView` / `includeCodeBlock` / `includeMermaid` | Include in find (default on) |
+| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` | Include in find (default on) |
 | `includeFoldedBlocks` / `includeInlineMemo` | Folded blocks / inline memos (default off) |
 | `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |
 

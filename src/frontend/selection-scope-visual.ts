@@ -912,6 +912,12 @@ export function captureSelectionScopeWithKind(
     edit: Element,
     options?: {
         includeAttributeView?: boolean;
+        includeTable?: boolean;
+        includeBlockquote?: boolean;
+        includeCallout?: boolean;
+        includeMathBlock?: boolean;
+        includeEmbedBlock?: boolean;
+        includeWidget?: boolean;
         includeCodeBlock?: boolean;
         includeMermaid?: boolean;
         includeInlineMemo?: boolean;
@@ -925,6 +931,12 @@ export function captureSelectionScopeWithKind(
 } {
     const blocks = collectSearchableBlocks(edit, {
         includeAttributeView: options?.includeAttributeView !== false,
+        includeTable: options?.includeTable !== false,
+        includeBlockquote: options?.includeBlockquote !== false,
+        includeCallout: options?.includeCallout !== false,
+        includeMathBlock: options?.includeMathBlock !== false,
+        includeEmbedBlock: options?.includeEmbedBlock !== false,
+        includeWidget: options?.includeWidget !== false,
         includeCodeBlock: options?.includeCodeBlock !== false,
         includeMermaid: options?.includeMermaid !== false,
         includeInlineMemo: options?.includeInlineMemo === true,

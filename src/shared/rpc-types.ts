@@ -40,6 +40,18 @@ export interface PluginPrefs {
     lastQuery: string;
     /** 是否匹配文档内数据库（Attribute View）；默认 true */
     includeAttributeView: boolean;
+    /** 是否匹配表格块（NodeTable）；默认 true */
+    includeTable: boolean;
+    /** 是否匹配引述块（NodeBlockquote）及其内部子块；默认 true */
+    includeBlockquote: boolean;
+    /** 是否匹配提示块（NodeCallout，含标题与内部子块）；默认 true */
+    includeCallout: boolean;
+    /** 是否匹配公式块（NodeMathBlock）；默认 true；不含行内公式 */
+    includeMathBlock: boolean;
+    /** 是否匹配嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
+    includeEmbedBlock: boolean;
+    /** 是否匹配挂件块（NodeWidget）；默认 true */
+    includeWidget: boolean;
     /** 是否匹配代码块（不含 Mermaid，由 includeMermaid 单独控制）；默认 true */
     includeCodeBlock: boolean;
     /** 是否匹配 Mermaid 图；默认 true */
@@ -81,6 +93,12 @@ export const DEFAULT_PREFS: PluginPrefs = {
     dialogTop: null,
     lastQuery: "",
     includeAttributeView: true,
+    includeTable: true,
+    includeBlockquote: true,
+    includeCallout: true,
+    includeMathBlock: true,
+    includeEmbedBlock: true,
+    includeWidget: true,
     includeCodeBlock: true,
     includeMermaid: true,
     includeFoldedBlocks: false,
@@ -101,6 +119,12 @@ export function coercePluginPrefs(
         dialogTop: typeof base.dialogTop === "number" ? base.dialogTop : null,
         lastQuery: typeof base.lastQuery === "string" ? base.lastQuery : "",
         includeAttributeView: base.includeAttributeView !== false,
+        includeTable: base.includeTable !== false,
+        includeBlockquote: base.includeBlockquote !== false,
+        includeCallout: base.includeCallout !== false,
+        includeMathBlock: base.includeMathBlock !== false,
+        includeEmbedBlock: base.includeEmbedBlock !== false,
+        includeWidget: base.includeWidget !== false,
         includeCodeBlock: base.includeCodeBlock !== false,
         includeMermaid: base.includeMermaid !== false,
         includeFoldedBlocks: base.includeFoldedBlocks === true,
@@ -125,6 +149,24 @@ export function mergePrefs(
         includeAttributeView: patch.includeAttributeView !== undefined
             ? patch.includeAttributeView
             : base.includeAttributeView,
+        includeTable: patch.includeTable !== undefined
+            ? patch.includeTable
+            : base.includeTable,
+        includeBlockquote: patch.includeBlockquote !== undefined
+            ? patch.includeBlockquote
+            : base.includeBlockquote,
+        includeCallout: patch.includeCallout !== undefined
+            ? patch.includeCallout
+            : base.includeCallout,
+        includeMathBlock: patch.includeMathBlock !== undefined
+            ? patch.includeMathBlock
+            : base.includeMathBlock,
+        includeEmbedBlock: patch.includeEmbedBlock !== undefined
+            ? patch.includeEmbedBlock
+            : base.includeEmbedBlock,
+        includeWidget: patch.includeWidget !== undefined
+            ? patch.includeWidget
+            : base.includeWidget,
         includeCodeBlock: patch.includeCodeBlock !== undefined
             ? patch.includeCodeBlock
             : base.includeCodeBlock,

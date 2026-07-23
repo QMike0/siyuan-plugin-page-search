@@ -39,6 +39,18 @@ export interface SearchPipelineOptions extends MatchOptions {
     selectionScope?: SelectionScope;
     /** 是否匹配数据库；默认 true */
     includeAttributeView?: boolean;
+    /** 是否匹配表格块；默认 true */
+    includeTable?: boolean;
+    /** 是否匹配引述块及其内部；默认 true */
+    includeBlockquote?: boolean;
+    /** 是否匹配提示块（含标题与内部）；默认 true */
+    includeCallout?: boolean;
+    /** 是否匹配公式块；默认 true；不含行内公式 */
+    includeMathBlock?: boolean;
+    /** 是否匹配嵌入块及其内部渲染内容；默认 true */
+    includeEmbedBlock?: boolean;
+    /** 是否匹配挂件块；默认 true */
+    includeWidget?: boolean;
     /** 是否匹配代码块（非 Mermaid）；默认 true */
     includeCodeBlock?: boolean;
     /** 是否匹配 Mermaid；默认 true */
@@ -213,6 +225,12 @@ export async function calculateSearchMatches(
                 selectionOnly: options.selectionOnly,
                 selectionScope: options.selectionScope,
                 includeAttributeView: options.includeAttributeView,
+                includeTable: options.includeTable,
+                includeBlockquote: options.includeBlockquote,
+                includeCallout: options.includeCallout,
+                includeMathBlock: options.includeMathBlock,
+                includeEmbedBlock: options.includeEmbedBlock,
+                includeWidget: options.includeWidget,
                 includeCodeBlock: options.includeCodeBlock,
                 includeMermaid: options.includeMermaid,
                 includeFoldedBlocks: options.includeFoldedBlocks,
@@ -225,6 +243,12 @@ export async function calculateSearchMatches(
 
     const blocks = collectSearchableBlocks(edit, {
         includeAttributeView: options.includeAttributeView !== false,
+        includeTable: options.includeTable !== false,
+        includeBlockquote: options.includeBlockquote !== false,
+        includeCallout: options.includeCallout !== false,
+        includeMathBlock: options.includeMathBlock !== false,
+        includeEmbedBlock: options.includeEmbedBlock !== false,
+        includeWidget: options.includeWidget !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeMermaid: options.includeMermaid !== false,
         includeInlineMemo: options.includeInlineMemo === true,

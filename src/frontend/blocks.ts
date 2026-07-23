@@ -11,7 +11,12 @@ const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/
 const PREVIEW_BLOCK_ID = '__preview__'
 const PREVIEW_BLOCK_TYPE = 'preview'
 const ATTRIBUTE_VIEW_TYPE = 'NodeAttributeView'
+const BLOCKQUOTE_TYPE = 'NodeBlockquote'
 const CALLOUT_TYPE = 'NodeCallout'
+const MATH_BLOCK_TYPE = 'NodeMathBlock'
+/** 嵌入块：内含 .protyle-wysiwyg__embed 渲染的源块副本 */
+const EMBED_BLOCK_TYPE = 'NodeBlockQueryEmbed'
+const WIDGET_TYPE = 'NodeWidget'
 const TABLE_TYPE = 'NodeTable'
 const CODE_BLOCK_TYPE = 'NodeCodeBlock'
 const MERMAID_SUBTYPE = 'mermaid'
@@ -122,6 +127,18 @@ function collectDocTitleUnit(edit: Element): SearchableBlock | null {
 export interface CollectSearchableBlocksOptions {
   /** 是否采集数据库（Attribute View）；默认 true */
   includeAttributeView?: boolean;
+  /** 是否采集表格块（NodeTable）；默认 true */
+  includeTable?: boolean;
+  /** 是否采集引述块（NodeBlockquote）及其内部子块；默认 true */
+  includeBlockquote?: boolean;
+  /** 是否采集提示块（NodeCallout，含标题与内部子块）；默认 true */
+  includeCallout?: boolean;
+  /** 是否采集公式块（NodeMathBlock）；默认 true；不含行内公式 */
+  includeMathBlock?: boolean;
+  /** 是否采集嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
+  includeEmbedBlock?: boolean;
+  /** 是否采集挂件块（NodeWidget）；默认 true */
+  includeWidget?: boolean;
   /** 是否采集代码块（非 Mermaid）；默认 true */
   includeCodeBlock?: boolean;
   /** 是否采集 Mermaid 图；默认 true */
@@ -140,6 +157,12 @@ export function collectSearchableBlocks(
   options: CollectSearchableBlocksOptions = {},
 ): SearchableBlock[] {
   const includeAttributeView = options.includeAttributeView !== false;
+  const includeTable = options.includeTable !== false;
+  const includeBlockquote = options.includeBlockquote !== false;
+  const includeCallout = options.includeCallout !== false;
+  const includeMathBlock = options.includeMathBlock !== false;
+  const includeEmbedBlock = options.includeEmbedBlock !== false;
+  const includeWidget = options.includeWidget !== false;
   const includeCodeBlock = options.includeCodeBlock !== false;
   const includeMermaid = options.includeMermaid !== false;
   const includeInlineMemo = options.includeInlineMemo === true;
@@ -159,6 +182,17 @@ export function collectSearchableBlocks(
     return []
   }
 
+  const includeGates: IncludeGates = {
+    includeAttributeView,
+    includeTable,
+    includeBlockquote,
+    includeCallout,
+    includeEmbedBlock,
+    includeWidget,
+    includeCodeBlock,
+    includeMermaid,
+  }
+
   const blocks: SearchableBlock[] = []
   if (collectBodyText) {
     const titleUnit = collectDocTitleUnit(edit)
@@ -167,7 +201,10 @@ export function collectSearchableBlocks(
     }
   }
 
-  const blockElements = collectBodyText ? getUniqueBlockElements(docRoot) : []
+  // 关嵌入时在去重阶段即排除嵌入 DOM，避免同 id 只保留嵌入副本而漏掉正文
+  const blockElements = collectBodyText
+    ? getUniqueBlockElements(docRoot, {excludeEmbed: !includeEmbedBlock})
+    : []
   if (collectBodyText && blockElements.length === 0) {
     const textNodes = collectTextNodes(docRoot, null)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
@@ -182,10 +219,16 @@ export function collectSearchableBlocks(
       })
     }
     if (collectMemo) {
-      blocks.push(...collectInlineMemoSearchUnits(docRoot))
+      blocks.push(...filterAttributeUnitsByIncludeGates(
+        collectInlineMemoSearchUnits(docRoot),
+        includeGates,
+      ))
     }
     if (collectMath) {
-      blocks.push(...collectInlineMathSearchUnits(docRoot))
+      blocks.push(...filterAttributeUnitsByIncludeGates(
+        collectInlineMathSearchUnits(docRoot),
+        includeGates,
+      ))
     }
     return blocks
   }
@@ -205,6 +248,33 @@ export function collectSearchableBlocks(
       }
     }
 
+    // 引述 / 提示 / 嵌入为容器块：关开关时跳过容器本身及其内部全部子块
+    // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts isContainerBlock
+    // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/blockRender.ts
+    if (
+      !includeBlockquote
+      && (blockType === BLOCKQUOTE_TYPE
+        || element.classList.contains('bq')
+        || Boolean(element.closest(`[data-type="${BLOCKQUOTE_TYPE}"], .bq`)))
+    ) {
+      return
+    }
+    if (
+      !includeCallout
+      && (blockType === CALLOUT_TYPE
+        || element.classList.contains('callout')
+        || Boolean(element.closest(`[data-type="${CALLOUT_TYPE}"], .callout`)))
+    ) {
+      return
+    }
+    if (
+      !includeEmbedBlock
+      && (blockType === EMBED_BLOCK_TYPE
+        || Boolean(element.closest(`[data-type="${EMBED_BLOCK_TYPE}"]`)))
+    ) {
+      return
+    }
+
     if (blockType === ATTRIBUTE_VIEW_TYPE) {
       if (!includeAttributeView) {
         return
@@ -215,7 +285,11 @@ export function collectSearchableBlocks(
     }
 
     if (blockType === TABLE_TYPE || element.classList.contains('table')) {
+      if (!includeTable) {
+        return
+      }
       // 表格按单元格拆分，禁止「传感器」+「2026」拼成「传感器20」
+      // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/util/table.ts
       blocks.push(...collectTableSearchUnits(element, blockId, blockIndex))
       return
     }
@@ -243,6 +317,18 @@ export function collectSearchableBlocks(
       return
     }
 
+    // 公式块（叶子块）；勿用 data-subtype="math"（行内公式也带该属性）
+    // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
+    if (blockType === MATH_BLOCK_TYPE && !includeMathBlock) {
+      return
+    }
+
+    // 挂件块（叶子块，iframe 独立上下文）
+    // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts isNotEditBlock
+    if (blockType === WIDGET_TYPE && !includeWidget) {
+      return
+    }
+
     if (blockType === CALLOUT_TYPE || element.classList.contains('callout')) {
       // Callout 标题在 .callout-title（非 contenteditable 子块），需单独采集
       // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts getCalloutInfo
@@ -267,21 +353,111 @@ export function collectSearchableBlocks(
   })
 
   if (collectMemo) {
-    blocks.push(...collectInlineMemoSearchUnits(docRoot))
+    blocks.push(...filterAttributeUnitsByIncludeGates(
+      collectInlineMemoSearchUnits(docRoot),
+      includeGates,
+    ))
   }
   if (collectMath) {
-    blocks.push(...collectInlineMathSearchUnits(docRoot))
+    blocks.push(...filterAttributeUnitsByIncludeGates(
+      collectInlineMathSearchUnits(docRoot),
+      includeGates,
+    ))
   }
 
   return blocks
 }
 
-function getUniqueBlockElements(root: ParentNode): HTMLElement[] {
+/** 「是否查找」块级门闩：备注 / 行内公式独立采集时也须遵守 */
+interface IncludeGates {
+  includeAttributeView: boolean
+  includeTable: boolean
+  includeBlockquote: boolean
+  includeCallout: boolean
+  includeEmbedBlock: boolean
+  includeWidget: boolean
+  includeCodeBlock: boolean
+  includeMermaid: boolean
+}
+
+/**
+ * 行内备注 / 行内公式扫整棵文档树，不会走块级 forEach 的 include* 早退。
+ * 关表格 / 引述 / 提示 / 嵌入 / 数据库等时，须在此过滤其内部的属性 unit。
+ */
+function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeGates): boolean {
+  if (
+    !gates.includeAttributeView
+    && Boolean(element.closest(`[data-type="${ATTRIBUTE_VIEW_TYPE}"], .av`))
+  ) {
+    return true
+  }
+  if (
+    !gates.includeTable
+    && Boolean(element.closest(`[data-type="${TABLE_TYPE}"], .table`))
+  ) {
+    return true
+  }
+  if (
+    !gates.includeBlockquote
+    && Boolean(element.closest(`[data-type="${BLOCKQUOTE_TYPE}"], .bq`))
+  ) {
+    return true
+  }
+  if (
+    !gates.includeCallout
+    && Boolean(element.closest(`[data-type="${CALLOUT_TYPE}"], .callout`))
+  ) {
+    return true
+  }
+  if (
+    !gates.includeEmbedBlock
+    && Boolean(element.closest(`[data-type="${EMBED_BLOCK_TYPE}"]`))
+  ) {
+    return true
+  }
+  if (
+    !gates.includeWidget
+    && Boolean(element.closest(`[data-type="${WIDGET_TYPE}"]`))
+  ) {
+    return true
+  }
+  const codeBlock = element.closest<HTMLElement>(`[data-type="${CODE_BLOCK_TYPE}"]`)
+  if (codeBlock) {
+    const isMermaid = codeBlock.getAttribute('data-subtype') === MERMAID_SUBTYPE
+    if (isMermaid && !gates.includeMermaid) {
+      return true
+    }
+    if (!isMermaid && !gates.includeCodeBlock) {
+      return true
+    }
+  }
+  return false
+}
+
+function filterAttributeUnitsByIncludeGates(
+  units: SearchableBlock[],
+  gates: IncludeGates,
+): SearchableBlock[] {
+  return units.filter((unit) => !shouldSkipAttributeUnitByIncludeGates(unit.element, gates))
+}
+
+function isInsideEmbedBlock(element: Element): boolean {
+  return Boolean(element.closest(`[data-type="${EMBED_BLOCK_TYPE}"]`))
+}
+
+function getUniqueBlockElements(
+  root: ParentNode,
+  options: {excludeEmbed?: boolean} = {},
+): HTMLElement[] {
   const byId = new Map<string, HTMLElement>()
+  const excludeEmbed = options.excludeEmbed === true
 
   Array.from(root.querySelectorAll<HTMLElement>('[data-node-id][data-type]')).forEach((element) => {
     const blockId = element.dataset.nodeId?.trim()
     if (!blockId) {
+      return
+    }
+    if (excludeEmbed && isInsideEmbedBlock(element)) {
       return
     }
 
@@ -838,7 +1014,8 @@ export function isInlineMemoSearchUnit(block: Pick<SearchableBlock, 'matchSource
 /**
  * 采集行内公式：匹配 KaTeX **渲染可见文本**（`.katex-html`），不搜 `data-content` LaTeX 源。
  * 否则搜 “d” 会命中 `\delta` / `\lambda` 等源码字母。
- * 正文/表格 TreeWalker 仍排除整段 inline-math，避免与独立 unit 重复计数；表格内公式靠本函数扫到。
+ * 正文/表格 TreeWalker 仍排除整段 inline-math，避免与独立 unit 重复计数；
+ * 表内 / 引述 / 提示等内的公式靠本函数扫到，再由 include* 门闩过滤。
  *
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
  *   `output: "html"` → 可见在 `.katex-html`；`.katex-mathml` 含源码 annotation，必须排除
@@ -929,4 +1106,12 @@ export function isAttributeInlineSearchUnit(
   return isInlineMemoSearchUnit(block) || isInlineMathSearchUnit(block)
 }
 
-export { ATTRIBUTE_VIEW_TYPE, CALLOUT_TYPE, TABLE_TYPE }
+export {
+  ATTRIBUTE_VIEW_TYPE,
+  BLOCKQUOTE_TYPE,
+  CALLOUT_TYPE,
+  EMBED_BLOCK_TYPE,
+  MATH_BLOCK_TYPE,
+  TABLE_TYPE,
+  WIDGET_TYPE,
+}

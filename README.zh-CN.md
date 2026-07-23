@@ -42,7 +42,7 @@
 | 分组 | 作用 |
 |------|------|
 | **限制查找** | 仅在所选行内类型中查找（多选 OR；全关=不限制）。查找框为空时预览所选类型的全部行内宿主（不可替换；计数超过 999 显示为 `999+` 仍全量高亮）。类型顺序：引用、链接、粗体、斜体、下划线、删除线、高亮、上标、下标、行级代码、键盘、标签、行级公式、行内备注。可与「选区内」同时生效 |
-| **是否查找** | 是否纳入行内备注、数据库、代码块、Mermaid |
+| **是否查找** | 是否纳入行内备注、数据库、表格、引述块、提示块、公式块、嵌入块、挂件、代码块、Mermaid |
 | **折叠块内容** | 是否匹配非标题折叠块内隐藏内容（与限制查找独立） |
 
 补充：
@@ -85,7 +85,7 @@
 | 字段 | 说明 |
 |------|------|
 | `dialogLeft` / `dialogTop` | 拖拽后的固定位置（点顶栏复位会清空） |
-| `includeAttributeView` / `includeCodeBlock` / `includeMermaid` | 是否查找（默认开） |
+| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` | 是否查找（默认开） |
 | `includeFoldedBlocks` / `includeInlineMemo` | 折叠块 / 行内备注（默认关） |
 | `restrictInlineTypes` | 限制查找类型（会话内；关闭搜索窗后清回空） |
 

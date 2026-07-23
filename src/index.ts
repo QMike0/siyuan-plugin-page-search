@@ -302,6 +302,12 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeScopeHint: t.settingsIncludeScopeHint
                 || "Controls which block-level types (and inline memos) may be searched",
             settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database",
+            settingsIncludeTable: t.settingsIncludeTable || "Table",
+            settingsIncludeBlockquote: t.settingsIncludeBlockquote || "Blockquote",
+            settingsIncludeCallout: t.settingsIncludeCallout || "Callout",
+            settingsIncludeMathBlock: t.settingsIncludeMathBlock || "Math block",
+            settingsIncludeEmbedBlock: t.settingsIncludeEmbedBlock || "Embed block",
+            settingsIncludeWidget: t.settingsIncludeWidget || "Widget",
             settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
             settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
             settingsIncludeFoldedBlocks: t.settingsIncludeFoldedBlocks || "Folded block content",
@@ -341,6 +347,66 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeAttributeView(value);
+        });
+    }
+
+    /** 将表格匹配开关同步到其它已打开面板 */
+    syncIncludeTable(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeTable(value);
+        });
+    }
+
+    /** 将引述块匹配开关同步到其它已打开面板 */
+    syncIncludeBlockquote(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeBlockquote(value);
+        });
+    }
+
+    /** 将提示块匹配开关同步到其它已打开面板 */
+    syncIncludeCallout(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeCallout(value);
+        });
+    }
+
+    /** 将公式块匹配开关同步到其它已打开面板 */
+    syncIncludeMathBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeMathBlock(value);
+        });
+    }
+
+    /** 将嵌入块匹配开关同步到其它已打开面板 */
+    syncIncludeEmbedBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeEmbedBlock(value);
+        });
+    }
+
+    /** 将挂件匹配开关同步到其它已打开面板 */
+    syncIncludeWidget(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeWidget(value);
         });
     }
 
@@ -651,6 +717,12 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     presetText: initialQuery || undefined,
                     replaceVisible: replaceVisibleOnCreate,
                     includeAttributeView: prefs.includeAttributeView !== false,
+                    includeTable: prefs.includeTable !== false,
+                    includeBlockquote: prefs.includeBlockquote !== false,
+                    includeCallout: prefs.includeCallout !== false,
+                    includeMathBlock: prefs.includeMathBlock !== false,
+                    includeEmbedBlock: prefs.includeEmbedBlock !== false,
+                    includeWidget: prefs.includeWidget !== false,
                     includeCodeBlock: prefs.includeCodeBlock !== false,
                     includeMermaid: prefs.includeMermaid !== false,
                     includeFoldedBlocks: prefs.includeFoldedBlocks === true,

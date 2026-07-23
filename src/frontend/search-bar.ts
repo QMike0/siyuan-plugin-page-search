@@ -106,6 +106,12 @@ export interface SearchBarI18n {
     settingsIncludeScope: string;
     settingsIncludeScopeHint: string;
     settingsIncludeAttributeView: string;
+    settingsIncludeTable: string;
+    settingsIncludeBlockquote: string;
+    settingsIncludeCallout: string;
+    settingsIncludeMathBlock: string;
+    settingsIncludeEmbedBlock: string;
+    settingsIncludeWidget: string;
     settingsIncludeCodeBlock: string;
     settingsIncludeMermaid: string;
     settingsIncludeFoldedBlocks: string;
@@ -142,6 +148,18 @@ export interface SearchBarHost {
     onSearchComponentUnmounted(callback?: (event: CustomEvent) => void): void;
     /** 将数据库匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeAttributeView?(value: boolean, source?: SearchBar): void;
+    /** 将表格匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeTable?(value: boolean, source?: SearchBar): void;
+    /** 将引述块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeBlockquote?(value: boolean, source?: SearchBar): void;
+    /** 将提示块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeCallout?(value: boolean, source?: SearchBar): void;
+    /** 将公式块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeMathBlock?(value: boolean, source?: SearchBar): void;
+    /** 将嵌入块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeEmbedBlock?(value: boolean, source?: SearchBar): void;
+    /** 将挂件匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeWidget?(value: boolean, source?: SearchBar): void;
     /** 将代码块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeCodeBlock?(value: boolean, source?: SearchBar): void;
     /** 将 Mermaid 匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -182,6 +200,18 @@ export class SearchBar {
     private selectionOnly = false;
     /** 是否匹配数据库；全局 prefs，默认 true */
     private includeAttributeView = true;
+    /** 是否匹配表格块；全局 prefs，默认 true */
+    private includeTable = true;
+    /** 是否匹配引述块；全局 prefs，默认 true */
+    private includeBlockquote = true;
+    /** 是否匹配提示块；全局 prefs，默认 true */
+    private includeCallout = true;
+    /** 是否匹配公式块；全局 prefs，默认 true（不含行内公式） */
+    private includeMathBlock = true;
+    /** 是否匹配嵌入块；全局 prefs，默认 true */
+    private includeEmbedBlock = true;
+    /** 是否匹配挂件；全局 prefs，默认 true */
+    private includeWidget = true;
     /** 是否匹配代码块（非 Mermaid）；全局 prefs，默认 true */
     private includeCodeBlock = true;
     /** 是否匹配 Mermaid；全局 prefs，默认 true */
@@ -234,6 +264,18 @@ export class SearchBar {
         replaceVisible?: boolean;
         /** 是否匹配数据库（来自全局 prefs） */
         includeAttributeView?: boolean;
+        /** 是否匹配表格块（来自全局 prefs） */
+        includeTable?: boolean;
+        /** 是否匹配引述块（来自全局 prefs） */
+        includeBlockquote?: boolean;
+        /** 是否匹配提示块（来自全局 prefs） */
+        includeCallout?: boolean;
+        /** 是否匹配公式块（来自全局 prefs；不含行内公式） */
+        includeMathBlock?: boolean;
+        /** 是否匹配嵌入块（来自全局 prefs） */
+        includeEmbedBlock?: boolean;
+        /** 是否匹配挂件（来自全局 prefs） */
+        includeWidget?: boolean;
         /** 是否匹配代码块（来自全局 prefs） */
         includeCodeBlock?: boolean;
         /** 是否匹配 Mermaid（来自全局 prefs） */
@@ -251,6 +293,12 @@ export class SearchBar {
         this.i18n = options.i18n;
         this.replaceVisible = Boolean(options.replaceVisible);
         this.includeAttributeView = options.includeAttributeView !== false;
+        this.includeTable = options.includeTable !== false;
+        this.includeBlockquote = options.includeBlockquote !== false;
+        this.includeCallout = options.includeCallout !== false;
+        this.includeMathBlock = options.includeMathBlock !== false;
+        this.includeEmbedBlock = options.includeEmbedBlock !== false;
+        this.includeWidget = options.includeWidget !== false;
         this.includeCodeBlock = options.includeCodeBlock !== false;
         this.includeMermaid = options.includeMermaid !== false;
         this.includeFoldedBlocks = options.includeFoldedBlocks === true;
@@ -692,6 +740,12 @@ export class SearchBar {
     private captureSelectionScope() {
         const {scope, kind, visualBlockIds, tableCellRefs} = captureSelectionScopeWithKind(this.edit, {
             includeAttributeView: this.includeAttributeView,
+            includeTable: this.includeTable,
+            includeBlockquote: this.includeBlockquote,
+            includeCallout: this.includeCallout,
+            includeMathBlock: this.includeMathBlock,
+            includeEmbedBlock: this.includeEmbedBlock,
+            includeWidget: this.includeWidget,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
             includeInlineMemo: this.includeInlineMemo,
@@ -709,6 +763,12 @@ export class SearchBar {
         }
         const blocks = collectSearchableBlocks(this.edit, {
             includeAttributeView: this.includeAttributeView,
+            includeTable: this.includeTable,
+            includeBlockquote: this.includeBlockquote,
+            includeCallout: this.includeCallout,
+            includeMathBlock: this.includeMathBlock,
+            includeEmbedBlock: this.includeEmbedBlock,
+            includeWidget: this.includeWidget,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
             includeInlineMemo: this.includeInlineMemo,
@@ -719,6 +779,12 @@ export class SearchBar {
             // 仍有现场选区时同步提示（用户改选了范围）；光标挪走后 live 为空则保持冻结提示
             const captured = captureSelectionScopeWithKind(this.edit, {
                 includeAttributeView: this.includeAttributeView,
+                includeTable: this.includeTable,
+                includeBlockquote: this.includeBlockquote,
+                includeCallout: this.includeCallout,
+                includeMathBlock: this.includeMathBlock,
+                includeEmbedBlock: this.includeEmbedBlock,
+                includeWidget: this.includeWidget,
                 includeCodeBlock: this.includeCodeBlock,
                 includeMermaid: this.includeMermaid,
                 includeInlineMemo: this.includeInlineMemo,
@@ -943,6 +1009,12 @@ export class SearchBar {
             selectionOnly: this.selectionOnly,
             selectionScope: this.resolveScopeForSearch(),
             includeAttributeView: this.includeAttributeView,
+            includeTable: this.includeTable,
+            includeBlockquote: this.includeBlockquote,
+            includeCallout: this.includeCallout,
+            includeMathBlock: this.includeMathBlock,
+            includeEmbedBlock: this.includeEmbedBlock,
+            includeWidget: this.includeWidget,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
             includeFoldedBlocks: this.includeFoldedBlocks,
@@ -1630,12 +1702,12 @@ export class SearchBar {
                     },
                 }),
                 this.buildMatchSwitchMenuItem({
-                    id: "page-search-include-attribute-view",
-                    icon: "iconDatabase",
-                    label: this.i18n.settingsIncludeAttributeView,
-                    checked: this.includeAttributeView,
+                    id: "page-search-include-math-block",
+                    icon: "iconMath",
+                    label: this.i18n.settingsIncludeMathBlock,
+                    checked: this.includeMathBlock,
                     onChange: (checked) => {
-                        void this.setIncludeAttributeView(checked);
+                        void this.setIncludeMathBlock(checked);
                     },
                 }),
                 this.buildMatchSwitchMenuItem({
@@ -1648,12 +1720,66 @@ export class SearchBar {
                     },
                 }),
                 this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-table",
+                    icon: "iconTable",
+                    label: this.i18n.settingsIncludeTable,
+                    checked: this.includeTable,
+                    onChange: (checked) => {
+                        void this.setIncludeTable(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-attribute-view",
+                    icon: "iconDatabase",
+                    label: this.i18n.settingsIncludeAttributeView,
+                    checked: this.includeAttributeView,
+                    onChange: (checked) => {
+                        void this.setIncludeAttributeView(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-embed-block",
+                    icon: "iconSQL",
+                    label: this.i18n.settingsIncludeEmbedBlock,
+                    checked: this.includeEmbedBlock,
+                    onChange: (checked) => {
+                        void this.setIncludeEmbedBlock(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-blockquote",
+                    icon: "iconQuote",
+                    label: this.i18n.settingsIncludeBlockquote,
+                    checked: this.includeBlockquote,
+                    onChange: (checked) => {
+                        void this.setIncludeBlockquote(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-callout",
+                    icon: "iconCallout",
+                    label: this.i18n.settingsIncludeCallout,
+                    checked: this.includeCallout,
+                    onChange: (checked) => {
+                        void this.setIncludeCallout(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
                     id: "page-search-include-mermaid",
                     icon: "iconCode",
                     label: this.i18n.settingsIncludeMermaid,
                     checked: this.includeMermaid,
                     onChange: (checked) => {
                         void this.setIncludeMermaid(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-widget",
+                    icon: "iconBoth",
+                    label: this.i18n.settingsIncludeWidget,
+                    checked: this.includeWidget,
+                    onChange: (checked) => {
+                        void this.setIncludeWidget(checked);
                     },
                 }),
             ],
@@ -1905,6 +2031,66 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setIncludeTable(value: boolean) {
+        if (this.includeTable === value) {
+            return;
+        }
+        this.includeTable = value;
+        await rpcSetPrefs(this.plugin, {includeTable: value});
+        this.plugin.syncIncludeTable?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeBlockquote(value: boolean) {
+        if (this.includeBlockquote === value) {
+            return;
+        }
+        this.includeBlockquote = value;
+        await rpcSetPrefs(this.plugin, {includeBlockquote: value});
+        this.plugin.syncIncludeBlockquote?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeCallout(value: boolean) {
+        if (this.includeCallout === value) {
+            return;
+        }
+        this.includeCallout = value;
+        await rpcSetPrefs(this.plugin, {includeCallout: value});
+        this.plugin.syncIncludeCallout?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeMathBlock(value: boolean) {
+        if (this.includeMathBlock === value) {
+            return;
+        }
+        this.includeMathBlock = value;
+        await rpcSetPrefs(this.plugin, {includeMathBlock: value});
+        this.plugin.syncIncludeMathBlock?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeEmbedBlock(value: boolean) {
+        if (this.includeEmbedBlock === value) {
+            return;
+        }
+        this.includeEmbedBlock = value;
+        await rpcSetPrefs(this.plugin, {includeEmbedBlock: value});
+        this.plugin.syncIncludeEmbedBlock?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeWidget(value: boolean) {
+        if (this.includeWidget === value) {
+            return;
+        }
+        this.includeWidget = value;
+        await rpcSetPrefs(this.plugin, {includeWidget: value});
+        this.plugin.syncIncludeWidget?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeCodeBlock(value: boolean) {
         if (this.includeCodeBlock === value) {
             return;
@@ -1980,6 +2166,54 @@ export class SearchBar {
             return;
         }
         this.includeAttributeView = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeTable(value: boolean) {
+        if (this.includeTable === value) {
+            return;
+        }
+        this.includeTable = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeBlockquote(value: boolean) {
+        if (this.includeBlockquote === value) {
+            return;
+        }
+        this.includeBlockquote = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeCallout(value: boolean) {
+        if (this.includeCallout === value) {
+            return;
+        }
+        this.includeCallout = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeMathBlock(value: boolean) {
+        if (this.includeMathBlock === value) {
+            return;
+        }
+        this.includeMathBlock = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeEmbedBlock(value: boolean) {
+        if (this.includeEmbedBlock === value) {
+            return;
+        }
+        this.includeEmbedBlock = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeWidget(value: boolean) {
+        if (this.includeWidget === value) {
+            return;
+        }
+        this.includeWidget = value;
         void this.highlightHitResult(this.searchText, true);
     }
 

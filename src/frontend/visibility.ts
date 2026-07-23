@@ -56,6 +56,28 @@ export function isElementVisible(
         && isMatchableFoldedHidden(htmlElement);
 }
 
+/**
+ * KaTeX `output: "html"` 时可见字形在 `.katex-html[aria-hidden="true"]`，
+ * MathML 在 `.katex-mathml`（无障碍树）。页内搜匹配的是渲染可见文字，不能把该层当隐藏。
+ * 否则：提示块 / 数据库等走宽松可见性时，公式块与行内公式命中会被全部丢掉。
+ *
+ * @see https://katex.org/docs/options.html
+ * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
+ */
+function isKatexDecorativeAriaHidden(element: HTMLElement): boolean {
+    if (element.getAttribute("aria-hidden") !== "true") {
+        return false;
+    }
+    return element.classList.contains("katex-html")
+        || Boolean(element.closest(".katex-html"));
+}
+
+/** 对页内搜索而言应视为「硬隐藏」的 aria-hidden（排除 KaTeX 装饰层） */
+function isSearchBlockingAriaHidden(element: HTMLElement): boolean {
+    return element.getAttribute("aria-hidden") === "true"
+        && !isKatexDecorativeAriaHidden(element);
+}
+
 /** 真正不可搜的壳（与折叠无关） */
 function isHardHiddenShell(element: HTMLElement): boolean {
     let current: HTMLElement | null = element;
@@ -63,7 +85,7 @@ function isHardHiddenShell(element: HTMLElement): boolean {
         if (
             current.classList.contains("fn__none")
             || current.hasAttribute("hidden")
-            || current.getAttribute("aria-hidden") === "true"
+            || isSearchBlockingAriaHidden(current)
         ) {
             return true;
         }
@@ -113,7 +135,7 @@ function isLooseUiElementVisible(element: HTMLElement): boolean {
         if (
             current.classList.contains("fn__none")
             || current.hasAttribute("hidden")
-            || current.getAttribute("aria-hidden") === "true"
+            || isSearchBlockingAriaHidden(current)
         ) {
             return false;
         }
