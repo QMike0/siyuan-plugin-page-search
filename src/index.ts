@@ -282,12 +282,13 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             selectionOnly: t.selectionOnly || "Find in selection",
             matchCase: t.matchCase || "Match case",
             wholeWord: t.wholeWord || "Whole word",
-            useRegex: t.useRegex || "Use regex (find; replace supports $1)",
+            searchMethodKeyword: t.searchMethodKeyword || "Keyword",
+            searchMethodRegex: t.searchMethodRegex || "Regular expression",
             preserveCase: t.preserveCase || "Preserve case",
             preserveCaseDisabledByRegex: t.preserveCaseDisabledByRegex
                 || "Unavailable with regex (replace uses $1 templates)",
             replaceUnsupportedHelp: t.replaceUnsupportedHelp
-                || "Replacement is unavailable in publish, export preview, or read-only mode; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced. With regex on, the replace box accepts $1, $2, $& (preserve-case is disabled; failed expansions are skipped)",
+                || "Replacement is unavailable in publish, export preview, or read-only mode; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced. With regular expression selected, the replace box accepts $1, $2, $& (preserve-case is disabled; failed expansions are skipped)",
             replaceAction: t.replaceAction || "Replace (Enter)",
             replaceAllAction: t.replaceAllAction || "Replace all (Ctrl+Alt+Enter)",
             replaceToggle: t.replaceToggle || "Expand or collapse replace row",
@@ -488,6 +489,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyRestrictInlineTypes(value);
+        });
+    }
+
+    /** 将查找方法（关键字/正则）同步到其它已打开面板 */
+    syncUseRegex(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyUseRegex(value);
         });
     }
 
@@ -759,6 +770,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeHtmlBlock: prefs.includeHtmlBlock !== false,
                     includeFoldedBlocks: prefs.includeFoldedBlocks === true,
                     includeInlineMemo: prefs.includeInlineMemo === true,
+                    useRegex: prefs.useRegex === true,
                     // 限制查找仅会话内有效，打开时始终不限制
                     restrictInlineTypes: [],
                 });

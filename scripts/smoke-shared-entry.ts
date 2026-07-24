@@ -174,6 +174,13 @@ assert(htmlHits.length === 1 && htmlHits[0].replaceable === false, "HTML hit rep
 assert(DEFAULT_PREFS.includeHtmlBlock === true, "includeHtmlBlock defaults on");
 assert(coercePluginPrefs({}).includeHtmlBlock === true, "coerce includeHtmlBlock default on");
 assert(coercePluginPrefs({includeHtmlBlock: false}).includeHtmlBlock === false, "coerce includeHtmlBlock off");
+assert(DEFAULT_PREFS.useRegex === false, "useRegex defaults off (keyword)");
+assert(coercePluginPrefs({}).useRegex === false, "coerce useRegex default off");
+assert(coercePluginPrefs({useRegex: true}).useRegex === true, "coerce useRegex on");
+assert(
+    mergePrefs(DEFAULT_PREFS, {useRegex: true}).useRegex === true,
+    "merge prefs useRegex",
+);
 
 const named = normalizeMatchRequest([{
     query: "传感器",

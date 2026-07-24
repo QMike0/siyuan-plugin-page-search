@@ -77,6 +77,11 @@ export interface PluginPrefs {
      * 非空时仅在这些类型中搜索（OR）；空查询时枚举行内宿主。
      */
     restrictInlineTypes: RestrictInlineType[];
+    /**
+     * 查找方法：false=关键字，true=正则表达式；默认 false。
+     * 跨次打开搜索条保持；发布服务/全局只读下不写 petal（与其它 prefs 相同）。
+     */
+    useRegex: boolean;
 }
 
 /** 跨窗口搜索状态同步（内核 broadcast → 前端 bind） */
@@ -110,6 +115,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeFoldedBlocks: false,
     includeInlineMemo: false,
     restrictInlineTypes: [],
+    useRegex: false,
 };
 
 export const PREFS_STORAGE_PATH = "prefs.json";
@@ -139,6 +145,7 @@ export function coercePluginPrefs(
         restrictInlineTypes: normalizeRestrictInlineTypes(base.restrictInlineTypes, {
             includeInlineMemo,
         }),
+        useRegex: base.useRegex === true,
     };
 }
 
@@ -192,6 +199,9 @@ export function mergePrefs(
         restrictInlineTypes: patch.restrictInlineTypes !== undefined
             ? patch.restrictInlineTypes
             : base.restrictInlineTypes,
+        useRegex: patch.useRegex !== undefined
+            ? patch.useRegex
+            : base.useRegex,
     });
 }
 

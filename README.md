@@ -27,7 +27,7 @@ Default hotkey: `Ctrl+Shift+Alt+F` (macOS: `⌥⇧⌘F`).
 |---------|--------|
 | `Aa` | Match case |
 | Whole word | ASCII word-boundary match |
-| `.*` | Regex find; replace box accepts `$1` / `$2` / `$&` / `$$` (`Aa*` disabled while regex is on; failed expansions are skipped) |
+| Method button | Opens a menu to choose **Keyword** or **Regular expression** (mutually exclusive). The icon follows the current mode (Exact / Regex). With regex, the replace box accepts `$1` / `$2` / `$&` / `$$` (`Aa*` disabled; failed expansions are skipped). The choice is saved in prefs and restored when reopening |
 | In selection | Limit find to the current selection (or block selection); independent of “prefill query from selection on open” |
 | `Aa*` | Preserve case of the match when replacing (foo→bar, FOO→BAR, Foo→Bar) |
 
@@ -89,7 +89,7 @@ With `disabledInPublish: false`, the plugin **still loads** under the publish se
 | Find / highlight / next-prev | ✅ |
 | Expand replace row / type replacement | ✅ (replace row is not hidden) |
 | Replace / replace-all / document write-back | ❌ Buttons disabled; click shows a notice |
-| Persisting prefs (`prefs.json` position & type toggles) | ❌ No petal writes; in-session toggles still apply locally |
+| Persisting prefs (`prefs.json` position, type toggles, find method) | ❌ No petal writes; in-session toggles still apply locally |
 
 Gate: `window.siyuan.isPublish` (same condition as SiYuan rejecting `saveData`/`removeData`). Export preview and read-only use the same “block replace, keep replace row” policy.
 
@@ -102,6 +102,7 @@ Stored at `data/storage/petal/<plugin>/prefs.json` (same path for kernel `storag
 | `dialogLeft` / `dialogTop` | Dragged position (cleared when resetting via top bar) |
 | `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in find (default on) |
 | `includeFoldedBlocks` / `includeInlineMemo` | Folded blocks / inline memos (default off) |
+| `useRegex` | Find method: `false`=keyword, `true`=regular expression (default keyword; kept across reopen) |
 | `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |
 
 Closing the search bar clears the query; reopening only prefills from the current selection.

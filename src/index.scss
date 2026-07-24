@@ -301,6 +301,12 @@
     color: var(--b3-theme-on-surface);
 }
 
+/* 方法触发器：图标随关键字 / 正则切换 */
+.highlight-search-result .search-method-trigger .icon--14_14 {
+    width: 14px;
+    height: 14px;
+}
+
 .highlight-search-result .search-tools--replace {
     margin-left: 0;
 }

@@ -86,7 +86,10 @@ export interface SearchBarI18n {
     selectionOnly: string;
     matchCase: string;
     wholeWord: string;
-    useRegex: string;
+    /** 查找方法：关键字 */
+    searchMethodKeyword: string;
+    /** 查找方法：正则表达式 */
+    searchMethodRegex: string;
     preserveCase: string;
     /** 正则开启时 Aa* 的禁用说明 */
     preserveCaseDisabledByRegex: string;
@@ -181,9 +184,11 @@ export interface SearchBarHost {
     syncIncludeInlineMemo?(value: boolean, source?: SearchBar): void;
     /** 将限制查找类型同步到其它已打开的搜索面板（不写 prefs） */
     syncRestrictInlineTypes?(value: RestrictInlineType[], source?: SearchBar): void;
+    /** 将查找方法（关键字/正则）同步到其它已打开的搜索面板（不写 prefs） */
+    syncUseRegex?(value: boolean, source?: SearchBar): void;
 }
 
-type MatchOptionKey = "caseSensitive" | "wholeWord" | "regex" | "preserveCase" | "selectionOnly";
+type MatchOptionKey = "caseSensitive" | "wholeWord" | "preserveCase" | "selectionOnly";
 
 export class SearchBar {
     readonly root: HTMLElement;
@@ -266,6 +271,9 @@ export class SearchBar {
     private memoUnderlineLayoutRaf = 0;
     /** 当前打开的齿轮设置菜单（关闭搜索窗时一并关掉） */
     private settingsMenu: Menu | null = null;
+    /** 关键字 / 正则表达式方法菜单（对齐官方搜索 method 菜单） */
+    private methodMenu: Menu | null = null;
+    private searchMethodBtn: HTMLElement | null = null;
 
     constructor(options: {
         edit: Element;
@@ -301,12 +309,15 @@ export class SearchBar {
         includeInlineMemo?: boolean;
         /** 限制查找行内类型（来自全局 prefs） */
         restrictInlineTypes?: RestrictInlineType[];
+        /** 查找方法是否为正则（来自全局 prefs；默认关键字） */
+        useRegex?: boolean;
     }) {
         this.edit = options.edit;
         this.root = options.root;
         this.plugin = options.plugin;
         this.i18n = options.i18n;
         this.replaceVisible = Boolean(options.replaceVisible);
+        this.regex = options.useRegex === true;
         this.includeAttributeView = options.includeAttributeView !== false;
         this.includeTable = options.includeTable !== false;
         this.includeBlockquote = options.includeBlockquote !== false;
@@ -334,11 +345,11 @@ export class SearchBar {
         this.replaceToggleBtn = this.root.querySelector('[data-action="toggle-replace"]');
         this.replaceBtn = this.root.querySelector('[data-action="replace"]');
         this.replaceAllBtn = this.root.querySelector('[data-action="replace-all"]');
+        this.searchMethodBtn = this.root.querySelector('[data-action="search-method"]');
 
         for (const key of [
             "caseSensitive",
             "wholeWord",
-            "regex",
             "preserveCase",
             "selectionOnly",
         ] as MatchOptionKey[]) {
@@ -363,9 +374,10 @@ export class SearchBar {
                 });
             },
             onSiyuanDialogLayerChange: (hasOpenDialog) => {
-                // 原生搜索/设置等 Dialog 打开时收起齿轮菜单，避免压在 Dialog 上
+                // 原生搜索/设置等 Dialog 打开时收起插件菜单，避免压在 Dialog 上
                 if (hasOpenDialog) {
                     this.closeSettingsMenu();
+                    this.closeSearchMethodMenu();
                 }
             },
         });
@@ -400,6 +412,7 @@ export class SearchBar {
         clearTimeout(this.typingTimer);
         clearTimeout(this.avRefreshTimer);
         this.closeSettingsMenu();
+        this.closeSearchMethodMenu();
         this.teardownSelectionScopeLayoutSync();
         this.teardownMemoUnderlineLayoutSync();
         this.clearSelectionScopeVisual();
@@ -519,7 +532,7 @@ export class SearchBar {
         <div class="search-field__toggles" role="group" aria-label="${escapeAttr(this.i18n.searchPlaceholder)}">
           <div class="search-option" data-option="caseSensitive" title="${escapeAttr(this.i18n.matchCase)}" aria-label="${escapeAttr(this.i18n.matchCase)}" role="button" tabindex="-1">Aa</div>
           <div class="search-option" data-option="wholeWord" title="${escapeAttr(this.i18n.wholeWord)}" aria-label="${escapeAttr(this.i18n.wholeWord)}" role="button" tabindex="-1">${wholeWordIcon()}</div>
-          <div class="search-option" data-option="regex" title="${escapeAttr(this.i18n.useRegex)}" aria-label="${escapeAttr(this.i18n.useRegex)}" role="button" tabindex="-1">.*</div>
+          <div class="search-option search-method-trigger" data-action="search-method" data-method="keyword" title="${escapeAttr(this.i18n.searchMethodKeyword)}" aria-label="${escapeAttr(this.i18n.searchMethodKeyword)}" aria-haspopup="menu" aria-expanded="false" role="button" tabindex="-1">${iconUse("#iconExact")}</div>
         </div>
       </div>
       <div class="search-row__trailing">
@@ -591,6 +604,9 @@ export class SearchBar {
         this.bindToolbarControl('[data-action="settings"]', (event) => {
             this.openSettingsMenu(event.currentTarget as HTMLElement);
         }, "none");
+        this.bindToolbarControl('[data-action="search-method"]', (event) => {
+            this.openSearchMethodMenu(event.currentTarget as HTMLElement);
+        }, "find");
 
         for (const [key, button] of this.optionButtons) {
             // pointerdown 阻止默认：避免选项按钮抢走输入框焦点
@@ -724,9 +740,6 @@ export class SearchBar {
                 break;
             case "wholeWord":
                 this.wholeWord = !this.wholeWord;
-                break;
-            case "regex":
-                this.regex = !this.regex;
                 break;
             case "preserveCase":
                 if (this.regex) {
@@ -948,10 +961,32 @@ export class SearchBar {
     private syncOptionButtons() {
         this.setOptionActive("caseSensitive", this.caseSensitive);
         this.setOptionActive("wholeWord", this.wholeWord);
-        this.setOptionActive("regex", this.regex);
         this.setOptionActive("preserveCase", this.preserveCase && !this.regex);
         this.setOptionActive("selectionOnly", this.selectionOnly);
+        this.syncSearchMethodTrigger();
         this.syncPreserveCaseAvailability();
+    }
+
+    /**
+     * 触发器图标/文案随当前方法变化（关键字 = Exact，正则 = Regex），对齐官方搜索栏。
+     */
+    private syncSearchMethodTrigger() {
+        const button = this.searchMethodBtn;
+        if (!button) {
+            return;
+        }
+        const label = this.regex
+            ? this.i18n.searchMethodRegex
+            : this.i18n.searchMethodKeyword;
+        button.dataset.method = this.regex ? "regex" : "keyword";
+        button.setAttribute("title", label);
+        button.setAttribute("aria-label", label);
+        button.setAttribute("aria-expanded", this.methodMenu ? "true" : "false");
+        button.innerHTML = this.regex
+            ? iconUse("#iconRegex")
+            : iconUse("#iconExact");
+        // 正则时高亮触发器，便于一眼区分当前模式
+        button.classList.toggle("is-active", this.regex);
     }
 
     /** 正则开启时灰显 Aa*（捕获组替换与保留大小写互斥） */
@@ -1731,6 +1766,7 @@ export class SearchBar {
      * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/plugin/Menu.ts
      */
     private openSettingsMenu(anchor: HTMLElement) {
+        this.closeSearchMethodMenu();
         this.closeSettingsMenu();
         const menu = new Menu("page-search-settings", () => {
             if (this.settingsMenu === menu) {
@@ -1882,6 +1918,86 @@ export class SearchBar {
         );
         // 菜单挂在 document，用 data-name 标记便于样式与关闭兜底
         menu.element.setAttribute("data-name", "page-search-settings");
+    }
+
+    /**
+     * 查找方法菜单：关键字 / 正则表达式（互斥，对齐官方 queryMenu）。
+     * 再次点击触发器则关闭；选中当前项仅关菜单不翻转。
+     */
+    private openSearchMethodMenu(anchor: HTMLElement) {
+        if (this.methodMenu) {
+            this.closeSearchMethodMenu();
+            return;
+        }
+        this.closeSettingsMenu();
+        const menu = new Menu("page-search-method", () => {
+            if (this.methodMenu === menu) {
+                this.methodMenu = null;
+            }
+            this.syncSearchMethodTrigger();
+        });
+        this.methodMenu = menu;
+        menu.addItem({
+            id: "page-search-method-keyword",
+            icon: "iconExact",
+            label: this.i18n.searchMethodKeyword,
+            current: !this.regex,
+            click: () => {
+                void this.setSearchMethod(false);
+            },
+        });
+        menu.addItem({
+            id: "page-search-method-regex",
+            icon: "iconRegex",
+            label: this.i18n.searchMethodRegex,
+            current: this.regex,
+            click: () => {
+                void this.setSearchMethod(true);
+            },
+        });
+        const rect = anchor.getBoundingClientRect();
+        menu.open({
+            x: rect.left,
+            y: rect.bottom,
+            isLeft: true,
+        });
+        menu.element.style.zIndex = String(
+            resolveSettingsMenuZIndex(this.dialog, menu.element),
+        );
+        menu.element.setAttribute("data-name", "page-search-method");
+        this.syncSearchMethodTrigger();
+    }
+
+    private closeSearchMethodMenu() {
+        try {
+            this.methodMenu?.close();
+        } catch {
+            // ignore
+        }
+        this.methodMenu = null;
+        try {
+            const globalMenu = (window as any).siyuan?.menus?.menu;
+            const el = globalMenu?.element as HTMLElement | undefined;
+            if (el?.getAttribute("data-name") === "page-search-method") {
+                globalMenu.remove();
+            }
+        } catch {
+            // ignore
+        }
+        this.syncSearchMethodTrigger();
+    }
+
+    /** 互斥设置查找方法；写 prefs + 同步其它面板；值未变则不重搜 */
+    private async setSearchMethod(useRegex: boolean) {
+        this.closeSearchMethodMenu();
+        if (this.regex === useRegex) {
+            return;
+        }
+        this.regex = useRegex;
+        this.syncOptionButtons();
+        await rpcSetPrefs(this.plugin, {useRegex});
+        this.plugin.syncUseRegex?.(useRegex, this);
+        void this.highlightHitResult(this.searchText, true);
     }
 
     /** 关闭齿轮设置菜单（搜索窗销毁时必须调用，避免菜单残留） */
@@ -2355,6 +2471,19 @@ export class SearchBar {
             return;
         }
         this.restrictInlineTypes = next;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    /**
+     * 其它面板同步过来的查找方法（不再写存储）。
+     */
+    applyUseRegex(value: boolean) {
+        if (this.regex === value) {
+            return;
+        }
+        this.regex = value;
+        this.closeSearchMethodMenu();
+        this.syncOptionButtons();
         void this.highlightHitResult(this.searchText, true);
     }
 }

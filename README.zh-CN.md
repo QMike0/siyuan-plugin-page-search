@@ -27,7 +27,7 @@
 |------|------|
 | `Aa` | 区分大小写 |
 | 整词 | ASCII 词边界全词匹配 |
-| `.*` | 正则查找；替换框可用 `$1` / `$2` / `$&` / `$$` 等（开启后 `Aa*` 灰显不可用；展开失败的命中计入跳过） |
+| 方法按钮 | 点击打开菜单，互斥选择「关键字」或「正则表达式」；图标随当前模式切换（Exact / Regex）。选正则后替换框可用 `$1` / `$2` / `$&` / `$$`（`Aa*` 灰显；展开失败计入跳过）。选择会写入 prefs，关闭后再开仍保持 |
 | 选区内 | 仅在当前选区（或块级选中）内查找；与「打开时预填选区文字」无关 |
 | `Aa*` | 替换时保留命中大小写形态（如 foo→bar、FOO→BAR、Foo→Bar） |
 
@@ -89,7 +89,7 @@
 | 查找 / 高亮 / 上下跳转 | ✅ 可用 |
 | 替换栏展开 / 输入替换词 | ✅ 可用（不隐藏替换栏） |
 | 替换 / 全部替换 / 文档写回 | ❌ 按钮禁用；点按提示不支持 |
-| 偏好持久化（`prefs.json` 面板位置、块类型开关） | ❌ 不写 petal；会话内开关仍可临时生效 |
+| 偏好持久化（`prefs.json` 面板位置、块类型开关、查找方法） | ❌ 不写 petal；会话内开关仍可临时生效 |
 
 判定依据：`window.siyuan.isPublish`（与思源 `saveData`/`removeData` 在发布态 403 对齐）。导出预览、文档只读同样走「禁替换、保留替换栏」策略。
 
@@ -102,6 +102,7 @@
 | `dialogLeft` / `dialogTop` | 拖拽后的固定位置（点顶栏复位会清空） |
 | `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | 是否查找（默认开） |
 | `includeFoldedBlocks` / `includeInlineMemo` | 折叠块 / 行内备注（默认关） |
+| `useRegex` | 查找方法：`false`=关键字，`true`=正则表达式（默认关键字；跨次打开保持） |
 | `restrictInlineTypes` | 限制查找类型（会话内；关闭搜索窗后清回空） |
 
 关闭搜索窗口时会清空关键词；再次打开仅在有选区时预填。
