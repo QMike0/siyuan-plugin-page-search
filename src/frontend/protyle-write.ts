@@ -82,7 +82,7 @@ function resolveSubmitBlockElement(
 
 /**
  * 是否可写回。判别顺序：
- * 1) 导出预览 / 只读模式
+ * 1) 发布服务 / 导出预览 / 只读模式
  * 2) 命中自身 replaceable（已含数据库、公式等）
  * 3) 文档标题 / 预览合成块兜底
  */

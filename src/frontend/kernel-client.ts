@@ -17,6 +17,7 @@ import {
     matchTextUnitsDetailed,
     normalizeSearchStateEvent,
 } from "../shared";
+import {isPluginStorageWritable} from "./editor-mode";
 
 /** 内核 running 状态码（见 IKernelPluginState） */
 const KERNEL_STATE_RUNNING = 2;
@@ -86,6 +87,11 @@ export async function rpcSetPrefs(
     plugin: Plugin,
     patch: Partial<PluginPrefs>,
 ): Promise<PluginPrefs> {
+    // 发布服务 / 全局只读：不写 petal；会话内 UI 状态由调用方本地字段维护
+    if (!isPluginStorageWritable()) {
+        const current = await rpcGetPrefs(plugin);
+        return coercePluginPrefs({...current, ...patch});
+    }
     if (!isKernelRunning(plugin)) {
         return coercePluginPrefs({...DEFAULT_PREFS, ...patch});
     }

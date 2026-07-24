@@ -79,9 +79,22 @@
 - **表格**：按单元格匹配与替换，不跨格；提交时更新整张 `NodeTable` 块 HTML  
 - **Callout 标题**：与其它可替单元同一顺序；写回更新整块 `NodeCallout`（含 `.callout-title`）  
 
+## 发布服务模式
+
+`plugin.json` 中 `disabledInPublish: false`，发布服务下**仍加载本插件**（可查找、高亮），但全面禁止写操作：
+
+| 能力 | 发布服务 |
+|------|----------|
+| 查找 / 高亮 / 上下跳转 | ✅ 可用 |
+| 替换栏展开 / 输入替换词 | ✅ 可用（不隐藏替换栏） |
+| 替换 / 全部替换 / 文档写回 | ❌ 按钮禁用；点按提示不支持 |
+| 偏好持久化（`prefs.json` 面板位置、块类型开关） | ❌ 不写 petal；会话内开关仍可临时生效 |
+
+判定依据：`window.siyuan.isPublish`（与思源 `saveData`/`removeData` 在发布态 403 对齐）。导出预览、文档只读同样走「禁替换、保留替换栏」策略。
+
 ## 偏好（内核 storage）
 
-保存在插件存储 `prefs.json`：
+保存在 `data/storage/petal/<插件名>/prefs.json`（内核 `storage.put` / 前端 `removeData` 同一路径）：
 
 | 字段 | 说明 |
 |------|------|
@@ -91,6 +104,15 @@
 | `restrictInlineTypes` | 限制查找类型（会话内；关闭搜索窗后清回空） |
 
 关闭搜索窗口时会清空关键词；再次打开仅在有选区时预填。
+
+## 生命周期与卸载
+
+| 钩子 | 何时触发 | 行为 |
+|------|----------|------|
+| `onunload` | 禁用、关闭应用、卸载前、同步重载 | 清理快捷键 / 搜索条 / 事件；**保留** `prefs.json` |
+| `uninstall` | 集市/设置中真卸载（非重载） | `removeData("prefs.json")` 删除配置 |
+
+思源卸载顺序为：`onunload` → `kernel.destroy` → `uninstall`。再次安装后偏好恢复默认。
 
 ## 内核能力
 

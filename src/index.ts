@@ -12,7 +12,7 @@ import {
 import {SearchBar, type SearchBarHost, type SearchBarI18n} from "./frontend/search-bar";
 import {isEditorReplaceModeBlocked} from "./frontend/editor-mode";
 import {scrubSelectionScopePollution, clearAllSelectionScopeSessionOverlays} from "./frontend/selection-scope-visual";
-import type {RestrictInlineType, SearchStateEvent} from "./shared";
+import {PREFS_STORAGE_PATH, type RestrictInlineType, type SearchStateEvent} from "./shared";
 
 export {
     findOffsetMatchesInText,
@@ -129,19 +129,32 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         });
     }
 
+    /**
+     * 禁用 / 关闭 / 卸载前清理运行时资源。
+     * 思源卸载顺序：onunload → kernel.destroy → uninstall（仅真卸载，非重载）。
+     * 此处不删 prefs：禁用后重开应保留面板位置与块类型开关。
+     * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/plugin/uninstall.ts
+     */
     onunload() {
-        window.removeEventListener("keydown", this.onWindowKeydownCapture, true);
-        this.closeSearchDialog();
-        this.stopCleanupTimer();
-        this.eventBus.off("kernel-plugin-state-change", this.onKernelPluginStateChange);
-        this.eventBus.off("loaded-protyle-static", this.onProtyleLoadedScrub);
-        this.unbindKernelSearchState();
-        scrubSelectionScopePollution();
-        clearAllSelectionScopeSessionOverlays();
+        this.teardownRuntime();
         console.log(this.i18n.pluginOnunload);
     }
 
-    uninstall() {
+    /**
+     * 真卸载时删除配置数据（`data/storage/petal/<name>/prefs.json`）。
+     * 禁用不会进入此钩子；重载插件（isReload）也不会。
+     */
+    async uninstall() {
+        try {
+            await this.removeData(PREFS_STORAGE_PATH);
+        } catch (error) {
+            console.warn("[page-search] uninstall removeData prefs.json failed", error);
+        }
+        console.log(this.i18n.pluginUninstall);
+    }
+
+    /** 卸下快捷键、搜索条、事件与选区视觉残留（不碰持久化配置） */
+    private teardownRuntime() {
         window.removeEventListener("keydown", this.onWindowKeydownCapture, true);
         this.closeSearchDialog();
         this.stopCleanupTimer();
@@ -150,7 +163,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         this.unbindKernelSearchState();
         scrubSelectionScopePollution();
         clearAllSelectionScopeSessionOverlays();
-        console.log(this.i18n.pluginUninstall);
     }
 
     /** 文档加载后清扫误写入内容块的选区提示 class */
@@ -273,7 +285,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             useRegex: t.useRegex || "Use regex (search only)",
             preserveCase: t.preserveCase || "Preserve case",
             replaceUnsupportedHelp: t.replaceUnsupportedHelp
-                || "Replacement is unavailable in export preview or read-only mode; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced",
+                || "Replacement is unavailable in publish, export preview, or read-only mode; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced",
             replaceAction: t.replaceAction || "Replace (Enter)",
             replaceAllAction: t.replaceAllAction || "Replace all (Ctrl+Alt+Enter)",
             replaceToggle: t.replaceToggle || "Expand or collapse replace row",
@@ -286,7 +298,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             replaceHtmlBlockUnsupported: t.replaceHtmlBlockUnsupported
                 || "HTML blocks support search and highlight of rendered text only; replacement is not supported",
             replaceModeUnsupported: t.replaceModeUnsupported
-                || "Replacement is unavailable in export preview or read-only mode",
+                || "Replacement is unavailable in publish, export preview, or read-only mode",
             replaceAllConfirm: t.replaceAllConfirm || "Replace {count} matches?",
             replaceAllConfirmTitle: t.replaceAllConfirmTitle || "Replace all",
             replaceCurrentDone: t.replaceCurrentDone || "Current match replaced",

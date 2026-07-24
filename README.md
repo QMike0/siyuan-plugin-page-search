@@ -79,9 +79,22 @@ Note: SiYuan sets Callout roots to `contenteditable="false"` (title edited via d
 - **Tables**: match/replace per cell (no cross-cell); submit updates the whole `NodeTable` block HTML  
 - **Callout titles**: same order as other units; write-back updates the whole `NodeCallout` (including `.callout-title`)  
 
+## Publish mode
+
+With `disabledInPublish: false`, the plugin **still loads** under the publish service (find & highlight work), but all writes are blocked:
+
+| Capability | Publish |
+|------------|---------|
+| Find / highlight / next-prev | ✅ |
+| Expand replace row / type replacement | ✅ (replace row is not hidden) |
+| Replace / replace-all / document write-back | ❌ Buttons disabled; click shows a notice |
+| Persisting prefs (`prefs.json` position & type toggles) | ❌ No petal writes; in-session toggles still apply locally |
+
+Gate: `window.siyuan.isPublish` (same condition as SiYuan rejecting `saveData`/`removeData`). Export preview and read-only use the same “block replace, keep replace row” policy.
+
 ## Preferences (kernel storage)
 
-Stored in `prefs.json`:
+Stored at `data/storage/petal/<plugin>/prefs.json` (same path for kernel `storage.put` and frontend `removeData`):
 
 | Field | Meaning |
 |------|---------|
@@ -91,6 +104,15 @@ Stored in `prefs.json`:
 | `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |
 
 Closing the search bar clears the query; reopening only prefills from the current selection.
+
+## Lifecycle & uninstall
+
+| Hook | When | Behavior |
+|------|------|----------|
+| `onunload` | Disable, app close, before uninstall, sync reload | Tear down hotkeys / search bar / listeners; **keep** `prefs.json` |
+| `uninstall` | Real uninstall from bazaar/settings (not reload) | `removeData("prefs.json")` deletes preferences |
+
+SiYuan uninstall order: `onunload` → `kernel.destroy` → `uninstall`. Reinstall starts from defaults.
 
 ## Kernel features
 
