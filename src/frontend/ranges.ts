@@ -134,7 +134,7 @@ export function createRangeFromBlockOffsets(
  * 节点边界处：start 偏向下一个节点开头，end 偏向上一个节点末尾，
  * 避免命中落在「隐藏图标文本 | 可见主键」边界时 Range 起点落在 .fn__none 内。
  */
-function locateTextPoint(
+export function locateTextPoint(
   textNodes: Text[],
   targetOffset: number,
   edge: "start" | "end",
@@ -178,4 +178,28 @@ function locateTextPoint(
   }
 
   return null
+}
+
+/**
+ * Range 内是否仅含文本（无元素节点）。
+ * 用于允许「同一父级下被拆开的多个 Text」替换，同时拒绝跨越加粗/链接等结构。
+ */
+export function isRangePlainTextOnly(range: Range): boolean {
+  if (
+    range.startContainer === range.endContainer
+    && range.startContainer.nodeType === Node.TEXT_NODE
+  ) {
+    return true
+  }
+  try {
+    const fragment = range.cloneContents()
+    for (let index = 0; index < fragment.childNodes.length; index++) {
+      if (fragment.childNodes[index].nodeType === Node.ELEMENT_NODE) {
+        return false
+      }
+    }
+    return true
+  } catch {
+    return false
+  }
 }

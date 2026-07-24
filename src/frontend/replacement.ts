@@ -1,7 +1,12 @@
 import type {SearchableBlock} from "./dom-types";
 import type {SearchMatch} from "./dom-types";
+import {expandRegexReplacement} from "../shared";
 import {preserveReplacementCase} from "./preserve-case";
-import {locateRangeInSingleTextNode} from "./ranges";
+import {
+    isRangePlainTextOnly,
+    locateRangeInSingleTextNode,
+    locateTextPoint,
+} from "./ranges";
 
 export interface ReplacementSpec {
     start: number;
@@ -12,14 +17,53 @@ export interface ReplacementSpec {
 
 export interface ApplyReplacementOptions {
     preserveCase?: boolean;
+    /**
+     * 正则查找模式：替换串按 $1/$2/$& 等展开。
+     * 开启时忽略 preserveCase，避免改写捕获组结果。
+     */
+    regex?: boolean;
+    /** 与查找相同的正则源（会 trim，与 match 引擎一致） */
+    searchQuery?: string;
+    caseSensitive?: boolean;
 }
 
 export interface ApplyReplacementOutcome {
     appliedCount: number;
+    /** 定位失败 / 文本漂移 / 正则展开失败等跳过的条数 */
+    skippedCount: number;
+    /** 其中因正则模板展开失败而跳过的条数 */
+    regexExpandFailedCount: number;
+}
+
+function resolveReplacementText(
+    haystack: string,
+    spec: ReplacementSpec,
+    replacementText: string,
+    options: ApplyReplacementOptions,
+): string | null {
+    if (options.regex) {
+        const patternSource = (options.searchQuery ?? "").trim();
+        if (!patternSource) {
+            return null;
+        }
+        return expandRegexReplacement({
+            haystack,
+            start: spec.start,
+            end: spec.end,
+            patternSource,
+            caseSensitive: options.caseSensitive === true,
+            template: replacementText,
+        });
+    }
+    if (options.preserveCase) {
+        return preserveReplacementCase(replacementText, spec.matchedText);
+    }
+    return replacementText;
 }
 
 /**
  * 在已定位的 textNodes 上从后往前替换（同一单元内）。
+ * 优先单 Text 节点；若命中跨多个纯 Text 拆分节点（编辑中未合并），用 Range 删除后插入。
  */
 function applyReplacementsToTextNodes(
     textNodes: Text[],
@@ -28,46 +72,103 @@ function applyReplacementsToTextNodes(
     options: ApplyReplacementOptions = {},
 ): ApplyReplacementOutcome {
     if (!textNodes.length || !replacements.length) {
-        return {appliedCount: 0};
+        return {
+            appliedCount: 0,
+            skippedCount: replacements.length,
+            regexExpandFailedCount: 0,
+        };
     }
 
+    const haystack = textNodes.map((node) => node.nodeValue ?? "").join("");
     const blockLike: SearchableBlock = {
         blockId: "",
         blockType: "",
         blockIndex: 0,
         element: (textNodes[0].parentElement ?? document.body) as HTMLElement,
-        text: textNodes.map((node) => node.nodeValue ?? "").join(""),
+        text: haystack,
         textNodes,
     };
 
     const sorted = [...replacements].sort((left, right) => right.start - left.start);
     let appliedCount = 0;
+    let skippedCount = 0;
+    let regexExpandFailedCount = 0;
 
     for (const replacement of sorted) {
-        const location = locateRangeInSingleTextNode(blockLike, replacement.start, replacement.end);
-        if (!location) {
+        const nextText = resolveReplacementText(
+            haystack,
+            replacement,
+            replacementText,
+            options,
+        );
+        if (nextText === null) {
+            skippedCount += 1;
+            if (options.regex) {
+                regexExpandFailedCount += 1;
+            }
             continue;
         }
 
-        const text = location.node.nodeValue ?? "";
-        const currentText = text.slice(location.startOffset, location.endOffset);
-        if (currentText !== replacement.matchedText) {
-            continue;
+        if (applyReplacementToTextNodes(blockLike, textNodes, replacement, nextText)) {
+            appliedCount += 1;
+        } else {
+            skippedCount += 1;
         }
-
-        const nextText = options.preserveCase
-            ? preserveReplacementCase(replacementText, replacement.matchedText)
-            : replacementText;
-
-        location.node.nodeValue = [
-            text.slice(0, location.startOffset),
-            nextText,
-            text.slice(location.endOffset),
-        ].join("");
-        appliedCount += 1;
     }
 
-    return {appliedCount};
+    return {appliedCount, skippedCount, regexExpandFailedCount};
+}
+
+/**
+ * 将 nextText 写入 [start,end)。单节点直接改 nodeValue；多节点纯文本用 Range。
+ */
+function applyReplacementToTextNodes(
+    blockLike: SearchableBlock,
+    textNodes: Text[],
+    replacement: ReplacementSpec,
+    nextText: string,
+): boolean {
+    const single = locateRangeInSingleTextNode(
+        blockLike,
+        replacement.start,
+        replacement.end,
+    );
+    if (single) {
+        const text = single.node.nodeValue ?? "";
+        const currentText = text.slice(single.startOffset, single.endOffset);
+        if (currentText !== replacement.matchedText) {
+            return false;
+        }
+        single.node.nodeValue = [
+            text.slice(0, single.startOffset),
+            nextText,
+            text.slice(single.endOffset),
+        ].join("");
+        return true;
+    }
+
+    const startPoint = locateTextPoint(textNodes, replacement.start, "start");
+    const endPoint = locateTextPoint(textNodes, replacement.end, "end");
+    if (!startPoint || !endPoint) {
+        return false;
+    }
+
+    try {
+        const range = document.createRange();
+        range.setStart(startPoint.node, startPoint.offset);
+        range.setEnd(endPoint.node, endPoint.offset);
+        if (range.toString() !== replacement.matchedText) {
+            return false;
+        }
+        if (!isRangePlainTextOnly(range)) {
+            return false;
+        }
+        range.deleteContents();
+        range.insertNode(document.createTextNode(nextText));
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -148,12 +249,16 @@ export function applyMatchesToSubmitClone(
     }
 
     let appliedCount = 0;
+    let skippedCount = 0;
+    let regexExpandFailedCount = 0;
     for (const [key, specs] of byUnit) {
         const unit = unitsByKey.get(key);
         if (!unit) {
+            skippedCount += specs.length;
             continue;
         }
         if (liveSubmit !== unit.element && !liveSubmit.contains(unit.element)) {
+            skippedCount += specs.length;
             continue;
         }
 
@@ -161,6 +266,7 @@ export function applyMatchesToSubmitClone(
             ? []
             : getNodePath(liveSubmit, unit.element);
         if (unitPath === null) {
+            skippedCount += specs.length;
             continue;
         }
 
@@ -168,23 +274,28 @@ export function applyMatchesToSubmitClone(
             ? cloneSubmit
             : followNodePath(cloneSubmit, unitPath);
         if (!(cloneUnitNode instanceof HTMLElement)) {
+            skippedCount += specs.length;
             continue;
         }
 
         const cloneTextNodes = mapTextNodesToClone(unit.element, cloneUnitNode, unit.textNodes);
         if (!cloneTextNodes.length) {
+            skippedCount += specs.length;
             continue;
         }
 
-        appliedCount += applyReplacementsToTextNodes(
+        const outcome = applyReplacementsToTextNodes(
             cloneTextNodes,
             specs,
             replacementText,
             options,
-        ).appliedCount;
+        );
+        appliedCount += outcome.appliedCount;
+        skippedCount += outcome.skippedCount;
+        regexExpandFailedCount += outcome.regexExpandFailedCount;
     }
 
-    return {appliedCount};
+    return {appliedCount, skippedCount, regexExpandFailedCount};
 }
 
 /**
@@ -210,17 +321,23 @@ export function applyMatchesToLiveUnits(
     }
 
     let appliedCount = 0;
+    let skippedCount = 0;
+    let regexExpandFailedCount = 0;
     for (const [key, specs] of byUnit) {
         const unit = unitsByKey.get(key);
         if (!unit) {
+            skippedCount += specs.length;
             continue;
         }
-        appliedCount += applyReplacementsToTextNodes(
+        const outcome = applyReplacementsToTextNodes(
             unit.textNodes,
             specs,
             replacementText,
             options,
-        ).appliedCount;
+        );
+        appliedCount += outcome.appliedCount;
+        skippedCount += outcome.skippedCount;
+        regexExpandFailedCount += outcome.regexExpandFailedCount;
     }
-    return {appliedCount};
+    return {appliedCount, skippedCount, regexExpandFailedCount};
 }

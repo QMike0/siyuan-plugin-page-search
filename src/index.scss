@@ -289,6 +289,18 @@
     color: var(--b3-theme-on-surface);
 }
 
+.highlight-search-result .search-field__toggles .search-option.is-disabled {
+    opacity: 0.45;
+    color: var(--b3-theme-on-surface);
+    cursor: not-allowed;
+}
+
+.highlight-search-result .search-field__toggles .search-option.is-disabled:hover,
+.highlight-search-result .search-field__toggles .search-option.is-disabled.is-active {
+    background-color: transparent;
+    color: var(--b3-theme-on-surface);
+}
+
 .highlight-search-result .search-tools--replace {
     margin-left: 0;
 }

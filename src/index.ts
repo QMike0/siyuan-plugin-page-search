@@ -282,15 +282,19 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             selectionOnly: t.selectionOnly || "Find in selection",
             matchCase: t.matchCase || "Match case",
             wholeWord: t.wholeWord || "Whole word",
-            useRegex: t.useRegex || "Use regex (search only)",
+            useRegex: t.useRegex || "Use regex (find; replace supports $1)",
             preserveCase: t.preserveCase || "Preserve case",
+            preserveCaseDisabledByRegex: t.preserveCaseDisabledByRegex
+                || "Unavailable with regex (replace uses $1 templates)",
             replaceUnsupportedHelp: t.replaceUnsupportedHelp
-                || "Replacement is unavailable in publish, export preview, or read-only mode; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced",
+                || "Replacement is unavailable in publish, export preview, or read-only mode; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced. With regex on, the replace box accepts $1, $2, $& (preserve-case is disabled; failed expansions are skipped)",
             replaceAction: t.replaceAction || "Replace (Enter)",
             replaceAllAction: t.replaceAllAction || "Replace all (Ctrl+Alt+Enter)",
             replaceToggle: t.replaceToggle || "Expand or collapse replace row",
             replaceCurrentUnsupported: t.replaceCurrentUnsupported
                 || "This match cannot be replaced directly",
+            replaceRegexExpandFailed: t.replaceRegexExpandFailed
+                || "Regex replace expansion failed; skipped",
             replaceAttributeViewUnsupported: t.replaceAttributeViewUnsupported
                 || "Database results cannot be replaced",
             replaceMermaidUnsupported: t.replaceMermaidUnsupported

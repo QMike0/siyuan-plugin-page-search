@@ -17,7 +17,7 @@ import {
     isInlineMemoSearchUnit,
 } from "./blocks";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
-import {createRangeFromBlockOffsets} from "./ranges";
+import {createRangeFromBlockOffsets, isRangePlainTextOnly} from "./ranges";
 import {matchRangePassesRestrictInline} from "./restrict-inline-dom";
 import {enumerateRestrictInlineMatches} from "./restrict-enumerate";
 import type {SearchableBlock, SearchMatch} from "./dom-types";
@@ -362,11 +362,13 @@ function attachRangesToHits(
         acceptedByUnit.set(key, accepted);
 
         // 2) 元素级：数据库 / 标题 / 公式等；行内备注与行内公式只搜不替
+        // 编辑中 Protyle 常把连续字拆成多个相邻 Text：可高亮但旧逻辑因跨 segment 判不可替。
+        // 仅当 Range 内无元素（未跨加粗/链接等）时允许替换。
         const replaceable = !isMemo
             && !isMath
             && !modeBlocked
-            && hit.replaceable
-            && isDomReplaceable(range, hit.blockType, hit.blockId);
+            && isDomReplaceable(range, hit.blockType, hit.blockId)
+            && isRangePlainTextOnly(range);
 
         result.push({
             id: hit.id,

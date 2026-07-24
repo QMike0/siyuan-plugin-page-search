@@ -8,6 +8,7 @@ import {
     SEARCH_COUNT_SOFT_CAP,
     canRestrictInlineMemo,
     coercePluginPrefs,
+    expandRegexReplacement,
     findOffsetMatchesInText,
     formatSearchCountLabel,
     generateSearchVariants,
@@ -447,4 +448,119 @@ assert(preserveReplacementCase("BAR", "foo") === "bar", "preserve lower");
 assert(preserveReplacementCase("bar", "Foo") === "Bar", "preserve title");
 assert(preserveReplacementCase("baz", "传感器") === "baz", "cjk unchanged");
 
-console.log("smoke:shared OK (match + restrict + selection + preserve-case)");
+const dateHaystack = "date 2024-01-02 end";
+assert(
+    expandRegexReplacement({
+        haystack: dateHaystack,
+        start: 5,
+        end: 15,
+        patternSource: "(\\d{4})-(\\d{2})-(\\d{2})",
+        template: "$2/$3/$1",
+    }) === "01/02/2024",
+    "regex replace capture groups",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "ab",
+        start: 0,
+        end: 2,
+        patternSource: "(a)(b)",
+        template: "$$ $& $1",
+    }) === "$ ab a",
+    "regex replace $$ and $&",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "x一y",
+        start: 0,
+        end: 3,
+        patternSource: "([^一])一([^一])",
+        template: "$1-$2",
+    }) === "x-y",
+    "regex replace like official sample",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "pre foobar post",
+        start: 4,
+        end: 7,
+        patternSource: "(?<=pre )foo(?=bar)",
+        template: "FOO",
+    }) === "FOO",
+    "regex replace keeps lookaround via haystack exec",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "abc",
+        start: 0,
+        end: 3,
+        patternSource: "no-match-here",
+        template: "$1",
+    }) === null,
+    "regex expand failure returns null (skip, do not write literal $1)",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "ab",
+        start: 0,
+        end: 2,
+        patternSource: "",
+        template: "$1",
+    }) === null,
+    "empty pattern expand returns null",
+);
+
+// 用户场景：中文引号捕获组 → 【$1】
+assert(
+    expandRegexReplacement({
+        haystack: "「思源笔记」",
+        start: 0,
+        end: 6,
+        patternSource: "「([^」]*)」",
+        template: "【$1】",
+    }) === "【思源笔记】",
+    "CJK quote capture $1 => 【思源笔记】",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "「111」",
+        start: 0,
+        end: 5,
+        patternSource: "「([^」]*)」",
+        template: "【$1】",
+    }) === "【111】",
+    "CJK quote capture $1 => 【111】",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "前「test」后",
+        start: 1,
+        end: 7,
+        patternSource: "「([^」]*)」",
+        template: "【$1】",
+    }) === "【test】",
+    "CJK quote capture $1 mid-string => 【test】",
+);
+// 无捕获组时保留字面 $1（对齐 JS）；与「组存在但匹配空」的【】区分开
+assert(
+    expandRegexReplacement({
+        haystack: "「思源笔记」",
+        start: 0,
+        end: 6,
+        patternSource: "「[^」]*」",
+        template: "【$1】",
+    }) === "【$1】",
+    "no capturing group => keep literal $1",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "「」",
+        start: 0,
+        end: 2,
+        patternSource: "「([^」]*)」",
+        template: "【$1】",
+    }) === "【】",
+    "capturing group matched empty => 【】",
+);
+
+console.log("smoke:shared OK (match + restrict + selection + preserve-case + regex-replace)");

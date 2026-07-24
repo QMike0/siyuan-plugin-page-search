@@ -16,6 +16,10 @@ const PREVIEW_BLOCK_ID = "__preview__";
 
 export interface ReplaceWriteOptions {
     preserveCase?: boolean;
+    /** 正则查找：替换串展开 $1 等 */
+    regex?: boolean;
+    searchQuery?: string;
+    caseSensitive?: boolean;
 }
 
 export interface ReplaceWriteResult {
@@ -154,10 +158,21 @@ export function replaceCurrentMatchInEditor(
         unitsByKey,
         [match],
         replacementText,
-        {preserveCase: options.preserveCase},
+        {
+            preserveCase: options.preserveCase,
+            regex: options.regex,
+            searchQuery: options.searchQuery,
+            caseSensitive: options.caseSensitive,
+        },
     );
     if (outcome.appliedCount === 0) {
-        return {replacedCount: 0, skippedCount: 1, error: "apply-failed"};
+        return {
+            replacedCount: 0,
+            skippedCount: Math.max(1, outcome.skippedCount),
+            error: outcome.regexExpandFailedCount > 0
+                ? "regex-expand-failed"
+                : "apply-failed",
+        };
     }
 
     try {
@@ -167,7 +182,10 @@ export function replaceCurrentMatchInEditor(
         return {replacedCount: 0, skippedCount: 1, error: "transaction-failed"};
     }
 
-    return {replacedCount: outcome.appliedCount, skippedCount: 0};
+    return {
+        replacedCount: outcome.appliedCount,
+        skippedCount: outcome.skippedCount,
+    };
 }
 
 /**
@@ -230,17 +248,22 @@ export function replaceAllMatchesInEditor(
             unitsByKey,
             blockMatches,
             replacementText,
-            {preserveCase: options.preserveCase},
+            {
+                preserveCase: options.preserveCase,
+                regex: options.regex,
+                searchQuery: options.searchQuery,
+                caseSensitive: options.caseSensitive,
+            },
         );
         if (outcome.appliedCount === 0) {
-            skippedCount += blockMatches.length;
+            skippedCount += outcome.skippedCount || blockMatches.length;
             continue;
         }
 
         doOperations.push({action: "update", id: blockId, data: clone.outerHTML});
         undoOperations.push({action: "update", id: blockId, data: oldHTML});
         replacedCount += outcome.appliedCount;
-        skippedCount += Math.max(0, blockMatches.length - outcome.appliedCount);
+        skippedCount += outcome.skippedCount;
     }
 
     if (doOperations.length === 0) {

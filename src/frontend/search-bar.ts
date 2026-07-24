@@ -88,11 +88,15 @@ export interface SearchBarI18n {
     wholeWord: string;
     useRegex: string;
     preserveCase: string;
+    /** 正则开启时 Aa* 的禁用说明 */
+    preserveCaseDisabledByRegex: string;
     replaceUnsupportedHelp: string;
     replaceAction: string;
     replaceAllAction: string;
     replaceToggle: string;
     replaceCurrentUnsupported: string;
+    /** 单次正则替换：模板展开失败并跳过 */
+    replaceRegexExpandFailed: string;
     replaceAttributeViewUnsupported: string;
     replaceMermaidUnsupported: string;
     replaceHtmlBlockUnsupported: string;
@@ -725,6 +729,9 @@ export class SearchBar {
                 this.regex = !this.regex;
                 break;
             case "preserveCase":
+                if (this.regex) {
+                    return;
+                }
                 this.preserveCase = !this.preserveCase;
                 this.syncOptionButtons();
                 return;
@@ -942,8 +949,25 @@ export class SearchBar {
         this.setOptionActive("caseSensitive", this.caseSensitive);
         this.setOptionActive("wholeWord", this.wholeWord);
         this.setOptionActive("regex", this.regex);
-        this.setOptionActive("preserveCase", this.preserveCase);
+        this.setOptionActive("preserveCase", this.preserveCase && !this.regex);
         this.setOptionActive("selectionOnly", this.selectionOnly);
+        this.syncPreserveCaseAvailability();
+    }
+
+    /** 正则开启时灰显 Aa*（捕获组替换与保留大小写互斥） */
+    private syncPreserveCaseAvailability() {
+        const button = this.optionButtons.get("preserveCase");
+        if (!button) {
+            return;
+        }
+        const disabled = this.regex;
+        button.classList.toggle("is-disabled", disabled);
+        button.setAttribute("aria-disabled", disabled ? "true" : "false");
+        const tip = disabled
+            ? (this.i18n.preserveCaseDisabledByRegex || this.i18n.preserveCase)
+            : this.i18n.preserveCase;
+        button.setAttribute("title", tip);
+        button.setAttribute("aria-label", tip);
     }
 
     private setOptionActive(key: MatchOptionKey, active: boolean) {
@@ -1595,7 +1619,12 @@ export class SearchBar {
                 this.edit,
                 match,
                 this.replaceText,
-                {preserveCase: this.preserveCase},
+                {
+                    preserveCase: this.preserveCase,
+                    regex: this.regex,
+                    searchQuery: this.searchText,
+                    caseSensitive: this.caseSensitive,
+                },
             );
             if (result.error === "readonly-or-preview") {
                 showMessage(this.i18n.replaceModeUnsupported, 3000, "info");
@@ -1603,6 +1632,11 @@ export class SearchBar {
             }
             if (result.error === "protyle-missing") {
                 showMessage(this.i18n.replaceProtyleMissing, 4000, "error");
+                return;
+            }
+            if (result.error === "regex-expand-failed") {
+                showMessage(this.i18n.replaceRegexExpandFailed, 3000, "info");
+                this.clickNext();
                 return;
             }
             if (result.replacedCount === 0) {
@@ -1656,7 +1690,12 @@ export class SearchBar {
                 this.edit,
                 this.resultMatches,
                 this.replaceText,
-                {preserveCase: this.preserveCase},
+                {
+                    preserveCase: this.preserveCase,
+                    regex: this.regex,
+                    searchQuery: this.searchText,
+                    caseSensitive: this.caseSensitive,
+                },
             );
             if (result.error === "readonly-or-preview") {
                 showMessage(this.i18n.replaceModeUnsupported, 3000, "info");

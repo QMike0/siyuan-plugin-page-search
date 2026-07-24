@@ -27,7 +27,7 @@ Default hotkey: `Ctrl+Shift+Alt+F` (macOS: `⌥⇧⌘F`).
 |---------|--------|
 | `Aa` | Match case |
 | Whole word | ASCII word-boundary match |
-| `.*` | Regex **search only** (no regex replace / no capture groups) |
+| `.*` | Regex find; replace box accepts `$1` / `$2` / `$&` / `$$` (`Aa*` disabled while regex is on; failed expansions are skipped) |
 | In selection | Limit find to the current selection (or block selection); independent of “prefill query from selection on open” |
 | `Aa*` | Preserve case of the match when replacing (foo→bar, FOO→BAR, Foo→Bar) |
 
@@ -58,6 +58,7 @@ Writes go through the current document’s **Protyle transaction** (`updateTrans
 - **Replace all** merges into one transaction for a single undo step  
 - **No Protyle**: replace is aborted with a message — never a silent kernel `updateBlock` (no false sense of undo)  
 - **Loaded DOM only**: off-screen / unloaded blocks are out of scope for this release  
+- **Regex replace**: with regex find on, the replace string is a `$n` template (e.g. find `(\d+)-(\d+)`, replace `$2/$1`); without regex, replace stays literal  
 
 ### Not auto-replaceable (still searchable / highlightable)
 
@@ -127,10 +128,10 @@ Falls back to local `matchTextUnits` when the kernel is unavailable.
 
 ## Explicitly out of scope
 
-- Regex replace capture groups (`$1`, etc.)  
 - Replacing attribute-view cells  
 - Default kernel `updateBlock` write-back (no undo)  
 - Replacing blocks that are not loaded in the current Protyle DOM  
+- Workspace-wide AST `/api/search/findReplace` (in-page DOM + Protyle transactions instead)  
 
 ## Regression checklist
 

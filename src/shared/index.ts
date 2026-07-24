@@ -13,6 +13,11 @@ export {
     rangesOverlap,
 } from "./match-text";
 export {
+    expandRegexReplacement,
+    expandReplacementTemplate,
+} from "./regex-replace";
+export type {ExpandRegexReplacementOptions} from "./regex-replace";
+export {
     ATTRIBUTE_VIEW_TYPE,
     NON_REPLACEABLE_DOM_CLOSEST,
 } from "./replaceable";
