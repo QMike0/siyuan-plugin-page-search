@@ -47,6 +47,10 @@ const TABLE_CELL_SELECTOR = '[data-type="NodeTableCell"], .table__cell, td, th'
 /** 数据库内不应参与搜索的 UI 节点（含 av__cursor 的 ZWSP，会干扰零宽变体匹配） */
 const AV_EXCLUDED_CLOSEST = [
   '.protyle-attr',
+  // 关闭「显示条目图标」时主键前的 .b3-menu__avemoji 带 fn__none，但仍含 emoji 文本节点；
+  // 若采入会导致「test」命中落在图标/主键文本边界，Range 起点落在 fn__none 内被可见性丢弃。
+  '.fn__none',
+  '.b3-menu__avemoji',
   'svg',
   'style',
   'script',

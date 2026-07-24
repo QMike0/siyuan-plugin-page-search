@@ -101,8 +101,8 @@ export function createRangeFromBlockOffsets(
     return null
   }
 
-  const startPoint = locateTextPoint(block.textNodes, start)
-  const endPoint = locateTextPoint(block.textNodes, end)
+  const startPoint = locateTextPoint(block.textNodes, start, "start")
+  const endPoint = locateTextPoint(block.textNodes, end, "end")
   if (!startPoint || !endPoint) {
     return null
   }
@@ -129,32 +129,52 @@ export function createRangeFromBlockOffsets(
   }
 }
 
-function locateTextPoint(textNodes: Text[], targetOffset: number): TextPoint | null {
-  let cursor = 0
+/**
+ * 将块内字符偏移映射到 Text 节点。
+ * 节点边界处：start 偏向下一个节点开头，end 偏向上一个节点末尾，
+ * 避免命中落在「隐藏图标文本 | 可见主键」边界时 Range 起点落在 .fn__none 内。
+ */
+function locateTextPoint(
+  textNodes: Text[],
+  targetOffset: number,
+  edge: "start" | "end",
+): TextPoint | null {
+  if (!textNodes.length) {
+    return null
+  }
 
-  for (const textNode of textNodes) {
-    const text = textNode.nodeValue ?? ''
+  let cursor = 0
+  for (let index = 0; index < textNodes.length; index++) {
+    const textNode = textNodes[index]
+    const text = textNode.nodeValue ?? ""
     const nextCursor = cursor + text.length
-    if (targetOffset >= cursor && targetOffset <= nextCursor) {
+    const isLast = index === textNodes.length - 1
+
+    if (edge === "start") {
+      // [cursor, nextCursor)；仅末节点包含全文末尾 nextCursor
+      if (
+        targetOffset >= cursor
+        && (targetOffset < nextCursor || (targetOffset === nextCursor && isLast))
+      ) {
+        return {
+          node: textNode,
+          offset: targetOffset - cursor,
+        }
+      }
+    } else if (targetOffset === 0 && index === 0) {
+      return {
+        node: textNode,
+        offset: 0,
+      }
+    } else if (targetOffset > cursor && targetOffset <= nextCursor) {
+      // (cursor, nextCursor]；边界偏向上一节点末尾
       return {
         node: textNode,
         offset: targetOffset - cursor,
       }
     }
+
     cursor = nextCursor
-  }
-
-  const lastNode = textNodes[textNodes.length - 1]
-  if (!lastNode) {
-    return null
-  }
-
-  const lastLength = lastNode.nodeValue?.length ?? 0
-  if (targetOffset === cursor) {
-    return {
-      node: lastNode,
-      offset: lastLength,
-    }
   }
 
   return null
