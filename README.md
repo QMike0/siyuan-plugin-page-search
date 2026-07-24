@@ -1,6 +1,6 @@
 [中文](./README.zh-CN.md)
 
-# In-Page Find & Replace
+# In-Page Search & Replace
 
 Search and highlight matches in the current SiYuan document (CSS Custom Highlight), with in-page replace.
 
@@ -28,7 +28,7 @@ Default hotkey: `Ctrl+Shift+Alt+F` (macOS: `⌥⇧⌘F`).
 | `Aa` | Match case |
 | Whole word | ASCII word-boundary match |
 | Method button | Opens a menu to choose **Keyword** or **Regular expression** (mutually exclusive). The icon follows the current mode (Exact / Regex). With regex, the replace box accepts `$1` / `$2` / `$&` / `$$` (`Aa*` disabled; failed expansions are skipped). The choice is saved in prefs and restored when reopening |
-| In selection | Limit find to the current selection (or block selection); independent of “prefill query from selection on open” |
+| In selection | Limit search to the current selection (or block selection); independent of “prefill query from selection on open” |
 | `Aa*` | Preserve case of the match when replacing (foo→bar, FOO→BAR, Foo→Bar) |
 
 Opening the bar with a selection only prefills the query; it does **not** turn on “In selection”.
@@ -41,15 +41,15 @@ Gear menu:
 
 | Group | Role |
 |------|------|
-| **Limit find** | Search only within selected inline types (OR; all off = no limit). Empty find box previews all hosts of selected types (not replaceable; counts over 999 show as `999+` while still highlighting all). Order: block ref, link, bold, italic, underline, strike, highlight, superscript, subscript, inline code, keyboard, tag, inline math, inline memo. Stacks with Find in selection |
-| **Include in find** | Whether to include inline memos, databases, tables, blockquotes, callouts, math blocks, embed blocks, widgets, code blocks, Mermaid |
-| **Folded block content** | Match hidden content in non-heading folded blocks (independent of Limit find) |
+| **Include in search** | Whether to include inline memos, databases, tables, blockquotes, callouts, math blocks, embed blocks, widgets, code blocks, Mermaid |
+| **Folded block content** | Match hidden content in non-heading folded blocks (independent of Limit search) |
+| **Limit search** | Search only within selected inline types (OR; all off = no limit). Empty search box previews all hosts of selected types (not replaceable; counts over 999 show as `999+` while still highlighting all). Order: block ref, link, bold, italic, underline, strike, highlight, superscript, subscript, inline code, keyboard, tag, inline math, inline memo. Stacks with Search in selection |
 
 Notes:
 
-- **Inline memos**: Include = search memo attributes in full-document mode; Limit find → Inline memo = include them in the OR set (requires Include first)
+- **Inline memos**: Include = search memo attributes in full-document mode; Limit search → Inline memo = include them in the OR set (requires Include first)
 - **Inline math**: matches KaTeX **rendered visible text** (not `data-content` LaTeX, so “d” won’t hit `\delta`); separate units cover body and table formulas; yellow/orange highlight; not replaceable
-- With Limit find off, behavior matches the previous release (AV / code / Mermaid / fold / memo underlines unchanged)
+- With Limit search off, behavior matches the previous release (AV / code / Mermaid / fold / memo underlines unchanged)
 
 ## Replace and undo
 
@@ -58,7 +58,7 @@ Writes go through the current document’s **Protyle transaction** (`updateTrans
 - **Replace all** merges into one transaction for a single undo step  
 - **No Protyle**: replace is aborted with a message — never a silent kernel `updateBlock` (no false sense of undo)  
 - **Loaded DOM only**: off-screen / unloaded blocks are out of scope for this release  
-- **Regex replace**: with regex find on, the replace string is a `$n` template (e.g. find `(\d+)-(\d+)`, replace `$2/$1`); without regex, replace stays literal  
+- **Regex replace**: with regex search on, the replace string is a `$n` template (e.g. find `(\d+)-(\d+)`, replace `$2/$1`); without regex, replace stays literal  
 
 ### Not auto-replaceable (still searchable / highlightable)
 
@@ -86,10 +86,10 @@ With `disabledInPublish: false`, the plugin **still loads** under the publish se
 
 | Capability | Publish |
 |------------|---------|
-| Find / highlight / next-prev | ✅ |
+| Search / highlight / next-prev | ✅ |
 | Expand replace row / type replacement | ✅ (replace row is not hidden) |
 | Replace / replace-all / document write-back | ❌ Buttons disabled; click shows a notice |
-| Persisting prefs (`prefs.json` position, type toggles, find method) | ❌ No petal writes; in-session toggles still apply locally |
+| Persisting prefs (`prefs.json` position, type toggles, search method) | ❌ No petal writes; in-session toggles still apply locally |
 
 Gate: `window.siyuan.isPublish` (same condition as SiYuan rejecting `saveData`/`removeData`). Export preview and read-only use the same “block replace, keep replace row” policy.
 
@@ -100,9 +100,9 @@ Stored at `data/storage/petal/<plugin>/prefs.json` (same path for kernel `storag
 | Field | Meaning |
 |------|---------|
 | `dialogLeft` / `dialogTop` | Dragged position (cleared when resetting via top bar) |
-| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in find (default on) |
+| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in search (default on) |
 | `includeFoldedBlocks` / `includeInlineMemo` | Folded blocks / inline memos (default off) |
-| `useRegex` | Find method: `false`=keyword, `true`=regular expression (default keyword; kept across reopen) |
+| `useRegex` | Search method: `false`=keyword, `true`=regular expression (default keyword; kept across reopen) |
 | `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |
 
 Closing the search bar clears the query; reopening only prefills from the current selection.
@@ -156,4 +156,4 @@ pnpm run build
 
 ## Status
 
-Phases 0–5 complete: scaffold, shared matcher, kernel RPC/MCP, selection-only find, search/replace UI, undoable Protyle write-back, docs and regression checklist.
+Phases 0–5 complete: scaffold, shared matcher, kernel RPC/MCP, selection-only search, search/replace UI, undoable Protyle write-back, docs and regression checklist.

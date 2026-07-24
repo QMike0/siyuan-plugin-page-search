@@ -274,12 +274,12 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     private getSearchI18n(): SearchBarI18n {
         const t = this.i18n as Record<string, string>;
         return {
-            searchPlaceholder: t.searchPlaceholder || "Find",
+            searchPlaceholder: t.searchPlaceholder || "Search",
             replacePlaceholder: t.replacePlaceholder || "Replace with",
             searchPrev: t.searchPrev || "Previous (Shift+Enter)",
             searchNext: t.searchNext || "Next (Enter)",
             searchClose: t.searchClose || "Close",
-            selectionOnly: t.selectionOnly || "Find in selection",
+            selectionOnly: t.selectionOnly || "Search in selection",
             matchCase: t.matchCase || "Match case",
             wholeWord: t.wholeWord || "Whole word",
             searchMethodKeyword: t.searchMethodKeyword || "Keyword",
@@ -288,7 +288,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             preserveCaseDisabledByRegex: t.preserveCaseDisabledByRegex
                 || "Unavailable with regex (replace uses $1 templates)",
             replaceUnsupportedHelp: t.replaceUnsupportedHelp
-                || "Replacement is unavailable in publish, export preview, or read-only mode; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced. With regular expression selected, the replace box accepts $1, $2, $& (preserve-case is disabled; failed expansions are skipped)",
+                || "Replacement is unavailable in read-only mode, export preview, and the publish service; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced. When the search mode is Regular expression, the replace box can use $1, $&, and similar syntax",
             replaceAction: t.replaceAction || "Replace (Enter)",
             replaceAllAction: t.replaceAllAction || "Replace all (Ctrl+Alt+Enter)",
             replaceToggle: t.replaceToggle || "Expand or collapse replace row",
@@ -314,10 +314,10 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             selectionOnlyNoScope: t.selectionOnlyNoScope
                 || "Selection-only mode is on, but there is no usable selection",
             settingsTitle: t.settingsTitle || "Search scope",
-            settingsRestrictInline: t.settingsRestrictInline || "Limit find",
+            settingsRestrictInline: t.settingsRestrictInline || "Limit search",
             settingsRestrictInlineHint: t.settingsRestrictInlineHint
-                || "When enabled, search only within the selected inline elements (multi-select). With an empty find box, preview all matching inline elements of the selected types. Limit-find choices reset when the search UI closes",
-            settingsIncludeScope: t.settingsIncludeScope || "Include in find",
+                || "When enabled, search only within the selected inline elements (multi-select). With an empty search box, preview all matching inline elements of the selected types. Limit-search choices reset when the search UI closes",
+            settingsIncludeScope: t.settingsIncludeScope || "Include in search",
             settingsIncludeScopeHint: t.settingsIncludeScopeHint
                 || "Controls which block-level types (and inline memos) may be searched",
             settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database",
@@ -355,9 +355,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 || "Match visible rendered formula text (not LaTeX source); not replaceable",
             settingsRestrictInlineMemo: t.settingsRestrictInlineMemo || "Inline memo",
             settingsRestrictInlineMemoHint: t.settingsRestrictInlineMemoHint
-                || "Turn on Include in find → Inline memos first; not replaceable",
+                || "Turn on Include in search → Inline memos first; not replaceable",
             settingsRestrictInlineMemoOnHint: t.settingsRestrictInlineMemoOnHint
-                || "Turn on Include in find → Inline memos first; not replaceable",
+                || "Turn on Include in search → Inline memos first; not replaceable",
             invalidRegex: t.invalidRegex || "Invalid regex: {error}",
         };
     }

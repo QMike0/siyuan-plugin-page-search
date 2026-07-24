@@ -985,8 +985,6 @@ export class SearchBar {
         button.innerHTML = this.regex
             ? iconUse("#iconRegex")
             : iconUse("#iconExact");
-        // 正则时高亮触发器，便于一眼区分当前模式
-        button.classList.toggle("is-active", this.regex);
     }
 
     /** 正则开启时灰显 Aa*（捕获组替换与保留大小写互斥） */
@@ -1761,8 +1759,8 @@ export class SearchBar {
     }
 
     /**
-     * 思源原生 Menu + b3-switch：匹配范围设置（全局持久化）。
-     * 一级：限制查找 ▸ / 是否查找 ▸ / 折叠块内容
+     * 思源原生 Menu + b3-switch：搜索范围设置（全局持久化）。
+     * 一级：是否搜索 ▸ / 折叠块内容 / 限制搜索 ▸
      * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/plugin/Menu.ts
      */
     private openSettingsMenu(anchor: HTMLElement) {
@@ -1775,18 +1773,8 @@ export class SearchBar {
         });
         this.settingsMenu = menu;
         menu.addItem({
-            id: "page-search-restrict-inline",
-            icon: "iconFilter",
-            label: this.i18n.settingsRestrictInline,
-            type: "submenu",
-            submenu: this.buildRestrictInlineSubmenuItems(),
-            bind: (element) => {
-                this.attachMenuHelpTip(element, this.i18n.settingsRestrictInlineHint);
-            },
-        });
-        menu.addItem({
             id: "page-search-include-scope",
-            icon: "iconList",
+            icon: "iconFilter",
             label: this.i18n.settingsIncludeScope,
             type: "submenu",
             submenu: [
@@ -1906,6 +1894,16 @@ export class SearchBar {
                 void this.setIncludeFoldedBlocks(checked);
             },
         }));
+        menu.addItem({
+            id: "page-search-restrict-inline",
+            icon: "iconList",
+            label: this.i18n.settingsRestrictInline,
+            type: "submenu",
+            submenu: this.buildRestrictInlineSubmenuItems(),
+            bind: (element) => {
+                this.attachMenuHelpTip(element, this.i18n.settingsRestrictInlineHint);
+            },
+        });
         const rect = anchor.getBoundingClientRect();
         menu.open({
             x: rect.left,
