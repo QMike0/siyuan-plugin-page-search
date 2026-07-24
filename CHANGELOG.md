@@ -1,3 +1,12 @@
+## v1.0.2 2026-07-24
+
+- 🇨🇳 修复关闭数据库「显示条目图标」会导致的主键文字匹配问题
+- 🇨🇳 明确插件卸载机制，卸载时自动删除配置文件
+- 🇨🇳 发布模式下禁用替换及配置持久化
+- 🇺🇸 Fixed an issue where disabling "Show Entry Icons" in the database would cause primary key text matching problems
+- 🇺🇸 Clarified plugin uninstallation mechanism, now automatically removes configuration files upon uninstallation
+- 🇺🇸 Disabled replacement and configuration persistence in release mode
+
 ## v1.0.1 2026-07-23
 
 - 🇨🇳 新增菜单「限制查找」，支持对行内元素的筛选与空查询预览，并更新相关配套功能
