@@ -148,8 +148,6 @@ export interface CollectSearchableBlocksOptions {
   includeMathBlock?: boolean;
   /** 是否采集嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
   includeEmbedBlock?: boolean;
-  /** 是否采集挂件块（NodeWidget）；默认 true */
-  includeWidget?: boolean;
   /** 是否采集代码块（非 Mermaid）；默认 true */
   includeCodeBlock?: boolean;
   /** 是否采集 Mermaid 图；默认 true */
@@ -178,7 +176,6 @@ export function collectSearchableBlocks(
   const includeCallout = options.includeCallout !== false;
   const includeMathBlock = options.includeMathBlock !== false;
   const includeEmbedBlock = options.includeEmbedBlock !== false;
-  const includeWidget = options.includeWidget !== false;
   const includeCodeBlock = options.includeCodeBlock !== false;
   const includeMermaid = options.includeMermaid !== false;
   const includeHtmlBlock = options.includeHtmlBlock !== false;
@@ -205,7 +202,6 @@ export function collectSearchableBlocks(
     includeBlockquote,
     includeCallout,
     includeEmbedBlock,
-    includeWidget,
     includeCodeBlock,
     includeMermaid,
     includeHtmlBlock,
@@ -341,9 +337,9 @@ export function collectSearchableBlocks(
       return
     }
 
-    // 挂件块（叶子块，iframe 独立上下文）
+    // 挂件块：内容在 iframe 内，当前不支持搜索（始终跳过）
     // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts isNotEditBlock
-    if (blockType === WIDGET_TYPE && !includeWidget) {
+    if (blockType === WIDGET_TYPE) {
       return
     }
 
@@ -408,7 +404,6 @@ interface IncludeGates {
   includeBlockquote: boolean
   includeCallout: boolean
   includeEmbedBlock: boolean
-  includeWidget: boolean
   includeCodeBlock: boolean
   includeMermaid: boolean
   includeHtmlBlock: boolean
@@ -449,10 +444,8 @@ function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeG
   ) {
     return true
   }
-  if (
-    !gates.includeWidget
-    && Boolean(element.closest(`[data-type="${WIDGET_TYPE}"]`))
-  ) {
+  // 挂件始终不搜（含其外壳上的行内备注 / 公式宿主）
+  if (Boolean(element.closest(`[data-type="${WIDGET_TYPE}"]`))) {
     return true
   }
   if (
@@ -1213,5 +1206,4 @@ export {
   EMBED_BLOCK_TYPE,
   MATH_BLOCK_TYPE,
   TABLE_TYPE,
-  WIDGET_TYPE,
 }

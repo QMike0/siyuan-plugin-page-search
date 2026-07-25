@@ -84,7 +84,6 @@ export function enumerateRestrictInlineMatches(
     const includeCallout = options.includeCallout !== false;
     const includeMathBlock = options.includeMathBlock !== false;
     const includeEmbedBlock = options.includeEmbedBlock !== false;
-    const includeWidget = options.includeWidget !== false;
     const includeCodeBlock = options.includeCodeBlock !== false;
     const includeMermaid = options.includeMermaid !== false;
     const includeHtmlBlock = options.includeHtmlBlock !== false;
@@ -99,7 +98,6 @@ export function enumerateRestrictInlineMatches(
         includeCallout,
         includeMathBlock,
         includeEmbedBlock,
-        includeWidget,
         includeCodeBlock,
         includeMermaid,
         includeHtmlBlock,
@@ -149,7 +147,6 @@ export function enumerateRestrictInlineMatches(
                     includeCallout,
                     includeMathBlock,
                     includeEmbedBlock,
-                    includeWidget,
                     includeCodeBlock,
                     includeMermaid,
                     includeHtmlBlock,
@@ -372,7 +369,6 @@ function shouldSkipHostByIncludeGates(
         includeCallout: boolean;
         includeMathBlock: boolean;
         includeEmbedBlock: boolean;
-        includeWidget: boolean;
         includeCodeBlock: boolean;
         includeMermaid: boolean;
         includeHtmlBlock: boolean;
@@ -419,10 +415,8 @@ function shouldSkipHostByIncludeGates(
     ) {
         return true;
     }
-    if (
-        !options.includeWidget
-        && Boolean(host.closest(`[data-type="${WIDGET_TYPE}"]`))
-    ) {
+    // 挂件始终不搜
+    if (Boolean(host.closest(`[data-type="${WIDGET_TYPE}"]`))) {
         return true;
     }
     if (

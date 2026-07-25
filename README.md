@@ -41,7 +41,7 @@ Gear menu:
 
 | Group | Role |
 |------|------|
-| **Include in search** | Whether to include inline memos, databases, tables, blockquotes, callouts, math blocks, embed blocks, widgets, code blocks, Mermaid |
+| **Include in search** | Whether to include inline memos, databases, tables, blockquotes, callouts, math blocks, embed blocks, code blocks, Mermaid |
 | **Folded block content** | Match hidden content in non-heading folded blocks (independent of Limit search) |
 | **Limit search** | Search only within selected inline types (OR; all off = no limit). Empty search box previews all hosts of selected types (not replaceable; counts over 999 show as `999+` while still highlighting all). Order: block ref, link, bold, italic, underline, strike, highlight, superscript, subscript, inline code, keyboard, tag, inline math, inline memo. Stacks with Search in selection |
 
@@ -100,7 +100,7 @@ Stored at `data/storage/petal/<plugin>/prefs.json` (same path for kernel `storag
 | Field | Meaning |
 |------|---------|
 | `dialogLeft` / `dialogTop` | Dragged position (cleared when resetting via top bar) |
-| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in search (default on) |
+| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in search (default on) |
 | `includeFoldedBlocks` / `includeInlineMemo` | Folded blocks / inline memos (default off) |
 | `useRegex` | Search method: `false`=keyword, `true`=regular expression (default keyword; kept across reopen) |
 | `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |

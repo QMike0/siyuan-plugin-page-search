@@ -121,7 +121,6 @@ export interface SearchBarI18n {
     settingsIncludeCallout: string;
     settingsIncludeMathBlock: string;
     settingsIncludeEmbedBlock: string;
-    settingsIncludeWidget: string;
     settingsIncludeCodeBlock: string;
     settingsIncludeMermaid: string;
     settingsIncludeHtmlBlock: string;
@@ -170,8 +169,6 @@ export interface SearchBarHost {
     syncIncludeMathBlock?(value: boolean, source?: SearchBar): void;
     /** 将嵌入块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeEmbedBlock?(value: boolean, source?: SearchBar): void;
-    /** 将挂件匹配开关同步到其它已打开的搜索面板（不写 prefs） */
-    syncIncludeWidget?(value: boolean, source?: SearchBar): void;
     /** 将代码块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeCodeBlock?(value: boolean, source?: SearchBar): void;
     /** 将 Mermaid 匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -226,8 +223,6 @@ export class SearchBar {
     private includeMathBlock = true;
     /** 是否匹配嵌入块；全局 prefs，默认 true */
     private includeEmbedBlock = true;
-    /** 是否匹配挂件；全局 prefs，默认 true */
-    private includeWidget = true;
     /** 是否匹配代码块（非 Mermaid）；全局 prefs，默认 true */
     private includeCodeBlock = true;
     /** 是否匹配 Mermaid；全局 prefs，默认 true */
@@ -295,8 +290,6 @@ export class SearchBar {
         includeMathBlock?: boolean;
         /** 是否匹配嵌入块（来自全局 prefs） */
         includeEmbedBlock?: boolean;
-        /** 是否匹配挂件（来自全局 prefs） */
-        includeWidget?: boolean;
         /** 是否匹配代码块（来自全局 prefs） */
         includeCodeBlock?: boolean;
         /** 是否匹配 Mermaid（来自全局 prefs） */
@@ -324,7 +317,6 @@ export class SearchBar {
         this.includeCallout = options.includeCallout !== false;
         this.includeMathBlock = options.includeMathBlock !== false;
         this.includeEmbedBlock = options.includeEmbedBlock !== false;
-        this.includeWidget = options.includeWidget !== false;
         this.includeCodeBlock = options.includeCodeBlock !== false;
         this.includeMermaid = options.includeMermaid !== false;
         this.includeHtmlBlock = options.includeHtmlBlock !== false;
@@ -783,7 +775,6 @@ export class SearchBar {
             includeCallout: this.includeCallout,
             includeMathBlock: this.includeMathBlock,
             includeEmbedBlock: this.includeEmbedBlock,
-            includeWidget: this.includeWidget,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
             includeHtmlBlock: this.includeHtmlBlock,
@@ -807,7 +798,6 @@ export class SearchBar {
             includeCallout: this.includeCallout,
             includeMathBlock: this.includeMathBlock,
             includeEmbedBlock: this.includeEmbedBlock,
-            includeWidget: this.includeWidget,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
             includeHtmlBlock: this.includeHtmlBlock,
@@ -824,7 +814,6 @@ export class SearchBar {
                 includeCallout: this.includeCallout,
                 includeMathBlock: this.includeMathBlock,
                 includeEmbedBlock: this.includeEmbedBlock,
-                includeWidget: this.includeWidget,
                 includeCodeBlock: this.includeCodeBlock,
                 includeMermaid: this.includeMermaid,
             includeHtmlBlock: this.includeHtmlBlock,
@@ -1092,7 +1081,6 @@ export class SearchBar {
             includeCallout: this.includeCallout,
             includeMathBlock: this.includeMathBlock,
             includeEmbedBlock: this.includeEmbedBlock,
-            includeWidget: this.includeWidget,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
             includeHtmlBlock: this.includeHtmlBlock,
@@ -1870,15 +1858,6 @@ export class SearchBar {
                         void this.setIncludeMermaid(checked);
                     },
                 }),
-                this.buildMatchSwitchMenuItem({
-                    id: "page-search-include-widget",
-                    icon: "iconBoth",
-                    label: this.i18n.settingsIncludeWidget,
-                    checked: this.includeWidget,
-                    onChange: (checked) => {
-                        void this.setIncludeWidget(checked);
-                    },
-                }),
             ],
             bind: (element) => {
                 this.attachMenuHelpTip(element, this.i18n.settingsIncludeScopeHint);
@@ -2268,16 +2247,6 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
-    private async setIncludeWidget(value: boolean) {
-        if (this.includeWidget === value) {
-            return;
-        }
-        this.includeWidget = value;
-        await rpcSetPrefs(this.plugin, {includeWidget: value});
-        this.plugin.syncIncludeWidget?.(value, this);
-        void this.highlightHitResult(this.searchText, true);
-    }
-
     private async setIncludeCodeBlock(value: boolean) {
         if (this.includeCodeBlock === value) {
             return;
@@ -2403,14 +2372,6 @@ export class SearchBar {
             return;
         }
         this.includeEmbedBlock = value;
-        void this.highlightHitResult(this.searchText, true);
-    }
-
-    applyIncludeWidget(value: boolean) {
-        if (this.includeWidget === value) {
-            return;
-        }
-        this.includeWidget = value;
         void this.highlightHitResult(this.searchText, true);
     }
 

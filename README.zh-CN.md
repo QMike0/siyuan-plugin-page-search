@@ -41,7 +41,7 @@
 
 | 分组 | 作用 |
 |------|------|
-| **是否搜索** | 是否纳入行内备注、数据库、表格、引述块、提示块、公式块、嵌入块、挂件、代码块、Mermaid |
+| **是否搜索** | 是否纳入行内备注、数据库、表格、引述块、提示块、公式块、嵌入块、代码块、Mermaid |
 | **折叠块内容** | 是否匹配非标题折叠块内隐藏内容（与限制搜索独立） |
 | **限制搜索** | 仅在所选行内类型中搜索（多选 OR；全关=不限制）。搜索框为空时预览所选类型的全部行内宿主（不可替换；计数超过 999 显示为 `999+` 仍全量高亮）。类型顺序：引用、链接、粗体、斜体、下划线、删除线、高亮、上标、下标、行级代码、键盘、标签、行级公式、行内备注。可与「选区内」同时生效 |
 
@@ -100,7 +100,7 @@
 | 字段 | 说明 |
 |------|------|
 | `dialogLeft` / `dialogTop` | 拖拽后的固定位置（点顶栏复位会清空） |
-| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeWidget` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | 是否搜索（默认开） |
+| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | 是否搜索（默认开） |
 | `includeFoldedBlocks` / `includeInlineMemo` | 折叠块 / 行内备注（默认关） |
 | `useRegex` | 搜索方法：`false`=关键字，`true`=正则表达式（默认关键字；跨次打开保持） |
 | `restrictInlineTypes` | 限制搜索类型（会话内；关闭搜索窗后清回空） |

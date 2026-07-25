@@ -50,8 +50,6 @@ export interface PluginPrefs {
     includeMathBlock: boolean;
     /** 是否匹配嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
     includeEmbedBlock: boolean;
-    /** 是否匹配挂件块（NodeWidget）；默认 true */
-    includeWidget: boolean;
     /** 是否匹配代码块（不含 Mermaid，由 includeMermaid 单独控制）；默认 true */
     includeCodeBlock: boolean;
     /** 是否匹配 Mermaid 图；默认 true */
@@ -108,7 +106,6 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeCallout: true,
     includeMathBlock: true,
     includeEmbedBlock: true,
-    includeWidget: true,
     includeCodeBlock: true,
     includeMermaid: true,
     includeHtmlBlock: true,
@@ -136,7 +133,6 @@ export function coercePluginPrefs(
         includeCallout: base.includeCallout !== false,
         includeMathBlock: base.includeMathBlock !== false,
         includeEmbedBlock: base.includeEmbedBlock !== false,
-        includeWidget: base.includeWidget !== false,
         includeCodeBlock: base.includeCodeBlock !== false,
         includeMermaid: base.includeMermaid !== false,
         includeHtmlBlock: base.includeHtmlBlock !== false,
@@ -178,9 +174,6 @@ export function mergePrefs(
         includeEmbedBlock: patch.includeEmbedBlock !== undefined
             ? patch.includeEmbedBlock
             : base.includeEmbedBlock,
-        includeWidget: patch.includeWidget !== undefined
-            ? patch.includeWidget
-            : base.includeWidget,
         includeCodeBlock: patch.includeCodeBlock !== undefined
             ? patch.includeCodeBlock
             : base.includeCodeBlock,

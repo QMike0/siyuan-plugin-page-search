@@ -45,7 +45,6 @@
   "settingsIncludeCallout": "提示块",
   "settingsIncludeMathBlock": "公式块",
   "settingsIncludeEmbedBlock": "嵌入块",
-  "settingsIncludeWidget": "挂件",
   "settingsIncludeCodeBlock": "代码块",
   "settingsIncludeMermaid": "Mermaid 图",
   "settingsIncludeHtmlBlock": "HTML 块",

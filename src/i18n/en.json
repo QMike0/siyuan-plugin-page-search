@@ -45,7 +45,6 @@
   "settingsIncludeCallout": "Callout",
   "settingsIncludeMathBlock": "Math block",
   "settingsIncludeEmbedBlock": "Embed block",
-  "settingsIncludeWidget": "Widget",
   "settingsIncludeCodeBlock": "Code blocks",
   "settingsIncludeMermaid": "Mermaid",
   "settingsIncludeHtmlBlock": "HTML block",

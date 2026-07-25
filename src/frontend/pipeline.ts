@@ -49,8 +49,6 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeMathBlock?: boolean;
     /** 是否匹配嵌入块及其内部渲染内容；默认 true */
     includeEmbedBlock?: boolean;
-    /** 是否匹配挂件块；默认 true */
-    includeWidget?: boolean;
     /** 是否匹配代码块（非 Mermaid）；默认 true */
     includeCodeBlock?: boolean;
     /** 是否匹配 Mermaid；默认 true */
@@ -238,7 +236,6 @@ export async function calculateSearchMatches(
                 includeCallout: options.includeCallout,
                 includeMathBlock: options.includeMathBlock,
                 includeEmbedBlock: options.includeEmbedBlock,
-                includeWidget: options.includeWidget,
                 includeCodeBlock: options.includeCodeBlock,
                 includeMermaid: options.includeMermaid,
                 includeHtmlBlock: options.includeHtmlBlock,
@@ -257,7 +254,6 @@ export async function calculateSearchMatches(
         includeCallout: options.includeCallout !== false,
         includeMathBlock: options.includeMathBlock !== false,
         includeEmbedBlock: options.includeEmbedBlock !== false,
-        includeWidget: options.includeWidget !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeMermaid: options.includeMermaid !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,

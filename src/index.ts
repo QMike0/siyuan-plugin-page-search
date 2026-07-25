@@ -326,7 +326,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeCallout: t.settingsIncludeCallout || "Callout",
             settingsIncludeMathBlock: t.settingsIncludeMathBlock || "Math block",
             settingsIncludeEmbedBlock: t.settingsIncludeEmbedBlock || "Embed block",
-            settingsIncludeWidget: t.settingsIncludeWidget || "Widget",
             settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
             settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
             settingsIncludeHtmlBlock: t.settingsIncludeHtmlBlock || "HTML block",
@@ -419,16 +418,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeEmbedBlock(value);
-        });
-    }
-
-    /** 将挂件匹配开关同步到其它已打开面板 */
-    syncIncludeWidget(value: boolean, source?: SearchBar) {
-        this.searchBars.forEach((bar) => {
-            if (bar === source) {
-                return;
-            }
-            bar.applyIncludeWidget(value);
         });
     }
 
@@ -764,7 +753,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeCallout: prefs.includeCallout !== false,
                     includeMathBlock: prefs.includeMathBlock !== false,
                     includeEmbedBlock: prefs.includeEmbedBlock !== false,
-                    includeWidget: prefs.includeWidget !== false,
                     includeCodeBlock: prefs.includeCodeBlock !== false,
                     includeMermaid: prefs.includeMermaid !== false,
                     includeHtmlBlock: prefs.includeHtmlBlock !== false,

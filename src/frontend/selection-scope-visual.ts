@@ -917,7 +917,6 @@ export function captureSelectionScopeWithKind(
         includeCallout?: boolean;
         includeMathBlock?: boolean;
         includeEmbedBlock?: boolean;
-        includeWidget?: boolean;
         includeCodeBlock?: boolean;
         includeMermaid?: boolean;
         includeHtmlBlock?: boolean;
@@ -937,7 +936,6 @@ export function captureSelectionScopeWithKind(
         includeCallout: options?.includeCallout !== false,
         includeMathBlock: options?.includeMathBlock !== false,
         includeEmbedBlock: options?.includeEmbedBlock !== false,
-        includeWidget: options?.includeWidget !== false,
         includeCodeBlock: options?.includeCodeBlock !== false,
         includeMermaid: options?.includeMermaid !== false,
         includeHtmlBlock: options?.includeHtmlBlock !== false,
