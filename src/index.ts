@@ -50,6 +50,12 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     private activeSearchComponentsCount = 0;
     private lastHighlightComponent: Element | null = null;
     private cleanupTimer: number | null = null;
+    /**
+     * 本次软件运行期内保留的查找/替换框文案（仅内存，不写 prefs）。
+     * 关闭搜索窗后再次打开可恢复；退出软件 / 禁用插件后丢弃。
+     */
+    private sessionSearchText = "";
+    private sessionReplaceText = "";
 
     isMobileView(): boolean {
         return this.isMobile;
@@ -573,6 +579,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             const bar = this.searchBars.get(element);
             this.searchBars.delete(element);
             if (bar) {
+                this.rememberSessionInputs(bar);
                 try {
                     bar.destroy();
                 } catch (error) {
@@ -651,6 +658,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
 
     closeSearchDialog() {
         this.searchBars.forEach((bar) => {
+            this.rememberSessionInputs(bar);
             try {
                 bar.destroy();
             } catch (error) {
@@ -668,12 +676,14 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         });
         this.lastHighlightComponent = null;
         // 限制查找不持久化：关闭时清回默认空，避免下次打开带回旧勾选
-        void rpcSetPrefs(this, {lastQuery: "", restrictInlineTypes: []});
+        // 查找/替换文案仅留在 session*，不写 prefs、不跨次启动恢复
+        void rpcSetPrefs(this, {restrictInlineTypes: []});
     }
 
     closeCurrentSearchDialog(element: Element, options?: {broadcast?: boolean}) {
         const bar = this.searchBars.get(element);
         if (bar) {
+            this.rememberSessionInputs(bar);
             try {
                 this.searchBars.delete(element);
                 bar.destroy();
@@ -688,7 +698,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             }
         }
 
-        void rpcSetPrefs(this, {lastQuery: "", restrictInlineTypes: []});
+        void rpcSetPrefs(this, {restrictInlineTypes: []});
 
         if (options?.broadcast) {
             void rpcEmitSearchState(this, {
@@ -696,6 +706,12 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 clientId: this.clientId,
             });
         }
+    }
+
+    /** 关闭前记下输入框文案，供本进程内再次打开时恢复 */
+    private rememberSessionInputs(bar: SearchBar) {
+        this.sessionSearchText = bar.getSearchText();
+        this.sessionReplaceText = bar.getReplaceText();
     }
 
     closePanel() {
@@ -748,9 +764,11 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         }
 
         const prefs = await rpcGetPrefs(this);
+        // 会话内保留查找/替换文案；有选区时优先用选区填查找框（对齐常见编辑器）
         const selectedText = this.getSelectedText();
-        // 仅预填当前选区；关闭窗口时会清空 lastQuery，不再恢复历史关键词
-        const initialQuery = selectedText || "";
+        const initialQuery = selectedText || this.sessionSearchText;
+        const initialReplace = this.sessionReplaceText;
+        const selectSearchOnOpen = !selectedText;
 
         edits.forEach((edit) => {
             const existingElement = mobile
@@ -774,6 +792,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     plugin: this,
                     i18n: this.getSearchI18n(),
                     presetText: initialQuery || undefined,
+                    presetReplaceText: initialReplace || undefined,
+                    selectSearchOnOpen,
                     replaceVisible: replaceVisibleOnCreate,
                     includeDocTitle: prefs.includeDocTitle !== false,
                     includeImageTitle: prefs.includeImageTitle !== false,

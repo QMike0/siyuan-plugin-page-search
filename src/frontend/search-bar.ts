@@ -292,6 +292,13 @@ export class SearchBar {
         plugin: Plugin & SearchBarHost;
         i18n: SearchBarI18n;
         presetText?: string;
+        /** 打开时预填替换框（会话恢复；不触发搜索） */
+        presetReplaceText?: string;
+        /**
+         * 预填查找词后是否全选。
+         * 选区带入时一般不选；会话恢复 / 空框打开时全选便于覆盖输入。
+         */
+        selectSearchOnOpen?: boolean;
         /** 打开时是否展开替换行（Ctrl+H） */
         replaceVisible?: boolean;
         /** 是否匹配文档标题（来自全局 prefs） */
@@ -406,11 +413,19 @@ export class SearchBar {
         // 抢焦点前先记下编辑器光标，关闭时再还回去（对齐 VS Code / Cursor）
         this.captureEditorCaretIfNeeded();
 
-        // presetText 仅预填关键词，不开启 selectionOnly
+        if (options.presetReplaceText) {
+            this.replaceText = options.presetReplaceText;
+            this.replaceInput.value = options.presetReplaceText;
+        }
+
+        // presetText 预填关键词；selectSearchOnOpen 控制是否全选
         if (options.presetText) {
             this.searchText = options.presetText;
             this.input.value = options.presetText;
             this.input.focus();
+            if (options.selectSearchOnOpen !== false) {
+                this.input.select();
+            }
             void this.highlightHitResult(options.presetText, true);
         } else {
             this.input.focus();
@@ -420,6 +435,16 @@ export class SearchBar {
                 void this.highlightHitResult("", true);
             }
         }
+    }
+
+    /** 当前查找框文案（关闭会话恢复用） */
+    getSearchText(): string {
+        return this.input?.value ?? this.searchText;
+    }
+
+    /** 当前替换框文案（关闭会话恢复用） */
+    getReplaceText(): string {
+        return this.replaceInput?.value ?? this.replaceText;
     }
 
     destroy() {
