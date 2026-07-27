@@ -1,6 +1,6 @@
 import type {IOperation, Protyle} from "siyuan";
 import {getAllEditor} from "siyuan";
-import {ATTRIBUTE_VIEW_TYPE, isPreviewSyntheticBlock} from "./blocks";
+import {ATTRIBUTE_VIEW_TYPE, isPreviewSyntheticBlock, isPreviewSyntheticBlockId} from "./blocks";
 import {collectSearchableBlocks} from "./blocks";
 import type {SearchableBlock} from "./dom-types";
 import type {SearchMatch} from "./dom-types";
@@ -16,7 +16,6 @@ import {
 import {unitKey} from "./selection";
 
 const DOC_TITLE_BLOCK_ID = "__doc-title__";
-const PREVIEW_BLOCK_ID = "__preview__";
 
 export interface ReplaceWriteOptions {
     preserveCase?: boolean;
@@ -109,7 +108,7 @@ export function isMatchWritable(
     if (match.blockType === ATTRIBUTE_VIEW_TYPE) {
         return false;
     }
-    if (match.blockId === PREVIEW_BLOCK_ID) {
+    if (isPreviewSyntheticBlockId(match.blockId)) {
         return false;
     }
     return true;
@@ -180,7 +179,8 @@ export async function replaceCurrentMatchInEditor(
         return {replacedCount: 0, skippedCount: 1, error: "block-missing"};
     }
 
-    const blocks = collectSearchableBlocks(edit).filter((block) => !isPreviewSyntheticBlock(block));
+    const blocks = collectSearchableBlocks(edit, {includeInlineMemo: true})
+        .filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks);
     const unit = unitsByKey.get(unitKey(match.blockId, match.unitId));
     if (!unit) {
@@ -284,7 +284,8 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
-    const blocks = collectSearchableBlocks(edit).filter((block) => !isPreviewSyntheticBlock(block));
+    const blocks = collectSearchableBlocks(edit, {includeInlineMemo: true})
+        .filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks);
 
     const grouped = new Map<string, SearchMatch[]>();

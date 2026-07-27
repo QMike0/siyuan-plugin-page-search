@@ -16,6 +16,7 @@ import {
     isDocTitleSearchUnit,
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
+    isPreviewSyntheticBlockId,
 } from "./blocks";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
 import {createRangeFromBlockOffsets, isRangePlainTextOnly} from "./ranges";
@@ -81,7 +82,6 @@ export interface SearchPipelineResult {
 const TABLE_CELL_CLOSEST = '[data-type="NodeTableCell"], .table__cell, td, th';
 const DOC_TITLE_BLOCK_ID = "__doc-title__";
 const DOC_TITLE_BLOCK_TYPE = "doc-title";
-const PREVIEW_BLOCK_ID = "__preview__";
 const PREVIEW_BLOCK_TYPE = "preview";
 
 function toSearchableUnit(block: SearchableBlock): SearchableUnit {
@@ -155,7 +155,7 @@ function isDomReplaceable(
     }
     if (
         blockType === PREVIEW_BLOCK_TYPE
-        || blockId === PREVIEW_BLOCK_ID
+        || (blockId != null && isPreviewSyntheticBlockId(blockId))
     ) {
         return false;
     }
@@ -369,13 +369,12 @@ function attachRangesToHits(
         accepted.push({start: hit.start, end: hit.end});
         acceptedByUnit.set(key, accepted);
 
-        // 2) 元素级：数据库 / 公式等；行内备注与行内公式只搜不替
+        // 2) 元素级：数据库 / 公式等不可替；行内备注改属性，不要求 Range 纯 Text
         // 文档标题：可替（renameDoc）；编辑中 Protyle 常把连续字拆成多个相邻 Text
-        const replaceable = !isMemo
-            && !isMath
+        const replaceable = !isMath
             && !modeBlocked
             && isDomReplaceable(range, hit.blockType, hit.blockId)
-            && (isDocTitle || isRangePlainTextOnly(range));
+            && (isMemo || isDocTitle || isRangePlainTextOnly(range));
 
         result.push({
             id: hit.id,

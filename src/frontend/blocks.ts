@@ -1,5 +1,6 @@
 import {
   normalizeRestrictInlineTypes,
+  plainTextFromInlineMemoContent,
   shouldCollectBodyTextForRestrict,
   shouldCollectInlineMathUnits,
   shouldCollectInlineMemoUnits,
@@ -1033,8 +1034,14 @@ function isOwnedByBlock(element: Element, ownerBlock: HTMLElement): boolean {
   return getOwnerBlock(element) === ownerBlock
 }
 
+/** 预览合成块，或无归属宿主时的备注/公式伪 id（`__preview__-memo-N` 等） */
+export function isPreviewSyntheticBlockId(blockId: string): boolean {
+  return blockId === PREVIEW_BLOCK_ID
+    || blockId.startsWith(`${PREVIEW_BLOCK_ID}-`)
+}
+
 export function isPreviewSyntheticBlock(block: SearchableBlock): boolean {
-  return block.blockId === PREVIEW_BLOCK_ID
+  return isPreviewSyntheticBlockId(block.blockId)
 }
 
 /**
@@ -1092,24 +1099,6 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
   }
 
   return units
-}
-
-/** 备注属性可能含已消毒 HTML；匹配用纯文本 */
-function plainTextFromInlineMemoContent(raw: string): string {
-  const value = raw ?? ''
-  if (!value) {
-    return ''
-  }
-  if (!/<[a-zA-Z!/?]/.test(value)) {
-    return value
-  }
-  try {
-    const template = document.createElement('template')
-    template.innerHTML = value
-    return template.content.textContent ?? ''
-  } catch {
-    return value.replace(/<[^>]*>/g, '')
-  }
 }
 
 export function isInlineMemoSearchUnit(block: Pick<SearchableBlock, 'matchSource' | 'unitId'>): boolean {
@@ -1205,7 +1194,7 @@ export function isInlineMathSearchUnit(block: Pick<SearchableBlock, 'matchSource
     || Boolean(block.unitId?.startsWith(INLINE_MATH_UNIT_PREFIX))
 }
 
-/** 备注或公式等属性型 unit（Range 对准宿主、默认不可替） */
+/** 备注或公式等属性型 unit（Range 对准宿主；公式不可替，备注可走属性写回） */
 export function isAttributeInlineSearchUnit(
   block: Pick<SearchableBlock, 'matchSource' | 'unitId'>,
 ): boolean {

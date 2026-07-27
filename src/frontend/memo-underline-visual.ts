@@ -101,6 +101,22 @@ export function applyMemoUnderlineVisual(
     }
 }
 
+/**
+ * 同一备注宿主上多处命中切换时：焦点虚线先黄再闪回橙，提示索引已变。
+ * 仅改叠加层 class，不碰内容块；可重复调用以重启动画。
+ */
+export function pulseMemoFocusUnderline(edit: Element): void {
+    const lines = edit.querySelectorAll(
+        `.protyle-content > .${MEMO_UNDERLINE_LAYER} .${MEMO_UNDERLINE}.is-focus`,
+    );
+    for (const line of lines) {
+        line.classList.remove("is-focus-pulse");
+        // 强制重排，确保连续「下一个」能重启 CSS animation
+        void (line as HTMLElement).offsetWidth;
+        line.classList.add("is-focus-pulse");
+    }
+}
+
 function rangesEqual(a: Range, b: Range): boolean {
     try {
         return a.compareBoundaryPoints(Range.START_TO_START, b) === 0

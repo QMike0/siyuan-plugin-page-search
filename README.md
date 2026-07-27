@@ -47,7 +47,7 @@ Gear menu:
 
 Notes:
 
-- **Inline memos**: Include = search memo attributes in full-document mode; Limit search → Inline memo = include them in the OR set (requires Include first)
+- **Inline memos**: Include = search memo attributes in full-document mode; Limit search → Inline memo = include them in the OR set (requires Include first); dashed underline on hits; replace updates only `data-inline-memo-content` (not host visible text) via Protyle transaction (Ctrl+Z)
 - **Inline math**: matches KaTeX **rendered visible text** (not `data-content` LaTeX, so “d” won’t hit `\delta`); separate units cover body and table formulas; yellow/orange highlight; not replaceable
 - With Limit search off, behavior matches the previous release (AV / code / Mermaid / fold / memo underlines unchanged)
 
@@ -60,6 +60,7 @@ Writes go through the current document’s **Protyle transaction** (`updateTrans
 - **Loaded DOM only**: off-screen / unloaded blocks are out of scope for this release  
 - **Regex replace**: with regex search on, the replace string is a `$n` template (e.g. find `(\d+)-(\d+)`, replace `$2/$1`); without regex, replace stays literal  
 - **Document title**: searchable & replaceable (toggle under Include in search); write-back uses `/api/filetree/renameDocByID` (or `renameDoc`) (**not** Ctrl+Z); replace-all merges title hits into one rename, separate from body transactions; empty result matches SiYuan: send `""` to the API so the kernel stores Language(16) with `custom-sy-title-empty`, while the title input shows empty (placeholder)  
+- **Inline memos**: attribute write-back with the owning block’s transaction (undoable); empty-query restrict preview stays non-replaceable  
 
 ### Not auto-replaceable (still searchable / highlightable)
 

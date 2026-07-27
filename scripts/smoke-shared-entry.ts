@@ -26,8 +26,10 @@ import {
     normalizeRestrictInlineTypes,
     normalizeSearchStateEvent,
     parseDataTypeTokens,
+    plainTextFromInlineMemoContent,
     rangeRestrictTokens,
     sanitizeDocTitle,
+    sanitizeInlineMemoContentForWrite,
     shouldCollectBodyTextForRestrict,
     shouldCollectInlineMathUnits,
     shouldCollectInlineMemoUnits,
@@ -586,4 +588,10 @@ assert(isValidDocTitle("ok"), "valid title");
 assert(isValidDocTitle(""), "empty title is valid for API");
 assert(!isValidDocTitle("bad\n"), "invalid title newline");
 
-console.log("smoke:shared OK (match + restrict + selection + preserve-case + regex-replace + doc-title)");
+// --- 行内备注属性纯文本（替换坐标系）---
+assert(plainTextFromInlineMemoContent("plain memo") === "plain memo", "memo plain passthrough");
+assert(plainTextFromInlineMemoContent("a <b>x</b> c") === "a x c", "memo strips tags");
+assert(plainTextFromInlineMemoContent("") === "", "memo empty");
+assert(sanitizeInlineMemoContentForWrite("keep") === "keep", "memo sanitize noop without DOMPurify");
+
+console.log("smoke:shared OK (match + restrict + selection + preserve-case + regex-replace + doc-title + inline-memo)");

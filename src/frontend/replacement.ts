@@ -1,6 +1,11 @@
 import type {SearchableBlock} from "./dom-types";
 import type {SearchMatch} from "./dom-types";
-import {expandRegexReplacement} from "../shared";
+import {
+    expandRegexReplacement,
+    plainTextFromInlineMemoContent,
+    sanitizeInlineMemoContentForWrite,
+} from "../shared";
+import {isInlineMemoSearchUnit} from "./blocks";
 import {preserveReplacementCase} from "./preserve-case";
 import {
     isRangePlainTextOnly,
@@ -117,6 +122,59 @@ export function applyReplacementsToString(
     }
 
     return {text, appliedCount, skippedCount, regexExpandFailedCount};
+}
+
+/**
+ * 行内备注：在 data-inline-memo-content 的纯文本视图上替换，再写回属性。
+ *
+ * 刻意不改宿主 span 可见字（与内核 findReplace 同时改 TextMarkTextContent 不同）：
+ * 本插件备注命中与正文命中分属不同 unit，宿主字可单独搜替，避免一次替换双改、导航到虚线命中却改了正文。
+ *
+ * @see https://github.com/siyuan-note/siyuan/blob/master/kernel/model/search.go inline-memo
+ * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/toolbar/index.ts showRender
+ */
+export function applyReplacementsToInlineMemoElement(
+    host: HTMLElement,
+    replacements: ReplacementSpec[],
+    replacementText: string,
+    options: ApplyReplacementOptions = {},
+): ApplyReplacementOutcome {
+    if (!replacements.length) {
+        return {appliedCount: 0, skippedCount: 0, regexExpandFailedCount: 0};
+    }
+    if (!host.matches('span[data-type~="inline-memo"]')) {
+        return {
+            appliedCount: 0,
+            skippedCount: replacements.length,
+            regexExpandFailedCount: 0,
+        };
+    }
+
+    const raw = host.getAttribute("data-inline-memo-content") ?? "";
+    const haystack = plainTextFromInlineMemoContent(raw);
+    const outcome = applyReplacementsToString(
+        haystack,
+        replacements,
+        replacementText,
+        options,
+    );
+    if (outcome.appliedCount === 0) {
+        return {
+            appliedCount: 0,
+            skippedCount: outcome.skippedCount,
+            regexExpandFailedCount: outcome.regexExpandFailedCount,
+        };
+    }
+
+    host.setAttribute(
+        "data-inline-memo-content",
+        sanitizeInlineMemoContentForWrite(outcome.text),
+    );
+    return {
+        appliedCount: outcome.appliedCount,
+        skippedCount: outcome.skippedCount,
+        regexExpandFailedCount: outcome.regexExpandFailedCount,
+    };
 }
 
 /**
@@ -336,6 +394,19 @@ export function applyMatchesToSubmitClone(
             continue;
         }
 
+        if (isInlineMemoSearchUnit(unit)) {
+            const outcome = applyReplacementsToInlineMemoElement(
+                cloneUnitNode,
+                specs,
+                replacementText,
+                options,
+            );
+            appliedCount += outcome.appliedCount;
+            skippedCount += outcome.skippedCount;
+            regexExpandFailedCount += outcome.regexExpandFailedCount;
+            continue;
+        }
+
         const cloneTextNodes = mapTextNodesToClone(unit.element, cloneUnitNode, unit.textNodes);
         if (!cloneTextNodes.length) {
             skippedCount += specs.length;
@@ -385,6 +456,18 @@ export function applyMatchesToLiveUnits(
         const unit = unitsByKey.get(key);
         if (!unit) {
             skippedCount += specs.length;
+            continue;
+        }
+        if (isInlineMemoSearchUnit(unit)) {
+            const outcome = applyReplacementsToInlineMemoElement(
+                unit.element,
+                specs,
+                replacementText,
+                options,
+            );
+            appliedCount += outcome.appliedCount;
+            skippedCount += outcome.skippedCount;
+            regexExpandFailedCount += outcome.regexExpandFailedCount;
             continue;
         }
         const outcome = applyReplacementsToTextNodes(

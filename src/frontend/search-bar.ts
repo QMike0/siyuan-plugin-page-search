@@ -49,13 +49,14 @@ import {
 import {
     applyMemoUnderlineVisual,
     clearMemoUnderlineVisual,
+    pulseMemoFocusUnderline,
 } from "./memo-underline-visual";
+import type {SearchMatch} from "./dom-types";
 import {
     collectNonHeadingFoldedAncestorIds,
     unfoldNonHeadingFoldedBlocks,
     waitForLayout,
 } from "./fold";
-import type {SearchMatch} from "./dom-types";
 
 /** 限制查找菜单：类型 → 图标（对齐思源 hint/工具栏符号 id） */
 const RESTRICT_INLINE_ICONS: Record<RestrictInlineType, string> = {
@@ -1398,15 +1399,19 @@ export class SearchBar {
         window.clearTimeout(this.avRefreshTimer);
     }
 
-    private scrollIntoRanges(index: number, scroll: boolean = true) {
-        void this.scrollIntoRangesAsync(index, scroll);
+    private scrollIntoRanges(index: number, scroll: boolean = true, pulseMemoFocus = false) {
+        void this.scrollIntoRangesAsync(index, scroll, pulseMemoFocus);
     }
 
     /**
      * 跳转命中：若开启折叠内容搜索，先展开路径上的非标题折叠块，再滚动高亮。
      * 匹配阶段不展开，避免改文档状态与性能开销。
      */
-    private async scrollIntoRangesAsync(index: number, scroll: boolean = true) {
+    private async scrollIntoRangesAsync(
+        index: number,
+        scroll: boolean = true,
+        pulseMemoFocus = false,
+    ) {
         // 滚动可能触发 AV 虚拟滚动 DOM 突变；短暂暂停观察，防止重搜重置索引
         if (scroll) {
             this.pauseAvWatch(600);
@@ -1465,10 +1470,19 @@ export class SearchBar {
             this.plugin.updateLastHighlightComponent(this.root);
         }
         this.syncMemoUnderlineVisual();
+        // 异步展开折叠后索引可能已变；仅当仍停在本次目标命中时才脉冲
+        if (
+            pulseMemoFocus
+            && match.highlightKind === "inline-memo"
+            && this.getCurrentMatch()?.id === match.id
+        ) {
+            pulseMemoFocusUnderline(this.edit);
+        }
         this.syncReplaceButtons();
     }
 
     private clickLast() {
+        const prevMatch = this.getCurrentMatch();
         if (this.resultCount === 0) {
             this.resultIndex = 0;
         } else if (this.resultIndex > 1 && this.resultIndex <= this.resultCount) {
@@ -1477,10 +1491,16 @@ export class SearchBar {
             this.resultIndex = this.resultCount;
         }
         this.updateCountLabel();
-        this.scrollIntoRanges(this.resultIndex - 1);
+        const nextMatch = this.resultMatches[this.resultIndex - 1];
+        this.scrollIntoRanges(
+            this.resultIndex - 1,
+            true,
+            shouldPulseMemoFocusOnNavigate(prevMatch, nextMatch),
+        );
     }
 
     private clickNext() {
+        const prevMatch = this.getCurrentMatch();
         if (this.resultCount === 0) {
             this.resultIndex = 0;
         } else if (this.resultIndex < this.resultCount) {
@@ -1489,7 +1509,12 @@ export class SearchBar {
             this.resultIndex = 1;
         }
         this.updateCountLabel();
-        this.scrollIntoRanges(this.resultIndex - 1);
+        const nextMatch = this.resultMatches[this.resultIndex - 1];
+        this.scrollIntoRanges(
+            this.resultIndex - 1,
+            true,
+            shouldPulseMemoFocusOnNavigate(prevMatch, nextMatch),
+        );
     }
 
     private clickClose() {
@@ -2616,6 +2641,40 @@ function escapeAttr(value: string): string {
         .replace(/"/g, "&quot;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
+}
+
+/**
+ * 同一行内备注宿主上、不同属性偏移命中之间导航时，虚线焦点色不变，需短脉冲提示。
+ * 仅看 highlightKind + unitId（或 Range 边界）；不碰内容 DOM。
+ */
+function shouldPulseMemoFocusOnNavigate(
+    prev: SearchMatch | null | undefined,
+    next: SearchMatch | null | undefined,
+): boolean {
+    if (!prev || !next) {
+        return false;
+    }
+    if (prev.highlightKind !== "inline-memo" || next.highlightKind !== "inline-memo") {
+        return false;
+    }
+    if (prev.id === next.id) {
+        return false;
+    }
+    if (prev.start === next.start && prev.end === next.end) {
+        return false;
+    }
+    if (prev.unitId && next.unitId) {
+        return prev.unitId === next.unitId;
+    }
+    if (prev.range && next.range) {
+        try {
+            return prev.range.compareBoundaryPoints(Range.START_TO_START, next.range) === 0
+                && prev.range.compareBoundaryPoints(Range.END_TO_END, next.range) === 0;
+        } catch {
+            return false;
+        }
+    }
+    return false;
 }
 
 function findScrollContainers(element: Element): HTMLElement[] {

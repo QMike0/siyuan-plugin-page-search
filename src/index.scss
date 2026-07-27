@@ -467,6 +467,34 @@ body.page-search-resizing * {
     );
 }
 
+/* 同宿主多命中导航：橙→黄→橙，仅叠加层，不进内容块 */
+.page-search-memo-underline.is-focus.is-focus-pulse {
+    animation: page-search-memo-focus-pulse 180ms ease-out;
+}
+
+@keyframes page-search-memo-focus-pulse {
+    0%,
+    35% {
+        background-image: repeating-linear-gradient(
+            to right,
+            rgb(235, 235, 5) 0,
+            rgb(235, 235, 5) 12px,
+            transparent 12px,
+            transparent 18px
+        );
+    }
+
+    100% {
+        background-image: repeating-linear-gradient(
+            to right,
+            rgb(255, 150, 50) 0,
+            rgb(255, 150, 50) 12px,
+            transparent 12px,
+            transparent 18px
+        );
+    }
+}
+
 /**
  * 「仅在选区内查找」冻结选区提示。
  * 块选底色 / 行内色块 / 竖线：全部叠加在 .protyle-content（不改内容块 DOM）。

@@ -56,7 +56,7 @@
   "settingsIncludeFoldedBlocks": "Folded block content",
   "settingsIncludeFoldedBlocksHint": "Controls whether to search hidden content inside folded blocks (excluding folded headings)",
   "settingsIncludeInlineMemo": "Inline memos",
-  "settingsIncludeInlineMemoHint": "Matches show a yellow/orange dashed underline under the corresponding text",
+  "settingsIncludeInlineMemoHint": "Matches show a yellow/orange dashed underline under the corresponding text; replacement is supported and can be undone with Ctrl+Z",
   "settingsRestrictBlockRef": "Block ref",
   "settingsRestrictLink": "Link",
   "settingsRestrictStrong": "Bold",
@@ -72,7 +72,7 @@
   "settingsRestrictInlineMath": "Inline math",
   "settingsRestrictInlineMathHint": "Match visible rendered formula text (not LaTeX source); not replaceable",
   "settingsRestrictInlineMemo": "Inline memo",
-  "settingsRestrictInlineMemoHint": "Turn on Include in search → Inline memos first; not replaceable",
-  "settingsRestrictInlineMemoOnHint": "Turn on Include in search → Inline memos first; not replaceable",
+  "settingsRestrictInlineMemoHint": "Turn on Include in search → Inline memos first",
+  "settingsRestrictInlineMemoOnHint": "Turn on Include in search → Inline memos first",
   "invalidRegex": "Invalid regex: {error}"
 }

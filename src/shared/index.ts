@@ -23,6 +23,10 @@ export {
 } from "./regex-replace";
 export type {ExpandRegexReplacementOptions} from "./regex-replace";
 export {
+    plainTextFromInlineMemoContent,
+    sanitizeInlineMemoContentForWrite,
+} from "./inline-memo-content";
+export {
     ATTRIBUTE_VIEW_TYPE,
     NON_REPLACEABLE_DOM_CLOSEST,
 } from "./replaceable";

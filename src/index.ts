@@ -343,7 +343,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 || "Controls whether to search hidden content inside folded blocks (excluding folded headings)",
             settingsIncludeInlineMemo: t.settingsIncludeInlineMemo || "Inline memos",
             settingsIncludeInlineMemoHint: t.settingsIncludeInlineMemoHint
-                || "Matches show a yellow/orange dashed underline under the corresponding text",
+                || "Matches show a yellow/orange dashed underline under the corresponding text; replacement is supported and can be undone with Ctrl+Z",
             settingsRestrictBlockRef: t.settingsRestrictBlockRef || "Block ref",
             settingsRestrictLink: t.settingsRestrictLink || "Link",
             settingsRestrictStrong: t.settingsRestrictStrong || "Bold",
@@ -361,9 +361,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 || "Match visible rendered formula text (not LaTeX source); not replaceable",
             settingsRestrictInlineMemo: t.settingsRestrictInlineMemo || "Inline memo",
             settingsRestrictInlineMemoHint: t.settingsRestrictInlineMemoHint
-                || "Turn on Include in search → Inline memos first; not replaceable",
+                || "Turn on Include in search → Inline memos first",
             settingsRestrictInlineMemoOnHint: t.settingsRestrictInlineMemoOnHint
-                || "Turn on Include in search → Inline memos first; not replaceable",
+                || "Turn on Include in search → Inline memos first",
             invalidRegex: t.invalidRegex || "Invalid regex: {error}",
         };
     }
