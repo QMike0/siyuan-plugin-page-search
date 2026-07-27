@@ -41,7 +41,7 @@ Gear menu:
 
 | Group | Role |
 |------|------|
-| **Include in search** | Whether to include document title, inline memos, databases, tables, blockquotes, callouts, math blocks, embed blocks, code blocks, Mermaid, HTML blocks |
+| **Include in search** | Whether to include document title, image title, inline memos, databases, tables, blockquotes, callouts, math blocks, embed blocks, code blocks, Mermaid, HTML blocks |
 | **Folded block content** | Match hidden content in non-heading folded blocks (independent of Limit search) |
 | **Limit search** | Search only within selected inline types (OR; all off = no limit). Empty search box previews all hosts of selected types (not replaceable; counts over 999 show as `999+` while still highlighting all). Order: block ref, link, bold, italic, underline, strike, highlight, superscript, subscript, inline code, keyboard, tag, inline math, inline memo. Stacks with Search in selection |
 
@@ -72,7 +72,7 @@ Writes go through the current document’s **Protyle transaction** (`updateTrans
 | Math / render-only | Inline math, block math, etc. |
 | Preview synthetic block | Skipped when there is no stable block id |
 
-Note: SiYuan sets Callout roots to `contenteditable="false"` (title edited via dialog). Tables may also sit under false containers. This plugin still allows **callout titles** and **table cells** to be updated via whole-block HTML transactions (same path SiYuan uses).
+Note: SiYuan sets Callout roots to `contenteditable="false"` (title edited via dialog). Tables may also sit under false containers. Image `.img` wrappers are likewise false, with the caption in `.protyle-action__title`. This plugin still allows **callout titles**, **table cells**, and **image titles** to be updated via whole-block HTML transactions (same path SiYuan uses; Ctrl+Z supported).
 
 **Replace** on a non-replaceable hit shows a tip and advances; **Replace all** counts them as skipped.
 
@@ -101,7 +101,7 @@ Stored at `data/storage/petal/<plugin>/prefs.json` (same path for kernel `storag
 | Field | Meaning |
 |------|---------|
 | `dialogLeft` / `dialogTop` | Dragged position (cleared when resetting via top bar) |
-| `includeDocTitle` / `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in search (default on; document title searchable & replaceable by default) |
+| `includeDocTitle` / `includeImageTitle` / `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in search (default on; document title / image title searchable & replaceable by default) |
 | `includeFoldedBlocks` / `includeInlineMemo` | Folded blocks / inline memos (default off) |
 | `useRegex` | Search method: `false`=keyword, `true`=regular expression (default keyword; kept across reopen) |
 | `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |

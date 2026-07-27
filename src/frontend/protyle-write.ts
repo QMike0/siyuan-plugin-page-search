@@ -179,7 +179,10 @@ export async function replaceCurrentMatchInEditor(
         return {replacedCount: 0, skippedCount: 1, error: "block-missing"};
     }
 
-    const blocks = collectSearchableBlocks(edit, {includeInlineMemo: true})
+    const blocks = collectSearchableBlocks(edit, {
+        includeInlineMemo: true,
+        includeImageTitle: true,
+    })
         .filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks);
     const unit = unitsByKey.get(unitKey(match.blockId, match.unitId));
@@ -284,7 +287,10 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
-    const blocks = collectSearchableBlocks(edit, {includeInlineMemo: true})
+    const blocks = collectSearchableBlocks(edit, {
+        includeInlineMemo: true,
+        includeImageTitle: true,
+    })
         .filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks);
 

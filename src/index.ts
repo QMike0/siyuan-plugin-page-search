@@ -327,6 +327,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeDocTitle: t.settingsIncludeDocTitle || "Document title",
             settingsIncludeDocTitleHint: t.settingsIncludeDocTitleHint
                 || "Replacing the document title cannot be undone with Ctrl+Z",
+            settingsIncludeImageTitle: t.settingsIncludeImageTitle || "Image title",
             settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database",
             settingsIncludeTable: t.settingsIncludeTable || "Table",
             settingsIncludeBlockquote: t.settingsIncludeBlockquote || "Blockquote",
@@ -375,6 +376,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeDocTitle(value);
+        });
+    }
+
+    /** 将图片标题匹配开关同步到其它已打开面板 */
+    syncIncludeImageTitle(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeImageTitle(value);
         });
     }
 
@@ -765,6 +776,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     presetText: initialQuery || undefined,
                     replaceVisible: replaceVisibleOnCreate,
                     includeDocTitle: prefs.includeDocTitle !== false,
+                    includeImageTitle: prefs.includeImageTitle !== false,
                     includeAttributeView: prefs.includeAttributeView !== false,
                     includeTable: prefs.includeTable !== false,
                     includeBlockquote: prefs.includeBlockquote !== false,

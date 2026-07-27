@@ -92,6 +92,8 @@ export function enumerateRestrictInlineMatches(
 
     // 选区偏移与 blockIndex：用「不限制」采集，保证正文块完整
     const scopeBlocks = collectSearchableBlocks(edit, {
+        includeDocTitle: options.includeDocTitle,
+        includeImageTitle: options.includeImageTitle,
         includeAttributeView,
         includeTable,
         includeBlockquote,

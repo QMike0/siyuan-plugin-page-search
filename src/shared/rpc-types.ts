@@ -40,6 +40,11 @@ export interface PluginPrefs {
     lastQuery: string;
     /** 是否匹配文档标题（.protyle-title__input）；默认 true；可替换（重命名，不可 Ctrl+Z） */
     includeDocTitle: boolean;
+    /**
+     * 是否匹配图片标题（`.img .protyle-action__title` 可见字，对应官方 imgTitle）；默认 true。
+     * 可替换：写回可见标题并同步 img[title]，走块 transaction，可 Ctrl+Z。
+     */
+    includeImageTitle: boolean;
     /** 是否匹配文档内数据库（Attribute View）；默认 true */
     includeAttributeView: boolean;
     /** 是否匹配表格块（NodeTable）；默认 true */
@@ -103,6 +108,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     dialogTop: null,
     lastQuery: "",
     includeDocTitle: true,
+    includeImageTitle: true,
     includeAttributeView: true,
     includeTable: true,
     includeBlockquote: true,
@@ -131,6 +137,7 @@ export function coercePluginPrefs(
         dialogTop: typeof base.dialogTop === "number" ? base.dialogTop : null,
         lastQuery: typeof base.lastQuery === "string" ? base.lastQuery : "",
         includeDocTitle: base.includeDocTitle !== false,
+        includeImageTitle: base.includeImageTitle !== false,
         includeAttributeView: base.includeAttributeView !== false,
         includeTable: base.includeTable !== false,
         includeBlockquote: base.includeBlockquote !== false,
@@ -163,6 +170,9 @@ export function mergePrefs(
         includeDocTitle: patch.includeDocTitle !== undefined
             ? patch.includeDocTitle
             : base.includeDocTitle,
+        includeImageTitle: patch.includeImageTitle !== undefined
+            ? patch.includeImageTitle
+            : base.includeImageTitle,
         includeAttributeView: patch.includeAttributeView !== undefined
             ? patch.includeAttributeView
             : base.includeAttributeView,

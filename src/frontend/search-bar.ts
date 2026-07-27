@@ -122,6 +122,7 @@ export interface SearchBarI18n {
     settingsIncludeScopeHint: string;
     settingsIncludeDocTitle: string;
     settingsIncludeDocTitleHint: string;
+    settingsIncludeImageTitle: string;
     settingsIncludeAttributeView: string;
     settingsIncludeTable: string;
     settingsIncludeBlockquote: string;
@@ -166,6 +167,8 @@ export interface SearchBarHost {
     onSearchComponentUnmounted(callback?: (event: CustomEvent) => void): void;
     /** 将文档标题匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeDocTitle?(value: boolean, source?: SearchBar): void;
+    /** 将图片标题匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeImageTitle?(value: boolean, source?: SearchBar): void;
     /** 将数据库匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeAttributeView?(value: boolean, source?: SearchBar): void;
     /** 将表格匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -222,6 +225,8 @@ export class SearchBar {
     private selectionOnly = false;
     /** 是否匹配文档标题；全局 prefs，默认 true */
     private includeDocTitle = true;
+    /** 是否匹配图片标题；全局 prefs，默认 true */
+    private includeImageTitle = true;
     /** 是否匹配数据库；全局 prefs，默认 true */
     private includeAttributeView = true;
     /** 是否匹配表格块；全局 prefs，默认 true */
@@ -291,6 +296,8 @@ export class SearchBar {
         replaceVisible?: boolean;
         /** 是否匹配文档标题（来自全局 prefs） */
         includeDocTitle?: boolean;
+        /** 是否匹配图片标题（来自全局 prefs） */
+        includeImageTitle?: boolean;
         /** 是否匹配数据库（来自全局 prefs） */
         includeAttributeView?: boolean;
         /** 是否匹配表格块（来自全局 prefs） */
@@ -325,6 +332,7 @@ export class SearchBar {
         this.replaceVisible = Boolean(options.replaceVisible);
         this.regex = options.useRegex === true;
         this.includeDocTitle = options.includeDocTitle !== false;
+        this.includeImageTitle = options.includeImageTitle !== false;
         this.includeAttributeView = options.includeAttributeView !== false;
         this.includeTable = options.includeTable !== false;
         this.includeBlockquote = options.includeBlockquote !== false;
@@ -784,6 +792,7 @@ export class SearchBar {
     private captureSelectionScope() {
         const {scope, kind, visualBlockIds, tableCellRefs} = captureSelectionScopeWithKind(this.edit, {
             includeDocTitle: this.includeDocTitle,
+            includeImageTitle: this.includeImageTitle,
             includeAttributeView: this.includeAttributeView,
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
@@ -808,6 +817,7 @@ export class SearchBar {
         }
         const blocks = collectSearchableBlocks(this.edit, {
             includeDocTitle: this.includeDocTitle,
+            includeImageTitle: this.includeImageTitle,
             includeAttributeView: this.includeAttributeView,
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
@@ -825,6 +835,7 @@ export class SearchBar {
             // 仍有现场选区时同步提示（用户改选了范围）；光标挪走后 live 为空则保持冻结提示
             const captured = captureSelectionScopeWithKind(this.edit, {
                 includeDocTitle: this.includeDocTitle,
+                includeImageTitle: this.includeImageTitle,
                 includeAttributeView: this.includeAttributeView,
                 includeTable: this.includeTable,
                 includeBlockquote: this.includeBlockquote,
@@ -1093,6 +1104,7 @@ export class SearchBar {
             selectionOnly: this.selectionOnly,
             selectionScope: this.resolveScopeForSearch(),
             includeDocTitle: this.includeDocTitle,
+            includeImageTitle: this.includeImageTitle,
             includeAttributeView: this.includeAttributeView,
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
@@ -1860,6 +1872,15 @@ export class SearchBar {
                     },
                 }),
                 this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-image-title",
+                    icon: "iconImage",
+                    label: this.i18n.settingsIncludeImageTitle,
+                    checked: this.includeImageTitle,
+                    onChange: (checked) => {
+                        void this.setIncludeImageTitle(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
                     id: "page-search-include-inline-memo",
                     icon: "iconM",
                     label: this.i18n.settingsIncludeInlineMemo,
@@ -2290,6 +2311,16 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setIncludeImageTitle(value: boolean) {
+        if (this.includeImageTitle === value) {
+            return;
+        }
+        this.includeImageTitle = value;
+        await rpcSetPrefs(this.plugin, {includeImageTitle: value});
+        this.plugin.syncIncludeImageTitle?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeAttributeView(value: boolean) {
         if (this.includeAttributeView === value) {
             return;
@@ -2435,6 +2466,14 @@ export class SearchBar {
             return;
         }
         this.includeDocTitle = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeImageTitle(value: boolean) {
+        if (this.includeImageTitle === value) {
+            return;
+        }
+        this.includeImageTitle = value;
         void this.highlightHitResult(this.searchText, true);
     }
 

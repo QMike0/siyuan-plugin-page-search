@@ -41,6 +41,8 @@ export interface SearchPipelineOptions extends MatchOptions {
     selectionScope?: SelectionScope;
     /** 是否匹配文档标题；默认 true；命中可走 renameDoc 替换 */
     includeDocTitle?: boolean;
+    /** 是否匹配图片标题；默认 true；可走块 transaction 替换 */
+    includeImageTitle?: boolean;
     /** 是否匹配数据库；默认 true */
     includeAttributeView?: boolean;
     /** 是否匹配表格块；默认 true */
@@ -111,6 +113,8 @@ function buildBlockMap(blocks: SearchableBlock[]): Map<string, SearchableBlock> 
  *   `.callout-title` 后对整块做 transaction（callout.ts / turnInto）。
  * - NodeTable 可编辑区在首个子节点 contenteditable 容器内；外层/移动端 wysiwyg
  *   也可能是 false，但格内文本仍应可随整表块更新。
+ * - 图片 `.img` 为 contenteditable=false；标题在 `.protyle-action__title`，官方菜单
+ *   改 title 后对所属块 transaction（menus/protyle.ts imgMenu），对应内核 imgTitle。
  */
 function isStructurallyWritableDespiteFalseAncestor(
     element: Element,
@@ -120,6 +124,10 @@ function isStructurallyWritableDespiteFalseAncestor(
         return true;
     }
     if (blockType === TABLE_TYPE && element.closest(TABLE_CELL_CLOSEST)) {
+        return true;
+    }
+    // 图片标题：不依赖 blockType（常在 NodeParagraph 内的 span.img）
+    if (element.closest(".img .protyle-action__title")) {
         return true;
     }
     return false;
@@ -239,6 +247,7 @@ export async function calculateSearchMatches(
                 selectionOnly: options.selectionOnly,
                 selectionScope: options.selectionScope,
                 includeDocTitle: options.includeDocTitle,
+                includeImageTitle: options.includeImageTitle,
                 includeAttributeView: options.includeAttributeView,
                 includeTable: options.includeTable,
                 includeBlockquote: options.includeBlockquote,
@@ -258,6 +267,7 @@ export async function calculateSearchMatches(
 
     const blocks = collectSearchableBlocks(edit, {
         includeDocTitle: options.includeDocTitle !== false,
+        includeImageTitle: options.includeImageTitle !== false,
         includeAttributeView: options.includeAttributeView !== false,
         includeTable: options.includeTable !== false,
         includeBlockquote: options.includeBlockquote !== false,

@@ -232,7 +232,34 @@ function applyReplacementsToTextNodes(
         }
     }
 
+    // 图片标题：可见字改完后同步 img[title]，对齐官方 imgMenu（menus/protyle.ts）
+    if (appliedCount > 0) {
+        syncImageTitleAttributeFromTextNodes(textNodes);
+    }
+
     return {appliedCount, skippedCount, regexExpandFailedCount};
+}
+
+/**
+ * 若本次替换落在图片标题区，把 `.protyle-action__title > span` 的全文写回 `img[title]`。
+ * 仅改已在 mutation 中的节点所属子树，不另开编辑器 API。
+ */
+function syncImageTitleAttributeFromTextNodes(textNodes: Text[]): void {
+    const seen = new Set<HTMLElement>();
+    for (const node of textNodes) {
+        const titleInner = node.parentElement
+            ?.closest(".img .protyle-action__title")
+            ?.querySelector<HTMLElement>(":scope > span");
+        if (!titleInner || seen.has(titleInner)) {
+            continue;
+        }
+        seen.add(titleInner);
+        const img = titleInner.closest(".img")?.querySelector("img");
+        if (!(img instanceof HTMLImageElement)) {
+            continue;
+        }
+        img.setAttribute("title", titleInner.innerText);
+    }
 }
 
 /**

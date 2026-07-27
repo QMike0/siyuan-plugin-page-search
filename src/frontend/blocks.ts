@@ -26,6 +26,8 @@ const MERMAID_SUBTYPE = 'mermaid'
 /** 正文 TreeWalker 排除：属性区 / 矢量 / 公式源码区；行内公式可见字形由独立 unit 采集 */
 const TEXT_NODE_EXCLUDED_CLOSEST =
   '.protyle-attr, svg, style, script, .katex-mathml, span[data-type~="inline-math"]'
+/** 图片标题可见字（官方 imgTitle / `.protyle-action__title`） */
+const IMAGE_TITLE_TEXT_CLOSEST = '.img .protyle-action__title'
 /** Mermaid 搜索单元：源码在 data-content，无可替换 Text 节点 */
 export const MERMAID_UNIT_ID = 'mermaid-source'
 /**
@@ -149,6 +151,8 @@ export function isDocTitleSearchUnit(
 export interface CollectSearchableBlocksOptions {
   /** 是否采集文档标题（.protyle-title__input）；默认 true */
   includeDocTitle?: boolean;
+  /** 是否采集图片标题（`.img .protyle-action__title`）；默认 true */
+  includeImageTitle?: boolean;
   /** 是否采集数据库（Attribute View）；默认 true */
   includeAttributeView?: boolean;
   /** 是否采集表格块（NodeTable）；默认 true */
@@ -184,6 +188,7 @@ export function collectSearchableBlocks(
   options: CollectSearchableBlocksOptions = {},
 ): SearchableBlock[] {
   const includeDocTitle = options.includeDocTitle !== false;
+  const includeImageTitle = options.includeImageTitle !== false;
   const includeAttributeView = options.includeAttributeView !== false;
   const includeTable = options.includeTable !== false;
   const includeBlockquote = options.includeBlockquote !== false;
@@ -234,7 +239,7 @@ export function collectSearchableBlocks(
     ? getUniqueBlockElements(docRoot, {excludeEmbed: !includeEmbedBlock})
     : []
   if (collectBodyText && blockElements.length === 0) {
-    const textNodes = collectTextNodes(docRoot, null)
+    const textNodes = collectTextNodes(docRoot, null, includeImageTitle)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     if (text) {
       blocks.push({
@@ -308,7 +313,7 @@ export function collectSearchableBlocks(
         return
       }
       // 数据库按单元格拆成独立搜索单元，禁止跨「框」拼接匹配
-      blocks.push(...collectAttributeViewSearchUnits(element, blockId, blockIndex))
+      blocks.push(...collectAttributeViewSearchUnits(element, blockId, blockIndex, includeImageTitle))
       return
     }
 
@@ -318,7 +323,7 @@ export function collectSearchableBlocks(
       }
       // 表格按单元格拆分，禁止「传感器」+「2026」拼成「传感器20」
       // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/util/table.ts
-      blocks.push(...collectTableSearchUnits(element, blockId, blockIndex))
+      blocks.push(...collectTableSearchUnits(element, blockId, blockIndex, includeImageTitle))
       return
     }
 
@@ -375,11 +380,11 @@ export function collectSearchableBlocks(
     if (blockType === CALLOUT_TYPE || element.classList.contains('callout')) {
       // Callout 标题在 .callout-title（非 contenteditable 子块），需单独采集
       // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts getCalloutInfo
-      blocks.push(...collectCalloutSearchUnits(element, blockId, blockIndex))
+      blocks.push(...collectCalloutSearchUnits(element, blockId, blockIndex, includeImageTitle))
       return
     }
 
-    const textNodes = collectTextNodes(element, element)
+    const textNodes = collectTextNodes(element, element, includeImageTitle)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     if (!text) {
       return
@@ -658,12 +663,13 @@ function collectCalloutSearchUnits(
   calloutBlock: HTMLElement,
   blockId: string,
   blockIndex: number,
+  includeImageTitle = true,
 ): SearchableBlock[] {
   const units: SearchableBlock[] = []
 
   const titleElement = calloutBlock.querySelector<HTMLElement>('.callout-title')
   if (titleElement) {
-    const titleNodes = collectDescendantTextNodes(titleElement)
+    const titleNodes = collectDescendantTextNodes(titleElement, includeImageTitle)
     const titleText = titleNodes.map((node) => node.nodeValue ?? '').join('')
     if (titleText) {
       units.push({
@@ -679,7 +685,7 @@ function collectCalloutSearchUnits(
   }
 
   // Callout 容器上可能还有标题区以外、且不属于子块的少量文本（一般为空）
-  const ownedNodes = collectTextNodes(calloutBlock, calloutBlock).filter((node) => {
+  const ownedNodes = collectTextNodes(calloutBlock, calloutBlock, includeImageTitle).filter((node) => {
     return !titleElement || !titleElement.contains(node)
   })
   const ownedText = ownedNodes.map((node) => node.nodeValue ?? '').join('')
@@ -698,8 +704,11 @@ function collectCalloutSearchUnits(
   return units
 }
 
-/** 收集元素后代文本，仅排除 svg/style/script/protyle-attr */
-function collectDescendantTextNodes(container: HTMLElement): Text[] {
+/** 收集元素后代文本，仅排除 svg/style/script/protyle-attr（及可选的图片标题） */
+function collectDescendantTextNodes(
+  container: HTMLElement,
+  includeImageTitle = true,
+): Text[] {
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       if (!(node instanceof Text) || !node.nodeValue?.length) {
@@ -707,6 +716,9 @@ function collectDescendantTextNodes(container: HTMLElement): Text[] {
       }
       const parentElement = node.parentElement
       if (!parentElement || parentElement.closest(TEXT_NODE_EXCLUDED_CLOSEST)) {
+        return NodeFilter.FILTER_REJECT
+      }
+      if (!includeImageTitle && parentElement.closest(IMAGE_TITLE_TEXT_CLOSEST)) {
         return NodeFilter.FILTER_REJECT
       }
       return NodeFilter.FILTER_ACCEPT
@@ -727,6 +739,7 @@ function collectTableSearchUnits(
   tableBlock: HTMLElement,
   blockId: string,
   blockIndex: number,
+  includeImageTitle = true,
 ): SearchableBlock[] {
   const units: SearchableBlock[] = []
   const seenUnitKeys = new Set<string>()
@@ -748,7 +761,7 @@ function collectTableSearchUnits(
       return
     }
 
-    const textNodes = collectDescendantTextNodes(cell)
+    const textNodes = collectDescendantTextNodes(cell, includeImageTitle)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     if (!text) {
       return
@@ -816,6 +829,7 @@ function collectAttributeViewSearchUnits(
   avBlock: HTMLElement,
   blockId: string,
   blockIndex: number,
+  includeImageTitle = true,
 ): SearchableBlock[] {
   const units: SearchableBlock[] = []
   const seenUnitKeys = new Set<string>()
@@ -824,7 +838,7 @@ function collectAttributeViewSearchUnits(
     if (seenUnitKeys.has(unitId)) {
       return
     }
-    const textNodes = collectTextNodesInContainer(container, avBlock)
+    const textNodes = collectTextNodesInContainer(container, avBlock, includeImageTitle)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     if (!text) {
       return
@@ -960,7 +974,11 @@ function cssEscapeAttr(value: string): string {
 }
 
 /** 在容器内收集可搜索文本节点（数据库单元格级） */
-function collectTextNodesInContainer(container: HTMLElement, avBlock: HTMLElement): Text[] {
+function collectTextNodesInContainer(
+  container: HTMLElement,
+  avBlock: HTMLElement,
+  includeImageTitle = true,
+): Text[] {
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       if (!(node instanceof Text) || !node.nodeValue?.length) {
@@ -969,6 +987,9 @@ function collectTextNodesInContainer(container: HTMLElement, avBlock: HTMLElemen
 
       const parentElement = node.parentElement
       if (!parentElement || parentElement.closest(AV_EXCLUDED_CLOSEST)) {
+        return NodeFilter.FILTER_REJECT
+      }
+      if (!includeImageTitle && parentElement.closest(IMAGE_TITLE_TEXT_CLOSEST)) {
         return NodeFilter.FILTER_REJECT
       }
 
@@ -988,7 +1009,11 @@ function collectTextNodesInContainer(container: HTMLElement, avBlock: HTMLElemen
  * 收集归属当前块的文本节点。
  * ownerBlock 为 null 时表示预览合成根，收集 root 下全部合法文本。
  */
-function collectTextNodes(root: HTMLElement, ownerBlock: HTMLElement | null): Text[] {
+function collectTextNodes(
+  root: HTMLElement,
+  ownerBlock: HTMLElement | null,
+  includeImageTitle = true,
+): Text[] {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       if (!(node instanceof Text) || !node.nodeValue?.length) {
@@ -1001,6 +1026,9 @@ function collectTextNodes(root: HTMLElement, ownerBlock: HTMLElement | null): Te
       }
 
       if (parentElement.closest(TEXT_NODE_EXCLUDED_CLOSEST)) {
+        return NodeFilter.FILTER_REJECT
+      }
+      if (!includeImageTitle && parentElement.closest(IMAGE_TITLE_TEXT_CLOSEST)) {
         return NodeFilter.FILTER_REJECT
       }
 

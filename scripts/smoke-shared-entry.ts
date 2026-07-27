@@ -179,11 +179,18 @@ assert(DEFAULT_PREFS.includeHtmlBlock === true, "includeHtmlBlock defaults on");
 assert(coercePluginPrefs({}).includeHtmlBlock === true, "coerce includeHtmlBlock default on");
 assert(coercePluginPrefs({includeHtmlBlock: false}).includeHtmlBlock === false, "coerce includeHtmlBlock off");
 assert(DEFAULT_PREFS.includeDocTitle === true, "includeDocTitle defaults on");
+assert(DEFAULT_PREFS.includeImageTitle === true, "includeImageTitle defaults on");
 assert(coercePluginPrefs({}).includeDocTitle === true, "coerce includeDocTitle default on");
+assert(coercePluginPrefs({}).includeImageTitle === true, "coerce includeImageTitle default on");
 assert(coercePluginPrefs({includeDocTitle: false}).includeDocTitle === false, "coerce includeDocTitle off");
+assert(coercePluginPrefs({includeImageTitle: false}).includeImageTitle === false, "coerce includeImageTitle off");
 assert(
     mergePrefs(DEFAULT_PREFS, {includeDocTitle: false}).includeDocTitle === false,
     "merge includeDocTitle off",
+);
+assert(
+    mergePrefs(DEFAULT_PREFS, {includeImageTitle: false}).includeImageTitle === false,
+    "merge includeImageTitle off",
 );
 assert(DEFAULT_PREFS.useRegex === false, "useRegex defaults off (keyword)");
 assert(coercePluginPrefs({}).useRegex === false, "coerce useRegex default off");

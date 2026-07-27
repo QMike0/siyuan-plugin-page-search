@@ -43,6 +43,7 @@
   "settingsIncludeScopeHint": "Controls which block-level types (and inline memos) may be searched",
   "settingsIncludeDocTitle": "Document title",
   "settingsIncludeDocTitleHint": "Replacing the document title cannot be undone with Ctrl+Z",
+  "settingsIncludeImageTitle": "Image title",
   "settingsIncludeAttributeView": "Database",
   "settingsIncludeTable": "Table",
   "settingsIncludeBlockquote": "Blockquote",
