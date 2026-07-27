@@ -192,6 +192,41 @@ assert(
     mergePrefs(DEFAULT_PREFS, {includeImageTitle: false}).includeImageTitle === false,
     "merge includeImageTitle off",
 );
+assert(DEFAULT_PREFS.includeListUnordered === true, "includeListUnordered defaults on");
+assert(DEFAULT_PREFS.includeListOrdered === true, "includeListOrdered defaults on");
+assert(DEFAULT_PREFS.includeListTask === true, "includeListTask defaults on");
+assert(coercePluginPrefs({}).includeListUnordered === true, "coerce includeListUnordered default on");
+assert(coercePluginPrefs({includeListUnordered: false}).includeListUnordered === false, "coerce includeListUnordered off");
+assert(
+    mergePrefs(DEFAULT_PREFS, {
+        includeListUnordered: false,
+        includeListOrdered: false,
+        includeListTask: false,
+    }).includeListTask === false,
+    "merge list includes all off",
+);
+assert(DEFAULT_PREFS.includeHeadingH1 === true, "includeHeadingH1 defaults on");
+assert(DEFAULT_PREFS.includeHeadingH6 === true, "includeHeadingH6 defaults on");
+assert(coercePluginPrefs({}).includeHeadingH2 === true, "coerce includeHeadingH2 default on");
+assert(coercePluginPrefs({includeHeadingH3: false}).includeHeadingH3 === false, "coerce includeHeadingH3 off");
+assert(
+    mergePrefs(DEFAULT_PREFS, {
+        includeHeadingH1: false,
+        includeHeadingH2: false,
+        includeHeadingH3: false,
+        includeHeadingH4: false,
+        includeHeadingH5: false,
+        includeHeadingH6: false,
+    }).includeHeadingH6 === false,
+    "merge heading includes all off",
+);
+assert(DEFAULT_PREFS.includeSuperBlock === true, "includeSuperBlock defaults on");
+assert(coercePluginPrefs({}).includeSuperBlock === true, "coerce includeSuperBlock default on");
+assert(coercePluginPrefs({includeSuperBlock: false}).includeSuperBlock === false, "coerce includeSuperBlock off");
+assert(
+    mergePrefs(DEFAULT_PREFS, {includeSuperBlock: false}).includeSuperBlock === false,
+    "merge includeSuperBlock off",
+);
 assert(DEFAULT_PREFS.useRegex === false, "useRegex defaults off (keyword)");
 assert(coercePluginPrefs({}).useRegex === false, "coerce useRegex default off");
 assert(coercePluginPrefs({useRegex: true}).useRegex === true, "coerce useRegex on");

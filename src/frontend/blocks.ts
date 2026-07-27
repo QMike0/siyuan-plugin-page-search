@@ -14,6 +14,12 @@ const PREVIEW_BLOCK_TYPE = 'preview'
 const ATTRIBUTE_VIEW_TYPE = 'NodeAttributeView'
 const BLOCKQUOTE_TYPE = 'NodeBlockquote'
 const CALLOUT_TYPE = 'NodeCallout'
+/** 超级块：容器（内部子块嵌套在 .sb 内） */
+const SUPER_BLOCK_TYPE = 'NodeSuperBlock'
+const LIST_TYPE = 'NodeList'
+const LIST_ITEM_TYPE = 'NodeListItem'
+/** 标题块：非容器（子块为随后兄弟，不在 NodeHeading DOM 内） */
+const HEADING_TYPE = 'NodeHeading'
 const MATH_BLOCK_TYPE = 'NodeMathBlock'
 /** 嵌入块：内含 .protyle-wysiwyg__embed 渲染的源块副本 */
 const EMBED_BLOCK_TYPE = 'NodeBlockQueryEmbed'
@@ -161,6 +167,27 @@ export interface CollectSearchableBlocksOptions {
   includeBlockquote?: boolean;
   /** 是否采集提示块（NodeCallout，含标题与内部子块）；默认 true */
   includeCallout?: boolean;
+  /** 是否采集超级块（NodeSuperBlock）及其内部子块；默认 true */
+  includeSuperBlock?: boolean;
+  /**
+   * 是否采集无序列表（data-subtype=u）及其内部；默认 true。
+   * 嵌套列表按最近列表祖先 subtype；三者全关 = 列表区都不采。
+   */
+  includeListUnordered?: boolean;
+  /** 是否采集有序列表（data-subtype=o）及其内部；默认 true */
+  includeListOrdered?: boolean;
+  /** 是否采集任务列表（data-subtype=t）及其内部；默认 true */
+  includeListTask?: boolean;
+  /**
+   * 是否采集一级标题块（NodeHeading h1）；默认 true。
+   * 六级独立；全关不采标题块。≠ 文档标题。标题非容器，不抑制其后兄弟块。
+   */
+  includeHeadingH1?: boolean;
+  includeHeadingH2?: boolean;
+  includeHeadingH3?: boolean;
+  includeHeadingH4?: boolean;
+  includeHeadingH5?: boolean;
+  includeHeadingH6?: boolean;
   /** 是否采集公式块（NodeMathBlock）；默认 true；不含行内公式 */
   includeMathBlock?: boolean;
   /** 是否采集嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
@@ -193,6 +220,16 @@ export function collectSearchableBlocks(
   const includeTable = options.includeTable !== false;
   const includeBlockquote = options.includeBlockquote !== false;
   const includeCallout = options.includeCallout !== false;
+  const includeSuperBlock = options.includeSuperBlock !== false;
+  const includeListUnordered = options.includeListUnordered !== false;
+  const includeListOrdered = options.includeListOrdered !== false;
+  const includeListTask = options.includeListTask !== false;
+  const includeHeadingH1 = options.includeHeadingH1 !== false;
+  const includeHeadingH2 = options.includeHeadingH2 !== false;
+  const includeHeadingH3 = options.includeHeadingH3 !== false;
+  const includeHeadingH4 = options.includeHeadingH4 !== false;
+  const includeHeadingH5 = options.includeHeadingH5 !== false;
+  const includeHeadingH6 = options.includeHeadingH6 !== false;
   const includeMathBlock = options.includeMathBlock !== false;
   const includeEmbedBlock = options.includeEmbedBlock !== false;
   const includeCodeBlock = options.includeCodeBlock !== false;
@@ -220,6 +257,16 @@ export function collectSearchableBlocks(
     includeTable,
     includeBlockquote,
     includeCallout,
+    includeSuperBlock,
+    includeListUnordered,
+    includeListOrdered,
+    includeListTask,
+    includeHeadingH1,
+    includeHeadingH2,
+    includeHeadingH3,
+    includeHeadingH4,
+    includeHeadingH5,
+    includeHeadingH6,
     includeEmbedBlock,
     includeCodeBlock,
     includeMermaid,
@@ -300,11 +347,43 @@ export function collectSearchableBlocks(
     ) {
       return
     }
+    // 超级块：容器门闩，关则跳过自身及内部全部子块（与引述/提示同类）
+    // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts isContainerBlock
+    if (
+      !includeSuperBlock
+      && (blockType === SUPER_BLOCK_TYPE
+        || element.classList.contains('sb')
+        || Boolean(element.closest(`[data-type="${SUPER_BLOCK_TYPE}"], .sb`)))
+    ) {
+      return
+    }
+    // 列表：按最近 NodeList / NodeListItem 的 data-subtype（u/o/t）门闩；嵌套取最近祖先
+    // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/search/menu.ts subTypes
+    if (shouldSkipElementByListInclude(element, {
+      includeListUnordered,
+      includeListOrdered,
+      includeListTask,
+    })) {
+      return
+    }
     if (
       !includeEmbedBlock
       && (blockType === EMBED_BLOCK_TYPE
         || Boolean(element.closest(`[data-type="${EMBED_BLOCK_TYPE}"]`)))
     ) {
+      return
+    }
+    // 标题块级别门闩（在容器门闩之后 = AND）：仅 NodeHeading 自身 / 其 DOM 内文本；
+    // 不抑制折叠展开后的兄弟段落。落在已关的引述/提示/列表/嵌入内时上面已 return。
+    // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts isContainerBlock
+    if (shouldSkipElementByHeadingInclude(element, {
+      includeHeadingH1,
+      includeHeadingH2,
+      includeHeadingH3,
+      includeHeadingH4,
+      includeHeadingH5,
+      includeHeadingH6,
+    })) {
       return
     }
 
@@ -313,7 +392,13 @@ export function collectSearchableBlocks(
         return
       }
       // 数据库按单元格拆成独立搜索单元，禁止跨「框」拼接匹配
-      blocks.push(...collectAttributeViewSearchUnits(element, blockId, blockIndex, includeImageTitle))
+      blocks.push(...collectAttributeViewSearchUnits(
+        element,
+        blockId,
+        blockIndex,
+        includeImageTitle,
+        includeGates,
+      ))
       return
     }
 
@@ -323,7 +408,13 @@ export function collectSearchableBlocks(
       }
       // 表格按单元格拆分，禁止「传感器」+「2026」拼成「传感器20」
       // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/util/table.ts
-      blocks.push(...collectTableSearchUnits(element, blockId, blockIndex, includeImageTitle))
+      blocks.push(...collectTableSearchUnits(
+        element,
+        blockId,
+        blockIndex,
+        includeImageTitle,
+        includeGates,
+      ))
       return
     }
 
@@ -422,10 +513,140 @@ interface IncludeGates {
   includeTable: boolean
   includeBlockquote: boolean
   includeCallout: boolean
+  includeSuperBlock: boolean
+  includeListUnordered: boolean
+  includeListOrdered: boolean
+  includeListTask: boolean
+  includeHeadingH1: boolean
+  includeHeadingH2: boolean
+  includeHeadingH3: boolean
+  includeHeadingH4: boolean
+  includeHeadingH5: boolean
+  includeHeadingH6: boolean
   includeEmbedBlock: boolean
   includeCodeBlock: boolean
   includeMermaid: boolean
   includeHtmlBlock: boolean
+}
+
+type HeadingIncludeGates = Pick<
+  IncludeGates,
+  | 'includeHeadingH1'
+  | 'includeHeadingH2'
+  | 'includeHeadingH3'
+  | 'includeHeadingH4'
+  | 'includeHeadingH5'
+  | 'includeHeadingH6'
+>
+
+/** 标题级别：与官方 subTypes h1–h6 / data-subtype 一致 */
+export type HeadingLevel = 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6'
+
+/**
+ * 若元素落在 NodeHeading DOM 内（含标题块自身），返回其 data-subtype。
+ * 标题不是容器：随后兄弟段落 closest 不到标题，不会被误伤。
+ * 文档标题（.protyle-title）不是 NodeHeading，返回 null。
+ */
+export function resolveHeadingLevel(element: Element): HeadingLevel | null {
+  const heading = element.closest<HTMLElement>(
+    `[data-type="${HEADING_TYPE}"][data-subtype], div.h1[data-subtype], div.h2[data-subtype], div.h3[data-subtype], div.h4[data-subtype], div.h5[data-subtype], div.h6[data-subtype]`,
+  )
+  if (!heading) {
+    return null
+  }
+  const sub = heading.getAttribute('data-subtype')
+  if (
+    sub === 'h1' || sub === 'h2' || sub === 'h3'
+    || sub === 'h4' || sub === 'h5' || sub === 'h6'
+  ) {
+    return sub
+  }
+  return null
+}
+
+export function isHeadingLevelIncluded(
+  level: HeadingLevel,
+  gates: HeadingIncludeGates,
+): boolean {
+  switch (level) {
+    case 'h1':
+      return gates.includeHeadingH1
+    case 'h2':
+      return gates.includeHeadingH2
+    case 'h3':
+      return gates.includeHeadingH3
+    case 'h4':
+      return gates.includeHeadingH4
+    case 'h5':
+      return gates.includeHeadingH5
+    case 'h6':
+      return gates.includeHeadingH6
+    default: {
+      const _exhaustive: never = level
+      return _exhaustive
+    }
+  }
+}
+
+/**
+ * 落在已关闭级别的标题块 DOM 内则跳过。
+ * 与引述/提示/列表/嵌入等容器门闩独立，调用方须先做容器判断（AND）。
+ */
+export function shouldSkipElementByHeadingInclude(
+  element: Element,
+  gates: HeadingIncludeGates,
+): boolean {
+  const level = resolveHeadingLevel(element)
+  if (!level) {
+    return false
+  }
+  return !isHeadingLevelIncluded(level, gates)
+}
+
+/** 列表 subtype：u=无序 / o=有序 / t=任务 */
+export type ListSubtype = 'u' | 'o' | 't'
+
+/**
+ * 最近列表祖先的 subtype（优先 ListItem，再 List；嵌套列表取最近一层）。
+ * 不在列表内则返回 null。
+ */
+export function resolveNearestListSubtype(element: Element): ListSubtype | null {
+  const listish = element.closest<HTMLElement>(
+    `[data-type="${LIST_ITEM_TYPE}"][data-subtype], [data-type="${LIST_TYPE}"][data-subtype], .li[data-subtype], .list[data-subtype]`,
+  )
+  if (!listish) {
+    return null
+  }
+  const sub = listish.getAttribute('data-subtype')
+  if (sub === 'u' || sub === 'o' || sub === 't') {
+    return sub
+  }
+  return null
+}
+
+export function isListSubtypeIncluded(
+  subtype: ListSubtype,
+  gates: Pick<IncludeGates, 'includeListUnordered' | 'includeListOrdered' | 'includeListTask'>,
+): boolean {
+  if (subtype === 'u') {
+    return gates.includeListUnordered
+  }
+  if (subtype === 'o') {
+    return gates.includeListOrdered
+  }
+  return gates.includeListTask
+}
+
+/** 落在已关闭 subtype 的列表区内则跳过 */
+export function shouldSkipElementByListInclude(
+  element: Element,
+  gates: Pick<IncludeGates, 'includeListUnordered' | 'includeListOrdered' | 'includeListTask'>,
+): boolean {
+  const subtype = resolveNearestListSubtype(element)
+  if (!subtype) {
+    return false
+  }
+  return !isListSubtypeIncluded(subtype, gates)
 }
 
 /**
@@ -455,6 +676,19 @@ function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeG
     !gates.includeCallout
     && Boolean(element.closest(`[data-type="${CALLOUT_TYPE}"], .callout`))
   ) {
+    return true
+  }
+  if (
+    !gates.includeSuperBlock
+    && Boolean(element.closest(`[data-type="${SUPER_BLOCK_TYPE}"], .sb`))
+  ) {
+    return true
+  }
+  if (shouldSkipElementByListInclude(element, gates)) {
+    return true
+  }
+  // 标题级别：备注/公式宿主若在某级标题 DOM 内，随该级开关；与容器门闩 AND
+  if (shouldSkipElementByHeadingInclude(element, gates)) {
     return true
   }
   if (
@@ -708,6 +942,7 @@ function collectCalloutSearchUnits(
 function collectDescendantTextNodes(
   container: HTMLElement,
   includeImageTitle = true,
+  headingGates?: HeadingIncludeGates,
 ): Text[] {
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
@@ -719,6 +954,10 @@ function collectDescendantTextNodes(
         return NodeFilter.FILTER_REJECT
       }
       if (!includeImageTitle && parentElement.closest(IMAGE_TITLE_TEXT_CLOSEST)) {
+        return NodeFilter.FILTER_REJECT
+      }
+      // 表格/AV 格内若嵌有标题块，正文走整格采集；须按标题级别门闩剔除其文本
+      if (headingGates && shouldSkipElementByHeadingInclude(parentElement, headingGates)) {
         return NodeFilter.FILTER_REJECT
       }
       return NodeFilter.FILTER_ACCEPT
@@ -740,6 +979,7 @@ function collectTableSearchUnits(
   blockId: string,
   blockIndex: number,
   includeImageTitle = true,
+  headingGates?: HeadingIncludeGates,
 ): SearchableBlock[] {
   const units: SearchableBlock[] = []
   const seenUnitKeys = new Set<string>()
@@ -761,7 +1001,7 @@ function collectTableSearchUnits(
       return
     }
 
-    const textNodes = collectDescendantTextNodes(cell, includeImageTitle)
+    const textNodes = collectDescendantTextNodes(cell, includeImageTitle, headingGates)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     if (!text) {
       return
@@ -830,6 +1070,7 @@ function collectAttributeViewSearchUnits(
   blockId: string,
   blockIndex: number,
   includeImageTitle = true,
+  headingGates?: HeadingIncludeGates,
 ): SearchableBlock[] {
   const units: SearchableBlock[] = []
   const seenUnitKeys = new Set<string>()
@@ -838,7 +1079,12 @@ function collectAttributeViewSearchUnits(
     if (seenUnitKeys.has(unitId)) {
       return
     }
-    const textNodes = collectTextNodesInContainer(container, avBlock, includeImageTitle)
+    const textNodes = collectTextNodesInContainer(
+      container,
+      avBlock,
+      includeImageTitle,
+      headingGates,
+    )
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     if (!text) {
       return
@@ -978,6 +1224,7 @@ function collectTextNodesInContainer(
   container: HTMLElement,
   avBlock: HTMLElement,
   includeImageTitle = true,
+  headingGates?: HeadingIncludeGates,
 ): Text[] {
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
@@ -990,6 +1237,9 @@ function collectTextNodesInContainer(
         return NodeFilter.FILTER_REJECT
       }
       if (!includeImageTitle && parentElement.closest(IMAGE_TITLE_TEXT_CLOSEST)) {
+        return NodeFilter.FILTER_REJECT
+      }
+      if (headingGates && shouldSkipElementByHeadingInclude(parentElement, headingGates)) {
         return NodeFilter.FILTER_REJECT
       }
 

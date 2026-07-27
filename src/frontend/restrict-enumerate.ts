@@ -17,6 +17,8 @@ import {
     collectSearchableBlocks,
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
+    shouldSkipElementByHeadingInclude,
+    shouldSkipElementByListInclude,
     type CollectSearchableBlocksOptions,
 } from "./blocks";
 import type {SearchableBlock, SearchMatch} from "./dom-types";
@@ -34,6 +36,7 @@ const ATTRIBUTE_VIEW_TYPE = "NodeAttributeView";
 const TABLE_TYPE = "NodeTable";
 const BLOCKQUOTE_TYPE = "NodeBlockquote";
 const CALLOUT_TYPE = "NodeCallout";
+const SUPER_BLOCK_TYPE = "NodeSuperBlock";
 const MATH_BLOCK_TYPE = "NodeMathBlock";
 const EMBED_BLOCK_TYPE = "NodeBlockQueryEmbed";
 const WIDGET_TYPE = "NodeWidget";
@@ -82,6 +85,16 @@ export function enumerateRestrictInlineMatches(
     const includeTable = options.includeTable !== false;
     const includeBlockquote = options.includeBlockquote !== false;
     const includeCallout = options.includeCallout !== false;
+    const includeSuperBlock = options.includeSuperBlock !== false;
+    const includeListUnordered = options.includeListUnordered !== false;
+    const includeListOrdered = options.includeListOrdered !== false;
+    const includeListTask = options.includeListTask !== false;
+    const includeHeadingH1 = options.includeHeadingH1 !== false;
+    const includeHeadingH2 = options.includeHeadingH2 !== false;
+    const includeHeadingH3 = options.includeHeadingH3 !== false;
+    const includeHeadingH4 = options.includeHeadingH4 !== false;
+    const includeHeadingH5 = options.includeHeadingH5 !== false;
+    const includeHeadingH6 = options.includeHeadingH6 !== false;
     const includeMathBlock = options.includeMathBlock !== false;
     const includeEmbedBlock = options.includeEmbedBlock !== false;
     const includeCodeBlock = options.includeCodeBlock !== false;
@@ -98,6 +111,16 @@ export function enumerateRestrictInlineMatches(
         includeTable,
         includeBlockquote,
         includeCallout,
+        includeSuperBlock,
+        includeListUnordered,
+        includeListOrdered,
+        includeListTask,
+        includeHeadingH1,
+        includeHeadingH2,
+        includeHeadingH3,
+        includeHeadingH4,
+        includeHeadingH5,
+        includeHeadingH6,
         includeMathBlock,
         includeEmbedBlock,
         includeCodeBlock,
@@ -147,6 +170,16 @@ export function enumerateRestrictInlineMatches(
                     includeTable,
                     includeBlockquote,
                     includeCallout,
+                    includeSuperBlock,
+                    includeListUnordered,
+                    includeListOrdered,
+                    includeListTask,
+                    includeHeadingH1,
+                    includeHeadingH2,
+                    includeHeadingH3,
+                    includeHeadingH4,
+                    includeHeadingH5,
+                    includeHeadingH6,
                     includeMathBlock,
                     includeEmbedBlock,
                     includeCodeBlock,
@@ -369,6 +402,16 @@ function shouldSkipHostByIncludeGates(
         includeTable: boolean;
         includeBlockquote: boolean;
         includeCallout: boolean;
+        includeSuperBlock: boolean;
+        includeListUnordered: boolean;
+        includeListOrdered: boolean;
+        includeListTask: boolean;
+        includeHeadingH1: boolean;
+        includeHeadingH2: boolean;
+        includeHeadingH3: boolean;
+        includeHeadingH4: boolean;
+        includeHeadingH5: boolean;
+        includeHeadingH6: boolean;
         includeMathBlock: boolean;
         includeEmbedBlock: boolean;
         includeCodeBlock: boolean;
@@ -402,6 +445,30 @@ function shouldSkipHostByIncludeGates(
         !options.includeCallout
         && Boolean(host.closest(`[data-type="${CALLOUT_TYPE}"], .callout`))
     ) {
+        return true;
+    }
+    if (
+        !options.includeSuperBlock
+        && Boolean(host.closest(`[data-type="${SUPER_BLOCK_TYPE}"], .sb`))
+    ) {
+        return true;
+    }
+    if (shouldSkipElementByListInclude(host, {
+        includeListUnordered: options.includeListUnordered,
+        includeListOrdered: options.includeListOrdered,
+        includeListTask: options.includeListTask,
+    })) {
+        return true;
+    }
+    // 标题级别与容器门闩 AND：宿主在已关级别的 NodeHeading DOM 内则跳过
+    if (shouldSkipElementByHeadingInclude(host, {
+        includeHeadingH1: options.includeHeadingH1,
+        includeHeadingH2: options.includeHeadingH2,
+        includeHeadingH3: options.includeHeadingH3,
+        includeHeadingH4: options.includeHeadingH4,
+        includeHeadingH5: options.includeHeadingH5,
+        includeHeadingH6: options.includeHeadingH6,
+    })) {
         return true;
     }
     // 仅公式块；勿用 data-subtype="math"（行内公式亦有该属性）

@@ -78,6 +78,17 @@ const RESTRICT_INLINE_ICONS: Record<RestrictInlineType, string> = {
 
 const DONE_TYPING_MS = 400;
 
+/** 「是否搜索 · 标题」级别 1–6（对应 data-subtype h1–h6） */
+export type HeadingIncludeLevel = 1 | 2 | 3 | 4 | 5 | 6;
+
+const HEADING_INCLUDE_LEVELS: HeadingIncludeLevel[] = [1, 2, 3, 4, 5, 6];
+
+function headingIncludePrefKey(
+    level: HeadingIncludeLevel,
+): `includeHeadingH${HeadingIncludeLevel}` {
+    return `includeHeadingH${level}`;
+}
+
 export interface SearchBarI18n {
     searchPlaceholder: string;
     replacePlaceholder: string;
@@ -127,6 +138,18 @@ export interface SearchBarI18n {
     settingsIncludeTable: string;
     settingsIncludeBlockquote: string;
     settingsIncludeCallout: string;
+    settingsIncludeSuperBlock: string;
+    settingsIncludeList: string;
+    settingsIncludeListUnordered: string;
+    settingsIncludeListOrdered: string;
+    settingsIncludeListTask: string;
+    settingsIncludeHeading: string;
+    settingsIncludeHeadingH1: string;
+    settingsIncludeHeadingH2: string;
+    settingsIncludeHeadingH3: string;
+    settingsIncludeHeadingH4: string;
+    settingsIncludeHeadingH5: string;
+    settingsIncludeHeadingH6: string;
     settingsIncludeMathBlock: string;
     settingsIncludeEmbedBlock: string;
     settingsIncludeCodeBlock: string;
@@ -177,6 +200,16 @@ export interface SearchBarHost {
     syncIncludeBlockquote?(value: boolean, source?: SearchBar): void;
     /** 将提示块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeCallout?(value: boolean, source?: SearchBar): void;
+    /** 将超级块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeSuperBlock?(value: boolean, source?: SearchBar): void;
+    /** 将无序列表匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeListUnordered?(value: boolean, source?: SearchBar): void;
+    /** 将有序列表匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeListOrdered?(value: boolean, source?: SearchBar): void;
+    /** 将任务列表匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeListTask?(value: boolean, source?: SearchBar): void;
+    /** 将标题级别（1–6）匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeHeadingLevel?(level: HeadingIncludeLevel, value: boolean, source?: SearchBar): void;
     /** 将公式块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeMathBlock?(value: boolean, source?: SearchBar): void;
     /** 将嵌入块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -235,6 +268,21 @@ export class SearchBar {
     private includeBlockquote = true;
     /** 是否匹配提示块；全局 prefs，默认 true */
     private includeCallout = true;
+    /** 是否匹配超级块；全局 prefs，默认 true */
+    private includeSuperBlock = true;
+    /** 是否匹配无序列表；全局 prefs，默认 true */
+    private includeListUnordered = true;
+    /** 是否匹配有序列表；全局 prefs，默认 true */
+    private includeListOrdered = true;
+    /** 是否匹配任务列表；全局 prefs，默认 true */
+    private includeListTask = true;
+    /** 是否匹配各级标题块；全局 prefs，默认 true（≠ 文档标题） */
+    private includeHeadingH1 = true;
+    private includeHeadingH2 = true;
+    private includeHeadingH3 = true;
+    private includeHeadingH4 = true;
+    private includeHeadingH5 = true;
+    private includeHeadingH6 = true;
     /** 是否匹配公式块；全局 prefs，默认 true（不含行内公式） */
     private includeMathBlock = true;
     /** 是否匹配嵌入块；全局 prefs，默认 true */
@@ -313,6 +361,20 @@ export class SearchBar {
         includeBlockquote?: boolean;
         /** 是否匹配提示块（来自全局 prefs） */
         includeCallout?: boolean;
+        /** 是否匹配超级块（来自全局 prefs） */
+        includeSuperBlock?: boolean;
+        /** 是否匹配无序列表（来自全局 prefs） */
+        includeListUnordered?: boolean;
+        /** 是否匹配有序列表（来自全局 prefs） */
+        includeListOrdered?: boolean;
+        /** 是否匹配任务列表（来自全局 prefs） */
+        includeListTask?: boolean;
+        includeHeadingH1?: boolean;
+        includeHeadingH2?: boolean;
+        includeHeadingH3?: boolean;
+        includeHeadingH4?: boolean;
+        includeHeadingH5?: boolean;
+        includeHeadingH6?: boolean;
         /** 是否匹配公式块（来自全局 prefs；不含行内公式） */
         includeMathBlock?: boolean;
         /** 是否匹配嵌入块（来自全局 prefs） */
@@ -344,6 +406,16 @@ export class SearchBar {
         this.includeTable = options.includeTable !== false;
         this.includeBlockquote = options.includeBlockquote !== false;
         this.includeCallout = options.includeCallout !== false;
+        this.includeSuperBlock = options.includeSuperBlock !== false;
+        this.includeListUnordered = options.includeListUnordered !== false;
+        this.includeListOrdered = options.includeListOrdered !== false;
+        this.includeListTask = options.includeListTask !== false;
+        this.includeHeadingH1 = options.includeHeadingH1 !== false;
+        this.includeHeadingH2 = options.includeHeadingH2 !== false;
+        this.includeHeadingH3 = options.includeHeadingH3 !== false;
+        this.includeHeadingH4 = options.includeHeadingH4 !== false;
+        this.includeHeadingH5 = options.includeHeadingH5 !== false;
+        this.includeHeadingH6 = options.includeHeadingH6 !== false;
         this.includeMathBlock = options.includeMathBlock !== false;
         this.includeEmbedBlock = options.includeEmbedBlock !== false;
         this.includeCodeBlock = options.includeCodeBlock !== false;
@@ -822,6 +894,16 @@ export class SearchBar {
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
             includeCallout: this.includeCallout,
+            includeSuperBlock: this.includeSuperBlock,
+            includeListUnordered: this.includeListUnordered,
+            includeListOrdered: this.includeListOrdered,
+            includeListTask: this.includeListTask,
+            includeHeadingH1: this.includeHeadingH1,
+            includeHeadingH2: this.includeHeadingH2,
+            includeHeadingH3: this.includeHeadingH3,
+            includeHeadingH4: this.includeHeadingH4,
+            includeHeadingH5: this.includeHeadingH5,
+            includeHeadingH6: this.includeHeadingH6,
             includeMathBlock: this.includeMathBlock,
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
@@ -847,6 +929,16 @@ export class SearchBar {
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
             includeCallout: this.includeCallout,
+            includeSuperBlock: this.includeSuperBlock,
+            includeListUnordered: this.includeListUnordered,
+            includeListOrdered: this.includeListOrdered,
+            includeListTask: this.includeListTask,
+            includeHeadingH1: this.includeHeadingH1,
+            includeHeadingH2: this.includeHeadingH2,
+            includeHeadingH3: this.includeHeadingH3,
+            includeHeadingH4: this.includeHeadingH4,
+            includeHeadingH5: this.includeHeadingH5,
+            includeHeadingH6: this.includeHeadingH6,
             includeMathBlock: this.includeMathBlock,
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
@@ -865,11 +957,21 @@ export class SearchBar {
                 includeTable: this.includeTable,
                 includeBlockquote: this.includeBlockquote,
                 includeCallout: this.includeCallout,
+                includeSuperBlock: this.includeSuperBlock,
+                includeListUnordered: this.includeListUnordered,
+                includeListOrdered: this.includeListOrdered,
+                includeListTask: this.includeListTask,
+                includeHeadingH1: this.includeHeadingH1,
+                includeHeadingH2: this.includeHeadingH2,
+                includeHeadingH3: this.includeHeadingH3,
+                includeHeadingH4: this.includeHeadingH4,
+                includeHeadingH5: this.includeHeadingH5,
+                includeHeadingH6: this.includeHeadingH6,
                 includeMathBlock: this.includeMathBlock,
                 includeEmbedBlock: this.includeEmbedBlock,
                 includeCodeBlock: this.includeCodeBlock,
                 includeMermaid: this.includeMermaid,
-            includeHtmlBlock: this.includeHtmlBlock,
+                includeHtmlBlock: this.includeHtmlBlock,
                 includeInlineMemo: this.includeInlineMemo,
                 restrictInlineTypes: this.restrictInlineTypes,
             });
@@ -1134,6 +1236,16 @@ export class SearchBar {
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
             includeCallout: this.includeCallout,
+            includeSuperBlock: this.includeSuperBlock,
+            includeListUnordered: this.includeListUnordered,
+            includeListOrdered: this.includeListOrdered,
+            includeListTask: this.includeListTask,
+            includeHeadingH1: this.includeHeadingH1,
+            includeHeadingH2: this.includeHeadingH2,
+            includeHeadingH3: this.includeHeadingH3,
+            includeHeadingH4: this.includeHeadingH4,
+            includeHeadingH5: this.includeHeadingH5,
+            includeHeadingH6: this.includeHeadingH6,
             includeMathBlock: this.includeMathBlock,
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
@@ -1915,6 +2027,60 @@ export class SearchBar {
                         void this.setIncludeInlineMemo(checked);
                     },
                 }),
+                {
+                    id: "page-search-include-heading",
+                    icon: "iconHeadings",
+                    label: this.i18n.settingsIncludeHeading,
+                    type: "submenu",
+                    submenu: HEADING_INCLUDE_LEVELS.map((level) => {
+                        const key = headingIncludePrefKey(level);
+                        const labelKey = `settingsIncludeHeadingH${level}` as const;
+                        return this.buildMatchSwitchMenuItem({
+                            id: `page-search-include-heading-h${level}`,
+                            icon: "iconHeadings",
+                            label: this.i18n[labelKey],
+                            checked: this[key],
+                            onChange: (checked) => {
+                                void this.setIncludeHeadingLevel(level, checked);
+                            },
+                        });
+                    }),
+                },
+                {
+                    id: "page-search-include-list",
+                    icon: "iconList",
+                    label: this.i18n.settingsIncludeList,
+                    type: "submenu",
+                    submenu: [
+                        this.buildMatchSwitchMenuItem({
+                            id: "page-search-include-list-unordered",
+                            icon: "iconList",
+                            label: this.i18n.settingsIncludeListUnordered,
+                            checked: this.includeListUnordered,
+                            onChange: (checked) => {
+                                void this.setIncludeListUnordered(checked);
+                            },
+                        }),
+                        this.buildMatchSwitchMenuItem({
+                            id: "page-search-include-list-ordered",
+                            icon: "iconOrderedList",
+                            label: this.i18n.settingsIncludeListOrdered,
+                            checked: this.includeListOrdered,
+                            onChange: (checked) => {
+                                void this.setIncludeListOrdered(checked);
+                            },
+                        }),
+                        this.buildMatchSwitchMenuItem({
+                            id: "page-search-include-list-task",
+                            icon: "iconCheck",
+                            label: this.i18n.settingsIncludeListTask,
+                            checked: this.includeListTask,
+                            onChange: (checked) => {
+                                void this.setIncludeListTask(checked);
+                            },
+                        }),
+                    ],
+                },
                 this.buildMatchSwitchMenuItem({
                     id: "page-search-include-math-block",
                     icon: "iconMath",
@@ -1967,6 +2133,15 @@ export class SearchBar {
                     checked: this.includeCallout,
                     onChange: (checked) => {
                         void this.setIncludeCallout(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-super-block",
+                    icon: "iconSuper",
+                    label: this.i18n.settingsIncludeSuperBlock,
+                    checked: this.includeSuperBlock,
+                    onChange: (checked) => {
+                        void this.setIncludeSuperBlock(checked);
                     },
                 }),
                 this.buildMatchSwitchMenuItem({
@@ -2386,6 +2561,57 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setIncludeSuperBlock(value: boolean) {
+        if (this.includeSuperBlock === value) {
+            return;
+        }
+        this.includeSuperBlock = value;
+        await rpcSetPrefs(this.plugin, {includeSuperBlock: value});
+        this.plugin.syncIncludeSuperBlock?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeListUnordered(value: boolean) {
+        if (this.includeListUnordered === value) {
+            return;
+        }
+        this.includeListUnordered = value;
+        await rpcSetPrefs(this.plugin, {includeListUnordered: value});
+        this.plugin.syncIncludeListUnordered?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeListOrdered(value: boolean) {
+        if (this.includeListOrdered === value) {
+            return;
+        }
+        this.includeListOrdered = value;
+        await rpcSetPrefs(this.plugin, {includeListOrdered: value});
+        this.plugin.syncIncludeListOrdered?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeListTask(value: boolean) {
+        if (this.includeListTask === value) {
+            return;
+        }
+        this.includeListTask = value;
+        await rpcSetPrefs(this.plugin, {includeListTask: value});
+        this.plugin.syncIncludeListTask?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeHeadingLevel(level: HeadingIncludeLevel, value: boolean) {
+        const key = headingIncludePrefKey(level);
+        if (this[key] === value) {
+            return;
+        }
+        this[key] = value;
+        await rpcSetPrefs(this.plugin, {[key]: value});
+        this.plugin.syncIncludeHeadingLevel?.(level, value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeMathBlock(value: boolean) {
         if (this.includeMathBlock === value) {
             return;
@@ -2531,6 +2757,47 @@ export class SearchBar {
             return;
         }
         this.includeCallout = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeSuperBlock(value: boolean) {
+        if (this.includeSuperBlock === value) {
+            return;
+        }
+        this.includeSuperBlock = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeListUnordered(value: boolean) {
+        if (this.includeListUnordered === value) {
+            return;
+        }
+        this.includeListUnordered = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeListOrdered(value: boolean) {
+        if (this.includeListOrdered === value) {
+            return;
+        }
+        this.includeListOrdered = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeListTask(value: boolean) {
+        if (this.includeListTask === value) {
+            return;
+        }
+        this.includeListTask = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeHeadingLevel(level: HeadingIncludeLevel, value: boolean) {
+        const key = headingIncludePrefKey(level);
+        if (this[key] === value) {
+            return;
+        }
+        this[key] = value;
         void this.highlightHitResult(this.searchText, true);
     }
 

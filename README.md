@@ -101,7 +101,7 @@ Stored at `data/storage/petal/<plugin>/prefs.json` (same path for kernel `storag
 | Field | Meaning |
 |------|---------|
 | `dialogLeft` / `dialogTop` | Dragged position (cleared when resetting via top bar) |
-| `includeDocTitle` / `includeImageTitle` / `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in search (default on; document title / image title searchable & replaceable by default) |
+| `includeDocTitle` / `includeImageTitle` / `includeAttributeView` / `includeTable` / `includeListUnordered` / `includeListOrdered` / `includeListTask` / `includeHeadingH1`–`H6` / `includeBlockquote` / `includeCallout` / `includeSuperBlock` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in search (default on; list/heading subtypes independent — all off skips that area; document title / image title searchable & replaceable by default) |
 | `includeFoldedBlocks` / `includeInlineMemo` | Folded blocks / inline memos (default off) |
 | `useRegex` | Search method: `false`=keyword, `true`=regular expression (default keyword; kept across reopen) |
 | `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |

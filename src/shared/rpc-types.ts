@@ -53,6 +53,31 @@ export interface PluginPrefs {
     includeBlockquote: boolean;
     /** 是否匹配提示块（NodeCallout，含标题与内部子块）；默认 true */
     includeCallout: boolean;
+    /**
+     * 是否匹配超级块（NodeSuperBlock / .sb）及其内部子块；默认 true。
+     * 容器门闩（与引述/提示同类）：关则跳过容器自身及 closest 子树。
+     */
+    includeSuperBlock: boolean;
+    /**
+     * 是否匹配无序列表（NodeList / NodeListItem，data-subtype=u）及其内部；默认 true。
+     * 与有序 / 任务独立；三者全关 = 列表区都不搜（无单独「列表项」开关）。
+     */
+    includeListUnordered: boolean;
+    /** 是否匹配有序列表（data-subtype=o）及其内部；默认 true */
+    includeListOrdered: boolean;
+    /** 是否匹配任务列表（data-subtype=t）及其内部；默认 true */
+    includeListTask: boolean;
+    /**
+     * 是否匹配一级标题块（NodeHeading，data-subtype=h1）；默认 true。
+     * 与 h2–h6 独立；六级全关 = 不搜任何标题块（≠ 文档标题 includeDocTitle）。
+     * 标题不是容器：不影响其后兄弟段落；若标题落在已关闭的引述/提示/列表等容器内，仍先被容器门闩跳过。
+     */
+    includeHeadingH1: boolean;
+    includeHeadingH2: boolean;
+    includeHeadingH3: boolean;
+    includeHeadingH4: boolean;
+    includeHeadingH5: boolean;
+    includeHeadingH6: boolean;
     /** 是否匹配公式块（NodeMathBlock）；默认 true；不含行内公式 */
     includeMathBlock: boolean;
     /** 是否匹配嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
@@ -113,6 +138,16 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeTable: true,
     includeBlockquote: true,
     includeCallout: true,
+    includeSuperBlock: true,
+    includeListUnordered: true,
+    includeListOrdered: true,
+    includeListTask: true,
+    includeHeadingH1: true,
+    includeHeadingH2: true,
+    includeHeadingH3: true,
+    includeHeadingH4: true,
+    includeHeadingH5: true,
+    includeHeadingH6: true,
     includeMathBlock: true,
     includeEmbedBlock: true,
     includeCodeBlock: true,
@@ -142,6 +177,16 @@ export function coercePluginPrefs(
         includeTable: base.includeTable !== false,
         includeBlockquote: base.includeBlockquote !== false,
         includeCallout: base.includeCallout !== false,
+        includeSuperBlock: base.includeSuperBlock !== false,
+        includeListUnordered: base.includeListUnordered !== false,
+        includeListOrdered: base.includeListOrdered !== false,
+        includeListTask: base.includeListTask !== false,
+        includeHeadingH1: base.includeHeadingH1 !== false,
+        includeHeadingH2: base.includeHeadingH2 !== false,
+        includeHeadingH3: base.includeHeadingH3 !== false,
+        includeHeadingH4: base.includeHeadingH4 !== false,
+        includeHeadingH5: base.includeHeadingH5 !== false,
+        includeHeadingH6: base.includeHeadingH6 !== false,
         includeMathBlock: base.includeMathBlock !== false,
         includeEmbedBlock: base.includeEmbedBlock !== false,
         includeCodeBlock: base.includeCodeBlock !== false,
@@ -185,6 +230,36 @@ export function mergePrefs(
         includeCallout: patch.includeCallout !== undefined
             ? patch.includeCallout
             : base.includeCallout,
+        includeSuperBlock: patch.includeSuperBlock !== undefined
+            ? patch.includeSuperBlock
+            : base.includeSuperBlock,
+        includeListUnordered: patch.includeListUnordered !== undefined
+            ? patch.includeListUnordered
+            : base.includeListUnordered,
+        includeListOrdered: patch.includeListOrdered !== undefined
+            ? patch.includeListOrdered
+            : base.includeListOrdered,
+        includeListTask: patch.includeListTask !== undefined
+            ? patch.includeListTask
+            : base.includeListTask,
+        includeHeadingH1: patch.includeHeadingH1 !== undefined
+            ? patch.includeHeadingH1
+            : base.includeHeadingH1,
+        includeHeadingH2: patch.includeHeadingH2 !== undefined
+            ? patch.includeHeadingH2
+            : base.includeHeadingH2,
+        includeHeadingH3: patch.includeHeadingH3 !== undefined
+            ? patch.includeHeadingH3
+            : base.includeHeadingH3,
+        includeHeadingH4: patch.includeHeadingH4 !== undefined
+            ? patch.includeHeadingH4
+            : base.includeHeadingH4,
+        includeHeadingH5: patch.includeHeadingH5 !== undefined
+            ? patch.includeHeadingH5
+            : base.includeHeadingH5,
+        includeHeadingH6: patch.includeHeadingH6 !== undefined
+            ? patch.includeHeadingH6
+            : base.includeHeadingH6,
         includeMathBlock: patch.includeMathBlock !== undefined
             ? patch.includeMathBlock
             : base.includeMathBlock,

@@ -51,6 +51,20 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeBlockquote?: boolean;
     /** 是否匹配提示块（含标题与内部）；默认 true */
     includeCallout?: boolean;
+    /** 是否匹配超级块及其内部；默认 true */
+    includeSuperBlock?: boolean;
+    /** 是否匹配无序列表及其内部；默认 true */
+    includeListUnordered?: boolean;
+    /** 是否匹配有序列表及其内部；默认 true */
+    includeListOrdered?: boolean;
+    /** 是否匹配任务列表及其内部；默认 true */
+    includeListTask?: boolean;
+    includeHeadingH1?: boolean;
+    includeHeadingH2?: boolean;
+    includeHeadingH3?: boolean;
+    includeHeadingH4?: boolean;
+    includeHeadingH5?: boolean;
+    includeHeadingH6?: boolean;
     /** 是否匹配公式块；默认 true；不含行内公式 */
     includeMathBlock?: boolean;
     /** 是否匹配嵌入块及其内部渲染内容；默认 true */
@@ -252,6 +266,16 @@ export async function calculateSearchMatches(
                 includeTable: options.includeTable,
                 includeBlockquote: options.includeBlockquote,
                 includeCallout: options.includeCallout,
+                includeSuperBlock: options.includeSuperBlock,
+                includeListUnordered: options.includeListUnordered,
+                includeListOrdered: options.includeListOrdered,
+                includeListTask: options.includeListTask,
+                includeHeadingH1: options.includeHeadingH1,
+                includeHeadingH2: options.includeHeadingH2,
+                includeHeadingH3: options.includeHeadingH3,
+                includeHeadingH4: options.includeHeadingH4,
+                includeHeadingH5: options.includeHeadingH5,
+                includeHeadingH6: options.includeHeadingH6,
                 includeMathBlock: options.includeMathBlock,
                 includeEmbedBlock: options.includeEmbedBlock,
                 includeCodeBlock: options.includeCodeBlock,
@@ -272,6 +296,16 @@ export async function calculateSearchMatches(
         includeTable: options.includeTable !== false,
         includeBlockquote: options.includeBlockquote !== false,
         includeCallout: options.includeCallout !== false,
+        includeSuperBlock: options.includeSuperBlock !== false,
+        includeListUnordered: options.includeListUnordered !== false,
+        includeListOrdered: options.includeListOrdered !== false,
+        includeListTask: options.includeListTask !== false,
+        includeHeadingH1: options.includeHeadingH1 !== false,
+        includeHeadingH2: options.includeHeadingH2 !== false,
+        includeHeadingH3: options.includeHeadingH3 !== false,
+        includeHeadingH4: options.includeHeadingH4 !== false,
+        includeHeadingH5: options.includeHeadingH5 !== false,
+        includeHeadingH6: options.includeHeadingH6 !== false,
         includeMathBlock: options.includeMathBlock !== false,
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,

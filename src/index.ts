@@ -9,7 +9,7 @@ import {
     rpcSetPrefs,
     unbindSearchStateListener,
 } from "./frontend/kernel-client";
-import {SearchBar, type SearchBarHost, type SearchBarI18n} from "./frontend/search-bar";
+import {SearchBar, type SearchBarHost, type SearchBarI18n, type HeadingIncludeLevel} from "./frontend/search-bar";
 import {isEditorReplaceModeBlocked} from "./frontend/editor-mode";
 import {scrubSelectionScopePollution, clearAllSelectionScopeSessionOverlays} from "./frontend/selection-scope-visual";
 import {PREFS_STORAGE_PATH, type RestrictInlineType, type SearchStateEvent} from "./shared";
@@ -338,11 +338,23 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeTable: t.settingsIncludeTable || "Table",
             settingsIncludeBlockquote: t.settingsIncludeBlockquote || "Blockquote",
             settingsIncludeCallout: t.settingsIncludeCallout || "Callout",
+            settingsIncludeSuperBlock: t.settingsIncludeSuperBlock || "Super block",
+            settingsIncludeList: t.settingsIncludeList || "List blocks",
+            settingsIncludeListUnordered: t.settingsIncludeListUnordered || "Unordered list",
+            settingsIncludeListOrdered: t.settingsIncludeListOrdered || "Ordered list",
+            settingsIncludeListTask: t.settingsIncludeListTask || "Task list",
+            settingsIncludeHeading: t.settingsIncludeHeading || "Heading blocks",
+            settingsIncludeHeadingH1: t.settingsIncludeHeadingH1 || "Heading 1",
+            settingsIncludeHeadingH2: t.settingsIncludeHeadingH2 || "Heading 2",
+            settingsIncludeHeadingH3: t.settingsIncludeHeadingH3 || "Heading 3",
+            settingsIncludeHeadingH4: t.settingsIncludeHeadingH4 || "Heading 4",
+            settingsIncludeHeadingH5: t.settingsIncludeHeadingH5 || "Heading 5",
+            settingsIncludeHeadingH6: t.settingsIncludeHeadingH6 || "Heading 6",
             settingsIncludeMathBlock: t.settingsIncludeMathBlock || "Math block",
             settingsIncludeEmbedBlock: t.settingsIncludeEmbedBlock || "Embed block",
             settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
-            settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
-            settingsIncludeHtmlBlock: t.settingsIncludeHtmlBlock || "HTML block",
+            settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid diagram",
+            settingsIncludeHtmlBlock: t.settingsIncludeHtmlBlock || "HTML",
             settingsIncludeHtmlBlockHint: t.settingsIncludeHtmlBlockHint
                 || "Match visible rendered text inside HTML blocks, not the HTML source",
             settingsIncludeFoldedBlocks: t.settingsIncludeFoldedBlocks || "Folded block content",
@@ -365,7 +377,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsRestrictTag: t.settingsRestrictTag || "Tag",
             settingsRestrictInlineMath: t.settingsRestrictInlineMath || "Inline math",
             settingsRestrictInlineMathHint: t.settingsRestrictInlineMathHint
-                || "Match visible rendered formula text (not LaTeX source); not replaceable",
+                || "Match visible rendered formula text rather than LaTeX source",
             settingsRestrictInlineMemo: t.settingsRestrictInlineMemo || "Inline memo",
             settingsRestrictInlineMemoHint: t.settingsRestrictInlineMemoHint
                 || "Turn on Include in search → Inline memos first",
@@ -432,6 +444,56 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeCallout(value);
+        });
+    }
+
+    /** 将超级块匹配开关同步到其它已打开面板 */
+    syncIncludeSuperBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeSuperBlock(value);
+        });
+    }
+
+    /** 将无序列表匹配开关同步到其它已打开面板 */
+    syncIncludeListUnordered(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeListUnordered(value);
+        });
+    }
+
+    /** 将有序列表匹配开关同步到其它已打开面板 */
+    syncIncludeListOrdered(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeListOrdered(value);
+        });
+    }
+
+    /** 将任务列表匹配开关同步到其它已打开面板 */
+    syncIncludeListTask(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeListTask(value);
+        });
+    }
+
+    /** 将标题级别匹配开关同步到其它已打开面板 */
+    syncIncludeHeadingLevel(level: HeadingIncludeLevel, value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeHeadingLevel(level, value);
         });
     }
 
@@ -801,6 +863,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeTable: prefs.includeTable !== false,
                     includeBlockquote: prefs.includeBlockquote !== false,
                     includeCallout: prefs.includeCallout !== false,
+                    includeSuperBlock: prefs.includeSuperBlock !== false,
+                    includeListUnordered: prefs.includeListUnordered !== false,
+                    includeListOrdered: prefs.includeListOrdered !== false,
+                    includeListTask: prefs.includeListTask !== false,
+                    includeHeadingH1: prefs.includeHeadingH1 !== false,
+                    includeHeadingH2: prefs.includeHeadingH2 !== false,
+                    includeHeadingH3: prefs.includeHeadingH3 !== false,
+                    includeHeadingH4: prefs.includeHeadingH4 !== false,
+                    includeHeadingH5: prefs.includeHeadingH5 !== false,
+                    includeHeadingH6: prefs.includeHeadingH6 !== false,
                     includeMathBlock: prefs.includeMathBlock !== false,
                     includeEmbedBlock: prefs.includeEmbedBlock !== false,
                     includeCodeBlock: prefs.includeCodeBlock !== false,

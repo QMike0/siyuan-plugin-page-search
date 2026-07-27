@@ -917,6 +917,16 @@ export function captureSelectionScopeWithKind(
         includeTable?: boolean;
         includeBlockquote?: boolean;
         includeCallout?: boolean;
+        includeSuperBlock?: boolean;
+        includeListUnordered?: boolean;
+        includeListOrdered?: boolean;
+        includeListTask?: boolean;
+        includeHeadingH1?: boolean;
+        includeHeadingH2?: boolean;
+        includeHeadingH3?: boolean;
+        includeHeadingH4?: boolean;
+        includeHeadingH5?: boolean;
+        includeHeadingH6?: boolean;
         includeMathBlock?: boolean;
         includeEmbedBlock?: boolean;
         includeCodeBlock?: boolean;
@@ -938,6 +948,16 @@ export function captureSelectionScopeWithKind(
         includeTable: options?.includeTable !== false,
         includeBlockquote: options?.includeBlockquote !== false,
         includeCallout: options?.includeCallout !== false,
+        includeSuperBlock: options?.includeSuperBlock !== false,
+        includeListUnordered: options?.includeListUnordered !== false,
+        includeListOrdered: options?.includeListOrdered !== false,
+        includeListTask: options?.includeListTask !== false,
+        includeHeadingH1: options?.includeHeadingH1 !== false,
+        includeHeadingH2: options?.includeHeadingH2 !== false,
+        includeHeadingH3: options?.includeHeadingH3 !== false,
+        includeHeadingH4: options?.includeHeadingH4 !== false,
+        includeHeadingH5: options?.includeHeadingH5 !== false,
+        includeHeadingH6: options?.includeHeadingH6 !== false,
         includeMathBlock: options?.includeMathBlock !== false,
         includeEmbedBlock: options?.includeEmbedBlock !== false,
         includeCodeBlock: options?.includeCodeBlock !== false,
