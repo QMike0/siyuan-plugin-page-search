@@ -911,6 +911,7 @@ function looksLikeFullBlockScope(edit: Element, scope: SelectionScope): boolean 
 export function captureSelectionScopeWithKind(
     edit: Element,
     options?: {
+        includeDocTitle?: boolean;
         includeAttributeView?: boolean;
         includeTable?: boolean;
         includeBlockquote?: boolean;
@@ -930,6 +931,7 @@ export function captureSelectionScopeWithKind(
     tableCellRefs: TableCellVisualRef[];
 } {
     const blocks = collectSearchableBlocks(edit, {
+        includeDocTitle: options?.includeDocTitle !== false,
         includeAttributeView: options?.includeAttributeView !== false,
         includeTable: options?.includeTable !== false,
         includeBlockquote: options?.includeBlockquote !== false,

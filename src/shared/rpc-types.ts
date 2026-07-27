@@ -38,6 +38,8 @@ export interface PluginPrefs {
     dialogLeft: number | null;
     dialogTop: number | null;
     lastQuery: string;
+    /** 是否匹配文档标题（.protyle-title__input）；默认 true；可替换（重命名，不可 Ctrl+Z） */
+    includeDocTitle: boolean;
     /** 是否匹配文档内数据库（Attribute View）；默认 true */
     includeAttributeView: boolean;
     /** 是否匹配表格块（NodeTable）；默认 true */
@@ -100,6 +102,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     dialogLeft: null,
     dialogTop: null,
     lastQuery: "",
+    includeDocTitle: true,
     includeAttributeView: true,
     includeTable: true,
     includeBlockquote: true,
@@ -127,6 +130,7 @@ export function coercePluginPrefs(
         dialogLeft: typeof base.dialogLeft === "number" ? base.dialogLeft : null,
         dialogTop: typeof base.dialogTop === "number" ? base.dialogTop : null,
         lastQuery: typeof base.lastQuery === "string" ? base.lastQuery : "",
+        includeDocTitle: base.includeDocTitle !== false,
         includeAttributeView: base.includeAttributeView !== false,
         includeTable: base.includeTable !== false,
         includeBlockquote: base.includeBlockquote !== false,
@@ -156,6 +160,9 @@ export function mergePrefs(
         dialogLeft: patch.dialogLeft !== undefined ? patch.dialogLeft : base.dialogLeft,
         dialogTop: patch.dialogTop !== undefined ? patch.dialogTop : base.dialogTop,
         lastQuery: patch.lastQuery !== undefined ? patch.lastQuery : base.lastQuery,
+        includeDocTitle: patch.includeDocTitle !== undefined
+            ? patch.includeDocTitle
+            : base.includeDocTitle,
         includeAttributeView: patch.includeAttributeView !== undefined
             ? patch.includeAttributeView
             : base.includeAttributeView,

@@ -1,5 +1,10 @@
 export {SEARCH_COUNT_SOFT_CAP, ZERO_WIDTH_GLOBAL_RE, ZERO_WIDTH_RE, formatSearchCountLabel} from "./constants";
 export {
+    DOC_TITLE_MAX_LENGTH,
+    isValidDocTitle,
+    sanitizeDocTitle,
+} from "./doc-title";
+export {
     createSearchPattern,
     escapeForRegex,
     findOffsetMatchesInText,

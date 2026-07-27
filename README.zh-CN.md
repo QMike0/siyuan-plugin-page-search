@@ -41,7 +41,7 @@
 
 | 分组 | 作用 |
 |------|------|
-| **是否搜索** | 是否纳入行内备注、数据库、表格、引述块、提示块、公式块、嵌入块、代码块、Mermaid |
+| **是否搜索** | 是否纳入文档标题、行内备注、数据库、表格、引述块、提示块、公式块、嵌入块、代码块、Mermaid、HTML 块 |
 | **折叠块内容** | 是否匹配非标题折叠块内隐藏内容（与限制搜索独立） |
 | **限制搜索** | 仅在所选行内类型中搜索（多选 OR；全关=不限制）。搜索框为空时预览所选类型的全部行内宿主（不可替换；计数超过 999 显示为 `999+` 仍全量高亮）。类型顺序：引用、链接、粗体、斜体、下划线、删除线、高亮、上标、下标、行级代码、键盘、标签、行级公式、行内备注。可与「选区内」同时生效 |
 
@@ -59,6 +59,7 @@
 - **拿不到 Protyle**：中止替换并提示，**不会**静默调用内核 `updateBlock`（避免误以为可撤销）  
 - **仅当前已打开 / 已加载的 DOM**：离屏未渲染块不在本阶段范围内  
 - **正则替换**：搜索开正则时，替换串按 JS/`$n` 模板展开（例：搜索 `(\d+)-(\d+)`，替换 `$2/$1`）；非正则模式仍为字面量替换  
+- **文档标题**：可搜可替（「是否搜索」可关）；写回走 `/api/filetree/renameDocByID`（或 `renameDoc`），**不支持** Ctrl+Z；全部替换时标题命中合并为一次重命名，与正文 transaction 分开；替换结果为空时与官方一致：API 传空串，由内核存为 Language(16) 并标记 `custom-sy-title-empty`，输入框显示为空（placeholder）  
 
 ### 不可自动替换（可搜、可高亮）
 
@@ -68,7 +69,6 @@
 | Mermaid / HTML 块 | 仅搜渲染可见文字并高亮 |
 | 跨 Text / 复杂格式 | 如普通字 + **加粗** 拼成一词 → `replaceable=false` |
 | 公式 / 只读渲染 | 行内公式、块公式等 |
-| 文档标题区 | 当前不走块 transaction 写回 |
 | 预览合成块 | 无稳定块 ID 时跳过写回 |
 
 说明：Callout 根节点在思源中为 `contenteditable=false`（标题经对话框编辑），表格也可能落在 false 容器内；插件仍允许对 **Callout 标题** 与 **表格单元格** 做整块 HTML 写回（与思源自身 transaction 一致）。
@@ -100,7 +100,7 @@
 | 字段 | 说明 |
 |------|------|
 | `dialogLeft` / `dialogTop` | 拖拽后的固定位置（点顶栏复位会清空） |
-| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | 是否搜索（默认开） |
+| `includeDocTitle` / `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | 是否搜索（默认开；文档标题默认可搜可替） |
 | `includeFoldedBlocks` / `includeInlineMemo` | 折叠块 / 行内备注（默认关） |
 | `useRegex` | 搜索方法：`false`=关键字，`true`=正则表达式（默认关键字；跨次打开保持） |
 | `restrictInlineTypes` | 限制搜索类型（会话内；关闭搜索窗后清回空） |

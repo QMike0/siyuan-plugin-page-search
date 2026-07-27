@@ -62,6 +62,64 @@ function resolveReplacementText(
 }
 
 /**
+ * 在纯字符串上从后往前应用替换（不改 DOM）。
+ * 用于文档标题：先算出完整新标题，再走 renameDoc。
+ */
+export function applyReplacementsToString(
+    haystack: string,
+    replacements: ReplacementSpec[],
+    replacementText: string,
+    options: ApplyReplacementOptions = {},
+): ApplyReplacementOutcome & {text: string} {
+    if (!replacements.length) {
+        return {
+            text: haystack,
+            appliedCount: 0,
+            skippedCount: 0,
+            regexExpandFailedCount: 0,
+        };
+    }
+
+    const sorted = [...replacements].sort((left, right) => right.start - left.start);
+    let text = haystack;
+    let appliedCount = 0;
+    let skippedCount = 0;
+    let regexExpandFailedCount = 0;
+
+    for (const replacement of sorted) {
+        if (
+            replacement.start < 0
+            || replacement.end > haystack.length
+            || replacement.start > replacement.end
+            || haystack.slice(replacement.start, replacement.end) !== replacement.matchedText
+        ) {
+            skippedCount += 1;
+            continue;
+        }
+
+        const nextText = resolveReplacementText(
+            haystack,
+            replacement,
+            replacementText,
+            options,
+        );
+        if (nextText === null) {
+            skippedCount += 1;
+            if (options.regex) {
+                regexExpandFailedCount += 1;
+            }
+            continue;
+        }
+
+        // 从后往前改：高 offset 不受此前替换长度变化影响
+        text = text.slice(0, replacement.start) + nextText + text.slice(replacement.end);
+        appliedCount += 1;
+    }
+
+    return {text, appliedCount, skippedCount, regexExpandFailedCount};
+}
+
+/**
  * 在已定位的 textNodes 上从后往前替换（同一单元内）。
  * 优先单 Text 节点；若命中跨多个纯 Text 拆分节点（编辑中未合并），用 Range 删除后插入。
  */

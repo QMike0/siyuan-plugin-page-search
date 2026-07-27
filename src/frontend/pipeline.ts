@@ -13,6 +13,7 @@ import {
     CALLOUT_TYPE,
     TABLE_TYPE,
     collectSearchableBlocks,
+    isDocTitleSearchUnit,
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
 } from "./blocks";
@@ -37,6 +38,8 @@ export interface SearchPipelineOptions extends MatchOptions {
      * 现场为空时可传 rememberedScope 兜底（由 SearchBar 管理）。
      */
     selectionScope?: SelectionScope;
+    /** 是否匹配文档标题；默认 true；命中可走 renameDoc 替换 */
+    includeDocTitle?: boolean;
     /** 是否匹配数据库；默认 true */
     includeAttributeView?: boolean;
     /** 是否匹配表格块；默认 true */
@@ -137,7 +140,7 @@ function isInsideNestedEditable(element: Element): boolean {
 
 /**
  * 元素级 replaceable（在模式级判断之后调用）：
- * 数据库 → 文档标题/预览合成块 → 数学公式 → contenteditable 边界。
+ * 数据库 → 预览合成块 → 文档标题（rename 路径）→ 数学公式 → contenteditable 边界。
  */
 function isDomReplaceable(
     range: Range,
@@ -153,10 +156,15 @@ function isDomReplaceable(
     if (
         blockType === PREVIEW_BLOCK_TYPE
         || blockId === PREVIEW_BLOCK_ID
-        || blockType === DOC_TITLE_BLOCK_TYPE
-        || blockId === DOC_TITLE_BLOCK_ID
     ) {
         return false;
+    }
+    // 文档标题：不走块 transaction，由 renameDoc 写回
+    if (
+        blockType === DOC_TITLE_BLOCK_TYPE
+        || blockId === DOC_TITLE_BLOCK_ID
+    ) {
+        return true;
     }
 
     const node = range.commonAncestorContainer;
@@ -230,6 +238,7 @@ export async function calculateSearchMatches(
             matches: enumerateRestrictInlineMatches(edit, {
                 selectionOnly: options.selectionOnly,
                 selectionScope: options.selectionScope,
+                includeDocTitle: options.includeDocTitle,
                 includeAttributeView: options.includeAttributeView,
                 includeTable: options.includeTable,
                 includeBlockquote: options.includeBlockquote,
@@ -248,6 +257,7 @@ export async function calculateSearchMatches(
     }
 
     const blocks = collectSearchableBlocks(edit, {
+        includeDocTitle: options.includeDocTitle !== false,
         includeAttributeView: options.includeAttributeView !== false,
         includeTable: options.includeTable !== false,
         includeBlockquote: options.includeBlockquote !== false,
@@ -344,7 +354,9 @@ function attachRangesToHits(
 
         const isMemo = isInlineMemoSearchUnit(block);
         const isMath = isInlineMathSearchUnit(block);
+        const isDocTitle = isDocTitleSearchUnit(block);
         // 限制查找：块级采集之后，仅保留落在所选行内类型内的命中（OR）；与选区过滤独立叠加
+        // 文档标题不是行内类型：限制激活时自然被滤掉
         if (
             restrictActive
             && !matchRangePassesRestrictInline(range, restrictInlineTypes, {
@@ -357,14 +369,13 @@ function attachRangesToHits(
         accepted.push({start: hit.start, end: hit.end});
         acceptedByUnit.set(key, accepted);
 
-        // 2) 元素级：数据库 / 标题 / 公式等；行内备注与行内公式只搜不替
-        // 编辑中 Protyle 常把连续字拆成多个相邻 Text：可高亮但旧逻辑因跨 segment 判不可替。
-        // 仅当 Range 内无元素（未跨加粗/链接等）时允许替换。
+        // 2) 元素级：数据库 / 公式等；行内备注与行内公式只搜不替
+        // 文档标题：可替（renameDoc）；编辑中 Protyle 常把连续字拆成多个相邻 Text
         const replaceable = !isMemo
             && !isMath
             && !modeBlocked
             && isDomReplaceable(range, hit.blockType, hit.blockId)
-            && isRangePlainTextOnly(range);
+            && (isDocTitle || isRangePlainTextOnly(range));
 
         result.push({
             id: hit.id,

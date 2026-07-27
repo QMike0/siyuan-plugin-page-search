@@ -41,7 +41,7 @@ Gear menu:
 
 | Group | Role |
 |------|------|
-| **Include in search** | Whether to include inline memos, databases, tables, blockquotes, callouts, math blocks, embed blocks, code blocks, Mermaid |
+| **Include in search** | Whether to include document title, inline memos, databases, tables, blockquotes, callouts, math blocks, embed blocks, code blocks, Mermaid, HTML blocks |
 | **Folded block content** | Match hidden content in non-heading folded blocks (independent of Limit search) |
 | **Limit search** | Search only within selected inline types (OR; all off = no limit). Empty search box previews all hosts of selected types (not replaceable; counts over 999 show as `999+` while still highlighting all). Order: block ref, link, bold, italic, underline, strike, highlight, superscript, subscript, inline code, keyboard, tag, inline math, inline memo. Stacks with Search in selection |
 
@@ -59,6 +59,7 @@ Writes go through the current document’s **Protyle transaction** (`updateTrans
 - **No Protyle**: replace is aborted with a message — never a silent kernel `updateBlock` (no false sense of undo)  
 - **Loaded DOM only**: off-screen / unloaded blocks are out of scope for this release  
 - **Regex replace**: with regex search on, the replace string is a `$n` template (e.g. find `(\d+)-(\d+)`, replace `$2/$1`); without regex, replace stays literal  
+- **Document title**: searchable & replaceable (toggle under Include in search); write-back uses `/api/filetree/renameDocByID` (or `renameDoc`) (**not** Ctrl+Z); replace-all merges title hits into one rename, separate from body transactions; empty result matches SiYuan: send `""` to the API so the kernel stores Language(16) with `custom-sy-title-empty`, while the title input shows empty (placeholder)  
 
 ### Not auto-replaceable (still searchable / highlightable)
 
@@ -68,7 +69,6 @@ Writes go through the current document’s **Protyle transaction** (`updateTrans
 | Mermaid / HTML block | Search & highlight rendered text only |
 | Cross-Text / complex marks | e.g. plain + **bold** spanning one word → `replaceable=false` |
 | Math / render-only | Inline math, block math, etc. |
-| Document title field | Not written via block transactions yet |
 | Preview synthetic block | Skipped when there is no stable block id |
 
 Note: SiYuan sets Callout roots to `contenteditable="false"` (title edited via dialog). Tables may also sit under false containers. This plugin still allows **callout titles** and **table cells** to be updated via whole-block HTML transactions (same path SiYuan uses).
@@ -100,7 +100,7 @@ Stored at `data/storage/petal/<plugin>/prefs.json` (same path for kernel `storag
 | Field | Meaning |
 |------|---------|
 | `dialogLeft` / `dialogTop` | Dragged position (cleared when resetting via top bar) |
-| `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in search (default on) |
+| `includeDocTitle` / `includeAttributeView` / `includeTable` / `includeBlockquote` / `includeCallout` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | Include in search (default on; document title searchable & replaceable by default) |
 | `includeFoldedBlocks` / `includeInlineMemo` | Folded blocks / inline memos (default off) |
 | `useRegex` | Search method: `false`=keyword, `true`=regular expression (default keyword; kept across reopen) |
 | `restrictInlineTypes` | Limit-find types (session only; cleared when search UI closes) |

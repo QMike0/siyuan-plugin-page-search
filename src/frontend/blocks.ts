@@ -40,8 +40,9 @@ const INLINE_MEMO_BLOCK_TYPE = 'inline-memo'
 const INLINE_MATH_UNIT_PREFIX = 'inline-math:'
 /** 合成块类型，便于 replaceable / 高亮分流 */
 const INLINE_MATH_BLOCK_TYPE = 'inline-math'
-const DOC_TITLE_BLOCK_ID = '__doc-title__'
-const DOC_TITLE_BLOCK_TYPE = 'doc-title'
+export const DOC_TITLE_BLOCK_ID = '__doc-title__'
+export const DOC_TITLE_BLOCK_TYPE = 'doc-title'
+export const DOC_TITLE_UNIT_ID = 'doc-title'
 const TABLE_CELL_SELECTOR = '[data-type="NodeTableCell"], .table__cell, td, th'
 
 /** 数据库内不应参与搜索的 UI 节点（含 av__cursor 的 ZWSP，会干扰零宽变体匹配） */
@@ -84,7 +85,7 @@ function resolveDocRoot(edit: Element): HTMLElement | null {
  * 思源标题在 .protyle-wysiwyg 之外：.protyle-title > .protyle-title__input
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/header/Title.ts
  */
-function resolveDocTitleInput(edit: Element): HTMLElement | null {
+export function resolveDocTitleInput(edit: Element): HTMLElement | null {
   let titleInput = edit.querySelector(
     ':scope > .protyle:not(.fn__none) .protyle-title .protyle-title__input',
   ) as HTMLElement | null
@@ -127,8 +128,17 @@ function collectDocTitleUnit(edit: Element): SearchableBlock | null {
     element: titleInput,
     text,
     textNodes,
-    unitId: 'doc-title',
+    unitId: DOC_TITLE_UNIT_ID,
   }
+}
+
+/** 是否为文档标题合成搜索单元 */
+export function isDocTitleSearchUnit(
+  block: Pick<SearchableBlock, 'blockId' | 'blockType' | 'unitId'>,
+): boolean {
+  return block.blockId === DOC_TITLE_BLOCK_ID
+    || block.blockType === DOC_TITLE_BLOCK_TYPE
+    || block.unitId === DOC_TITLE_UNIT_ID
 }
 
 /**
@@ -136,6 +146,8 @@ function collectDocTitleUnit(edit: Element): SearchableBlock | null {
  * 预览模式无 data-node-id 时回退为整根合成块，保证行为不回退。
  */
 export interface CollectSearchableBlocksOptions {
+  /** 是否采集文档标题（.protyle-title__input）；默认 true */
+  includeDocTitle?: boolean;
   /** 是否采集数据库（Attribute View）；默认 true */
   includeAttributeView?: boolean;
   /** 是否采集表格块（NodeTable）；默认 true */
@@ -170,6 +182,7 @@ export function collectSearchableBlocks(
   edit: Element,
   options: CollectSearchableBlocksOptions = {},
 ): SearchableBlock[] {
+  const includeDocTitle = options.includeDocTitle !== false;
   const includeAttributeView = options.includeAttributeView !== false;
   const includeTable = options.includeTable !== false;
   const includeBlockquote = options.includeBlockquote !== false;
@@ -208,7 +221,7 @@ export function collectSearchableBlocks(
   }
 
   const blocks: SearchableBlock[] = []
-  if (collectBodyText) {
+  if (collectBodyText && includeDocTitle) {
     const titleUnit = collectDocTitleUnit(edit)
     if (titleUnit) {
       blocks.push(titleUnit)

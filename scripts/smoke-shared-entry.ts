@@ -16,6 +16,7 @@ import {
     isHitReplaceableByUnit,
     isOffsetReplaceable,
     isRestrictInlineActive,
+    isValidDocTitle,
     matchPassesRestrictInline,
     matchTextUnits,
     matchTextUnitsDetailed,
@@ -26,6 +27,7 @@ import {
     normalizeSearchStateEvent,
     parseDataTypeTokens,
     rangeRestrictTokens,
+    sanitizeDocTitle,
     shouldCollectBodyTextForRestrict,
     shouldCollectInlineMathUnits,
     shouldCollectInlineMemoUnits,
@@ -174,6 +176,13 @@ assert(htmlHits.length === 1 && htmlHits[0].replaceable === false, "HTML hit rep
 assert(DEFAULT_PREFS.includeHtmlBlock === true, "includeHtmlBlock defaults on");
 assert(coercePluginPrefs({}).includeHtmlBlock === true, "coerce includeHtmlBlock default on");
 assert(coercePluginPrefs({includeHtmlBlock: false}).includeHtmlBlock === false, "coerce includeHtmlBlock off");
+assert(DEFAULT_PREFS.includeDocTitle === true, "includeDocTitle defaults on");
+assert(coercePluginPrefs({}).includeDocTitle === true, "coerce includeDocTitle default on");
+assert(coercePluginPrefs({includeDocTitle: false}).includeDocTitle === false, "coerce includeDocTitle off");
+assert(
+    mergePrefs(DEFAULT_PREFS, {includeDocTitle: false}).includeDocTitle === false,
+    "merge includeDocTitle off",
+);
 assert(DEFAULT_PREFS.useRegex === false, "useRegex defaults off (keyword)");
 assert(coercePluginPrefs({}).useRegex === false, "coerce useRegex default off");
 assert(coercePluginPrefs({useRegex: true}).useRegex === true, "coerce useRegex on");
@@ -570,4 +579,11 @@ assert(
     "capturing group matched empty => 【】",
 );
 
-console.log("smoke:shared OK (match + restrict + selection + preserve-case + regex-replace)");
+assert(sanitizeDocTitle("a/b") === "a／b", "sanitize title slash");
+assert(sanitizeDocTitle("a\nb") === "ab", "sanitize title newline");
+assert(sanitizeDocTitle("") === "", "sanitize keeps empty string for renameDoc");
+assert(isValidDocTitle("ok"), "valid title");
+assert(isValidDocTitle(""), "empty title is valid for API");
+assert(!isValidDocTitle("bad\n"), "invalid title newline");
+
+console.log("smoke:shared OK (match + restrict + selection + preserve-case + regex-replace + doc-title)");

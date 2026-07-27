@@ -104,6 +104,10 @@ export interface SearchBarI18n {
     replaceMermaidUnsupported: string;
     replaceHtmlBlockUnsupported: string;
     replaceModeUnsupported: string;
+    /** 文档标题替换失败（重命名校验/接口） */
+    replaceDocTitleFailed: string;
+    /** 文档标题替换结果为空 */
+    replaceDocTitleEmpty: string;
     replaceAllConfirm: string;
     replaceAllConfirmTitle: string;
     replaceCurrentDone: string;
@@ -115,6 +119,8 @@ export interface SearchBarI18n {
     settingsRestrictInlineHint: string;
     settingsIncludeScope: string;
     settingsIncludeScopeHint: string;
+    settingsIncludeDocTitle: string;
+    settingsIncludeDocTitleHint: string;
     settingsIncludeAttributeView: string;
     settingsIncludeTable: string;
     settingsIncludeBlockquote: string;
@@ -157,6 +163,8 @@ export interface SearchBarHost {
     closeCurrentSearchDialog(element: Element, options?: {broadcast?: boolean}): void;
     onSearchComponentMounted(callback: (event: CustomEvent) => void): void;
     onSearchComponentUnmounted(callback?: (event: CustomEvent) => void): void;
+    /** 将文档标题匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeDocTitle?(value: boolean, source?: SearchBar): void;
     /** 将数据库匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeAttributeView?(value: boolean, source?: SearchBar): void;
     /** 将表格匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -211,6 +219,8 @@ export class SearchBar {
     private preserveCase = false;
     /** 选区内查找；打开预填关键词不会自动打开 */
     private selectionOnly = false;
+    /** 是否匹配文档标题；全局 prefs，默认 true */
+    private includeDocTitle = true;
     /** 是否匹配数据库；全局 prefs，默认 true */
     private includeAttributeView = true;
     /** 是否匹配表格块；全局 prefs，默认 true */
@@ -278,6 +288,8 @@ export class SearchBar {
         presetText?: string;
         /** 打开时是否展开替换行（Ctrl+H） */
         replaceVisible?: boolean;
+        /** 是否匹配文档标题（来自全局 prefs） */
+        includeDocTitle?: boolean;
         /** 是否匹配数据库（来自全局 prefs） */
         includeAttributeView?: boolean;
         /** 是否匹配表格块（来自全局 prefs） */
@@ -311,6 +323,7 @@ export class SearchBar {
         this.i18n = options.i18n;
         this.replaceVisible = Boolean(options.replaceVisible);
         this.regex = options.useRegex === true;
+        this.includeDocTitle = options.includeDocTitle !== false;
         this.includeAttributeView = options.includeAttributeView !== false;
         this.includeTable = options.includeTable !== false;
         this.includeBlockquote = options.includeBlockquote !== false;
@@ -769,6 +782,7 @@ export class SearchBar {
 
     private captureSelectionScope() {
         const {scope, kind, visualBlockIds, tableCellRefs} = captureSelectionScopeWithKind(this.edit, {
+            includeDocTitle: this.includeDocTitle,
             includeAttributeView: this.includeAttributeView,
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
@@ -792,6 +806,7 @@ export class SearchBar {
             return new Map();
         }
         const blocks = collectSearchableBlocks(this.edit, {
+            includeDocTitle: this.includeDocTitle,
             includeAttributeView: this.includeAttributeView,
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
@@ -808,6 +823,7 @@ export class SearchBar {
         if (live.size > 0) {
             // 仍有现场选区时同步提示（用户改选了范围）；光标挪走后 live 为空则保持冻结提示
             const captured = captureSelectionScopeWithKind(this.edit, {
+                includeDocTitle: this.includeDocTitle,
                 includeAttributeView: this.includeAttributeView,
                 includeTable: this.includeTable,
                 includeBlockquote: this.includeBlockquote,
@@ -1075,6 +1091,7 @@ export class SearchBar {
             regex: this.regex,
             selectionOnly: this.selectionOnly,
             selectionScope: this.resolveScopeForSearch(),
+            includeDocTitle: this.includeDocTitle,
             includeAttributeView: this.includeAttributeView,
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
@@ -1636,7 +1653,7 @@ export class SearchBar {
         const keepIndex = this.resultIndex;
         this.replaceBusy = true;
         try {
-            const result = replaceCurrentMatchInEditor(
+            const result = await replaceCurrentMatchInEditor(
                 this.edit,
                 match,
                 this.replaceText,
@@ -1658,6 +1675,19 @@ export class SearchBar {
             if (result.error === "regex-expand-failed") {
                 showMessage(this.i18n.replaceRegexExpandFailed, 3000, "info");
                 this.clickNext();
+                return;
+            }
+            if (result.error === "title-invalid") {
+                showMessage(this.i18n.replaceDocTitleEmpty, 3000, "info");
+                this.clickNext();
+                return;
+            }
+            if (
+                result.error === "title-context-missing"
+                || result.error === "title-rename-failed"
+                || result.error === "title-missing"
+            ) {
+                showMessage(this.formatDocTitleReplaceError(result.detail), 4000, "error");
                 return;
             }
             if (result.replacedCount === 0) {
@@ -1707,7 +1737,7 @@ export class SearchBar {
 
         this.replaceBusy = true;
         try {
-            const result = replaceAllMatchesInEditor(
+            const result = await replaceAllMatchesInEditor(
                 this.edit,
                 this.resultMatches,
                 this.replaceText,
@@ -1724,6 +1754,24 @@ export class SearchBar {
             }
             if (result.error === "protyle-missing") {
                 showMessage(this.i18n.replaceProtyleMissing, 4000, "error");
+                return;
+            }
+            if (
+                result.replacedCount === 0
+                && result.error === "title-invalid"
+            ) {
+                showMessage(this.i18n.replaceDocTitleEmpty, 3000, "info");
+                return;
+            }
+            if (
+                result.replacedCount === 0
+                && (
+                    result.error === "title-rename-failed"
+                    || result.error === "title-missing"
+                    || result.error === "title-context-missing"
+                )
+            ) {
+                showMessage(this.formatDocTitleReplaceError(result.detail), 4000, "error");
                 return;
             }
 
@@ -1746,6 +1794,16 @@ export class SearchBar {
         }
     }
 
+    /** 标题重命名失败：有内核 msg 时追加一行，避免只剩笼统文案 */
+    private formatDocTitleReplaceError(detail?: string): string {
+        const base = this.i18n.replaceDocTitleFailed;
+        const msg = detail?.trim();
+        if (!msg) {
+            return base;
+        }
+        return `${base}：${msg}`;
+    }
+
     /**
      * 思源原生 Menu + b3-switch：搜索范围设置（全局持久化）。
      * 一级：是否搜索 ▸ / 折叠块内容 / 限制搜索 ▸
@@ -1766,6 +1824,16 @@ export class SearchBar {
             label: this.i18n.settingsIncludeScope,
             type: "submenu",
             submenu: [
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-doc-title",
+                    icon: "iconFile",
+                    label: this.i18n.settingsIncludeDocTitle,
+                    checked: this.includeDocTitle,
+                    helpTip: this.i18n.settingsIncludeDocTitleHint,
+                    onChange: (checked) => {
+                        void this.setIncludeDocTitle(checked);
+                    },
+                }),
                 this.buildMatchSwitchMenuItem({
                     id: "page-search-include-inline-memo",
                     icon: "iconM",
@@ -2187,6 +2255,16 @@ export class SearchBar {
     }
 
     /** 用户切换：写 prefs + 同步其它面板 + 重搜 */
+    private async setIncludeDocTitle(value: boolean) {
+        if (this.includeDocTitle === value) {
+            return;
+        }
+        this.includeDocTitle = value;
+        await rpcSetPrefs(this.plugin, {includeDocTitle: value});
+        this.plugin.syncIncludeDocTitle?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeAttributeView(value: boolean) {
         if (this.includeAttributeView === value) {
             return;
@@ -2327,6 +2405,14 @@ export class SearchBar {
      * 其它面板同步过来的 prefs 值（不再写存储）。
      * 由插件 host 在 prefs 变更后调用。
      */
+    applyIncludeDocTitle(value: boolean) {
+        if (this.includeDocTitle === value) {
+            return;
+        }
+        this.includeDocTitle = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     applyIncludeAttributeView(value: boolean) {
         if (this.includeAttributeView === value) {
             return;

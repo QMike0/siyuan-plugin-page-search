@@ -4,6 +4,10 @@ import {ATTRIBUTE_VIEW_TYPE, isPreviewSyntheticBlock} from "./blocks";
 import {collectSearchableBlocks} from "./blocks";
 import type {SearchableBlock} from "./dom-types";
 import type {SearchMatch} from "./dom-types";
+import {
+    isDocTitleMatch,
+    replaceDocTitleMatchesInEditor,
+} from "./doc-title-replace";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
 import {
     applyMatchesToLiveUnits,
@@ -26,6 +30,8 @@ export interface ReplaceWriteResult {
     replacedCount: number;
     skippedCount: number;
     error?: string;
+    /** 透传标题 rename 等失败时的内核 msg */
+    detail?: string;
 }
 
 /**
@@ -87,12 +93,12 @@ function resolveSubmitBlockElement(
 /**
  * 是否可写回。判别顺序：
  * 1) 发布服务 / 导出预览 / 只读模式
- * 2) 命中自身 replaceable（已含数据库、公式等）
- * 3) 文档标题 / 预览合成块兜底
+ * 2) 命中自身 replaceable（已含数据库、公式等；文档标题在 pipeline 中可标 true）
+ * 3) 预览合成块兜底
  */
 export function isMatchWritable(
     edit: Element,
-    match: Pick<SearchMatch, "replaceable" | "blockType" | "blockId">,
+    match: Pick<SearchMatch, "replaceable" | "blockType" | "blockId" | "unitId">,
 ): boolean {
     if (isEditorReplaceModeBlocked(edit)) {
         return false;
@@ -103,7 +109,7 @@ export function isMatchWritable(
     if (match.blockType === ATTRIBUTE_VIEW_TYPE) {
         return false;
     }
-    if (match.blockId === DOC_TITLE_BLOCK_ID || match.blockId === PREVIEW_BLOCK_ID) {
+    if (match.blockId === PREVIEW_BLOCK_ID) {
         return false;
     }
     return true;
@@ -117,15 +123,33 @@ function buildUnitMap(blocks: SearchableBlock[]): Map<string, SearchableBlock> {
     return map;
 }
 
+function replaceOptionsFrom(
+    options: ReplaceWriteOptions,
+): {
+    preserveCase?: boolean;
+    regex?: boolean;
+    searchQuery?: string;
+    caseSensitive?: boolean;
+} {
+    return {
+        preserveCase: options.preserveCase,
+        regex: options.regex,
+        searchQuery: options.searchQuery,
+        caseSensitive: options.caseSensitive,
+    };
+}
+
 /**
- * 替换单次命中：改 live DOM + updateTransactionElement（可 Ctrl+Z）。
+ * 替换单次命中。
+ * - 正文：live DOM + updateTransactionElement（可 Ctrl+Z）
+ * - 文档标题：renameDoc（不考虑撤销）
  */
-export function replaceCurrentMatchInEditor(
+export async function replaceCurrentMatchInEditor(
     edit: Element,
     match: SearchMatch,
     replacementText: string,
     options: ReplaceWriteOptions = {},
-): ReplaceWriteResult {
+): Promise<ReplaceWriteResult> {
     if (isEditorReplaceModeBlocked(edit)) {
         return {replacedCount: 0, skippedCount: 1, error: "readonly-or-preview"};
     }
@@ -137,8 +161,18 @@ export function replaceCurrentMatchInEditor(
     if (!protyle) {
         return {replacedCount: 0, skippedCount: 1, error: "protyle-missing"};
     }
-    if (protyle.disabled) {
+    if (protyle.protyle?.disabled) {
         return {replacedCount: 0, skippedCount: 1, error: "readonly-or-preview"};
+    }
+
+    if (isDocTitleMatch(match)) {
+        return replaceDocTitleMatchesInEditor(
+            edit,
+            protyle,
+            [match],
+            replacementText,
+            replaceOptionsFrom(options),
+        );
     }
 
     const submit = resolveSubmitBlockElement(edit, match.blockId);
@@ -158,12 +192,7 @@ export function replaceCurrentMatchInEditor(
         unitsByKey,
         [match],
         replacementText,
-        {
-            preserveCase: options.preserveCase,
-            regex: options.regex,
-            searchQuery: options.searchQuery,
-            caseSensitive: options.caseSensitive,
-        },
+        replaceOptionsFrom(options),
     );
     if (outcome.appliedCount === 0) {
         return {
@@ -189,14 +218,14 @@ export function replaceCurrentMatchInEditor(
 }
 
 /**
- * 全部替换：按块 clone 后合并为一批 transaction（一次 Ctrl+Z 回退）。
+ * 全部替换：标题命中单独 rename；正文按块合并为一批 transaction。
  */
-export function replaceAllMatchesInEditor(
+export async function replaceAllMatchesInEditor(
     edit: Element,
     matches: SearchMatch[],
     replacementText: string,
     options: ReplaceWriteOptions = {},
-): ReplaceWriteResult {
+): Promise<ReplaceWriteResult> {
     if (isEditorReplaceModeBlocked(edit)) {
         return {replacedCount: 0, skippedCount: matches.length, error: "readonly-or-preview"};
     }
@@ -205,25 +234,61 @@ export function replaceAllMatchesInEditor(
     if (!protyle) {
         return {replacedCount: 0, skippedCount: matches.length, error: "protyle-missing"};
     }
-    if (protyle.disabled) {
+    if (protyle.protyle?.disabled) {
         return {replacedCount: 0, skippedCount: matches.length, error: "readonly-or-preview"};
+    }
+
+    const replaceOpts = replaceOptionsFrom(options);
+    const titleMatches: SearchMatch[] = [];
+    const bodyMatches: SearchMatch[] = [];
+    let skippedCount = 0;
+
+    for (const match of matches) {
+        if (!isMatchWritable(edit, match)) {
+            skippedCount += 1;
+            continue;
+        }
+        if (isDocTitleMatch(match)) {
+            titleMatches.push(match);
+        } else {
+            bodyMatches.push(match);
+        }
+    }
+
+    let replacedCount = 0;
+    let firstError: string | undefined;
+    let firstDetail: string | undefined;
+
+    if (titleMatches.length > 0) {
+        const titleResult = await replaceDocTitleMatchesInEditor(
+            edit,
+            protyle,
+            titleMatches,
+            replacementText,
+            replaceOpts,
+        );
+        replacedCount += titleResult.replacedCount;
+        skippedCount += titleResult.skippedCount;
+        if (titleResult.error && titleResult.replacedCount === 0) {
+            firstError = titleResult.error;
+            firstDetail = titleResult.detail;
+        }
+    }
+
+    if (bodyMatches.length === 0) {
+        return {
+            replacedCount,
+            skippedCount,
+            error: replacedCount === 0 ? firstError : undefined,
+            detail: replacedCount === 0 ? firstDetail : undefined,
+        };
     }
 
     const blocks = collectSearchableBlocks(edit).filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks);
 
-    const writable: SearchMatch[] = [];
-    let skippedCount = 0;
-    for (const match of matches) {
-        if (isMatchWritable(edit, match)) {
-            writable.push(match);
-        } else {
-            skippedCount += 1;
-        }
-    }
-
     const grouped = new Map<string, SearchMatch[]>();
-    for (const match of writable) {
+    for (const match of bodyMatches) {
         const list = grouped.get(match.blockId) ?? [];
         list.push(match);
         grouped.set(match.blockId, list);
@@ -231,7 +296,6 @@ export function replaceAllMatchesInEditor(
 
     const doOperations: IOperation[] = [];
     const undoOperations: IOperation[] = [];
-    let replacedCount = 0;
 
     for (const [blockId, blockMatches] of grouped) {
         const submit = resolveSubmitBlockElement(edit, blockId);
@@ -248,12 +312,7 @@ export function replaceAllMatchesInEditor(
             unitsByKey,
             blockMatches,
             replacementText,
-            {
-                preserveCase: options.preserveCase,
-                regex: options.regex,
-                searchQuery: options.searchQuery,
-                caseSensitive: options.caseSensitive,
-            },
+            replaceOpts,
         );
         if (outcome.appliedCount === 0) {
             skippedCount += outcome.skippedCount || blockMatches.length;
@@ -267,14 +326,24 @@ export function replaceAllMatchesInEditor(
     }
 
     if (doOperations.length === 0) {
-        return {replacedCount: 0, skippedCount};
+        return {
+            replacedCount,
+            skippedCount,
+            error: replacedCount === 0 ? firstError : undefined,
+            detail: replacedCount === 0 ? firstDetail : undefined,
+        };
     }
 
     try {
         protyle.transaction(doOperations, undoOperations);
     } catch (error) {
         console.warn("[page-search] transaction failed", error);
-        return {replacedCount: 0, skippedCount: matches.length, error: "transaction-failed"};
+        // 标题可能已 rename 成功：保留已替换计数，正文计为跳过
+        return {
+            replacedCount,
+            skippedCount: skippedCount + bodyMatches.length,
+            error: "transaction-failed",
+        };
     }
 
     return {replacedCount, skippedCount};

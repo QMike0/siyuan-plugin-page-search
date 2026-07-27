@@ -288,7 +288,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             preserveCaseDisabledByRegex: t.preserveCaseDisabledByRegex
                 || "Unavailable with regex (replace uses $1 templates)",
             replaceUnsupportedHelp: t.replaceUnsupportedHelp
-                || "Replacement is unavailable in read-only mode, export preview, and the publish service; the document title, math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced. When the search mode is Regular expression, the replace box can use $1, $&, and similar syntax",
+                || "Replacement is unavailable in read-only mode, export preview, and the publish service; math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced; replacing the document title cannot be undone with Ctrl+Z. When the search mode is Regular expression, the replace box can use $1, $&, and similar syntax",
             replaceAction: t.replaceAction || "Replace (Enter)",
             replaceAllAction: t.replaceAllAction || "Replace all (Ctrl+Alt+Enter)",
             replaceToggle: t.replaceToggle || "Expand or collapse replace row",
@@ -304,6 +304,10 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 || "HTML blocks support search and highlight of rendered text only; replacement is not supported",
             replaceModeUnsupported: t.replaceModeUnsupported
                 || "Replacement is unavailable in publish, export preview, or read-only mode",
+            replaceDocTitleFailed: t.replaceDocTitleFailed
+                || "Failed to rename the document title",
+            replaceDocTitleEmpty: t.replaceDocTitleEmpty
+                || "Document title is invalid; skipped",
             replaceAllConfirm: t.replaceAllConfirm || "Replace {count} matches?",
             replaceAllConfirmTitle: t.replaceAllConfirmTitle || "Replace all",
             replaceCurrentDone: t.replaceCurrentDone || "Current match replaced",
@@ -320,6 +324,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeScope: t.settingsIncludeScope || "Include in search",
             settingsIncludeScopeHint: t.settingsIncludeScopeHint
                 || "Controls which block-level types (and inline memos) may be searched",
+            settingsIncludeDocTitle: t.settingsIncludeDocTitle || "Document title",
+            settingsIncludeDocTitleHint: t.settingsIncludeDocTitleHint
+                || "Replacing the document title cannot be undone with Ctrl+Z",
             settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database",
             settingsIncludeTable: t.settingsIncludeTable || "Table",
             settingsIncludeBlockquote: t.settingsIncludeBlockquote || "Blockquote",
@@ -359,6 +366,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 || "Turn on Include in search → Inline memos first; not replaceable",
             invalidRegex: t.invalidRegex || "Invalid regex: {error}",
         };
+    }
+
+    /** 将文档标题匹配开关同步到其它已打开面板 */
+    syncIncludeDocTitle(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeDocTitle(value);
+        });
     }
 
     /** 将数据库匹配开关同步到其它已打开面板 */
@@ -747,6 +764,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     i18n: this.getSearchI18n(),
                     presetText: initialQuery || undefined,
                     replaceVisible: replaceVisibleOnCreate,
+                    includeDocTitle: prefs.includeDocTitle !== false,
                     includeAttributeView: prefs.includeAttributeView !== false,
                     includeTable: prefs.includeTable !== false,
                     includeBlockquote: prefs.includeBlockquote !== false,
