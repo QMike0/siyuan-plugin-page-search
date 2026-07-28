@@ -143,6 +143,7 @@ export interface SearchBarI18n {
     settingsIncludeListUnordered: string;
     settingsIncludeListOrdered: string;
     settingsIncludeListTask: string;
+    settingsIncludeParagraph: string;
     settingsIncludeHeading: string;
     settingsIncludeHeadingH1: string;
     settingsIncludeHeadingH2: string;
@@ -208,6 +209,8 @@ export interface SearchBarHost {
     syncIncludeListOrdered?(value: boolean, source?: SearchBar): void;
     /** 将任务列表匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeListTask?(value: boolean, source?: SearchBar): void;
+    /** 将段落块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeParagraph?(value: boolean, source?: SearchBar): void;
     /** 将标题级别（1–6）匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeHeadingLevel?(level: HeadingIncludeLevel, value: boolean, source?: SearchBar): void;
     /** 将公式块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -276,6 +279,8 @@ export class SearchBar {
     private includeListOrdered = true;
     /** 是否匹配任务列表；全局 prefs，默认 true */
     private includeListTask = true;
+    /** 是否匹配段落块；全局 prefs，默认 true */
+    private includeParagraph = true;
     /** 是否匹配各级标题块；全局 prefs，默认 true（≠ 文档标题） */
     private includeHeadingH1 = true;
     private includeHeadingH2 = true;
@@ -369,6 +374,8 @@ export class SearchBar {
         includeListOrdered?: boolean;
         /** 是否匹配任务列表（来自全局 prefs） */
         includeListTask?: boolean;
+        /** 是否匹配段落块（来自全局 prefs） */
+        includeParagraph?: boolean;
         includeHeadingH1?: boolean;
         includeHeadingH2?: boolean;
         includeHeadingH3?: boolean;
@@ -410,6 +417,7 @@ export class SearchBar {
         this.includeListUnordered = options.includeListUnordered !== false;
         this.includeListOrdered = options.includeListOrdered !== false;
         this.includeListTask = options.includeListTask !== false;
+        this.includeParagraph = options.includeParagraph !== false;
         this.includeHeadingH1 = options.includeHeadingH1 !== false;
         this.includeHeadingH2 = options.includeHeadingH2 !== false;
         this.includeHeadingH3 = options.includeHeadingH3 !== false;
@@ -898,6 +906,7 @@ export class SearchBar {
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
+            includeParagraph: this.includeParagraph,
             includeHeadingH1: this.includeHeadingH1,
             includeHeadingH2: this.includeHeadingH2,
             includeHeadingH3: this.includeHeadingH3,
@@ -933,6 +942,7 @@ export class SearchBar {
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
+            includeParagraph: this.includeParagraph,
             includeHeadingH1: this.includeHeadingH1,
             includeHeadingH2: this.includeHeadingH2,
             includeHeadingH3: this.includeHeadingH3,
@@ -961,6 +971,7 @@ export class SearchBar {
                 includeListUnordered: this.includeListUnordered,
                 includeListOrdered: this.includeListOrdered,
                 includeListTask: this.includeListTask,
+                includeParagraph: this.includeParagraph,
                 includeHeadingH1: this.includeHeadingH1,
                 includeHeadingH2: this.includeHeadingH2,
                 includeHeadingH3: this.includeHeadingH3,
@@ -1240,6 +1251,7 @@ export class SearchBar {
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
+            includeParagraph: this.includeParagraph,
             includeHeadingH1: this.includeHeadingH1,
             includeHeadingH2: this.includeHeadingH2,
             includeHeadingH3: this.includeHeadingH3,
@@ -2027,6 +2039,15 @@ export class SearchBar {
                         void this.setIncludeInlineMemo(checked);
                     },
                 }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-paragraph",
+                    icon: "iconParagraph",
+                    label: this.i18n.settingsIncludeParagraph,
+                    checked: this.includeParagraph,
+                    onChange: (checked) => {
+                        void this.setIncludeParagraph(checked);
+                    },
+                }),
                 {
                     id: "page-search-include-heading",
                     icon: "iconHeadings",
@@ -2601,6 +2622,16 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setIncludeParagraph(value: boolean) {
+        if (this.includeParagraph === value) {
+            return;
+        }
+        this.includeParagraph = value;
+        await rpcSetPrefs(this.plugin, {includeParagraph: value});
+        this.plugin.syncIncludeParagraph?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeHeadingLevel(level: HeadingIncludeLevel, value: boolean) {
         const key = headingIncludePrefKey(level);
         if (this[key] === value) {
@@ -2789,6 +2820,14 @@ export class SearchBar {
             return;
         }
         this.includeListTask = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeParagraph(value: boolean) {
+        if (this.includeParagraph === value) {
+            return;
+        }
+        this.includeParagraph = value;
         void this.highlightHitResult(this.searchText, true);
     }
 

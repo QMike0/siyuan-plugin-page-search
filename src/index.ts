@@ -343,6 +343,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeListUnordered: t.settingsIncludeListUnordered || "Unordered list",
             settingsIncludeListOrdered: t.settingsIncludeListOrdered || "Ordered list",
             settingsIncludeListTask: t.settingsIncludeListTask || "Task list",
+            settingsIncludeParagraph: t.settingsIncludeParagraph || "Paragraph block",
             settingsIncludeHeading: t.settingsIncludeHeading || "Heading blocks",
             settingsIncludeHeadingH1: t.settingsIncludeHeadingH1 || "Heading 1",
             settingsIncludeHeadingH2: t.settingsIncludeHeadingH2 || "Heading 2",
@@ -484,6 +485,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeListTask(value);
+        });
+    }
+
+    /** 将段落块匹配开关同步到其它已打开面板 */
+    syncIncludeParagraph(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeParagraph(value);
         });
     }
 
@@ -867,6 +878,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeListUnordered: prefs.includeListUnordered !== false,
                     includeListOrdered: prefs.includeListOrdered !== false,
                     includeListTask: prefs.includeListTask !== false,
+                    includeParagraph: prefs.includeParagraph !== false,
                     includeHeadingH1: prefs.includeHeadingH1 !== false,
                     includeHeadingH2: prefs.includeHeadingH2 !== false,
                     includeHeadingH3: prefs.includeHeadingH3 !== false,

@@ -227,6 +227,13 @@ assert(
     mergePrefs(DEFAULT_PREFS, {includeSuperBlock: false}).includeSuperBlock === false,
     "merge includeSuperBlock off",
 );
+assert(DEFAULT_PREFS.includeParagraph === true, "includeParagraph defaults on");
+assert(coercePluginPrefs({}).includeParagraph === true, "coerce includeParagraph default on");
+assert(coercePluginPrefs({includeParagraph: false}).includeParagraph === false, "coerce includeParagraph off");
+assert(
+    mergePrefs(DEFAULT_PREFS, {includeParagraph: false}).includeParagraph === false,
+    "merge includeParagraph off",
+);
 assert(DEFAULT_PREFS.useRegex === false, "useRegex defaults off (keyword)");
 assert(coercePluginPrefs({}).useRegex === false, "coerce useRegex default off");
 assert(coercePluginPrefs({useRegex: true}).useRegex === true, "coerce useRegex on");

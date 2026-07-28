@@ -59,6 +59,8 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeListOrdered?: boolean;
     /** 是否匹配任务列表及其内部；默认 true */
     includeListTask?: boolean;
+    /** 是否匹配段落块；默认 true */
+    includeParagraph?: boolean;
     includeHeadingH1?: boolean;
     includeHeadingH2?: boolean;
     includeHeadingH3?: boolean;
@@ -270,6 +272,7 @@ export async function calculateSearchMatches(
                 includeListUnordered: options.includeListUnordered,
                 includeListOrdered: options.includeListOrdered,
                 includeListTask: options.includeListTask,
+                includeParagraph: options.includeParagraph,
                 includeHeadingH1: options.includeHeadingH1,
                 includeHeadingH2: options.includeHeadingH2,
                 includeHeadingH3: options.includeHeadingH3,
@@ -300,6 +303,7 @@ export async function calculateSearchMatches(
         includeListUnordered: options.includeListUnordered !== false,
         includeListOrdered: options.includeListOrdered !== false,
         includeListTask: options.includeListTask !== false,
+        includeParagraph: options.includeParagraph !== false,
         includeHeadingH1: options.includeHeadingH1 !== false,
         includeHeadingH2: options.includeHeadingH2 !== false,
         includeHeadingH3: options.includeHeadingH3 !== false,

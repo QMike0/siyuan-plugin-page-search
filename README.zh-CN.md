@@ -1,164 +1,67 @@
-[English](./README.md)
-
 # 页内搜索替换
 
-在当前思源文档内搜索并高亮匹配结果（CSS Custom Highlight），支持页内替换。
+[English](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.md)|[简体中文](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.zh-CN.md)
 
-基于官方 [plugin-sample](https://github.com/siyuan-note/plugin-sample)（Webpack + 前端 `index.js` + 内核 `kernel.js`）。
+## 主要特性
 
-## 环境要求
+### （1）匹配选项
 
-- 思源笔记 **≥ 3.7.0**（需内核插件运行时）
-- Node.js ≥ 24、pnpm
+- **Aa**：区分大小写
+- **整词**：ASCII 词边界全词匹配
+- **匹配模式**：关键字 / 正则表达式。正则替换支持 `$1`、`$&` 等
+- **选区内**：仅在当前选区或块选范围内搜索
+- **Aa\***：替换时保留命中的大小写形态（正则模式下不可用）
 
-## 使用
+### （2）搜索范围（齿轮菜单）
 
-1. 启用插件后，点击顶栏搜索图标，或使用快捷键打开搜索条  
-2. 输入关键词（400ms 防抖），黄色高亮全部结果，橙色为当前焦点  
-3. `Enter` 下一个 / `Shift+Enter` 上一个 / `Esc` 关闭  
-4. 默认仅显示搜索行；点击 ⌄ 展开替换行（替换 / 跳过 / 全部替换）  
-5. 桌面端拖动「计数」区域可移动搜索条；再次点顶栏会复位位置  
+![image-20260728110038465](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110038465.png)
 
-默认快捷键：`Ctrl+Shift+Alt+F`（macOS：`⌥⇧⌘F`），可在思源快捷键设置中修改。
+- **是否搜索**：按类型开关是否纳入搜索——文档标题、图片标题、行内备注、段落块、标题块（一至六级）、列表块（无序 / 有序 / 任务）、公式块、代码块、表格、数据库、引述块、提示块、超级块、嵌入块、HTML、Mermaid 图等
+- **折叠块内容**：是否搜索非标题折叠块内的隐藏内容
+- **限制搜索**：仅在所选行内类型中搜索（可多选）；搜索框为空时可预览该类元素。关闭搜索窗后限制项会复位
 
-### 选项开关
+### （3）页内搜索
 
-| 开关 | 作用 |
-|------|------|
-| `Aa` | 区分大小写 |
-| 整词 | ASCII 词边界全词匹配 |
-| 方法按钮 | 点击打开菜单，互斥选择「关键字」或「正则表达式」；图标随当前模式切换（Exact / Regex）。选正则后替换框可用 `$1` / `$2` / `$&` / `$$`（`Aa*` 灰显；展开失败计入跳过）。选择会写入 prefs，关闭后再开仍保持 |
-| 选区内 | 仅在当前选区（或块级选中）内搜索；与「打开时预填选区文字」无关 |
-| `Aa*` | 替换时保留命中大小写形态（如 foo→bar、FOO→BAR、Foo→Bar） |
+![image-20260728110005220](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110005220.png)
 
-打开搜索条时若有选区，只会预填关键词，**不会**自动开启「选区内」。
+- 顶栏图标或快捷键打开搜索条（默认 `Ctrl+F` / macOS `⌘F`，可在思源快捷键中修改）
+- 黄标全部命中、橙标当前项；`Enter` 下一个、`Shift+Enter` 上一个、`Esc` 关闭
+- 桌面端可拖动计数区移动面板；再点顶栏复位位置
+- 打开时若有选区，仅预填关键词，不会自动开启「选区内」
 
-### 搜索范围
+### （4）页内替换
 
-段落、文档标题、表格单元格、数据库（可搜可高亮）、Callout 标题、预览模式、浮窗与多页签。
+![image-20260728110019082](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110019082.png)
 
-齿轮菜单：
+- 默认折叠替换行，点 ⌄ 展开，或者快捷键打开替换功能区域（默认 `Ctrl+H` / macOS `⌘H`，可在思源快捷键中修改）
+- 支持 替换 / 全部替换
+- 写回尽量走当前文档 Protyle transaction，一般可用 `Ctrl+Z` / `Ctrl+Y`  撤销重做
 
-| 分组 | 作用 |
-|------|------|
-| **是否搜索** | 是否纳入文档标题、图片标题、行内备注、标题块、列表块、公式块、代码块、表格、数据库、引述块、提示块、超级块、嵌入块、HTML、Mermaid 图 |
-| **折叠块内容** | 是否匹配非标题折叠块内隐藏内容（与限制搜索独立） |
-| **限制搜索** | 仅在所选行内类型中搜索（多选 OR；全关=不限制）。搜索框为空时预览所选类型的全部行内宿主（不可替换；计数超过 999 显示为 `999+` 仍全量高亮）。类型顺序：引用、链接、粗体、斜体、下划线、删除线、高亮、上标、下标、行级代码、键盘、标签、行级公式、行内备注。可与「选区内」同时生效 |
+部分结果可搜可高亮、但不可自动替换，例如：数据库、Mermaid、HTML 块渲染字、行内 / 块公式、跨格式拼词等。点「替换」会提示并跳到下一项；「全部替换」计入跳过。
 
-补充：
+### （5）发布与只读
 
-- **行内备注**：是否搜索 = 全文是否搜备注属性；限制搜索·备注 = 限制模式下是否纳入 OR（需先开是否搜索）；命中虚线高亮；替换只改 `data-inline-memo-content`（不改宿主可见字），走 Protyle transaction，可 Ctrl+Z
-- **行内公式**：匹配 KaTeX **渲染可见文字**（非 `data-content` 源码，避免 “d” 误中 `\delta`）；正文/表格靠独立 unit 覆盖（含表内公式）；高亮黄/橙，不可替换
-- 关限制搜索时行为与旧版一致（AV / 代码块 / Mermaid / 折叠 / 备注虚线不受影响）
+发布服务、导出预览、文档只读下仍可搜索与高亮，替换按钮禁用；配置也不会写入存储（会话内开关仍可临时生效）。
 
-## 替换与撤销
+## 更新日志
 
-写回优先走当前文档的 **Protyle transaction**（`updateTransactionElement` / 批量 `transaction`），因此在拿到编辑器实例时可使用 **Ctrl+Z / Ctrl+Y** 撤销与重做。
+见 [CHANGELOG.md](https://cdn.jsdelivr.net/gh/QMike0/siyuan-plugin-page-search@main/CHANGELOG.md)
 
-- **全部替换**：同一文档合并为一批操作，便于一次撤销整批  
-- **拿不到 Protyle**：中止替换并提示，**不会**静默调用内核 `updateBlock`（避免误以为可撤销）  
-- **仅当前已打开 / 已加载的 DOM**：离屏未渲染块不在本阶段范围内  
-- **正则替换**：搜索开正则时，替换串按 JS/`$n` 模板展开（例：搜索 `(\d+)-(\d+)`，替换 `$2/$1`）；非正则模式仍为字面量替换  
-- **文档标题**：可搜可替（「是否搜索」可关）；写回走 `/api/filetree/renameDocByID`（或 `renameDoc`），**不支持** Ctrl+Z；全部替换时标题命中合并为一次重命名，与正文 transaction 分开；替换结果为空时与官方一致：API 传空串，由内核存为 Language(16) 并标记 `custom-sy-title-empty`，输入框显示为空（placeholder）  
-- **行内备注**：改属性后随所属块 transaction 写回，可撤销；空查询限制预览仍不可替  
+## 开发相关
 
-### 不可自动替换（可搜、可高亮）
-
-| 类型 | 说明 |
-|------|------|
-| 数据库（AV） | 永不替换 |
-| Mermaid / HTML 块 | 仅搜渲染可见文字并高亮 |
-| 跨 Text / 复杂格式 | 如普通字 + **加粗** 拼成一词 → `replaceable=false` |
-| 公式 / 只读渲染 | 行内公式、块公式等 |
-| 预览合成块 | 无稳定块 ID 时跳过写回 |
-
-说明：Callout 根节点在思源中为 `contenteditable=false`（标题经对话框编辑），表格也可能落在 false 容器内；图片 `.img` 同为 false，标题在 `.protyle-action__title`。插件仍允许对 **Callout 标题**、**表格单元格** 与 **图片标题** 做整块 HTML 写回（与思源自身 transaction 一致，可 Ctrl+Z）。
-
-点「替换」遇到不可替项会提示并跳到下一项；「全部替换」会计入 skipped。
-
-### 表格与 Callout
-
-- **表格**：按单元格匹配与替换，不跨格；提交时更新整张 `NodeTable` 块 HTML  
-- **Callout 标题**：与其它可替单元同一顺序；写回更新整块 `NodeCallout`（含 `.callout-title`）  
-
-## 发布服务模式
-
-`plugin.json` 中 `disabledInPublish: false`，发布服务下**仍加载本插件**（可搜索、高亮），但全面禁止写操作：
-
-| 能力 | 发布服务 |
-|------|----------|
-| 搜索 / 高亮 / 上下跳转 | ✅ 可用 |
-| 替换栏展开 / 输入替换词 | ✅ 可用（不隐藏替换栏） |
-| 替换 / 全部替换 / 文档写回 | ❌ 按钮禁用；点按提示不支持 |
-| 偏好持久化（`prefs.json` 面板位置、块类型开关、搜索方法） | ❌ 不写 petal；会话内开关仍可临时生效 |
-
-判定依据：`window.siyuan.isPublish`（与思源 `saveData`/`removeData` 在发布态 403 对齐）。导出预览、文档只读同样走「禁替换、保留替换栏」策略。
-
-## 偏好（内核 storage）
-
-保存在 `data/storage/petal/<插件名>/prefs.json`（内核 `storage.put` / 前端 `removeData` 同一路径）：
-
-| 字段 | 说明 |
-|------|------|
-| `dialogLeft` / `dialogTop` | 拖拽后的固定位置（点顶栏复位会清空） |
-| `includeDocTitle` / `includeImageTitle` / `includeAttributeView` / `includeTable` / `includeListUnordered` / `includeListOrdered` / `includeListTask` / `includeHeadingH1`–`H6` / `includeBlockquote` / `includeCallout` / `includeSuperBlock` / `includeMathBlock` / `includeEmbedBlock` / `includeCodeBlock` / `includeMermaid` / `includeHtmlBlock` | 是否搜索（默认开；列表/标题子类型各自独立，全关则对应区域不搜；文档标题 / 图片标题默认可搜可替） |
-| `includeFoldedBlocks` / `includeInlineMemo` | 折叠块 / 行内备注（默认关） |
-| `useRegex` | 搜索方法：`false`=关键字，`true`=正则表达式（默认关键字；跨次打开保持） |
-| `restrictInlineTypes` | 限制搜索类型（会话内；关闭搜索窗后清回空） |
-
-关闭搜索窗口时会清空关键词；再次打开仅在有选区时预填。
-
-## 生命周期与卸载
-
-| 钩子 | 何时触发 | 行为 |
-|------|----------|------|
-| `onunload` | 禁用、关闭应用、卸载前、同步重载 | 清理快捷键 / 搜索条 / 事件；**保留** `prefs.json` |
-| `uninstall` | 集市/设置中真卸载（非重载） | `removeData("prefs.json")` 删除配置 |
-
-思源卸载顺序为：`onunload` → `kernel.destroy` → `uninstall`。再次安装后偏好恢复默认。
-
-## 内核能力
-
-| 能力 | 说明 |
-|------|------|
-| RPC `match` | 对纯文本 units 做匹配（支持 `caseSensitive` / `wholeWord` / `regex`） |
-| RPC `prefs.get` / `prefs.set` | 读写偏好 |
-| RPC `search.emit` | 广播 `search-state`（`close` / `clear`），多窗口同步关闭或清空高亮 |
-| MCP `page_search` | 与 `match` 同一引擎；可传 `units` 或纯 `text` |
-
-前端在内核未就绪时会自动回退到本地 `matchTextUnits`。
-
-## 明确不做
-
-- 数据库单元格替换  
-- 默认内核 `updateBlock` 写回（无 Undo）  
-- 未打开文档的离屏块替换  
-- 全库 AST 级 `/api/search/findReplace`（页内 DOM + Protyle 事务，与官方全局搜不同）  
-
-## 回归检查清单
-
-建议在真实文档中核对：
-
-- [ ] 表格列名与首行同文：两者都能搜到；替换只改目标格  
-- [ ] Callout 标题可搜可替（可替时），顺序与正文命中一致  
-- [ ] 公式旁普通文本可搜；公式本身不可替  
-- [ ] 跨加粗词：可高亮，替换按钮禁用或点按时跳过  
-- [ ] 多页签：关闭/清空会经 `search-state` 同步；替换后其它页签高亮可清  
-- [ ] 替换后 **Ctrl+Z / Ctrl+Y** 可回退（Protyle 可用时）  
-- [ ] 「选区内」与打开预填关键词互不影响  
-- [ ] 非法正则有错误提示，不产生错误高亮  
-
-## 开发
-
-```bash
-pnpm i
-pnpm run dev
-pnpm run smoke:shared   # 共享匹配核 + 选区/大小写冒烟
-pnpm run build          # 生成 package.zip
-```
+1. 安装 Node.js 与 pnpm  
+2. 在仓库根目录执行 `pnpm i`  
+3. `pnpm run dev` 开发构建；`pnpm run build` 打包 `package.zip`  
+4. `pnpm run smoke:shared` 运行共享匹配冒烟测试  
 
 在思源 → 集市 → 已下载 中启用本插件。
 
-## 状态
+## 许可证
 
-Phase 0–5 已完成：脚手架、shared 匹配、内核 RPC/MCP、选区内搜索、搜/替 UI、Protyle 可撤销写回、文档与回归清单。
+MIT License
+
+## 致谢
+
+- 基于 [SiYuan plugin sample](https://github.com/siyuan-note/plugin-sample) 模板开发
+- 「[siyuan-plugin-hsr-mdzz2048-fork](https://github.com/TCOTC/siyuan-plugin-hsr-mdzz2048-fork)」：为本插件提供了基本架构思路
+- 「[famotime/siyuan-sou-easy](https://github.com/famotime/siyuan-sou-easy)」：为本插件提供了功能拓展思路

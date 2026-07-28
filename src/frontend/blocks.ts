@@ -18,6 +18,8 @@ const CALLOUT_TYPE = 'NodeCallout'
 const SUPER_BLOCK_TYPE = 'NodeSuperBlock'
 const LIST_TYPE = 'NodeList'
 const LIST_ITEM_TYPE = 'NodeListItem'
+/** 段落块：叶子块（非容器） */
+const PARAGRAPH_TYPE = 'NodeParagraph'
 /** 标题块：非容器（子块为随后兄弟，不在 NodeHeading DOM 内） */
 const HEADING_TYPE = 'NodeHeading'
 const MATH_BLOCK_TYPE = 'NodeMathBlock'
@@ -179,6 +181,11 @@ export interface CollectSearchableBlocksOptions {
   /** 是否采集任务列表（data-subtype=t）及其内部；默认 true */
   includeListTask?: boolean;
   /**
+   * 是否采集段落块（NodeParagraph）；默认 true。
+   * 关段落时若仍开 includeImageTitle，仍单独采集段内图片标题。
+   */
+  includeParagraph?: boolean;
+  /**
    * 是否采集一级标题块（NodeHeading h1）；默认 true。
    * 六级独立；全关不采标题块。≠ 文档标题。标题非容器，不抑制其后兄弟块。
    */
@@ -224,6 +231,7 @@ export function collectSearchableBlocks(
   const includeListUnordered = options.includeListUnordered !== false;
   const includeListOrdered = options.includeListOrdered !== false;
   const includeListTask = options.includeListTask !== false;
+  const includeParagraph = options.includeParagraph !== false;
   const includeHeadingH1 = options.includeHeadingH1 !== false;
   const includeHeadingH2 = options.includeHeadingH2 !== false;
   const includeHeadingH3 = options.includeHeadingH3 !== false;
@@ -261,6 +269,7 @@ export function collectSearchableBlocks(
     includeListUnordered,
     includeListOrdered,
     includeListTask,
+    includeParagraph,
     includeHeadingH1,
     includeHeadingH2,
     includeHeadingH3,
@@ -384,6 +393,16 @@ export function collectSearchableBlocks(
       includeHeadingH5,
       includeHeadingH6,
     })) {
+      return
+    }
+    // 段落：叶子门闩。关段落时正文不采；若仍开图片标题则只采段内 `.protyle-action__title`
+    if (
+      (blockType === PARAGRAPH_TYPE || element.classList.contains('p'))
+      && !includeParagraph
+    ) {
+      if (includeImageTitle) {
+        blocks.push(...collectImageTitleSearchUnits(element, blockId, blockIndex))
+      }
       return
     }
 
@@ -517,6 +536,7 @@ interface IncludeGates {
   includeListUnordered: boolean
   includeListOrdered: boolean
   includeListTask: boolean
+  includeParagraph: boolean
   includeHeadingH1: boolean
   includeHeadingH2: boolean
   includeHeadingH3: boolean
@@ -685,6 +705,15 @@ function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeG
     return true
   }
   if (shouldSkipElementByListInclude(element, gates)) {
+    return true
+  }
+  // 段落叶子门闩：备注/公式宿主落在段落 DOM 内时随 includeParagraph；
+  // 图片标题在关段落时走专项 unit，不依赖本过滤。
+  if (
+    !gates.includeParagraph
+    && Boolean(element.closest(`[data-type="${PARAGRAPH_TYPE}"], .p`))
+    && !element.closest(IMAGE_TITLE_TEXT_CLOSEST)
+  ) {
     return true
   }
   // 标题级别：备注/公式宿主若在某级标题 DOM 内，随该级开关；与容器门闩 AND
@@ -885,6 +914,40 @@ function collectMermaidRenderedTextNodes(container: HTMLElement): Text[] {
     },
   })
   return collectWalkerTextNodes(walker)
+}
+
+/**
+ * 关段落块但仍开图片标题时：只采集块内 `.img .protyle-action__title` 可见字。
+ * 每个标题一个 unit，便于替换路径按标题 DOM 写回。
+ */
+function collectImageTitleSearchUnits(
+  ownerBlock: HTMLElement,
+  blockId: string,
+  blockIndex: number,
+): SearchableBlock[] {
+  const units: SearchableBlock[] = []
+  const titles = Array.from(
+    ownerBlock.querySelectorAll<HTMLElement>(IMAGE_TITLE_TEXT_CLOSEST),
+  ).filter((title) => {
+    return getOwnerBlock(title) === ownerBlock
+  })
+  titles.forEach((titleElement, index) => {
+    const textNodes = collectDescendantTextNodes(titleElement, true)
+    const text = textNodes.map((node) => node.nodeValue ?? '').join('')
+    if (!text) {
+      return
+    }
+    units.push({
+      blockId,
+      blockType: PARAGRAPH_TYPE,
+      blockIndex,
+      element: titleElement,
+      text,
+      textNodes,
+      unitId: `image-title:${index}`,
+    })
+  })
+  return units
 }
 
 /**

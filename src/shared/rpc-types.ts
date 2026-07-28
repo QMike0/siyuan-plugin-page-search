@@ -68,6 +68,11 @@ export interface PluginPrefs {
     /** 是否匹配任务列表（data-subtype=t）及其内部；默认 true */
     includeListTask: boolean;
     /**
+     * 是否匹配段落块（NodeParagraph）；默认 true。
+     * 叶子门闩：不影响标题块等。关段落时若仍开 includeImageTitle，仍单独采集段内图片标题。
+     */
+    includeParagraph: boolean;
+    /**
      * 是否匹配一级标题块（NodeHeading，data-subtype=h1）；默认 true。
      * 与 h2–h6 独立；六级全关 = 不搜任何标题块（≠ 文档标题 includeDocTitle）。
      * 标题不是容器：不影响其后兄弟段落；若标题落在已关闭的引述/提示/列表等容器内，仍先被容器门闩跳过。
@@ -142,6 +147,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeListUnordered: true,
     includeListOrdered: true,
     includeListTask: true,
+    includeParagraph: true,
     includeHeadingH1: true,
     includeHeadingH2: true,
     includeHeadingH3: true,
@@ -181,6 +187,7 @@ export function coercePluginPrefs(
         includeListUnordered: base.includeListUnordered !== false,
         includeListOrdered: base.includeListOrdered !== false,
         includeListTask: base.includeListTask !== false,
+        includeParagraph: base.includeParagraph !== false,
         includeHeadingH1: base.includeHeadingH1 !== false,
         includeHeadingH2: base.includeHeadingH2 !== false,
         includeHeadingH3: base.includeHeadingH3 !== false,
@@ -242,6 +249,9 @@ export function mergePrefs(
         includeListTask: patch.includeListTask !== undefined
             ? patch.includeListTask
             : base.includeListTask,
+        includeParagraph: patch.includeParagraph !== undefined
+            ? patch.includeParagraph
+            : base.includeParagraph,
         includeHeadingH1: patch.includeHeadingH1 !== undefined
             ? patch.includeHeadingH1
             : base.includeHeadingH1,

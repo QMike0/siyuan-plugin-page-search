@@ -1,3 +1,20 @@
+## v1.0.3 2026-07-28
+
+- 🇨🇳 实现正则替换
+- 🇨🇳 优化搜索模式切换为菜单形式，当前支持「关键字」和「正则表达式」
+- 🇨🇳 「是否搜索」中新增对列表块、标题块、超级块、段落块的筛选
+- 🇨🇳 新增对文档标题、行内备注、图片标题的替换支持
+- 🇨🇳 优化同一备注宿主上的多处命中时的关键词跳转切换动画
+- 🇨🇳 删除挂件搜索相关代码逻辑，默认无法搜索挂件中的可见文字（类似于IFRAME）
+- 🇨🇳 优化搜索窗口输入框文本的缓存机制
+- 🇺🇸 Implement regex replacement
+- 🇺🇸 Optimize search mode switching as a menu, currently supporting 「Keyword」 and 「Regular Expression」
+- 🇺🇸 Add filtering for list blocks, heading blocks, super blocks, and paragraph blocks under 「Search Scope」
+- 🇺🇸 Add replacement support for document titles, inline annotations, and image captions
+- 🇺🇸 Optimize the keyword navigation transition animation when multiple matches are found on the same annotation host
+- 🇺🇸 Remove code logic related to widget search; widgets (similar to IFRAME) are no longer searchable by default for visible text
+- 🇺🇸 Optimize the cache mechanism for input text in the search window
+
 ## v1.0.2 2026-07-24
 
 - 🇨🇳 修复关闭数据库「显示条目图标」会导致的主键文字匹配问题

@@ -37,6 +37,7 @@ const TABLE_TYPE = "NodeTable";
 const BLOCKQUOTE_TYPE = "NodeBlockquote";
 const CALLOUT_TYPE = "NodeCallout";
 const SUPER_BLOCK_TYPE = "NodeSuperBlock";
+const PARAGRAPH_TYPE = "NodeParagraph";
 const MATH_BLOCK_TYPE = "NodeMathBlock";
 const EMBED_BLOCK_TYPE = "NodeBlockQueryEmbed";
 const WIDGET_TYPE = "NodeWidget";
@@ -89,6 +90,7 @@ export function enumerateRestrictInlineMatches(
     const includeListUnordered = options.includeListUnordered !== false;
     const includeListOrdered = options.includeListOrdered !== false;
     const includeListTask = options.includeListTask !== false;
+    const includeParagraph = options.includeParagraph !== false;
     const includeHeadingH1 = options.includeHeadingH1 !== false;
     const includeHeadingH2 = options.includeHeadingH2 !== false;
     const includeHeadingH3 = options.includeHeadingH3 !== false;
@@ -115,6 +117,7 @@ export function enumerateRestrictInlineMatches(
         includeListUnordered,
         includeListOrdered,
         includeListTask,
+        includeParagraph,
         includeHeadingH1,
         includeHeadingH2,
         includeHeadingH3,
@@ -174,6 +177,7 @@ export function enumerateRestrictInlineMatches(
                     includeListUnordered,
                     includeListOrdered,
                     includeListTask,
+                    includeParagraph,
                     includeHeadingH1,
                     includeHeadingH2,
                     includeHeadingH3,
@@ -406,6 +410,7 @@ function shouldSkipHostByIncludeGates(
         includeListUnordered: boolean;
         includeListOrdered: boolean;
         includeListTask: boolean;
+        includeParagraph: boolean;
         includeHeadingH1: boolean;
         includeHeadingH2: boolean;
         includeHeadingH3: boolean;
@@ -458,6 +463,12 @@ function shouldSkipHostByIncludeGates(
         includeListOrdered: options.includeListOrdered,
         includeListTask: options.includeListTask,
     })) {
+        return true;
+    }
+    if (
+        !options.includeParagraph
+        && Boolean(host.closest(`[data-type="${PARAGRAPH_TYPE}"], .p`))
+    ) {
         return true;
     }
     // 标题级别与容器门闩 AND：宿主在已关级别的 NodeHeading DOM 内则跳过

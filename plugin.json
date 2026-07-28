@@ -19,8 +19,8 @@
     "zh-CN": "页内搜索替换"
   },
   "description": {
-    "default": "Implement in-document search and replace for SiYuan, featuring undo/redo with write-back, block-type filtering, and the ability to search inline elements independently",
-    "zh-CN": "为思源笔记提供文档页面内的搜索、替换功能（支持撤销&重做），并支持块级类型的控制与行内元素的单独搜索"
+    "default": "Provide search and replace functionality for most visible text within document pages in SiYuan (with support for undo & redo), along with block-level type control and separate search for inline elements",
+    "zh-CN": "为思源笔记提供文档页面内绝大多数可见文字的搜索、替换功能（支持撤销&重做），并支持块级类型的控制与行内元素的单独搜索"
   },
   "readme": {
     "default": "README.md",

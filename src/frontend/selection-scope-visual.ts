@@ -921,6 +921,7 @@ export function captureSelectionScopeWithKind(
         includeListUnordered?: boolean;
         includeListOrdered?: boolean;
         includeListTask?: boolean;
+        includeParagraph?: boolean;
         includeHeadingH1?: boolean;
         includeHeadingH2?: boolean;
         includeHeadingH3?: boolean;
@@ -952,6 +953,7 @@ export function captureSelectionScopeWithKind(
         includeListUnordered: options?.includeListUnordered !== false,
         includeListOrdered: options?.includeListOrdered !== false,
         includeListTask: options?.includeListTask !== false,
+        includeParagraph: options?.includeParagraph !== false,
         includeHeadingH1: options?.includeHeadingH1 !== false,
         includeHeadingH2: options?.includeHeadingH2 !== false,
         includeHeadingH3: options?.includeHeadingH3 !== false,
