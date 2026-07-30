@@ -2,6 +2,10 @@
 
 [简体中文](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.zh-CN.md)|[English](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.md)
 
+> Due to underlying design constraints, the plugin currently only supports matching against content that has already been loaded in the document. Therefore, when used with long documents, it may miss some keywords during search/replace operations.
+>
+> You can use the plugin 「[highlight-search](https://github.com/TCOTC/highlight-search)」 for a more comprehensive search experience.
+
 ## Key Features
 
 ### (1) Match options

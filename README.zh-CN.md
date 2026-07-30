@@ -2,6 +2,10 @@
 
 [English](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.md)|[简体中文](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.zh-CN.md)
 
+> 受限于底层设计，插件目前仅支持匹配文档已加载内容，因此在用于长文档时，可能会出现关键词搜索/替换的遗漏。
+>
+> 可使用插件「[highlight-search](https://github.com/TCOTC/highlight-search)」以获得更完善的搜索体验
+
 ## 主要特性
 
 ### （1）匹配选项

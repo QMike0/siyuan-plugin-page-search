@@ -1,3 +1,10 @@
+## v1.0.4 2026-07-30
+
+- 🇨🇳 更换顶栏图标
+- 🇨🇳 更新README.md
+- 🇺🇸 Replace top bar icons
+- 🇺🇸 Update README.md
+
 ## v1.0.3 2026-07-28
 
 - 🇨🇳 实现正则替换
