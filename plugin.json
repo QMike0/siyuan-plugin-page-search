@@ -2,7 +2,7 @@
   "name": "siyuan-plugin-page-search-replace",
   "author": "QMike0",
   "url": "https://github.com/QMike0/siyuan-plugin-page-search",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "minAppVersion": "3.7.0",
   "kernels": [
     "all"
