@@ -31,9 +31,15 @@ const HTML_BLOCK_TYPE = 'NodeHTMLBlock'
 const TABLE_TYPE = 'NodeTable'
 const CODE_BLOCK_TYPE = 'NodeCodeBlock'
 const MERMAID_SUBTYPE = 'mermaid'
-/** 正文 TreeWalker 排除：属性区 / 矢量 / 公式源码区；行内公式可见字形由独立 unit 采集 */
+/**
+ * 正文 TreeWalker 排除：属性区 / 矢量 / 公式。
+ * 行内公式和行级公式的可见字形单独采集。若正文再走一遍 .katex，同一个词会计两次。
+ * MathML / annotation 与 .katex-html 字形重复，也不能计入。
+ * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
+ * @see https://github.com/KaTeX/KaTeX/blob/v0.16.9/src/buildTree.js
+ */
 const TEXT_NODE_EXCLUDED_CLOSEST =
-  '.protyle-attr, svg, style, script, .katex-mathml, span[data-type~="inline-math"]'
+  '.protyle-attr, svg, style, script, .katex, .katex-html, .katex-display, .katex-mathml, math, annotation, span[data-type~="inline-math"]'
 /** 图片标题可见字（官方 imgTitle / `.protyle-action__title`） */
 const IMAGE_TITLE_TEXT_CLOSEST = '.img .protyle-action__title'
 /** Mermaid 搜索单元：源码在 data-content，无可替换 Text 节点 */
@@ -78,13 +84,20 @@ const AV_EXCLUDED_CLOSEST = [
  * 解析当前编辑器内的可搜索文档根（编辑态 wysiwyg / 预览态 b3-typography）
  */
 function resolveDocRoot(edit: Element): HTMLElement | null {
+  const offscreen = edit.closest('[data-page-search-offscreen]')
+    ?? (edit.hasAttribute('data-page-search-offscreen') ? edit : null)
+  if (offscreen) {
+    return offscreen.querySelector('.protyle-wysiwyg')
+  }
+
+  const protyleSelector = '.protyle:not(.fn__none):not([data-page-search-offscreen])'
   let docRoot = edit.querySelector(
-    ':scope > .protyle:not(.fn__none) :is(.protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography)',
+    `:scope > ${protyleSelector} :is(.protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography)`,
   ) as HTMLElement | null
 
   if (!docRoot) {
     docRoot = edit.querySelector(
-      '.protyle:not(.fn__none) :is(.protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography)',
+      `${protyleSelector} :is(.protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography)`,
     ) as HTMLElement | null
   }
 
@@ -215,6 +228,11 @@ export interface CollectSearchableBlocksOptions {
    * 与 includeInlineMemo 共同决定是否采备注；仅限制备注/公式等属性类型时跳过正文。
    */
   restrictInlineTypes?: RestrictInlineType[];
+  /**
+   * 只采集这些根节点里的块。省略时采集整篇编辑器。
+   * 根节点自身若是块，也会计入。
+   */
+  scopeRoots?: HTMLElement[];
 }
 
 export function collectSearchableBlocks(
@@ -255,8 +273,10 @@ export function collectSearchableBlocks(
     restrictTypes: restrictInlineTypes,
   });
   const collectMath = shouldCollectInlineMathUnits(restrictInlineTypes);
+  const scopeRoots = (options.scopeRoots ?? []).filter((root) => root.isConnected);
+  const scoped = scopeRoots.length > 0;
   const docRoot = resolveDocRoot(edit)
-  if (!docRoot) {
+  if (!scoped && !docRoot) {
     return []
   }
 
@@ -283,7 +303,7 @@ export function collectSearchableBlocks(
   }
 
   const blocks: SearchableBlock[] = []
-  if (collectBodyText && includeDocTitle) {
+  if (!scoped && collectBodyText && includeDocTitle) {
     const titleUnit = collectDocTitleUnit(edit)
     if (titleUnit) {
       blocks.push(titleUnit)
@@ -291,10 +311,12 @@ export function collectSearchableBlocks(
   }
 
   // 关嵌入时在去重阶段即排除嵌入 DOM，避免同 id 只保留嵌入副本而漏掉正文
-  const blockElements = collectBodyText
-    ? getUniqueBlockElements(docRoot, {excludeEmbed: !includeEmbedBlock})
-    : []
-  if (collectBodyText && blockElements.length === 0) {
+  const blockElements = !collectBodyText
+    ? []
+    : scoped
+      ? collectScopedBlockElements(scopeRoots, !includeEmbedBlock)
+      : getUniqueBlockElements(docRoot as HTMLElement, {excludeEmbed: !includeEmbedBlock})
+  if (!scoped && docRoot && collectBodyText && blockElements.length === 0) {
     const textNodes = collectTextNodes(docRoot, null, includeImageTitle)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     if (text) {
@@ -309,7 +331,7 @@ export function collectSearchableBlocks(
     }
     if (collectMemo) {
       blocks.push(...filterAttributeUnitsByIncludeGates(
-        collectInlineMemoSearchUnits(docRoot),
+        collectInlineMemoSearchUnits(docRoot, includeImageTitle),
         includeGates,
       ))
     }
@@ -461,8 +483,26 @@ export function collectSearchableBlocks(
     }
 
     // 公式块（叶子块）；勿用 data-subtype="math"（行内公式也带该属性）
+    // 只取第一个 .katex-html。displayMode 的 MathML 与可见层字形相同，两层都收会把同一个词计两次。
     // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
-    if (blockType === MATH_BLOCK_TYPE && !includeMathBlock) {
+    if (blockType === MATH_BLOCK_TYPE) {
+      if (!includeMathBlock) {
+        return
+      }
+      const katexHtml = element.querySelector<HTMLElement>('.katex-html')
+      const textNodes = katexHtml ? collectKatexGlyphTextNodes(katexHtml) : []
+      const text = textNodes.map((node) => node.nodeValue ?? '').join('')
+      if (!text.replace(ZERO_WIDTH_RE, '').trim()) {
+        return
+      }
+      blocks.push({
+        blockId,
+        blockType,
+        blockIndex,
+        element,
+        text,
+        textNodes,
+      })
       return
     }
 
@@ -510,17 +550,22 @@ export function collectSearchableBlocks(
     })
   })
 
+  const attributeRoots = scoped ? scopeRoots : (docRoot ? [docRoot] : [])
   if (collectMemo) {
-    blocks.push(...filterAttributeUnitsByIncludeGates(
-      collectInlineMemoSearchUnits(docRoot),
-      includeGates,
-    ))
+    attributeRoots.forEach((root) => {
+      blocks.push(...filterAttributeUnitsByIncludeGates(
+        collectInlineMemoSearchUnits(root, includeImageTitle),
+        includeGates,
+      ))
+    })
   }
   if (collectMath) {
-    blocks.push(...filterAttributeUnitsByIncludeGates(
-      collectInlineMathSearchUnits(docRoot),
-      includeGates,
-    ))
+    attributeRoots.forEach((root) => {
+      blocks.push(...filterAttributeUnitsByIncludeGates(
+        collectInlineMathSearchUnits(root),
+        includeGates,
+      ))
+    })
   }
 
   return blocks
@@ -758,6 +803,29 @@ function filterAttributeUnitsByIncludeGates(
 
 function isInsideEmbedBlock(element: Element): boolean {
   return Boolean(element.closest(`[data-type="${EMBED_BLOCK_TYPE}"]`))
+}
+
+/** 范围采集：计入根自身，再计入其中的子块。多个根的后代互不重叠。 */
+function collectScopedBlockElements(roots: HTMLElement[], excludeEmbed: boolean): HTMLElement[] {
+  const byId = new Map<string, HTMLElement>()
+  const consider = (element: HTMLElement) => {
+    const blockId = element.dataset.nodeId?.trim()
+    if (!blockId || !element.dataset.type) {
+      return
+    }
+    if (excludeEmbed && isInsideEmbedBlock(element)) {
+      return
+    }
+    const existing = byId.get(blockId)
+    if (!existing || shouldPreferBlockElement(element, existing)) {
+      byId.set(blockId, element)
+    }
+  }
+  roots.forEach((root) => {
+    consider(root)
+    getUniqueBlockElements(root, {excludeEmbed}).forEach(consider)
+  })
+  return Array.from(byId.values())
 }
 
 function getUniqueBlockElements(
@@ -1194,6 +1262,48 @@ function collectAttributeViewSearchUnits(
     })
   }
 
+  // 日历视图不用 .av__cell，条目在 .av__calendar-item，字段在 .av__calendar-field。
+  // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/av/calendar/render.ts
+  const pushCalendarItems = () => {
+    avBlock.querySelectorAll<HTMLElement>('.av__calendar-field').forEach((field, index) => {
+      if (field.closest('.av__calendar-preview, .fn__none')) {
+        return
+      }
+      const item = field.closest<HTMLElement>('.av__calendar-item')
+      const rowId = item?.getAttribute('data-id')?.trim()
+        || item?.dataset.calendarItem?.trim()
+        || 'norow'
+      const colId = field.dataset.colId?.trim()
+        || field.dataset.fieldId?.trim()
+        || `idx-${index}`
+      pushUnit(field, `calendar:${rowId}:${colId}`)
+    })
+    avBlock.querySelectorAll<HTMLElement>('.av__calendar-item').forEach((item) => {
+      if (item.closest('.av__calendar-preview, .fn__none')) {
+        return
+      }
+      if (item.querySelector('.av__calendar-field')) {
+        return
+      }
+      const content = item.querySelector<HTMLElement>('.av__calendar-item-content')
+      if (!content) {
+        return
+      }
+      const rowId = item.getAttribute('data-id')?.trim()
+        || item.dataset.calendarItem?.trim()
+        || 'norow'
+      pushUnit(content, `calendar:${rowId}:title`)
+    })
+    avBlock.querySelectorAll<HTMLElement>('.av__calendar-undated-item .b3-menu__label').forEach((label) => {
+      if (label.closest('.fn__none')) {
+        return
+      }
+      const item = label.closest<HTMLElement>('.av__calendar-undated-item')
+      const rowId = item?.dataset.calendarUndatedRow?.trim() || 'undated'
+      pushUnit(label, `calendar:${rowId}:undated`)
+    })
+  }
+
   // 标题
   const title = avBlock.querySelector<HTMLElement>('.av__title')
   if (title) {
@@ -1209,10 +1319,49 @@ function collectAttributeViewSearchUnits(
     pushUnit(nameElement, `view-name:${viewId}`)
   })
 
+  // 设置行「新建」、各视图「添加条目」、日历「今天 / 年月」不在单元格里。
+  // @see app/src/protyle/render/av/headerEditing.ts
+  // @see app/src/protyle/render/av/render.ts getTableHTMLs
+  // @see app/src/protyle/render/av/calendar/render.ts
+  const pushChrome = (element: HTMLElement, unitId: string) => {
+    if (element.closest('.fn__none, .av__calendar-preview')) {
+      return
+    }
+    pushUnit(element, unitId)
+  }
+  avBlock.querySelectorAll<HTMLElement>('[data-type="av-add-more"]').forEach((button, index) => {
+    pushChrome(button, `chrome:new:${index}`)
+  })
+  avBlock.querySelectorAll<HTMLElement>('[data-type="av-add-bottom"]').forEach((button, index) => {
+    pushChrome(button, `chrome:add-row:${index}`)
+  })
+  avBlock.querySelectorAll<HTMLElement>('.av__calendar-label').forEach((label, index) => {
+    pushChrome(label, `chrome:calendar-label:${index}`)
+  })
+  avBlock.querySelectorAll<HTMLElement>('.av__calendar-today').forEach((button, index) => {
+    pushChrome(button, `chrome:calendar-today:${index}`)
+  })
+  // 表头「周一」、日期数字、ISO 周数。条目字段仍由上面的日历条目收集，这里不扫 .av__calendar-events。
+  // @see app/src/protyle/render/av/calendar/render.ts
+  avBlock.querySelectorAll<HTMLElement>('.av__calendar-weekdays > div').forEach((cell, index) => {
+    pushChrome(cell, `chrome:calendar-weekday:${index}`)
+  })
+  avBlock.querySelectorAll<HTMLElement>('.av__calendar-day > span').forEach((day, index) => {
+    const stamp = day.parentElement?.getAttribute('data-calendar-day')?.trim() || String(index)
+    pushChrome(day, `chrome:calendar-day:${stamp}`)
+  })
+  avBlock.querySelectorAll<HTMLElement>('.av__calendar-week-number').forEach((week, index) => {
+    pushChrome(week, `chrome:calendar-week:${index}`)
+  })
+  avBlock.querySelectorAll<HTMLElement>('.av__calendar-more').forEach((more, index) => {
+    pushChrome(more, `chrome:calendar-more:${index}`)
+  })
+
   const groupTitles = Array.from(avBlock.querySelectorAll<HTMLElement>('.av__group-title'))
   if (groupTitles.length === 0) {
-    // 未分组：整表按 DOM 顺序收集单元格
+    // 未分组：整表按 DOM 顺序收集单元格，并带上日历条目
     pushCellsInRoot(avBlock)
+    pushCalendarItems()
     return units
   }
 
@@ -1238,6 +1387,7 @@ function collectAttributeViewSearchUnits(
     }
   })
 
+  pushCalendarItems()
   return units
 }
 
@@ -1392,7 +1542,7 @@ export function isPreviewSyntheticBlock(block: SearchableBlock): boolean {
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/toolbar/InlineMemo.ts
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/block/popover.ts
  */
-function collectInlineMemoSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
+function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = true): SearchableBlock[] {
   const units: SearchableBlock[] = []
   // ~= 匹配 data-type 空格分隔 token，避免扫全站 span
   const spans = Array.from(
@@ -1405,6 +1555,7 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
       ownerIndexById.set(id, index)
     }
   })
+  const textNodesByOwner = new Map<HTMLElement, Text[]>()
   let memoIndex = 0
 
   for (const span of spans) {
@@ -1425,6 +1576,9 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
     const blockIndex = owner?.dataset.nodeId
       ? (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? memoIndex)
       : memoIndex
+    const anchorOffset = owner
+      ? memoHostOffset(owner, span, includeImageTitle, textNodesByOwner)
+      : 0
 
     units.push({
       blockId,
@@ -1435,11 +1589,37 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
       textNodes: [],
       unitId: `${INLINE_MEMO_UNIT_PREFIX}${memoIndex}`,
       matchSource: 'inline-memo',
+      anchorOffset,
     })
     memoIndex += 1
   }
 
   return units
+}
+
+/** 备注宿主在所属块已采集文本中的起始位置，同一宿主只扫一次正文。 */
+function memoHostOffset(
+  owner: HTMLElement,
+  span: HTMLElement,
+  includeImageTitle: boolean,
+  cache: Map<HTMLElement, Text[]>,
+): number {
+  let nodes = cache.get(owner)
+  if (!nodes) {
+    nodes = collectTextNodes(owner, owner, includeImageTitle)
+    cache.set(owner, nodes)
+  }
+  let offset = 0
+  for (const node of nodes) {
+    if (span.contains(node)) {
+      return offset
+    }
+    if (span.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      return offset
+    }
+    offset += node.nodeValue?.length ?? 0
+  }
+  return offset
 }
 
 export function isInlineMemoSearchUnit(block: Pick<SearchableBlock, 'matchSource' | 'unitId'>): boolean {
@@ -1475,7 +1655,7 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
       continue
     }
 
-    const textNodes = collectInlineMathRenderedTextNodes(span)
+    const textNodes = collectKatexGlyphTextNodes(span)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     // 仅零宽占位则跳过（思源在公式旁插入 ZWSP）
     if (!text.replace(ZERO_WIDTH_RE, '').length) {
@@ -1507,20 +1687,46 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
 }
 
 /**
- * 只取渲染层文字；排除 MathML / annotation（其中含 TeX 源码）。
+ * 只取第一个 .katex-html 里的可见字形。
+ * 同一行若被拆成内容相同的多个 .base，只留一份，避免行级公式把同一个词计两次。
+ * 不走正文排除列表，否则 .katex 会被整段丢掉。
  */
-function collectInlineMathRenderedTextNodes(span: HTMLElement): Text[] {
-  const htmlRoot = span.querySelector<HTMLElement>('.katex-html')
-  const root = htmlRoot ?? span
+function collectKatexGlyphTextNodes(spanOrHtml: HTMLElement): Text[] {
+  const htmlRoot = spanOrHtml.classList.contains('katex-html')
+    ? spanOrHtml
+    : spanOrHtml.querySelector<HTMLElement>('.katex-html')
+  if (!htmlRoot) {
+    return []
+  }
+  const bases = Array.from(htmlRoot.querySelectorAll<HTMLElement>(':scope > .base'))
+  const roots = bases.length ? bases : [htmlRoot]
+  const seen = new Set<string>()
+  const nodes: Text[] = []
+  for (const root of roots) {
+    const part = walkKatexGlyphTextNodes(root)
+    const text = part.map((node) => node.nodeValue ?? '').join('').replace(ZERO_WIDTH_RE, '').trim()
+    if (!text || seen.has(text)) {
+      continue
+    }
+    seen.add(text)
+    nodes.push(...part)
+  }
+  return nodes
+}
+
+function walkKatexGlyphTextNodes(root: HTMLElement): Text[] {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       if (!(node instanceof Text) || !node.nodeValue?.length) {
         return NodeFilter.FILTER_REJECT
       }
+      if (!node.nodeValue.replace(ZERO_WIDTH_RE, '').length) {
+        return NodeFilter.FILTER_REJECT
+      }
       const parentElement = node.parentElement
       if (
         !parentElement
-        || parentElement.closest('.katex-mathml, annotation, svg, style, script')
+        || parentElement.closest('.katex-mathml, math, annotation, svg, style, script')
       ) {
         return NodeFilter.FILTER_REJECT
       }

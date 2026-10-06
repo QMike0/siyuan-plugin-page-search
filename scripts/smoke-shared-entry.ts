@@ -5,7 +5,6 @@ import {
     ATTRIBUTE_VIEW_TYPE,
     DEFAULT_PREFS,
     PREFS_STORAGE_PATH,
-    SEARCH_COUNT_SOFT_CAP,
     canRestrictInlineMemo,
     coercePluginPrefs,
     expandRegexReplacement,
@@ -463,10 +462,9 @@ assert(!shouldEnumerateRestrictInline("", undefined), "undefined restrict → no
 assert(shouldEnumerateRestrictInline("", ["strong"]), "empty + restrict → enumerate");
 assert(shouldEnumerateRestrictInline("  ", ["mark"]), "whitespace-only query → enumerate");
 assert(!shouldEnumerateRestrictInline("foo", ["strong"]), "keyword + restrict → keyword mode");
-assert(SEARCH_COUNT_SOFT_CAP === 999, "soft cap 999");
-assert(formatSearchCountLabel(1, 10) === "1/10", "count below soft cap");
-assert(formatSearchCountLabel(3, 1000) === "3/999+", "count above soft cap shows N+");
-assert(formatSearchCountLabel(1200, 1500) === "1200/999+", "index can exceed soft cap display");
+assert(formatSearchCountLabel(1, 10) === "1/10", "count label");
+assert(formatSearchCountLabel(3, 1000) === "3/1000", "count above 999 shows full total");
+assert(formatSearchCountLabel(1200, 1500) === "1200/1500", "full count for large results");
 
 const state = normalizeSearchStateEvent([{type: "close", clientId: "c1"}]);
 assert(state?.type === "close" && state.clientId === "c1", "search-state event");

@@ -1,13 +1,12 @@
 import type {IOperation, Protyle} from "siyuan";
-import {getAllEditor} from "siyuan";
+import {fetchSyncPost, getAllEditor} from "siyuan";
 import {ATTRIBUTE_VIEW_TYPE, isPreviewSyntheticBlock, isPreviewSyntheticBlockId} from "./blocks";
 import {collectSearchableBlocks} from "./blocks";
+import {extractUnitsFromDoms} from "./corpus/extract";
+import {invalidateDocumentSearchCaches} from "./corpus/search";
 import type {SearchableBlock} from "./dom-types";
 import type {SearchMatch} from "./dom-types";
-import {
-    isDocTitleMatch,
-    replaceDocTitleMatchesInEditor,
-} from "./doc-title-replace";
+import {isDocTitleMatch} from "./doc-title-replace";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
 import {
     applyMatchesToLiveUnits,
@@ -102,7 +101,7 @@ export function isMatchWritable(
     if (isEditorReplaceModeBlocked(edit)) {
         return false;
     }
-    if (!match.replaceable) {
+    if (!match.replaceable || isDocTitleMatch(match)) {
         return false;
     }
     if (match.blockType === ATTRIBUTE_VIEW_TYPE) {
@@ -114,6 +113,63 @@ export function isMatchWritable(
     return true;
 }
 
+function keepsBlockType(before: HTMLElement, after: HTMLElement): boolean {
+    return (before.getAttribute("data-type") ?? "") === (after.getAttribute("data-type") ?? "");
+}
+
+/**
+ * 子块写在容器内部的类型。标题不是：标题下的块是后续兄弟，内核 MoveFoldHeading 会在更新时把它们接回去。
+ * 列表 / 引述 / 提示 / 超级块的折叠只是 CSS，正常时子块仍在 DOM 里。
+ * 一旦界面上的这份 HTML 已经没有子块，不能拿它做 update，否则内核会卸掉折叠内容，撤销也找不到那些子块。
+ * getBlockDOM 走 cleanRenderNode(node, false)，返回的是含折叠子块的完整 DOM。
+ */
+const FOLDED_CONTENT_CONTAINER_TYPES = new Set([
+    "NodeList",
+    "NodeListItem",
+    "NodeBlockquote",
+    "NodeCallout",
+    "NodeSuperBlock",
+]);
+
+function foldedContainerOmitsChildBlocks(element: HTMLElement): boolean {
+    if (element.getAttribute("fold") !== "1") {
+        return false;
+    }
+    const type = element.getAttribute("data-type") ?? "";
+    if (!FOLDED_CONTENT_CONTAINER_TYPES.has(type)) {
+        return false;
+    }
+    return element.querySelector("[data-node-id]") === null;
+}
+
+/**
+ * 思源大表把屏外行收进 data-sy-table-virtual-rows，界面上的 outerHTML 不是整张表。
+ * 搜索这些表时用的是 getBlockDOM 的完整行，替换必须同一份，否则屏外单元格对不上，写回还会丢掉那些行。
+ */
+function editorTableOmitsRows(element: HTMLElement): boolean {
+    const type = element.getAttribute("data-type") ?? "";
+    if (type !== "NodeTable" && !element.classList.contains("table")) {
+        return false;
+    }
+    return element.hasAttribute("data-sy-table-virtual-id")
+        || element.querySelector(
+            "[data-sy-table-virtual-rows], [data-sy-table-virtual-columns], [data-sy-table-virtual-id]",
+        ) !== null;
+}
+
+/** 思源 3.8 的块类型锁：更新后的根类型必须和原块一致。 */
+function lockedUpdate(id: string, data: string): IOperation {
+    return {action: "update", id, data, lockType: true} as IOperation;
+}
+
+function restoreOuterHtml(element: HTMLElement, html: string): void {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const restored = template.content.firstElementChild;
+    if (restored && element.parentNode) {
+        element.parentNode.replaceChild(restored, element);
+    }
+}
 function buildUnitMap(blocks: SearchableBlock[]): Map<string, SearchableBlock> {
     const map = new Map<string, SearchableBlock>();
     for (const block of blocks) {
@@ -165,18 +221,12 @@ export async function replaceCurrentMatchInEditor(
     }
 
     if (isDocTitleMatch(match)) {
-        return replaceDocTitleMatchesInEditor(
-            edit,
-            protyle,
-            [match],
-            replacementText,
-            replaceOptionsFrom(options),
-        );
+        return {replacedCount: 0, skippedCount: 1};
     }
 
     const submit = resolveSubmitBlockElement(edit, match.blockId);
-    if (!submit) {
-        return {replacedCount: 0, skippedCount: 1, error: "block-missing"};
+    if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
+        return replaceFetchedBlockMatches(protyle, match.blockId, [match], replacementText, options);
     }
 
     const blocks = collectSearchableBlocks(edit, {
@@ -190,6 +240,7 @@ export async function replaceCurrentMatchInEditor(
         return {replacedCount: 0, skippedCount: 1, error: "unit-missing"};
     }
 
+    const typeBefore = submit.getAttribute("data-type");
     const oldHTML = submit.outerHTML;
     const outcome = applyMatchesToLiveUnits(
         unitsByKey,
@@ -206,6 +257,10 @@ export async function replaceCurrentMatchInEditor(
                 : "apply-failed",
         };
     }
+    if ((submit.getAttribute("data-type") ?? "") !== (typeBefore ?? "")) {
+        restoreOuterHtml(submit, oldHTML);
+        return {replacedCount: 0, skippedCount: 1};
+    }
 
     try {
         protyle.updateTransactionElement(submit, oldHTML);
@@ -220,8 +275,263 @@ export async function replaceCurrentMatchInEditor(
     };
 }
 
+const BLOCK_DOM_BATCH_SIZE = 64;
+
+interface PreparedBlockUpdate {
+    id: string;
+    oldHTML: string;
+    newHTML: string;
+    appliedCount: number;
+}
+
+interface PreparedBlockResult {
+    update: PreparedBlockUpdate | null;
+    skippedCount: number;
+    error?: string;
+}
+
 /**
- * 全部替换：标题命中单独 rename；正文按块合并为一批 transaction。
+ * 父块更新会整段换掉自己的 HTML。子块 id 还在这份 HTML 里时，子块必须排在后面，
+ * 否则父块里的旧子树会盖掉子块刚刚写入的文本。
+ * 无法证明包含关系时保持原顺序：未加载块在前、已加载块在后，和原先的提交顺序一致。
+ */
+function orderBlockUpdates(updates: PreparedBlockUpdate[]): PreparedBlockUpdate[] {
+    if (updates.length < 2) {
+        return updates;
+    }
+    const byId = new Map(updates.map((update) => [update.id, update]));
+    const children = new Map<string, string[]>();
+    const indegree = new Map<string, number>();
+    for (const update of updates) {
+        children.set(update.id, []);
+        indegree.set(update.id, 0);
+    }
+    const idPattern = /data-node-id="([^"]+)"/g;
+    for (const update of updates) {
+        const seen = new Set<string>();
+        idPattern.lastIndex = 0;
+        let found: RegExpExecArray | null;
+        while ((found = idPattern.exec(update.newHTML)) !== null) {
+            const childId = found[1];
+            if (!childId || childId === update.id || !byId.has(childId) || seen.has(childId)) {
+                continue;
+            }
+            seen.add(childId);
+            children.get(update.id)?.push(childId);
+            indegree.set(childId, (indegree.get(childId) ?? 0) + 1);
+        }
+    }
+
+    const pending = updates.filter((update) => (indegree.get(update.id) ?? 0) === 0);
+    const ordered: PreparedBlockUpdate[] = [];
+    const emitted = new Set<string>();
+    for (let cursor = 0; cursor < pending.length; cursor += 1) {
+        const current = pending[cursor];
+        if (emitted.has(current.id)) {
+            continue;
+        }
+        emitted.add(current.id);
+        ordered.push(current);
+        for (const childId of children.get(current.id) ?? []) {
+            const next = (indegree.get(childId) ?? 1) - 1;
+            indegree.set(childId, next);
+            if (next === 0) {
+                const child = byId.get(childId);
+                if (child) {
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    for (const update of updates) {
+        if (!emitted.has(update.id)) {
+            ordered.push(update);
+        }
+    }
+    return ordered;
+}
+
+function prepareBlockElementUpdate(
+    blockId: string,
+    blockEl: HTMLElement,
+    oldHTML: string,
+    unitsByKey: Map<string, SearchableBlock>,
+    matches: SearchMatch[],
+    replacementText: string,
+    replaceOpts: ReturnType<typeof replaceOptionsFrom>,
+): PreparedBlockResult {
+    const clone = blockEl.cloneNode(true) as HTMLElement;
+    const outcome = applyMatchesToSubmitClone(
+        blockEl,
+        clone,
+        unitsByKey,
+        matches,
+        replacementText,
+        replaceOpts,
+    );
+    if (outcome.appliedCount === 0) {
+        return {
+            update: null,
+            skippedCount: outcome.skippedCount || matches.length,
+            error: outcome.regexExpandFailedCount > 0 ? "regex-expand-failed" : "apply-failed",
+        };
+    }
+    if (!keepsBlockType(blockEl, clone)) {
+        return {update: null, skippedCount: matches.length};
+    }
+    return {
+        update: {
+            id: blockId,
+            oldHTML,
+            newHTML: clone.outerHTML,
+            appliedCount: outcome.appliedCount,
+        },
+        skippedCount: outcome.skippedCount,
+    };
+}
+
+const BLOCK_COMMIT_WAIT_MS = 8000;
+const BLOCK_COMMIT_POLL_MS = 80;
+
+/**
+ * protyle.transaction 把请求放进编辑器队列后就返回。
+ * 未加载块的刷新只能读内核 HTML，这里等到探针块的 DOM 离开替换前的快照。
+ */
+async function waitUntilBlockHtmlChanges(blockId: string, previousHtml: string): Promise<void> {
+    const deadline = Date.now() + BLOCK_COMMIT_WAIT_MS;
+    while (Date.now() < deadline) {
+        await new Promise((resolve) => {
+            window.setTimeout(resolve, BLOCK_COMMIT_POLL_MS);
+        });
+        try {
+            const response = await fetchSyncPost("/api/block/getBlockDOMs", {ids: [blockId]});
+            if (response?.code !== 0 || !response.data || typeof response.data !== "object") {
+                continue;
+            }
+            const html = (response.data as Record<string, string>)[blockId];
+            if (html !== previousHtml) {
+                return;
+            }
+        } catch {
+            // 请求还没写完时继续等到上限，避免刷新读到旧文本
+        }
+    }
+}
+
+async function fetchBlockHtmlBatch(ids: string[]): Promise<Map<string, string>> {
+    const htmlById = new Map<string, string>();
+    let data: Record<string, string> | null = null;
+    try {
+        const response = await fetchSyncPost("/api/block/getBlockDOMs", {ids});
+        if (response?.code === 0 && response.data && typeof response.data === "object") {
+            data = response.data as Record<string, string>;
+        }
+    } catch {
+        data = null;
+    }
+    if (!data) {
+        return htmlById;
+    }
+    for (const id of ids) {
+        const html = data[id];
+        if (html) {
+            htmlById.set(id, html);
+        }
+    }
+    return htmlById;
+}
+
+async function prepareFetchedBlockUpdates(
+    matchesById: Map<string, SearchMatch[]>,
+    replacementText: string,
+    options: ReplaceWriteOptions,
+): Promise<{updates: PreparedBlockUpdate[]; skippedCount: number; error?: string}> {
+    const ids = Array.from(matchesById.keys());
+    const updates: PreparedBlockUpdate[] = [];
+    let skippedCount = 0;
+    let error: string | undefined;
+    if (ids.length === 0) {
+        return {updates, skippedCount};
+    }
+
+    const replaceOpts = replaceOptionsFrom(options);
+    for (let index = 0; index < ids.length; index += BLOCK_DOM_BATCH_SIZE) {
+        const batch = ids.slice(index, index + BLOCK_DOM_BATCH_SIZE);
+        const htmlById = await fetchBlockHtmlBatch(batch);
+        const present: string[] = [];
+        const doms: Record<string, string> = {};
+        for (const id of batch) {
+            const html = htmlById.get(id);
+            const blockMatches = matchesById.get(id) ?? [];
+            if (!html) {
+                skippedCount += blockMatches.length;
+                error ??= "block-missing";
+                continue;
+            }
+            present.push(id);
+            doms[id] = html;
+        }
+        if (present.length === 0) {
+            continue;
+        }
+
+        let extracted: Awaited<ReturnType<typeof extractUnitsFromDoms>> | null = null;
+        try {
+            extracted = await extractUnitsFromDoms(
+                present,
+                doms,
+                {includeInlineMemo: true, includeImageTitle: true, includeDocTitle: false},
+                new Set(),
+                "none",
+            );
+        } catch (extractError) {
+            console.warn("[page-search] prepare unloaded replace failed", extractError);
+            for (const id of present) {
+                skippedCount += matchesById.get(id)?.length ?? 0;
+            }
+            error ??= "block-missing";
+            continue;
+        }
+
+        try {
+            const unitsByKey = buildUnitMap(extracted.blocks);
+            for (const id of present) {
+                const blockMatches = matchesById.get(id) ?? [];
+                const unit = extracted.blocks.find((block) => block.blockId === id);
+                const blockEl = unit?.element.closest<HTMLElement>(
+                    `[data-node-id="${CSS.escape(id)}"]`,
+                ) ?? unit?.element ?? null;
+                if (!blockEl) {
+                    skippedCount += blockMatches.length;
+                    error ??= "block-missing";
+                    continue;
+                }
+                const prepared = prepareBlockElementUpdate(
+                    id,
+                    blockEl,
+                    doms[id],
+                    unitsByKey,
+                    blockMatches,
+                    replacementText,
+                    replaceOpts,
+                );
+                skippedCount += prepared.skippedCount;
+                if (prepared.update) {
+                    updates.push(prepared.update);
+                } else if (prepared.error) {
+                    error ??= prepared.error;
+                }
+            }
+        } finally {
+            extracted.dispose();
+        }
+    }
+    return {updates, skippedCount, error};
+}
+
+/**
+ * 全部替换：文档标题不参与。
+ * 正文不论是否已在编辑器里，都合成一笔 transaction。
  */
 export async function replaceAllMatchesInEditor(
     edit: Element,
@@ -242,7 +552,6 @@ export async function replaceAllMatchesInEditor(
     }
 
     const replaceOpts = replaceOptionsFrom(options);
-    const titleMatches: SearchMatch[] = [];
     const bodyMatches: SearchMatch[] = [];
     let skippedCount = 0;
 
@@ -251,39 +560,16 @@ export async function replaceAllMatchesInEditor(
             skippedCount += 1;
             continue;
         }
-        if (isDocTitleMatch(match)) {
-            titleMatches.push(match);
-        } else {
-            bodyMatches.push(match);
-        }
+        bodyMatches.push(match);
     }
 
-    let replacedCount = 0;
     let firstError: string | undefined;
-    let firstDetail: string | undefined;
-
-    if (titleMatches.length > 0) {
-        const titleResult = await replaceDocTitleMatchesInEditor(
-            edit,
-            protyle,
-            titleMatches,
-            replacementText,
-            replaceOpts,
-        );
-        replacedCount += titleResult.replacedCount;
-        skippedCount += titleResult.skippedCount;
-        if (titleResult.error && titleResult.replacedCount === 0) {
-            firstError = titleResult.error;
-            firstDetail = titleResult.detail;
-        }
-    }
 
     if (bodyMatches.length === 0) {
         return {
-            replacedCount,
+            replacedCount: 0,
             skippedCount,
-            error: replacedCount === 0 ? firstError : undefined,
-            detail: replacedCount === 0 ? firstDetail : undefined,
+            error: undefined,
         };
     }
 
@@ -301,57 +587,135 @@ export async function replaceAllMatchesInEditor(
         grouped.set(match.blockId, list);
     }
 
-    const doOperations: IOperation[] = [];
-    const undoOperations: IOperation[] = [];
+    const skippedBeforeBody = skippedCount;
+    const loadedUpdates: PreparedBlockUpdate[] = [];
+    const unloadedMatches = new Map<string, SearchMatch[]>();
+    let bodySkipped = 0;
 
     for (const [blockId, blockMatches] of grouped) {
         const submit = resolveSubmitBlockElement(edit, blockId);
-        if (!submit) {
-            skippedCount += blockMatches.length;
+        // 折叠容器或缺行大表不用界面上的残缺 HTML，改走 getBlockDOM。
+        if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
+            unloadedMatches.set(blockId, blockMatches);
             continue;
         }
-
-        const oldHTML = submit.outerHTML;
-        const clone = submit.cloneNode(true) as HTMLElement;
-        const outcome = applyMatchesToSubmitClone(
+        const prepared = prepareBlockElementUpdate(
+            blockId,
             submit,
-            clone,
+            submit.outerHTML,
             unitsByKey,
             blockMatches,
             replacementText,
             replaceOpts,
         );
-        if (outcome.appliedCount === 0) {
-            skippedCount += outcome.skippedCount || blockMatches.length;
-            continue;
+        bodySkipped += prepared.skippedCount;
+        if (prepared.update) {
+            loadedUpdates.push(prepared.update);
+        } else if (prepared.error) {
+            firstError ??= prepared.error;
         }
-
-        doOperations.push({action: "update", id: blockId, data: clone.outerHTML});
-        undoOperations.push({action: "update", id: blockId, data: oldHTML});
-        replacedCount += outcome.appliedCount;
-        skippedCount += outcome.skippedCount;
     }
 
-    if (doOperations.length === 0) {
+    const fetched = await prepareFetchedBlockUpdates(
+        unloadedMatches,
+        replacementText,
+        options,
+    );
+    bodySkipped += fetched.skippedCount;
+    if (fetched.error) {
+        firstError ??= fetched.error;
+    }
+
+    const ordered = orderBlockUpdates([...fetched.updates, ...loadedUpdates]);
+    if (ordered.length === 0) {
         return {
-            replacedCount,
-            skippedCount,
-            error: replacedCount === 0 ? firstError : undefined,
-            detail: replacedCount === 0 ? firstDetail : undefined,
+            replacedCount: 0,
+            skippedCount: skippedBeforeBody + bodySkipped,
+            error: firstError,
         };
     }
 
     try {
-        protyle.transaction(doOperations, undoOperations);
+        protyle.transaction(
+            ordered.map((update) => lockedUpdate(update.id, update.newHTML)),
+            ordered.map((update) => lockedUpdate(update.id, update.oldHTML)),
+        );
     } catch (error) {
         console.warn("[page-search] transaction failed", error);
-        // 标题可能已 rename 成功：保留已替换计数，正文计为跳过
         return {
-            replacedCount,
-            skippedCount: skippedCount + bodyMatches.length,
+            replacedCount: 0,
+            skippedCount: skippedBeforeBody + bodyMatches.length,
             error: "transaction-failed",
         };
     }
 
-    return {replacedCount, skippedCount};
+    if (fetched.updates.length > 0) {
+        // 未加载块要等内核落盘后再清缓存，否则紧接着的刷新会读到替换前的 HTML。
+        await waitUntilBlockHtmlChanges(fetched.updates[0].id, fetched.updates[0].oldHTML);
+        invalidateDocumentSearchCaches();
+    }
+
+    return {
+        replacedCount: ordered.reduce((count, update) => count + update.appliedCount, 0),
+        skippedCount: skippedBeforeBody + bodySkipped,
+    };
+}
+
+async function commitBlockHtml(
+    protyle: Protyle,
+    blockId: string,
+    oldHTML: string,
+    newHTML: string,
+): Promise<boolean> {
+    try {
+        protyle.transaction(
+            [lockedUpdate(blockId, newHTML)],
+            [lockedUpdate(blockId, oldHTML)],
+        );
+        return true;
+    } catch (error) {
+        console.warn("[page-search] transaction failed, trying /api/transactions", error);
+    }
+    try {
+        const response = await fetchSyncPost("/api/transactions", {
+            session: "page-search",
+            app: "page-search",
+            transactions: [{
+                doOperations: [lockedUpdate(blockId, newHTML)],
+                undoOperations: [lockedUpdate(blockId, oldHTML)],
+            }],
+        });
+        return response?.code === 0;
+    } catch {
+        return false;
+    }
+}
+
+/** 单条替换：块不在当前 DOM 时单独提交，仍是一次 Ctrl+Z。全部替换不走这里。 */
+async function replaceFetchedBlockMatches(
+    protyle: Protyle,
+    blockId: string,
+    matches: SearchMatch[],
+    replacementText: string,
+    options: ReplaceWriteOptions,
+): Promise<ReplaceWriteResult> {
+    const prepared = await prepareFetchedBlockUpdates(
+        new Map([[blockId, matches]]),
+        replacementText,
+        options,
+    );
+    const update = prepared.updates[0];
+    if (!update) {
+        return {
+            replacedCount: 0,
+            skippedCount: Math.max(matches.length, prepared.skippedCount),
+            error: prepared.error ?? "apply-failed",
+        };
+    }
+    const committed = await commitBlockHtml(protyle, update.id, update.oldHTML, update.newHTML);
+    if (!committed) {
+        return {replacedCount: 0, skippedCount: matches.length, error: "transaction-failed"};
+    }
+    invalidateDocumentSearchCaches();
+    return {replacedCount: update.appliedCount, skippedCount: prepared.skippedCount};
 }

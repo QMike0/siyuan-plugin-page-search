@@ -8,7 +8,9 @@ import {
     type RestrictInlineType,
 } from "../shared";
 import type {MatchHit, MatchOptions, SearchableUnit} from "../shared";
-import {rpcMatch} from "./kernel-client";
+import {searchCurrentDocument} from "./corpus/search";
+import {editorFocusId} from "./corpus/focus";
+import {matchTextUnitsDetailed} from "../shared";
 import {
     CALLOUT_TYPE,
     TABLE_TYPE,
@@ -95,6 +97,12 @@ export interface SearchPipelineResult {
     matches: SearchMatch[];
     /** 非法正则等；空表示成功 */
     error: string;
+    /** 内核查询 API 不可用，结果只覆盖已加载 DOM */
+    degraded?: boolean;
+    /** 渲染块或正则文本库仍在后台补齐 */
+    partial?: boolean;
+    /** 图表 / HTML / 公式渲染失败、未计入命中的块数 */
+    unrendered?: number;
 }
 
 const TABLE_CELL_CLOSEST = '[data-type="NodeTableCell"], .table__cell, td, th';
@@ -254,6 +262,32 @@ export async function calculateSearchMatches(
     const keyword = value.trim();
     const restrictInlineTypes = options.restrictInlineTypes;
 
+    if (keyword && options.selectionOnly !== true) {
+        const full = await searchCurrentDocument(plugin, edit, value, options);
+        if (full) {
+            return full;
+        }
+        const loaded = await calculateLoadedDomMatches(plugin, edit, value, options);
+        return {...loaded, degraded: true};
+    }
+
+    return calculateLoadedDomMatches(plugin, edit, value, options);
+}
+
+/**
+ * 已加载 DOM 路径：选区内搜索，以及无法调用文档 API 时的降级。
+ * 空查询 + 限制激活时枚举行内宿主（只覆盖当前 DOM）。
+ */
+async function calculateLoadedDomMatches(
+    _plugin: Plugin,
+    edit: Element,
+    value: string,
+    options: SearchPipelineOptions,
+): Promise<SearchPipelineResult> {
+    const keyword = value.trim();
+    const restrictInlineTypes = options.restrictInlineTypes;
+    const includeDocTitle = options.includeDocTitle !== false && !editorFocusId(edit);
+
     if (!keyword) {
         if (!shouldEnumerateRestrictInline(value, restrictInlineTypes)) {
             return {matches: [], error: ""};
@@ -262,7 +296,7 @@ export async function calculateSearchMatches(
             matches: enumerateRestrictInlineMatches(edit, {
                 selectionOnly: options.selectionOnly,
                 selectionScope: options.selectionScope,
-                includeDocTitle: options.includeDocTitle,
+                includeDocTitle,
                 includeImageTitle: options.includeImageTitle,
                 includeAttributeView: options.includeAttributeView,
                 includeTable: options.includeTable,
@@ -293,7 +327,7 @@ export async function calculateSearchMatches(
     }
 
     const blocks = collectSearchableBlocks(edit, {
-        includeDocTitle: options.includeDocTitle !== false,
+        includeDocTitle,
         includeImageTitle: options.includeImageTitle !== false,
         includeAttributeView: options.includeAttributeView !== false,
         includeTable: options.includeTable !== false,
@@ -331,22 +365,19 @@ export async function calculateSearchMatches(
     const blockMap = buildBlockMap(blocks);
     const units = blocks.map(toSearchableUnit);
 
-    // 前端负责可见性过滤，内核侧不要贪心去重
-    const response = await rpcMatch(plugin, {
-        query: value,
-        units,
+    const matched = matchTextUnitsDetailed(units, value, {
         dedupeOverlaps: false,
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
         regex: options.regex,
     });
 
-    if (response.error) {
-        return {matches: [], error: response.error};
+    if (matched.error) {
+        return {matches: [], error: matched.error};
     }
 
     const scopedHits = selectionOnly
-        ? response.hits.filter((hit) =>
+        ? matched.hits.filter((hit) =>
             isMatchWithinSelection(
                 unitKey(hit.blockId, hit.unitId),
                 hit.start,
@@ -355,7 +386,7 @@ export async function calculateSearchMatches(
                 selectionScope,
             )
         )
-        : response.hits;
+        : matched.hits;
 
     return {
         matches: attachRangesToHits(blockMap, scopedHits, edit, {
@@ -417,12 +448,12 @@ function attachRangesToHits(
         accepted.push({start: hit.start, end: hit.end});
         acceptedByUnit.set(key, accepted);
 
-        // 2) 元素级：数据库 / 公式等不可替；行内备注改属性，不要求 Range 纯 Text
-        // 文档标题：可替（renameDoc）；编辑中 Protyle 常把连续字拆成多个相邻 Text
-        const replaceable = !isMath
+        // 文档标题只参与查找。编辑中 Protyle 常把连续字拆成多个相邻 Text。
+        const replaceable = !isDocTitle
+            && !isMath
             && !modeBlocked
             && isDomReplaceable(range, hit.blockType, hit.blockId)
-            && (isMemo || isDocTitle || isRangePlainTextOnly(range));
+            && (isMemo || isRangePlainTextOnly(range));
 
         result.push({
             id: hit.id,
@@ -436,6 +467,7 @@ function attachRangesToHits(
             replaceable,
             range,
             highlightKind: isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
+            anchorOffset: isMemo ? block.anchorOffset : undefined,
         });
     }
 
@@ -467,6 +499,11 @@ function compareSearchMatches(a: SearchMatch, b: SearchMatch): number {
         } catch {
             // 跨文档等异常时回退
         }
+    }
+    const leftPos = a.highlightKind === "inline-memo" ? (a.anchorOffset ?? a.start) : a.start;
+    const rightPos = b.highlightKind === "inline-memo" ? (b.anchorOffset ?? b.start) : b.start;
+    if (leftPos !== rightPos) {
+        return leftPos - rightPos;
     }
     const kindCmp = highlightKindRank(a.highlightKind) - highlightKindRank(b.highlightKind);
     if (kindCmp !== 0) {

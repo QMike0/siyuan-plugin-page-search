@@ -159,7 +159,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeCodeBlock: true,
     includeMermaid: true,
     includeHtmlBlock: true,
-    includeFoldedBlocks: false,
+    includeFoldedBlocks: true,
     includeInlineMemo: false,
     restrictInlineTypes: [],
     useRegex: false,

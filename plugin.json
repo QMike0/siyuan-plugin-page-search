@@ -3,7 +3,7 @@
   "author": "QMike0",
   "url": "https://github.com/QMike0/siyuan-plugin-page-search",
   "version": "1.0.4",
-  "minAppVersion": "3.7.0",
+  "minAppVersion": "3.8.6",
   "kernels": [
     "all"
   ],

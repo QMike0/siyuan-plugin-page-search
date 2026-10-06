@@ -1,22 +1,6 @@
 import type {Plugin} from "siyuan";
-import type {
-    MatchHit,
-    MatchOptions,
-    MatchRequest,
-    MatchResponse,
-    PluginPrefs,
-    SearchableUnit,
-    SearchStateEvent,
-} from "../shared";
-import {
-    DEFAULT_PREFS,
-    SEARCH_EMIT_METHOD,
-    SEARCH_STATE_METHOD,
-    coercePluginPrefs,
-    matchOptionsFromRequest,
-    matchTextUnitsDetailed,
-    normalizeSearchStateEvent,
-} from "../shared";
+import type {PluginPrefs} from "../shared";
+import {DEFAULT_PREFS, coercePluginPrefs} from "../shared";
 import {isPluginStorageWritable} from "./editor-mode";
 
 /** 内核 running 状态码（见 IKernelPluginState） */
@@ -28,46 +12,6 @@ export function isKernelRunning(plugin: Plugin): boolean {
 
 export function createClientId(): string {
     return `ps-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/**
- * 通过内核 RPC 匹配；内核未就绪或调用失败时回退到本地 shared 引擎。
- */
-export async function rpcMatch(
-    plugin: Plugin,
-    request: MatchRequest,
-): Promise<MatchResponse> {
-    const started = Date.now();
-    const localFallback = (): MatchResponse => {
-        const options = matchOptionsFromRequest(request);
-        const matched = matchTextUnitsDetailed(request.units ?? [], request.query ?? "", options);
-        return {
-            hits: matched.hits,
-            elapsedMs: Date.now() - started,
-            hitCount: matched.hits.length,
-            error: matched.error || undefined,
-        };
-    };
-
-    if (!isKernelRunning(plugin)) {
-        return localFallback();
-    }
-
-    try {
-        const result = await plugin.kernel.rpc.call.match(request) as MatchResponse;
-        if (!result || !Array.isArray(result.hits)) {
-            return localFallback();
-        }
-        return {
-            hits: result.hits,
-            elapsedMs: typeof result.elapsedMs === "number" ? result.elapsedMs : Date.now() - started,
-            hitCount: typeof result.hitCount === "number" ? result.hitCount : result.hits.length,
-            error: typeof result.error === "string" ? result.error : undefined,
-        };
-    } catch (error) {
-        console.warn("[page-search] rpc.match failed, using local fallback", error);
-        return localFallback();
-    }
 }
 
 export async function rpcGetPrefs(plugin: Plugin): Promise<PluginPrefs> {
@@ -102,59 +46,4 @@ export async function rpcSetPrefs(
         console.warn("[page-search] prefs.set failed", error);
         return coercePluginPrefs({...DEFAULT_PREFS, ...patch});
     }
-}
-
-/** 通过内核广播 search-state（关闭 / 清空高亮） */
-export async function rpcEmitSearchState(
-    plugin: Plugin,
-    event: SearchStateEvent,
-): Promise<void> {
-    if (!isKernelRunning(plugin)) {
-        return;
-    }
-    try {
-        await plugin.kernel.rpc.call[SEARCH_EMIT_METHOD](event);
-    } catch (error) {
-        console.warn("[page-search] search.emit failed", error);
-    }
-}
-
-export function bindSearchStateListener(
-    plugin: Plugin,
-    handler: (event: SearchStateEvent) => void | Promise<void>,
-): (...args: any[]) => Promise<void> {
-    const wrapped = async (...args: any[]) => {
-        const event = normalizeSearchStateEvent(args)
-            ?? (args.length > 0 ? normalizeSearchStateEvent([args[0]]) : null);
-        if (!event) {
-            return;
-        }
-        await handler(event);
-    };
-    plugin.kernel.rpc.bind(SEARCH_STATE_METHOD, wrapped);
-    return wrapped;
-}
-
-export function unbindSearchStateListener(
-    plugin: Plugin,
-    handler: (...args: any[]) => void | Promise<void>,
-): void {
-    plugin.kernel.rpc.unbind(SEARCH_STATE_METHOD, handler);
-}
-
-/** 便捷：仅传 units + query + 可选匹配选项 */
-export async function matchUnitsViaKernel(
-    plugin: Plugin,
-    query: string,
-    units: SearchableUnit[],
-    dedupeOverlaps = true,
-    matchOptions: MatchOptions = {},
-): Promise<MatchHit[]> {
-    const response = await rpcMatch(plugin, {
-        query,
-        units,
-        dedupeOverlaps,
-        ...matchOptions,
-    });
-    return response.hits;
 }

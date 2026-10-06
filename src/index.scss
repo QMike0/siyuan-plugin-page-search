@@ -124,7 +124,9 @@
     width: 0;
     min-width: 0;
     max-width: none;
+    border: none !important;
     border-radius: 0;
+    outline: none;
     box-shadow: none !important;
     background-color: transparent;
     cursor: text;
@@ -143,6 +145,8 @@
     /* 整体略向左：与右边缘留出空隙 */
     padding: 1px 5px 1px 0;
     margin-right: 2px;
+    border: none;
+    box-shadow: none;
     cursor: default;
 }
 
@@ -156,6 +160,51 @@
     margin: 0;
     flex-shrink: 0;
     color: var(--b3-theme-on-surface);
+}
+
+.highlight-search-result .search-index-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    height: 18px;
+    margin: 0 2px 0 0;
+    padding: 0 6px 0 5px;
+    border: 1px solid var(--b3-theme-warning);
+    border-radius: 9px;
+    font-size: 11px;
+    line-height: 1;
+    color: var(--b3-theme-warning);
+    background-color: transparent;
+}
+
+.highlight-search-result .search-index-status[hidden] {
+    display: none !important;
+}
+
+.highlight-search-result .search-index-status::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background-color: var(--b3-theme-warning);
+    animation: page-search-index-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes page-search-index-pulse {
+    0%,
+    100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.2;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .highlight-search-result .search-index-status::before {
+        animation: none;
+    }
 }
 
 .highlight-search-result .search-tools {

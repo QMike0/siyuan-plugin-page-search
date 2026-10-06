@@ -14,10 +14,18 @@ import {
 } from "../shared";
 import type {IMenu, Plugin} from "siyuan";
 import {confirm, Menu, showMessage} from "siyuan";
-import {rpcEmitSearchState, rpcSetPrefs} from "./kernel-client";
-import {collectSearchableBlocks, HTML_BLOCK_UNIT_ID, MERMAID_UNIT_ID} from "./blocks";
+import {rpcSetPrefs} from "./kernel-client";
+import {
+    collectSearchableBlocks,
+    HTML_BLOCK_UNIT_ID,
+    MERMAID_UNIT_ID,
+    type CollectSearchableBlocksOptions,
+} from "./blocks";
 import {parentElementCrossingShadow} from "./dom-parent";
 import {calculateSearchMatches} from "./pipeline";
+import {fillLiveRanges} from "./corpus/project";
+import {blockIsInEditor, openBlockInEditor} from "./corpus/locate";
+import {cancelBackgroundCorpusJobs, editorRootId, invalidateDocumentSearchCaches, subscribeIndexSettled} from "./corpus/search";
 import {
     isMatchWritable,
     replaceAllMatchesInEditor,
@@ -53,7 +61,11 @@ import {
 } from "./memo-underline-visual";
 import type {SearchMatch} from "./dom-types";
 import {
+    clearNonHeadingFoldLocally,
     collectNonHeadingFoldedAncestorIds,
+    consumeUnfoldedOuterHeadingId,
+    isUnderNonHeadingCssFold,
+    listBlocksUnfoldedAfterHeading,
     unfoldNonHeadingFoldedBlocks,
     waitForLayout,
 } from "./fold";
@@ -126,6 +138,14 @@ export interface SearchBarI18n {
     replaceAllResult: string;
     replaceProtyleMissing: string;
     selectionOnlyNoScope: string;
+    /** 发布或预览无法调用文档 API 时的说明 */
+    searchDegradedLoadedOnly?: string;
+    /** 正则或渲染缓存仍在补齐 */
+    searchPartialIndexing?: string;
+    searchIndexingBadge?: string;
+    replaceDocTitleUnsupported?: string;
+    /** 渲染失败未计入的块数 */
+    searchUnrendered?: string;
     settingsTitle: string;
     settingsRestrictInline: string;
     settingsRestrictInlineHint: string;
@@ -186,7 +206,7 @@ export interface SearchBarHost {
     getClientId(): string;
     updateLastHighlightComponent(element: Element): void;
     isLastHighlightComponent(element: Element): boolean;
-    closeCurrentSearchDialog(element: Element, options?: {broadcast?: boolean}): void;
+    closeCurrentSearchDialog(element: Element): void;
     onSearchComponentMounted(callback: (event: CustomEvent) => void): void;
     onSearchComponentUnmounted(callback?: (event: CustomEvent) => void): void;
     /** 将文档标题匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -243,6 +263,7 @@ export class SearchBar {
     private readonly input: HTMLInputElement;
     private readonly replaceInput: HTMLInputElement;
     private readonly countEl: HTMLElement;
+    private readonly indexStatusEl: HTMLElement;
     private readonly dialog: HTMLElement;
 
     private searchText = "";
@@ -250,6 +271,10 @@ export class SearchBar {
     private resultIndex = 0;
     private resultCount = 0;
     private resultMatches: SearchMatch[] = [];
+    private degradedNotified = false;
+    private indexSettledTimer: number | null = null;
+    private unsubscribeIndexSettled: (() => void) | null = null;
+    private locatePending = false;
     private typingTimer: number | undefined;
     private searchGeneration = 0;
 
@@ -299,7 +324,7 @@ export class SearchBar {
     /** 是否匹配 HTML 块渲染可见文字；全局 prefs，默认 true */
     private includeHtmlBlock = true;
     /** 是否匹配非标题折叠块内隐藏内容；全局 prefs，默认 false */
-    private includeFoldedBlocks = false;
+    private includeFoldedBlocks = true;
     /** 是否匹配行内备注；全局 prefs，默认 false */
     private includeInlineMemo = false;
     /** 限制查找的行内类型；空 = 不限制 */
@@ -325,6 +350,8 @@ export class SearchBar {
     private avRefreshTimer: number | undefined;
     /** 跳转滚动期间抑制 AV DOM 观察触发的重搜，避免把索引打回 1 */
     private avWatchPausedUntil = 0;
+    /** 折叠展开或装载块期间，禁止把当前序号清成 0 */
+    private indexResetPausedUntil = 0;
     /** 打开面板前编辑器内选区快照；关闭时用于恢复焦点（匹配导航优先） */
     private restoreEditorRange: Range | null = null;
     /** 选区提示几何同步：滚动/缩放后按冻结 scope 重测坐标（不写内容块） */
@@ -402,6 +429,9 @@ export class SearchBar {
         useRegex?: boolean;
     }) {
         this.edit = options.edit;
+        this.unsubscribeIndexSettled = subscribeIndexSettled((rootId) => {
+            this.scheduleIndexRefresh(rootId);
+        });
         this.root = options.root;
         this.plugin = options.plugin;
         this.i18n = options.i18n;
@@ -429,7 +459,7 @@ export class SearchBar {
         this.includeCodeBlock = options.includeCodeBlock !== false;
         this.includeMermaid = options.includeMermaid !== false;
         this.includeHtmlBlock = options.includeHtmlBlock !== false;
-        this.includeFoldedBlocks = options.includeFoldedBlocks === true;
+        this.includeFoldedBlocks = options.includeFoldedBlocks !== false;
         this.includeInlineMemo = options.includeInlineMemo === true;
         this.restrictInlineTypes = normalizeRestrictInlineTypes(
             options.restrictInlineTypes,
@@ -442,6 +472,7 @@ export class SearchBar {
         this.input = this.root.querySelector(".search-input-find") as HTMLInputElement;
         this.replaceInput = this.root.querySelector(".search-input-replace") as HTMLInputElement;
         this.countEl = this.root.querySelector(".search-count") as HTMLElement;
+        this.indexStatusEl = this.root.querySelector(".search-index-status") as HTMLElement;
         this.replaceRow = this.root.querySelector(".search-row--replace");
         this.replaceToggleBtn = this.root.querySelector('[data-action="toggle-replace"]');
         this.replaceBtn = this.root.querySelector('[data-action="replace"]');
@@ -528,8 +559,15 @@ export class SearchBar {
     }
 
     destroy() {
+        cancelBackgroundCorpusJobs();
         clearTimeout(this.typingTimer);
         clearTimeout(this.avRefreshTimer);
+        if (this.indexSettledTimer != null) {
+            window.clearTimeout(this.indexSettledTimer);
+            this.indexSettledTimer = null;
+        }
+        this.unsubscribeIndexSettled?.();
+        this.unsubscribeIndexSettled = null;
         this.closeSettingsMenu();
         this.closeSearchMethodMenu();
         this.teardownSelectionScopeLayoutSync();
@@ -656,6 +694,7 @@ export class SearchBar {
       </div>
       <div class="search-row__trailing">
         <span class="search-count">0/0</span>
+        <span class="search-index-status" hidden aria-live="polite"></span>
         <div class="search-tools">
           <div data-action="prev" title="${escapeAttr(this.i18n.searchPrev)}">${iconUse("#iconUp")}</div>
           <div data-action="next" title="${escapeAttr(this.i18n.searchNext)}">${iconUse("#iconDown")}</div>
@@ -1235,7 +1274,7 @@ export class SearchBar {
         }
 
         const generation = ++this.searchGeneration;
-        const {matches, error} = await calculateSearchMatches(this.plugin, this.edit, value, {
+        const {matches, error, degraded, partial, unrendered} = await calculateSearchMatches(this.plugin, this.edit, value, {
             caseSensitive: this.caseSensitive,
             wholeWord: this.wholeWord,
             regex: this.regex,
@@ -1282,20 +1321,77 @@ export class SearchBar {
             return [];
         }
 
+        const previous = change ? undefined : this.resultMatches[this.resultIndex - 1];
         this.resultMatches = matches;
         this.resultCount = matches.length;
+        this.noteSearchCoverage(degraded, partial, unrendered);
         if (change && matches.length > 0) {
             // 仅 change=true 时按光标/选区锚定；失败回退第 1 项。替换后走 keepIndex，不走这里。
             this.resultIndex = resolveInitialMatchIndex(matches, {
                 anchorRange: this.getSearchAnchorRange(),
                 modeBlocked: isEditorReplaceModeBlocked(this.edit),
             });
+        } else if (previous) {
+            const kept = matches.findIndex((match) => {
+                return match.blockId === previous.blockId
+                    && match.unitId === previous.unitId
+                    && match.start === previous.start;
+            });
+            if (kept >= 0) {
+                this.resultIndex = kept + 1;
+            } else if (this.resultIndex > matches.length) {
+                this.resultIndex = matches.length;
+            }
         } else if (this.resultIndex > matches.length) {
             this.resultIndex = matches.length;
         }
         this.updateCountLabel();
         this.syncReplaceButtons();
         return matches;
+    }
+
+    private noteSearchCoverage(degraded?: boolean, partial?: boolean, unrendered?: number) {
+        if (degraded && !this.degradedNotified) {
+            this.degradedNotified = true;
+            showMessage(
+                this.i18n.searchDegradedLoadedOnly
+                    ?? "当前环境不能读取未加载内容，结果只包含已加载区域",
+                5000,
+                "info",
+            );
+        }
+        const indexing = Boolean(partial);
+        const indexingText = this.i18n.searchPartialIndexing ?? "仍在索引文档其余内容";
+        this.indexStatusEl.hidden = !indexing;
+        this.indexStatusEl.textContent = indexing
+            ? (this.i18n.searchIndexingBadge ?? "索引中")
+            : "";
+        this.indexStatusEl.title = indexing ? indexingText : "";
+        const notes: string[] = [];
+        if (indexing) {
+            notes.push(indexingText);
+        }
+        if (unrendered && unrendered > 0) {
+            notes.push(
+                (this.i18n.searchUnrendered ?? "有 {count} 个块渲染失败，未计入")
+                    .replace("{count}", String(unrendered)),
+            );
+        }
+        this.countEl.title = notes.join("；");
+    }
+
+    /** 后台索引结束时合并成一次刷新，避免补图期间反复全量搜索。 */
+    private scheduleIndexRefresh(rootId: string) {
+        if (!this.searchText.trim() || editorRootId(this.edit) !== rootId) {
+            return;
+        }
+        if (this.indexSettledTimer != null) {
+            window.clearTimeout(this.indexSettledTimer);
+        }
+        this.indexSettledTimer = window.setTimeout(() => {
+            this.indexSettledTimer = null;
+            void this.highlightHitResult(this.searchText, false);
+        }, 80);
     }
 
     async highlightHitResult(value: string, change: boolean) {
@@ -1305,11 +1401,6 @@ export class SearchBar {
         // 空查询且未限制：清空高亮（旧行为）。限制激活的空查询走下方枚举高亮。
         if (!trimmed && !shouldEnumerateRestrictInline(value, this.restrictInlineTypes)) {
             this.clearHighlight();
-            void rpcEmitSearchState(this.plugin, {
-                type: "clear",
-                clientId: this.plugin.getClientId(),
-                query: "",
-            });
             return;
         }
 
@@ -1344,6 +1435,11 @@ export class SearchBar {
 
         if (change && this.resultIndex >= 1) {
             this.scrollIntoRanges(this.resultIndex - 1, false);
+        } else if (Date.now() < this.indexResetPausedUntil) {
+            const current = this.getCurrentMatch();
+            if (current?.range && current.highlightKind !== "inline-memo") {
+                this.applyFocusHighlight(current.range);
+            }
         }
     }
 
@@ -1501,11 +1597,20 @@ export class SearchBar {
 
             clearTimeout(this.typingTimer);
             this.typingTimer = window.setTimeout(() => {
-                this.resultIndex = 0;
-                this.updateCountLabel();
+                const preserveIndex = event.type === "loaded-protyle-dynamic"
+                    || this.locatePending
+                    || Date.now() < this.indexResetPausedUntil;
+                if (!preserveIndex) {
+                    this.resultIndex = 0;
+                    this.updateCountLabel();
+                }
                 // 文档重载后 DOM 几何变化，按冻结 scope 重画选区提示
                 if (this.selectionOnly) {
                     this.syncSelectionScopeVisual();
+                }
+                // 折叠展开后的刷新由跳转自己做一次；这里并行重搜会抢走序号
+                if (this.locatePending) {
+                    return;
                 }
                 if (this.plugin.isLastHighlightComponent(this.root)) {
                     void this.highlightHitResult(this.searchText, false);
@@ -1560,36 +1665,308 @@ export class SearchBar {
         window.clearTimeout(this.avRefreshTimer);
     }
 
+    private pauseIndexReset(ms: number) {
+        this.indexResetPausedUntil = Math.max(this.indexResetPausedUntil, Date.now() + ms);
+    }
+
+    private revealUnloadedMatch(index: number, match: SearchMatch | undefined, scroll: boolean) {
+        if (!match || match.blockId === "__doc-title__") {
+            return;
+        }
+        if (scroll && match.snippet) {
+            showMessage(match.snippet, 4000, "info");
+        }
+        const existing = this.edit.querySelector<HTMLElement>(
+            `[data-node-id="${CSS.escape(match.blockId)}"]`,
+        );
+        const shown = existing
+            && existing.clientHeight > 0
+            && !isUnderNonHeadingCssFold(existing);
+        if (shown && !match.range && this.tryBindUnfoldedMatch(index + 1)) {
+            void this.scrollIntoRangesAsync(index, scroll).then(() => {
+                window.requestAnimationFrame(() => this.applyResultHighlights());
+            });
+            return;
+        }
+        if (shown || (match.blockType === ATTRIBUTE_VIEW_TYPE && existing)) {
+            existing?.scrollIntoView({block: "center", inline: "nearest"});
+            return;
+        }
+        if (this.locatePending) {
+            return;
+        }
+        const app = (this.plugin as unknown as Plugin).app;
+        if (!app) {
+            return;
+        }
+        this.locatePending = true;
+        const keepIndex = this.resultIndex >= 1 ? this.resultIndex : index + 1;
+        this.pauseIndexReset(4000);
+        openBlockInEditor(app, match.blockId, () => {
+            const finish = this.finishLocatedMatch(keepIndex, scroll);
+            const release = () => {
+                this.locatePending = false;
+                this.pauseIndexReset(800);
+            };
+            finish.then(release, release);
+        }, this.edit);
+    }
+
+    /**
+     * 折叠块插回当前文档后停在原来的那一条。
+     * 先给当前命中补高亮并滚动；标题下其余命中下一帧再补，对不上才整篇重搜。
+     */
+    private async finishLocatedMatch(keepIndex: number, scroll: boolean) {
+        const index = this.resultIndex >= 1 && this.resultIndex <= this.resultMatches.length
+            ? this.resultIndex
+            : keepIndex;
+        if (index >= 1 && this.tryBindUnfoldedMatch(index)) {
+            if (this.resultIndex < 1) {
+                this.resultIndex = Math.min(index, this.resultMatches.length);
+                this.updateCountLabel();
+            }
+            if (scroll) {
+                await this.scrollIntoRangesAsync(index - 1, true, false, true);
+            }
+            await new Promise<void>((resolve) => {
+                window.requestAnimationFrame(() => resolve());
+            });
+            this.bindUnfoldedHeadingSection();
+            return;
+        }
+        consumeUnfoldedOuterHeadingId();
+        await this.highlightHitResult(this.searchText, false);
+        if (this.resultIndex < 1 && keepIndex >= 1 && this.resultCount > 0) {
+            this.resultIndex = Math.min(keepIndex, this.resultCount);
+            this.updateCountLabel();
+        }
+        if (!scroll || this.resultIndex < 1) {
+            return;
+        }
+        const current = this.resultMatches[this.resultIndex - 1];
+        if (current?.range) {
+            await this.scrollIntoRangesAsync(this.resultIndex - 1, true);
+            return;
+        }
+        if (!current?.blockId) {
+            return;
+        }
+        this.edit.querySelector<HTMLElement>(
+            `[data-node-id="${CSS.escape(current.blockId)}"]`,
+        )?.scrollIntoView({block: "center", inline: "nearest"});
+    }
+
+    /** 当前这条已经在编辑器里时，只采集这一块并补上 Range，不重搜全文 */
+    private tryBindUnfoldedMatch(index: number): boolean {
+        const match = this.resultMatches[index - 1];
+        if (!match || match.blockId === "__doc-title__") {
+            return false;
+        }
+        const owner = this.edit.querySelector<HTMLElement>(
+            `[data-node-id="${CSS.escape(match.blockId)}"]`,
+        );
+        if (!owner) {
+            return false;
+        }
+        const live = collectSearchableBlocks(this.edit, {
+            ...this.searchCollectOptions(),
+            includeDocTitle: false,
+            scopeRoots: [owner],
+        });
+        this.resultMatches = fillLiveRanges(this.resultMatches, live, this.includeFoldedBlocks);
+        const current = this.resultMatches[index - 1];
+        if (!current?.range) {
+            return false;
+        }
+        if (current.highlightKind !== "inline-memo") {
+            this.applyFocusHighlight(current.range);
+        }
+        return true;
+    }
+
+    /** 折叠标题刚展开的那一段：只采集这些块，给已有命中补高亮 */
+    private bindUnfoldedHeadingSection() {
+        const headingId = consumeUnfoldedOuterHeadingId();
+        if (!headingId) {
+            return;
+        }
+        const heading = this.edit.querySelector<HTMLElement>(
+            `[data-node-id="${CSS.escape(headingId)}"]`,
+        );
+        if (!heading) {
+            return;
+        }
+        const roots = listBlocksUnfoldedAfterHeading(heading);
+        if (!roots.length) {
+            return;
+        }
+        const live = collectSearchableBlocks(this.edit, {
+            ...this.searchCollectOptions(),
+            includeDocTitle: false,
+            scopeRoots: roots,
+        });
+        this.resultMatches = fillLiveRanges(this.resultMatches, live, this.includeFoldedBlocks);
+        this.applyResultHighlights();
+    }
+
+    private searchCollectOptions(): CollectSearchableBlocksOptions {
+        return {
+            includeDocTitle: this.includeDocTitle,
+            includeImageTitle: this.includeImageTitle,
+            includeAttributeView: this.includeAttributeView,
+            includeTable: this.includeTable,
+            includeBlockquote: this.includeBlockquote,
+            includeCallout: this.includeCallout,
+            includeSuperBlock: this.includeSuperBlock,
+            includeListUnordered: this.includeListUnordered,
+            includeListOrdered: this.includeListOrdered,
+            includeListTask: this.includeListTask,
+            includeParagraph: this.includeParagraph,
+            includeHeadingH1: this.includeHeadingH1,
+            includeHeadingH2: this.includeHeadingH2,
+            includeHeadingH3: this.includeHeadingH3,
+            includeHeadingH4: this.includeHeadingH4,
+            includeHeadingH5: this.includeHeadingH5,
+            includeHeadingH6: this.includeHeadingH6,
+            includeMathBlock: this.includeMathBlock,
+            includeEmbedBlock: this.includeEmbedBlock,
+            includeCodeBlock: this.includeCodeBlock,
+            includeMermaid: this.includeMermaid,
+            includeHtmlBlock: this.includeHtmlBlock,
+            includeInlineMemo: this.includeInlineMemo,
+            restrictInlineTypes: this.restrictInlineTypes,
+        };
+    }
+
+    /** 用当前命中上的 Range 重画高亮，不清除还没补上的命中 */
+    private applyResultHighlights() {
+        const HighlightCtor = (window as any).Highlight as {
+            new (...ranges: Range[]): Highlight;
+        };
+        if (typeof HighlightCtor !== "function" || !(CSS as any).highlights) {
+            this.syncMemoUnderlineVisual();
+            return;
+        }
+        const textRanges: Range[] = [];
+        for (const match of this.resultMatches) {
+            if (!match.range || match.highlightKind === "inline-memo") {
+                continue;
+            }
+            try {
+                if (!match.range.startContainer.isConnected) {
+                    continue;
+                }
+            } catch {
+                continue;
+            }
+            textRanges.push(match.range);
+        }
+        if (textRanges.length) {
+            (CSS as any).highlights.set("search-results", new HighlightCtor(...textRanges));
+        }
+        this.syncMemoUnderlineVisual();
+        this.plugin.updateLastHighlightComponent(this.root);
+    }
+
     private scrollIntoRanges(index: number, scroll: boolean = true, pulseMemoFocus = false) {
         void this.scrollIntoRangesAsync(index, scroll, pulseMemoFocus);
     }
 
     /**
-     * 跳转命中：若开启折叠内容搜索，先展开路径上的非标题折叠块，再滚动高亮。
-     * 匹配阶段不展开，避免改文档状态与性能开销。
+     * 折叠标题删块后，Range 仍可能连在文首。只有起点还在原块里才算有效。
+     */
+    private rangeStillInMatchBlock(range: Range, blockId: string): boolean {
+        let node: Node | null = null;
+        try {
+            node = range.startContainer;
+            if (!node?.isConnected) {
+                return false;
+            }
+        } catch {
+            return false;
+        }
+        if (!blockId || blockId === "__doc-title__") {
+            return true;
+        }
+        const selector = `[data-node-id="${CSS.escape(blockId)}"]`;
+        let element: Element | null = node.nodeType === Node.ELEMENT_NODE
+            ? node as Element
+            : node.parentElement;
+        while (element) {
+            if (element.matches(selector)) {
+                return true;
+            }
+            element = parentElementCrossingShadow(element);
+        }
+        return false;
+    }
+
+    /** 当前命中立刻标成橙色。标题展开路径在滚动之前调用。 */
+    private applyFocusHighlight(range: Range) {
+        const HighlightCtor = (window as any).Highlight as {
+            new (...ranges: Range[]): Highlight;
+        };
+        if (typeof HighlightCtor !== "function" || !(CSS as any).highlights) {
+            return;
+        }
+        const highlights = (CSS as any).highlights;
+        highlights.delete("search-focus");
+        highlights.delete("search-math-focus");
+        highlights.set("search-focus", new HighlightCtor(range));
+        this.plugin.updateLastHighlightComponent(this.root);
+    }
+
+    /**
+     * 跳转命中：已在编辑器里的折叠列表/提示先展开再滚动。
+     * 折叠标题下的命中不在 DOM 里，展开后仍停在当前序号，不进入聚焦。
+     * immediate：标题刚展开时先上橙色并立刻滚动，折叠持久化放到后台。
+     * scroll 为 false 时只刷新高亮，不展开用户刚刚折叠的块。
      */
     private async scrollIntoRangesAsync(
         index: number,
         scroll: boolean = true,
         pulseMemoFocus = false,
+        immediate = false,
     ) {
         // 滚动可能触发 AV 虚拟滚动 DOM 突变；短暂暂停观察，防止重搜重置索引
         if (scroll) {
             this.pauseAvWatch(600);
         }
         const match = this.resultMatches[index];
-        const range = match?.range;
+        let range = match?.range;
+        // 折叠标题会删掉后面的块，浏览器把旧 Range 缩到文首。跳转时不能再滚到那里。
+        if (range && match && !this.rangeStillInMatchBlock(range, match.blockId)) {
+            match.range = undefined;
+            range = undefined;
+        }
         if (!range) {
+            if (!scroll) {
+                return;
+            }
+            this.revealUnloadedMatch(index, match, scroll);
             return;
         }
+        if (immediate && match.highlightKind !== "inline-memo") {
+            this.applyFocusHighlight(range);
+        }
 
-        if (this.includeFoldedBlocks) {
+        let backgroundFoldIds: string[] = [];
+        if (scroll && this.includeFoldedBlocks) {
             const ancestor = range.commonAncestorContainer;
             const fromNode = ancestor.nodeType === Node.TEXT_NODE
                 ? ancestor.parentElement
                 : ancestor as Element | null;
             const foldIds = collectNonHeadingFoldedAncestorIds(fromNode);
-            if (foldIds.length) {
+            if (foldIds.length && immediate) {
+                clearNonHeadingFoldLocally(foldIds);
+                const host = range.startContainer.nodeType === Node.ELEMENT_NODE
+                    ? range.startContainer as HTMLElement
+                    : range.startContainer.parentElement;
+                if (host) {
+                    void host.offsetHeight;
+                }
+                backgroundFoldIds = foldIds;
+            } else if (foldIds.length) {
                 this.pauseAvWatch(800);
                 await unfoldNonHeadingFoldedBlocks(foldIds);
                 await waitForLayout();
@@ -1618,17 +1995,11 @@ export class SearchBar {
             }
         }
 
-        const HighlightCtor = (window as any).Highlight as {
-            new (...ranges: Range[]): Highlight;
-        };
-        if (typeof HighlightCtor === "function" && (CSS as any).highlights) {
-            const highlights = (CSS as any).highlights;
-            highlights.delete("search-focus");
-            highlights.delete("search-math-focus"); // 旧版独立公式焦点名
-            if (match.highlightKind !== "inline-memo") {
-                highlights.set("search-focus", new HighlightCtor(range));
-            }
-            this.plugin.updateLastHighlightComponent(this.root);
+        if (match.highlightKind !== "inline-memo") {
+            this.applyFocusHighlight(range);
+        }
+        if (backgroundFoldIds.length) {
+            void unfoldNonHeadingFoldedBlocks(backgroundFoldIds);
         }
         this.syncMemoUnderlineVisual();
         // 异步展开折叠后索引可能已变；仅当仍停在本次目标命中时才脉冲
@@ -1680,7 +2051,7 @@ export class SearchBar {
 
     private clickClose() {
         this.clearHighlight();
-        this.plugin.closeCurrentSearchDialog(this.root, {broadcast: true});
+        this.plugin.closeCurrentSearchDialog(this.root);
     }
 
     /**
@@ -1823,6 +2194,11 @@ export class SearchBar {
         if (!match) {
             return;
         }
+        if (match.blockId === "__doc-title__" || match.blockType === "doc-title" || match.unitId === "doc-title") {
+            showMessage(this.i18n.replaceDocTitleUnsupported ?? "文档标题仅支持搜索，不参与替换", 3000, "info");
+            this.clickNext();
+            return;
+        }
         if (!match.replaceable) {
             const msg = match.blockType === ATTRIBUTE_VIEW_TYPE
                 ? this.i18n.replaceAttributeViewUnsupported
@@ -1839,9 +2215,30 @@ export class SearchBar {
         const keepIndex = this.resultIndex;
         this.replaceBusy = true;
         try {
+            let current = match;
+            if (!current.range && !blockIsInEditor(this.edit, current.blockId)) {
+                const app = (this.plugin as unknown as Plugin).app;
+                if (app) {
+                    await new Promise<void>((resolve) => {
+                        let settled = false;
+                        const done = () => {
+                            if (settled) {
+                                return;
+                            }
+                            settled = true;
+                            resolve();
+                        };
+                        this.pauseIndexReset(4500);
+                        openBlockInEditor(app, current.blockId, done, this.edit);
+                        window.setTimeout(done, 4500);
+                    });
+                    await this.highlightHitResult(this.searchText, false);
+                    current = this.getCurrentMatch() ?? current;
+                }
+            }
             const result = await replaceCurrentMatchInEditor(
                 this.edit,
-                match,
+                current,
                 this.replaceText,
                 {
                     preserveCase: this.preserveCase,
@@ -1891,11 +2288,7 @@ export class SearchBar {
                 this.scrollIntoRanges(this.resultIndex - 1, false);
             }
             showMessage(this.i18n.replaceCurrentDone, 2000, "info");
-            void rpcEmitSearchState(this.plugin, {
-                type: "clear",
-                clientId: this.plugin.getClientId(),
-                query: this.searchText,
-            });
+            invalidateDocumentSearchCaches();
         } finally {
             this.replaceBusy = false;
         }
@@ -1970,11 +2363,7 @@ export class SearchBar {
                 4000,
                 "info",
             );
-            void rpcEmitSearchState(this.plugin, {
-                type: "clear",
-                clientId: this.plugin.getClientId(),
-                query: this.searchText,
-            });
+            invalidateDocumentSearchCaches();
         } finally {
             this.replaceBusy = false;
         }

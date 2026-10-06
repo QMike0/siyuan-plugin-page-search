@@ -1,0 +1,466 @@
+import {fetchSyncPost} from "siyuan";
+import type {SearchableUnit} from "../../shared";
+import {postJson} from "./api";
+
+const PAGE_SIZE = 200;
+const MAX_PAGES = 500;
+
+export interface AvBlockRef {
+    blockId: string;
+    avId: string;
+    updated: string;
+}
+
+interface AvCell {
+    text: string;
+    snippet: string;
+}
+
+interface AvUnitDraft {
+    unitId: string;
+    text: string;
+    snippet?: string;
+}
+
+const cache = new Map<string, SearchableUnit[]>();
+
+export function invalidateAvCache(): void {
+    cache.clear();
+}
+
+export function readAvId(...sources: string[]): string {
+    for (const source of sources) {
+        const matched = /(?:data-)?av-id="([^"]+)"/.exec(source);
+        if (matched?.[1]) {
+            return matched[1].trim();
+        }
+    }
+    return "";
+}
+
+export function readAvIdFromMarkdown(markdown: string): string {
+    return readAvId(markdown);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === "object" && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null;
+}
+
+function textOf(value: unknown): string {
+    if (value == null) {
+        return "";
+    }
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        return String(value);
+    }
+    if (Array.isArray(value)) {
+        return value.map((item) => textOf(item)).filter(Boolean).join(" ");
+    }
+    const record = asRecord(value);
+    if (!record) {
+        return "";
+    }
+    if (typeof record.content === "string" && record.content) {
+        return record.content;
+    }
+    const parts: string[] = [];
+    for (const key of ["text", "block", "number", "date", "url", "email", "phone", "template", "rollup", "mSelect", "mAsset", "relation", "checkbox"]) {
+        if (key in record) {
+            const piece = textOf(record[key]);
+            if (piece) {
+                parts.push(piece);
+            }
+        }
+    }
+    if (typeof record.content2 === "string" && record.content2) {
+        parts.push(record.content2);
+    }
+    if (Array.isArray(record.contents)) {
+        parts.push(textOf(record.contents));
+    }
+    return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function columnNames(view: Record<string, unknown>): Map<string, string> {
+    const names = new Map<string, string>();
+    const columns = view.columns ?? view.fields ?? view.cols;
+    if (!Array.isArray(columns)) {
+        return names;
+    }
+    for (const column of columns) {
+        const record = asRecord(column);
+        if (!record) {
+            continue;
+        }
+        const id = String(record.id ?? record.keyID ?? "");
+        const name = String(record.name ?? "");
+        if (id && name) {
+            names.set(id, name);
+        }
+    }
+    return names;
+}
+
+function cellDisplay(
+    cell: unknown,
+    rowId: string,
+    viewName: string,
+    columns: Map<string, string>,
+): {itemId: string; keyId: string; cell: AvCell} | null {
+    const record = asRecord(cell);
+    if (!record) {
+        return null;
+    }
+    const value = asRecord(record.value) ?? record;
+    const itemId = String(record.itemID ?? record.blockID ?? value.blockID ?? value.id ?? rowId);
+    const keyId = String(value.keyID ?? record.keyID ?? record.fieldID ?? "");
+    const text = textOf(value);
+    if (!itemId || !keyId || !text) {
+        return null;
+    }
+    const columnName = columns.get(keyId) ?? "";
+    const snippet = [viewName, columnName, text].filter(Boolean).join(" · ");
+    return {itemId, keyId, cell: {text, snippet}};
+}
+
+function rowList(view: Record<string, unknown>): unknown[] {
+    const rows = view.rows ?? view.cards;
+    return Array.isArray(rows) ? rows : [];
+}
+
+function absorbRows(
+    target: Map<string, AvCell>,
+    view: Record<string, unknown>,
+    viewName: string,
+    overwrite: boolean,
+): void {
+    const columns = columnNames(view);
+    const put = (cell: unknown, rowId: string) => {
+        const parsed = cellDisplay(cell, rowId, viewName, columns);
+        if (!parsed) {
+            return;
+        }
+        const key = `${parsed.itemId}:${parsed.keyId}`;
+        if (overwrite || !target.has(key)) {
+            target.set(key, parsed.cell);
+        }
+    };
+    for (const row of rowList(view)) {
+        const record = asRecord(row);
+        if (!record) {
+            continue;
+        }
+        const rowId = String(record.id ?? "");
+        const cells = record.cells ?? record.values;
+        if (!Array.isArray(cells)) {
+            continue;
+        }
+        for (const cell of cells) {
+            put(cell, rowId);
+        }
+    }
+    if (!Array.isArray(view.groups)) {
+        return;
+    }
+    for (const group of view.groups) {
+        const record = asRecord(group);
+        if (!record) {
+            continue;
+        }
+        absorbRows(target, record, viewName, overwrite);
+    }
+}
+
+function groupSnapshots(view: Record<string, unknown>): Array<{id: string; rows: number; total: number}> {
+    if (!Array.isArray(view.groups)) {
+        return [];
+    }
+    const snapshots: Array<{id: string; rows: number; total: number}> = [];
+    for (const group of view.groups) {
+        const record = asRecord(group);
+        if (!record) {
+            continue;
+        }
+        const id = String(record.id ?? record.groupID ?? "");
+        snapshots.push({
+            id,
+            rows: rowList(record).length,
+            total: Number(record.rowCount ?? record.cardCount ?? 0) || 0,
+        });
+    }
+    return snapshots;
+}
+
+function pageDone(rows: number, page: number, total: number): boolean {
+    if (rows < PAGE_SIZE) {
+        return true;
+    }
+    return total > 0 && page * PAGE_SIZE >= total;
+}
+
+async function renderView(
+    avId: string,
+    blockId: string,
+    viewId: string,
+    viewName: string,
+    target: Map<string, AvCell>,
+): Promise<void> {
+    const first = await postJson<Record<string, unknown>>("/api/av/renderAttributeView", {
+        id: avId,
+        blockID: blockId,
+        viewID: viewId,
+        page: 1,
+        pageSize: PAGE_SIZE,
+        query: "",
+        groupPaging: {},
+        createIfNotExist: false,
+    });
+    const firstView = asRecord(first?.view);
+    if (!firstView) {
+        return;
+    }
+    const seenRows = new Set<string>();
+    const noteRows = (view: Record<string, unknown>): number => {
+        let added = 0;
+        for (const row of rowList(view)) {
+            const id = String(asRecord(row)?.id ?? "");
+            if (!id || seenRows.has(id)) {
+                continue;
+            }
+            seenRows.add(id);
+            added += 1;
+        }
+        if (Array.isArray(view.groups)) {
+            for (const group of view.groups) {
+                const record = asRecord(group);
+                if (record) {
+                    added += noteRows(record);
+                }
+            }
+        }
+        return added;
+    };
+    noteRows(firstView);
+    absorbRows(target, firstView, viewName, true);
+    const groups = groupSnapshots(firstView);
+    if (groups.length > 0) {
+        const pages = new Map<string, number>();
+        for (const group of groups) {
+            if (group.id) {
+                pages.set(group.id, 1);
+            }
+        }
+        for (let round = 0; round < MAX_PAGES; round += 1) {
+            const groupPaging: Record<string, {page: number; pageSize: number}> = {};
+            let pending = false;
+            for (const group of groups) {
+                if (!group.id) {
+                    continue;
+                }
+                const page = pages.get(group.id) ?? 1;
+                if (!pageDone(group.rows, page, group.total) && group.rows > 0) {
+                    pages.set(group.id, page + 1);
+                    groupPaging[group.id] = {page: page + 1, pageSize: PAGE_SIZE};
+                    pending = true;
+                }
+            }
+            if (!pending) {
+                return;
+            }
+            const data = await postJson<Record<string, unknown>>("/api/av/renderAttributeView", {
+                id: avId,
+                blockID: blockId,
+                viewID: viewId,
+                page: 1,
+                pageSize: PAGE_SIZE,
+                query: "",
+                groupPaging,
+                createIfNotExist: false,
+            });
+            const view = asRecord(data?.view);
+            if (!view || noteRows(view) === 0) {
+                return;
+            }
+            absorbRows(target, view, viewName, true);
+            const next = groupSnapshots(view);
+            groups.splice(0, groups.length, ...next.filter((group) => pages.has(group.id)));
+            if (!groups.length) {
+                return;
+            }
+        }
+        return;
+    }
+
+    let page = 1;
+    let rows = rowList(firstView).length;
+    let total = Number(firstView.rowCount ?? firstView.cardCount ?? 0) || 0;
+    const pageCount = Number(firstView.pageCount ?? 0) || 0;
+    while (!pageDone(rows, page, total) && (pageCount === 0 || page < pageCount) && page < MAX_PAGES) {
+        page += 1;
+        const data = await postJson<Record<string, unknown>>("/api/av/renderAttributeView", {
+            id: avId,
+            blockID: blockId,
+            viewID: viewId,
+            page,
+            pageSize: PAGE_SIZE,
+            query: "",
+            groupPaging: {},
+            createIfNotExist: false,
+        });
+        const view = asRecord(data?.view);
+        if (!view || noteRows(view) === 0) {
+            return;
+        }
+        absorbRows(target, view, viewName, true);
+        rows = rowList(view).length;
+        total = Number(view.rowCount ?? view.cardCount ?? total) || total;
+    }
+}
+
+function absorbRaw(target: Map<string, AvCell>, data: unknown): {name: string; views: Array<{id: string; name: string}>} {
+    const root = asRecord(data);
+    const av = asRecord(root?.av) ?? root;
+    const name = typeof av?.name === "string" ? av.name : "";
+    const views: Array<{id: string; name: string}> = [];
+    if (Array.isArray(av?.views)) {
+        for (const view of av.views) {
+            const record = asRecord(view);
+            if (!record?.id) {
+                continue;
+            }
+            views.push({id: String(record.id), name: String(record.name ?? "")});
+        }
+    }
+    const keyValues = av?.keyValues;
+    if (!Array.isArray(keyValues)) {
+        return {name, views};
+    }
+    for (const entry of keyValues) {
+        const record = asRecord(entry);
+        const key = asRecord(record?.key);
+        const keyId = String(key?.id ?? "");
+        const columnName = String(key?.name ?? "");
+        const values = record?.values;
+        if (!keyId || !Array.isArray(values)) {
+            continue;
+        }
+        for (const value of values) {
+            const item = asRecord(value);
+            const itemId = String(item?.blockID ?? item?.blockId ?? "");
+            const text = textOf(item);
+            if (!itemId || !text) {
+                continue;
+            }
+            const mapKey = `${itemId}:${keyId}`;
+            if (target.has(mapKey)) {
+                continue;
+            }
+            target.set(mapKey, {
+                text,
+                snippet: [columnName, text].filter(Boolean).join(" · "),
+            });
+        }
+    }
+    return {name, views};
+}
+
+function toUnits(blockId: string, drafts: AvUnitDraft[]): Array<SearchableUnit & {snippet?: string}> {
+    return drafts.map((draft) => ({
+        blockId,
+        blockType: "NodeAttributeView",
+        blockIndex: 0,
+        text: draft.text,
+        unitId: draft.unitId,
+        snippet: draft.snippet,
+    }));
+}
+
+export function peekAvUnits(refs: AvBlockRef[]): {units: Array<SearchableUnit & {snippet?: string}>; missing: AvBlockRef[]} {
+    const units: Array<SearchableUnit & {snippet?: string}> = [];
+    const missing: AvBlockRef[] = [];
+    for (const ref of refs) {
+        const cached = cache.get(`${ref.blockId}:${ref.avId}:${ref.updated}`);
+        if (cached) {
+            units.push(...cached);
+        } else {
+            missing.push(ref);
+        }
+    }
+    return {units, missing};
+}
+
+export async function loadAvUnits(refs: AvBlockRef[]): Promise<Array<SearchableUnit & {snippet?: string}>> {
+    const units: Array<SearchableUnit & {snippet?: string}> = [];
+    for (const ref of refs) {
+        const cacheKey = `${ref.blockId}:${ref.avId}:${ref.updated}`;
+        const cached = cache.get(cacheKey);
+        if (cached) {
+            units.push(...cached);
+            continue;
+        }
+        const cells = new Map<string, AvCell>();
+        const raw = await postJson<unknown>("/api/av/getAttributeView", {id: ref.avId});
+        const info = absorbRaw(new Map(), raw);
+        const drafts: AvUnitDraft[] = [];
+        if (info.name) {
+            drafts.push({unitId: "av-title", text: info.name, snippet: info.name});
+        }
+        for (const view of info.views) {
+            if (view.name) {
+                drafts.push({unitId: `av-view:${view.id}`, text: view.name, snippet: view.name});
+            }
+            await renderView(ref.avId, ref.blockId, view.id, view.name, cells);
+        }
+        if (info.views.length === 0) {
+            await renderView(ref.avId, ref.blockId, "", info.name, cells);
+        }
+        absorbRaw(cells, raw);
+        for (const [key, cell] of cells) {
+            drafts.push({unitId: `av:${key}`, text: cell.text, snippet: cell.snippet});
+        }
+        const built = toUnits(ref.blockId, drafts);
+        cache.set(cacheKey, built);
+        units.push(...built);
+    }
+    return units;
+}
+
+export async function resolveMissingAvIds(
+    rows: Array<{id: string; updated?: string; markdown?: string; ial?: string}>,
+): Promise<AvBlockRef[]> {
+    const refs: AvBlockRef[] = [];
+    const missing: string[] = [];
+    for (const row of rows) {
+        if (!row.id) {
+            continue;
+        }
+        const avId = readAvId(String(row.markdown ?? ""), String(row.ial ?? ""));
+        if (avId) {
+            refs.push({blockId: row.id, avId, updated: String(row.updated ?? "")});
+        } else {
+            missing.push(row.id);
+        }
+    }
+    if (missing.length === 0) {
+        return refs;
+    }
+    try {
+        const response = await fetchSyncPost("/api/block/getBlockDOMs", {ids: missing});
+        const doms = response?.code === 0 && response.data && typeof response.data === "object"
+            ? response.data as Record<string, string>
+            : {};
+        for (const id of missing) {
+            const avId = readAvId(String(doms[id] ?? ""));
+            if (!avId) {
+                continue;
+            }
+            const row = rows.find((item) => item.id === id);
+            refs.push({blockId: id, avId, updated: String(row?.updated ?? "")});
+        }
+    } catch {
+        return refs;
+    }
+    return refs;
+}

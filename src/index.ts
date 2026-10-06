@@ -1,18 +1,15 @@
 import {getFrontend, IKernelPluginState, Plugin} from "siyuan";
 import "./index.scss";
 import {
-    bindSearchStateListener,
     createClientId,
     isKernelRunning,
-    rpcEmitSearchState,
     rpcGetPrefs,
     rpcSetPrefs,
-    unbindSearchStateListener,
 } from "./frontend/kernel-client";
 import {SearchBar, type SearchBarHost, type SearchBarI18n, type HeadingIncludeLevel} from "./frontend/search-bar";
 import {isEditorReplaceModeBlocked} from "./frontend/editor-mode";
 import {scrubSelectionScopePollution, clearAllSelectionScopeSessionOverlays} from "./frontend/selection-scope-visual";
-import {PREFS_STORAGE_PATH, type RestrictInlineType, type SearchStateEvent} from "./shared";
+import {PREFS_STORAGE_PATH, type RestrictInlineType} from "./shared";
 
 export {
     findOffsetMatchesInText,
@@ -22,10 +19,7 @@ export {
 export type {MatchHit, SearchableUnit, SearchStateEvent} from "./shared";
 export {
     isKernelRunning,
-    matchUnitsViaKernel,
-    rpcEmitSearchState,
     rpcGetPrefs,
-    rpcMatch,
     rpcSetPrefs,
 } from "./frontend/kernel-client";
 
@@ -43,7 +37,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     private isMobile = false;
     private kernelReady = false;
     private readonly clientId = createClientId();
-    private searchStateHandler: ((...args: any[]) => void | Promise<void>) | null = null;
 
     private searchComponentCallbacks: Set<(event: CustomEvent) => void> = new Set();
     private searchBars: Map<Element, SearchBar> = new Map();
@@ -119,7 +112,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         this.eventBus.on("kernel-plugin-state-change", this.onKernelPluginStateChange);
         // 清扫历史版本误写入 td/th 的选区提示 class（曾被 outerHTML 持久化进文档）
         this.eventBus.on("loaded-protyle-static", this.onProtyleLoadedScrub);
-        this.bindKernelSearchState();
         scrubSelectionScopePollution();
 
         console.log(this.i18n.pluginOnload, {
@@ -172,7 +164,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         this.stopCleanupTimer();
         this.eventBus.off("kernel-plugin-state-change", this.onKernelPluginStateChange);
         this.eventBus.off("loaded-protyle-static", this.onProtyleLoadedScrub);
-        this.unbindKernelSearchState();
         scrubSelectionScopePollution();
         clearAllSelectionScopeSessionOverlays();
     }
@@ -278,7 +269,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         }
 
         for (const root of toClose) {
-            this.closeCurrentSearchDialog(root, {broadcast: true});
+            this.closeCurrentSearchDialog(root);
         }
         return true;
     }
@@ -604,42 +595,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         });
     }
 
-    private bindKernelSearchState() {
-        if (this.searchStateHandler) {
-            return;
-        }
-        this.searchStateHandler = bindSearchStateListener(this, async (event: SearchStateEvent) => {
-            if (!event || event.clientId === this.clientId) {
-                return;
-            }
-            if (event.type === "close") {
-                this.closeSearchDialog();
-                return;
-            }
-            if (event.type === "clear") {
-                this.searchBars.forEach((bar) => bar.clearHighlightsOnly());
-                this.lastHighlightComponent = null;
-            }
-        });
-    }
-
-    private unbindKernelSearchState() {
-        if (!this.searchStateHandler) {
-            return;
-        }
-        try {
-            unbindSearchStateListener(this, this.searchStateHandler);
-        } catch (error) {
-            console.warn("[page-search] unbind search-state failed", error);
-        }
-        this.searchStateHandler = null;
-    }
-
     private readonly onKernelPluginStateChange = ({detail}: CustomEvent<IKernelPluginState>) => {
         this.kernelReady = detail?.code === 2;
-        if (this.kernelReady) {
-            this.bindKernelSearchState();
-        }
     };
 
     private cleanupInvalidComponents() {
@@ -759,7 +716,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         void rpcSetPrefs(this, {restrictInlineTypes: []});
     }
 
-    closeCurrentSearchDialog(element: Element, options?: {broadcast?: boolean}) {
+    closeCurrentSearchDialog(element: Element) {
         const bar = this.searchBars.get(element);
         if (bar) {
             this.rememberSessionInputs(bar);
@@ -778,13 +735,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         }
 
         void rpcSetPrefs(this, {restrictInlineTypes: []});
-
-        if (options?.broadcast) {
-            void rpcEmitSearchState(this, {
-                type: "close",
-                clientId: this.clientId,
-            });
-        }
     }
 
     /** 关闭前记下输入框文案，供本进程内再次打开时恢复 */

@@ -42,7 +42,7 @@ export function isElementVisible(
     if (
         isInsideProtyleHtmlShadow(htmlElement)
         || htmlElement.closest(
-            '.av, .callout, .callout-title, .callout-info, .protyle-title, .protyle-title__input, [data-subtype="mermaid"], svg, foreignObject, protyle-html, [data-type="NodeHTMLBlock"]',
+            '.av, .callout, .callout-title, .callout-info, .protyle-title, .protyle-title__input, [data-subtype="mermaid"], svg, foreignObject, protyle-html, [data-type="NodeHTMLBlock"], .katex-html',
         )
     ) {
         if (isLooseUiElementVisible(htmlElement)) {
@@ -131,7 +131,9 @@ function isStrictlyVisible(htmlElement: HTMLElement): boolean {
         return htmlElement.checkVisibility({
             visibilityProperty: true,
             opacityProperty: true,
-        });
+            // 大列表用 content-visibility: auto 跳过布局，文字仍在 DOM 里，应继续高亮
+            contentVisibilityAuto: true,
+        } as Parameters<HTMLElement["checkVisibility"]>[0]);
     }
 
     const style = window.getComputedStyle(htmlElement);
