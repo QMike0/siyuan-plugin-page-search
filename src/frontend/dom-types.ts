@@ -37,6 +37,10 @@ export interface SearchMatch {
     range?: Range;
     /** 高亮样式：备注虚线；公式与正文同走 CSS Highlight（有渲染 Text 时按偏移，否则回退宿主） */
     highlightKind?: "text" | "inline-memo" | "inline-math";
-    /** 数据库命中无法做词级高亮时，展示视图、列和单元格文字。 */
+    /** 数据库命中无法做词级高亮时，展示视图、列和单元格文字。跳转时可能弹出提示。 */
     snippet?: string;
+    /** 结果列表的单行摘要。与 snippet 分开，避免每次跳转都弹提示。 */
+    listText?: string;
+    /** listText 里需要标出的命中区间。 */
+    listMark?: {start: number; end: number};
 }

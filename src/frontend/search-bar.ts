@@ -25,6 +25,7 @@ import {parentElementCrossingShadow} from "./dom-parent";
 import {calculateSearchMatches} from "./pipeline";
 import {fillLiveRanges} from "./corpus/project";
 import {blockIsInEditor, openBlockInEditor} from "./corpus/locate";
+import {revealHiddenTabs, mirrorTabsTitleRange} from "./tabs-reveal";
 import {cancelBackgroundCorpusJobs, editorRootId, invalidateDocumentSearchCaches, subscribeIndexSettled} from "./corpus/search";
 import {
     isMatchWritable,
@@ -89,6 +90,11 @@ const RESTRICT_INLINE_ICONS: Record<RestrictInlineType, string> = {
 };
 
 const DONE_TYPING_MS = 400;
+/** 结果列表：固定行高，只渲染视口附近的行。 */
+const RESULTS_ITEM_HEIGHT = 26;
+const RESULTS_LIST_PADDING = 4;
+const RESULTS_MAX_HEIGHT = 240;
+const RESULTS_OVERSCAN = 5;
 
 /** 「是否搜索 · 标题」级别 1–6（对应 data-subtype h1–h6） */
 export type HeadingIncludeLevel = 1 | 2 | 3 | 4 | 5 | 6;
@@ -140,9 +146,12 @@ export interface SearchBarI18n {
     selectionOnlyNoScope: string;
     /** 发布或预览无法调用文档 API 时的说明 */
     searchDegradedLoadedOnly?: string;
-    /** 正则或渲染缓存仍在补齐 */
+    /** 正则或渲染缓存仍在补齐。仅给屏幕阅读器，界面上改为计数闪烁。 */
     searchPartialIndexing?: string;
     searchIndexingBadge?: string;
+    /** 结果列表按钮的悬浮说明 */
+    resultsPanelToggle?: string;
+    resultsPanelEmpty?: string;
     replaceDocTitleUnsupported?: string;
     /** 渲染失败未计入的块数 */
     searchUnrendered?: string;
@@ -159,6 +168,7 @@ export interface SearchBarI18n {
     settingsIncludeBlockquote: string;
     settingsIncludeCallout: string;
     settingsIncludeSuperBlock: string;
+    settingsIncludeTabs: string;
     settingsIncludeList: string;
     settingsIncludeListUnordered: string;
     settingsIncludeListOrdered: string;
@@ -223,6 +233,8 @@ export interface SearchBarHost {
     syncIncludeCallout?(value: boolean, source?: SearchBar): void;
     /** 将超级块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeSuperBlock?(value: boolean, source?: SearchBar): void;
+    /** 将页签块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeTabs?(value: boolean, source?: SearchBar): void;
     /** 将无序列表匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeListUnordered?(value: boolean, source?: SearchBar): void;
     /** 将有序列表匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -272,6 +284,7 @@ export class SearchBar {
     private resultCount = 0;
     private resultMatches: SearchMatch[] = [];
     private degradedNotified = false;
+    private unrenderedNotified = false;
     private indexSettledTimer: number | null = null;
     private unsubscribeIndexSettled: (() => void) | null = null;
     private locatePending = false;
@@ -298,6 +311,8 @@ export class SearchBar {
     private includeCallout = true;
     /** 是否匹配超级块；全局 prefs，默认 true */
     private includeSuperBlock = true;
+    /** 是否匹配页签块；全局 prefs，默认 true */
+    private includeTabs = true;
     /** 是否匹配无序列表；全局 prefs，默认 true */
     private includeListUnordered = true;
     /** 是否匹配有序列表；全局 prefs，默认 true */
@@ -365,6 +380,33 @@ export class SearchBar {
     /** 关键字 / 正则表达式方法菜单（对齐官方搜索 method 菜单） */
     private methodMenu: Menu | null = null;
     private searchMethodBtn: HTMLElement | null = null;
+    private resultsPanelEl: HTMLElement | null = null;
+    private resultsListEl: HTMLElement | null = null;
+    private resultsPanelOpen = false;
+    private resultsScrollLock = false;
+    private resultsScrollRaf = 0;
+    private readonly onResultsListScroll = () => {
+        if (this.resultsScrollLock || !this.resultsPanelOpen || this.resultCount === 0 || !this.resultsListEl) {
+            return;
+        }
+        if (this.resultsScrollRaf) {
+            return;
+        }
+        this.resultsScrollRaf = window.requestAnimationFrame(() => {
+            this.resultsScrollRaf = 0;
+            this.renderResultsWindow(this.resultsListEl?.scrollTop ?? 0);
+        });
+    };
+    private readonly onResultsPanelOutsidePointerDown = (event: PointerEvent) => {
+        if (!this.resultsPanelOpen) {
+            return;
+        }
+        const target = event.target;
+        if (!(target instanceof Node) || this.dialog.contains(target)) {
+            return;
+        }
+        this.closeResultsPanel();
+    };
 
     constructor(options: {
         edit: Element;
@@ -395,6 +437,8 @@ export class SearchBar {
         includeCallout?: boolean;
         /** 是否匹配超级块（来自全局 prefs） */
         includeSuperBlock?: boolean;
+        /** 是否匹配页签块（来自全局 prefs） */
+        includeTabs?: boolean;
         /** 是否匹配无序列表（来自全局 prefs） */
         includeListUnordered?: boolean;
         /** 是否匹配有序列表（来自全局 prefs） */
@@ -444,6 +488,7 @@ export class SearchBar {
         this.includeBlockquote = options.includeBlockquote !== false;
         this.includeCallout = options.includeCallout !== false;
         this.includeSuperBlock = options.includeSuperBlock !== false;
+        this.includeTabs = options.includeTabs !== false;
         this.includeListUnordered = options.includeListUnordered !== false;
         this.includeListOrdered = options.includeListOrdered !== false;
         this.includeListTask = options.includeListTask !== false;
@@ -473,6 +518,8 @@ export class SearchBar {
         this.replaceInput = this.root.querySelector(".search-input-replace") as HTMLInputElement;
         this.countEl = this.root.querySelector(".search-count") as HTMLElement;
         this.indexStatusEl = this.root.querySelector(".search-index-status") as HTMLElement;
+        this.resultsPanelEl = this.root.querySelector(".search-results-panel");
+        this.resultsListEl = this.root.querySelector(".search-results-panel__list");
         this.replaceRow = this.root.querySelector(".search-row--replace");
         this.replaceToggleBtn = this.root.querySelector('[data-action="toggle-replace"]');
         this.replaceBtn = this.root.querySelector('[data-action="replace"]');
@@ -575,6 +622,8 @@ export class SearchBar {
         this.clearSelectionScopeVisual();
         this.restoreEditorFocus();
         this.clearHighlight();
+        this.closeResultsPanel();
+        document.removeEventListener("pointerdown", this.onResultsPanelOutsidePointerDown, true);
         this.stopAvDomWatch?.();
         this.stopAvDomWatch = null;
         this.panelFrame?.destroy();
@@ -693,8 +742,8 @@ export class SearchBar {
         </div>
       </div>
       <div class="search-row__trailing">
-        <span class="search-count">0/0</span>
-        <span class="search-index-status" hidden aria-live="polite"></span>
+        <div class="search-count search-no-drag ariaLabel" data-action="results" data-position="north" role="button" tabindex="-1" aria-expanded="false" aria-label="${escapeAttr(this.i18n.resultsPanelToggle ?? "搜索结果列表")}">0/0</div>
+        <span class="search-index-status" aria-live="polite"></span>
         <div class="search-tools">
           <div data-action="prev" title="${escapeAttr(this.i18n.searchPrev)}">${iconUse("#iconUp")}</div>
           <div data-action="next" title="${escapeAttr(this.i18n.searchNext)}">${iconUse("#iconDown")}</div>
@@ -724,6 +773,9 @@ export class SearchBar {
       </div>
     </div>
   </div>
+  <div class="search-results-panel search-no-drag" hidden>
+    <div class="search-results-panel__list" role="listbox"></div>
+  </div>
 </div>`;
     }
 
@@ -745,6 +797,9 @@ export class SearchBar {
         // 面板内统一处理 Esc / Ctrl+F/H（焦点在按钮上时输入框监听收不到）
         this.dialog.addEventListener("keydown", (event) => this.onPanelKeydown(event));
 
+        this.bindToolbarControl('[data-action="results"]', () => {
+            this.toggleResultsPanel();
+        }, "find");
         this.bindToolbarControl('[data-action="prev"]', () => this.clickLast(), "find");
         this.bindToolbarControl('[data-action="next"]', () => this.clickNext(), "find");
         this.bindToolbarControl('[data-action="close"]', () => this.clickClose(), "none");
@@ -784,6 +839,23 @@ export class SearchBar {
         this.root.querySelector(".search-replace-help")?.addEventListener("pointerdown", (event) => {
             event.preventDefault();
         });
+        this.resultsListEl?.addEventListener("click", (event) => {
+            const target = event.target instanceof Element
+                ? event.target.closest<HTMLElement>(".search-results-panel__item")
+                : null;
+            if (!target) {
+                return;
+            }
+            const index = Number(target.dataset.index);
+            if (!Number.isInteger(index)) {
+                return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            this.clickResultsItem(index);
+        });
+        this.resultsListEl?.addEventListener("scroll", this.onResultsListScroll);
+        document.addEventListener("pointerdown", this.onResultsPanelOutsidePointerDown, true);
     }
 
     /**
@@ -862,6 +934,10 @@ export class SearchBar {
         }
         event.preventDefault();
         event.stopPropagation();
+        if (this.resultsPanelOpen) {
+            this.closeResultsPanel();
+            return true;
+        }
         this.clickClose();
         return true;
     }
@@ -942,6 +1018,7 @@ export class SearchBar {
             includeBlockquote: this.includeBlockquote,
             includeCallout: this.includeCallout,
             includeSuperBlock: this.includeSuperBlock,
+            includeTabs: this.includeTabs,
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
@@ -978,6 +1055,7 @@ export class SearchBar {
             includeBlockquote: this.includeBlockquote,
             includeCallout: this.includeCallout,
             includeSuperBlock: this.includeSuperBlock,
+            includeTabs: this.includeTabs,
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
@@ -1007,6 +1085,7 @@ export class SearchBar {
                 includeBlockquote: this.includeBlockquote,
                 includeCallout: this.includeCallout,
                 includeSuperBlock: this.includeSuperBlock,
+            includeTabs: this.includeTabs,
                 includeListUnordered: this.includeListUnordered,
                 includeListOrdered: this.includeListOrdered,
                 includeListTask: this.includeListTask,
@@ -1251,8 +1330,157 @@ export class SearchBar {
         return this.resultMatches[this.resultIndex - 1] ?? null;
     }
 
-    private updateCountLabel() {
+    private updateCountLabel(scrollPanelToActive = false) {
         this.countEl.textContent = formatSearchCountLabel(this.resultIndex, this.resultCount);
+        if (this.resultsPanelOpen) {
+            this.renderResultsPanel(scrollPanelToActive);
+        }
+    }
+
+    private toggleResultsPanel() {
+        if (this.resultsPanelOpen) {
+            this.closeResultsPanel();
+            return;
+        }
+        if (!this.resultsPanelEl || !this.resultsListEl) {
+            return;
+        }
+        this.resultsPanelOpen = true;
+        this.resultsPanelEl.hidden = false;
+        this.countEl.setAttribute("aria-expanded", "true");
+        this.renderResultsPanel(true);
+    }
+
+    private closeResultsPanel() {
+        if (this.resultsScrollRaf) {
+            window.cancelAnimationFrame(this.resultsScrollRaf);
+            this.resultsScrollRaf = 0;
+        }
+        this.resultsPanelOpen = false;
+        this.countEl?.setAttribute("aria-expanded", "false");
+        if (this.resultsPanelEl) {
+            this.resultsPanelEl.hidden = true;
+        }
+        if (this.resultsListEl) {
+            this.resultsScrollLock = true;
+            this.resultsListEl.innerHTML = "";
+            this.resultsListEl.scrollTop = 0;
+            this.resultsScrollLock = false;
+        }
+    }
+
+    private clickResultsItem(index: number) {
+        if (index < 0 || index >= this.resultMatches.length) {
+            return;
+        }
+        const previous = this.getCurrentMatch();
+        this.resultIndex = index + 1;
+        this.updateCountLabel(false);
+        const next = this.resultMatches[index];
+        this.scrollIntoRanges(
+            index,
+            true,
+            shouldPulseMemoFocusOnNavigate(previous, next),
+        );
+    }
+
+    private escapeResultsText(text: string): string {
+        return text
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+    }
+
+    private formatResultsItemHtml(index: number): string {
+        const match = this.resultMatches[index];
+        const plain = match?.listText || match?.matchedText || match?.blockId || "";
+        const active = index + 1 === this.resultIndex ? " search-results-panel__item--active" : "";
+        const title = this.escapeResultsText(plain).replace(/"/g, "&quot;");
+        const mark = match?.listMark;
+        let body = this.escapeResultsText(plain);
+        if (mark && mark.start >= 0 && mark.end <= plain.length && mark.start < mark.end) {
+            body = this.escapeResultsText(plain.slice(0, mark.start))
+                + `<mark>${this.escapeResultsText(plain.slice(mark.start, mark.end))}</mark>`
+                + this.escapeResultsText(plain.slice(mark.end));
+        }
+        return `<div class="search-results-panel__item${active}" role="option" data-index="${index}" title="${title}">${body}</div>`;
+    }
+
+    private resultsContentHeight(): number {
+        return RESULTS_LIST_PADDING * 2 + this.resultCount * RESULTS_ITEM_HEIGHT;
+    }
+
+    private resultsViewportHeight(): number {
+        const measured = this.resultsListEl?.clientHeight ?? 0;
+        if (measured > 0) {
+            return measured;
+        }
+        return Math.min(RESULTS_MAX_HEIGHT, this.resultsContentHeight());
+    }
+
+    private activeResultsScrollTop(): number {
+        const list = this.resultsListEl;
+        if (!list || this.resultIndex < 1 || this.resultCount === 0) {
+            return list?.scrollTop ?? 0;
+        }
+        const itemTop = RESULTS_LIST_PADDING + (this.resultIndex - 1) * RESULTS_ITEM_HEIGHT;
+        const viewportHeight = this.resultsViewportHeight();
+        const contentHeight = list.scrollHeight > 0 ? list.scrollHeight : this.resultsContentHeight();
+        const maxScroll = Math.max(0, contentHeight - viewportHeight);
+        const next = itemTop - (viewportHeight - RESULTS_ITEM_HEIGHT) / 2;
+        return Math.max(0, Math.min(next, maxScroll));
+    }
+
+    /** 只画视口附近的行。列表关闭时不调用。 */
+    private renderResultsWindow(scrollTop: number) {
+        const list = this.resultsListEl;
+        if (!list) {
+            return;
+        }
+        const count = this.resultCount;
+        const viewportHeight = this.resultsViewportHeight();
+        const contentScrollTop = Math.max(0, scrollTop - RESULTS_LIST_PADDING);
+        const startIndex = Math.max(0, Math.floor(contentScrollTop / RESULTS_ITEM_HEIGHT) - RESULTS_OVERSCAN);
+        const visibleCount = Math.ceil(viewportHeight / RESULTS_ITEM_HEIGHT) + RESULTS_OVERSCAN * 2;
+        const endIndex = Math.min(count, startIndex + visibleCount);
+        const topSpacerHeight = RESULTS_LIST_PADDING + startIndex * RESULTS_ITEM_HEIGHT;
+        const bottomSpacerHeight = RESULTS_LIST_PADDING + (count - endIndex) * RESULTS_ITEM_HEIGHT;
+        const items: string[] = [];
+        for (let index = startIndex; index < endIndex; index++) {
+            items.push(this.formatResultsItemHtml(index));
+        }
+        this.resultsScrollLock = true;
+        list.innerHTML = `<div class="search-results-panel__spacer" style="height:${topSpacerHeight}px"></div>`
+            + items.join("")
+            + `<div class="search-results-panel__spacer" style="height:${bottomSpacerHeight}px"></div>`;
+        list.scrollTop = scrollTop;
+        this.resultsScrollLock = false;
+    }
+
+    private renderResultsPanel(scrollToActive: boolean) {
+        const list = this.resultsListEl;
+        if (!this.resultsPanelOpen || !list) {
+            return;
+        }
+        if (this.resultsScrollRaf) {
+            window.cancelAnimationFrame(this.resultsScrollRaf);
+            this.resultsScrollRaf = 0;
+        }
+        if (this.resultCount === 0) {
+            const emptyText = this.escapeResultsText(this.i18n.resultsPanelEmpty ?? "无匹配结果");
+            this.resultsScrollLock = true;
+            list.scrollTop = 0;
+            list.innerHTML = `<div class="search-results-panel__empty">${emptyText}</div>`;
+            this.resultsScrollLock = false;
+            return;
+        }
+        this.renderResultsWindow(list.scrollTop);
+        if (!scrollToActive) {
+            return;
+        }
+        const maxScroll = Math.max(0, list.scrollHeight - list.clientHeight);
+        const scrollTop = Math.min(this.activeResultsScrollTop(), maxScroll);
+        this.renderResultsWindow(scrollTop);
     }
 
     private async calculateSearchResults(value: string, change: boolean): Promise<SearchMatch[]> {
@@ -1287,6 +1515,7 @@ export class SearchBar {
             includeBlockquote: this.includeBlockquote,
             includeCallout: this.includeCallout,
             includeSuperBlock: this.includeSuperBlock,
+            includeTabs: this.includeTabs,
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
@@ -1345,7 +1574,7 @@ export class SearchBar {
         } else if (this.resultIndex > matches.length) {
             this.resultIndex = matches.length;
         }
-        this.updateCountLabel();
+        this.updateCountLabel(true);
         this.syncReplaceButtons();
         return matches;
     }
@@ -1361,23 +1590,19 @@ export class SearchBar {
             );
         }
         const indexing = Boolean(partial);
-        const indexingText = this.i18n.searchPartialIndexing ?? "仍在索引文档其余内容";
-        this.indexStatusEl.hidden = !indexing;
+        this.countEl.classList.toggle("is-indexing", indexing);
         this.indexStatusEl.textContent = indexing
             ? (this.i18n.searchIndexingBadge ?? "索引中")
             : "";
-        this.indexStatusEl.title = indexing ? indexingText : "";
-        const notes: string[] = [];
-        if (indexing) {
-            notes.push(indexingText);
-        }
-        if (unrendered && unrendered > 0) {
-            notes.push(
+        if (unrendered && unrendered > 0 && !this.unrenderedNotified) {
+            this.unrenderedNotified = true;
+            showMessage(
                 (this.i18n.searchUnrendered ?? "有 {count} 个块渲染失败，未计入")
                     .replace("{count}", String(unrendered)),
+                5000,
+                "info",
             );
         }
-        this.countEl.title = notes.join("；");
     }
 
     /** 后台索引结束时合并成一次刷新，避免补图期间反复全量搜索。 */
@@ -1421,6 +1646,10 @@ export class SearchBar {
                 continue;
             }
             textRanges.push(match.range);
+            const mirror = mirrorTabsTitleRange(match.range);
+            if (mirror) {
+                textRanges.push(mirror);
+            }
         }
         if (typeof HighlightCtor === "function" && (CSS as any).highlights) {
             if (textRanges.length) {
@@ -1679,6 +1908,9 @@ export class SearchBar {
         const existing = this.edit.querySelector<HTMLElement>(
             `[data-node-id="${CSS.escape(match.blockId)}"]`,
         );
+        if (existing && revealHiddenTabs(existing)) {
+            void existing.offsetHeight;
+        }
         const shown = existing
             && existing.clientHeight > 0
             && !isUnderNonHeadingCssFold(existing);
@@ -1768,6 +2000,9 @@ export class SearchBar {
         if (!owner) {
             return false;
         }
+        if (revealHiddenTabs(owner)) {
+            void owner.offsetHeight;
+        }
         const live = collectSearchableBlocks(this.edit, {
             ...this.searchCollectOptions(),
             includeDocTitle: false,
@@ -1818,6 +2053,7 @@ export class SearchBar {
             includeBlockquote: this.includeBlockquote,
             includeCallout: this.includeCallout,
             includeSuperBlock: this.includeSuperBlock,
+            includeTabs: this.includeTabs,
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
@@ -1860,9 +2096,17 @@ export class SearchBar {
                 continue;
             }
             textRanges.push(match.range);
+            const mirror = mirrorTabsTitleRange(match.range);
+            if (mirror) {
+                textRanges.push(mirror);
+            }
         }
         if (textRanges.length) {
             (CSS as any).highlights.set("search-results", new HighlightCtor(...textRanges));
+        }
+        const current = this.getCurrentMatch();
+        if (current?.range && current.highlightKind !== "inline-memo") {
+            this.applyFocusHighlight(current.range);
         }
         this.syncMemoUnderlineVisual();
         this.plugin.updateLastHighlightComponent(this.root);
@@ -1912,7 +2156,12 @@ export class SearchBar {
         const highlights = (CSS as any).highlights;
         highlights.delete("search-focus");
         highlights.delete("search-math-focus");
-        highlights.set("search-focus", new HighlightCtor(range));
+        const ranges = [range];
+        const mirror = mirrorTabsTitleRange(range);
+        if (mirror) {
+            ranges.push(mirror);
+        }
+        highlights.set("search-focus", new HighlightCtor(...ranges));
         this.plugin.updateLastHighlightComponent(this.root);
     }
 
@@ -1933,6 +2182,9 @@ export class SearchBar {
             this.pauseAvWatch(600);
         }
         const match = this.resultMatches[index];
+        if (scroll) {
+            this.revealMatchTabs(match);
+        }
         let range = match?.range;
         // 折叠标题会删掉后面的块，浏览器把旧 Range 缩到文首。跳转时不能再滚到那里。
         if (range && match && !this.rangeStillInMatchBlock(range, match.blockId)) {
@@ -2013,6 +2265,19 @@ export class SearchBar {
         this.syncReplaceButtons();
     }
 
+    /** 命中在未选中的页签里时先切换页签，再滚动。保存刷新走 scroll=false，不会切页签。 */
+    private revealMatchTabs(match: SearchMatch | undefined) {
+        if (!match?.blockId || match.blockId === "__doc-title__") {
+            return;
+        }
+        const host = this.edit.querySelector<HTMLElement>(
+            `[data-node-id="${CSS.escape(match.blockId)}"]`,
+        );
+        if (host && revealHiddenTabs(host)) {
+            void host.offsetHeight;
+        }
+    }
+
     private clickLast() {
         const prevMatch = this.getCurrentMatch();
         if (this.resultCount === 0) {
@@ -2022,7 +2287,7 @@ export class SearchBar {
         } else {
             this.resultIndex = this.resultCount;
         }
-        this.updateCountLabel();
+        this.updateCountLabel(true);
         const nextMatch = this.resultMatches[this.resultIndex - 1];
         this.scrollIntoRanges(
             this.resultIndex - 1,
@@ -2040,7 +2305,7 @@ export class SearchBar {
         } else {
             this.resultIndex = 1;
         }
-        this.updateCountLabel();
+        this.updateCountLabel(true);
         const nextMatch = this.resultMatches[this.resultIndex - 1];
         this.scrollIntoRanges(
             this.resultIndex - 1,
@@ -2555,6 +2820,15 @@ export class SearchBar {
                     },
                 }),
                 this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-tabs",
+                    icon: "iconTabs",
+                    label: this.i18n.settingsIncludeTabs,
+                    checked: this.includeTabs,
+                    onChange: (checked) => {
+                        void this.setIncludeTabs(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
                     id: "page-search-include-embed-block",
                     icon: "iconSQL",
                     label: this.i18n.settingsIncludeEmbedBlock,
@@ -2981,6 +3255,16 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setIncludeTabs(value: boolean) {
+        if (this.includeTabs === value) {
+            return;
+        }
+        this.includeTabs = value;
+        await rpcSetPrefs(this.plugin, {includeTabs: value});
+        this.plugin.syncIncludeTabs?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeListUnordered(value: boolean) {
         if (this.includeListUnordered === value) {
             return;
@@ -3185,6 +3469,14 @@ export class SearchBar {
             return;
         }
         this.includeSuperBlock = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeTabs(value: boolean) {
+        if (this.includeTabs === value) {
+            return;
+        }
+        this.includeTabs = value;
         void this.highlightHitResult(this.searchText, true);
     }
 

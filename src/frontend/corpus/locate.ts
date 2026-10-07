@@ -3,6 +3,7 @@ import type {App, TProtyleAction} from "siyuan";
 import {editorRootId} from "./search";
 import {isEditorZoomed} from "./focus";
 import {isUnderNonHeadingCssFold, unfoldPathToBlock} from "../fold";
+import {revealHiddenTabs} from "../tabs-reveal";
 
 /** 展开后等块插回当前编辑器的上限；常见情况在前几帧就出现 */
 const UNFOLD_APPEAR_TIMEOUT_MS = 1500;
@@ -102,6 +103,7 @@ export function openBlockInEditor(
     void unfoldPathToBlock(blockId, root, rootId).then((unfolded) => {
         if (!unfolded) {
             if (blockInEditor(root, blockId)) {
+                revealLoadedBlock(root, blockId);
                 finish();
                 return;
             }
@@ -109,12 +111,20 @@ export function openBlockInEditor(
         }
         return waitForUnfoldedBlock(root, blockId, UNFOLD_APPEAR_TIMEOUT_MS).then((appeared) => {
             if (appeared || blockInEditor(root, blockId)) {
+                revealLoadedBlock(root, blockId);
                 finish();
                 return;
             }
             return openOrStay();
         }, openOrStay);
     }, openOrStay);
+}
+
+function revealLoadedBlock(root: ParentNode, blockId: string): void {
+    const node = blockInEditor(root, blockId);
+    if (node) {
+        revealHiddenTabs(node);
+    }
 }
 
 export function blockIsInEditor(edit: Element, blockId: string): boolean {

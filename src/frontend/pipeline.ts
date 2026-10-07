@@ -10,6 +10,7 @@ import {
 import type {MatchHit, MatchOptions, SearchableUnit} from "../shared";
 import {searchCurrentDocument} from "./corpus/search";
 import {editorFocusId} from "./corpus/focus";
+import {buildListSnippet} from "./list-snippet";
 import {matchTextUnitsDetailed} from "../shared";
 import {
     CALLOUT_TYPE,
@@ -55,6 +56,8 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeCallout?: boolean;
     /** 是否匹配超级块及其内部；默认 true */
     includeSuperBlock?: boolean;
+    /** 是否匹配页签块及其内部、页签标题；默认 true */
+    includeTabs?: boolean;
     /** 是否匹配无序列表及其内部；默认 true */
     includeListUnordered?: boolean;
     /** 是否匹配有序列表及其内部；默认 true */
@@ -303,6 +306,7 @@ async function calculateLoadedDomMatches(
                 includeBlockquote: options.includeBlockquote,
                 includeCallout: options.includeCallout,
                 includeSuperBlock: options.includeSuperBlock,
+                includeTabs: options.includeTabs,
                 includeListUnordered: options.includeListUnordered,
                 includeListOrdered: options.includeListOrdered,
                 includeListTask: options.includeListTask,
@@ -334,6 +338,7 @@ async function calculateLoadedDomMatches(
         includeBlockquote: options.includeBlockquote !== false,
         includeCallout: options.includeCallout !== false,
         includeSuperBlock: options.includeSuperBlock !== false,
+        includeTabs: options.includeTabs !== false,
         includeListUnordered: options.includeListUnordered !== false,
         includeListOrdered: options.includeListOrdered !== false,
         includeListTask: options.includeListTask !== false,
@@ -468,6 +473,7 @@ function attachRangesToHits(
             range,
             highlightKind: isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
             anchorOffset: isMemo ? block.anchorOffset : undefined,
+            ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
         });
     }
 

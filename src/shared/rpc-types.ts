@@ -59,6 +59,10 @@ export interface PluginPrefs {
      */
     includeSuperBlock: boolean;
     /**
+     * 是否匹配页签块（NodeTabs）及其内部和页签标题；默认 true。
+     */
+    includeTabs: boolean;
+    /**
      * 是否匹配无序列表（NodeList / NodeListItem，data-subtype=u）及其内部；默认 true。
      * 与有序 / 任务独立；三者全关 = 列表区都不搜（无单独「列表项」开关）。
      */
@@ -144,6 +148,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeBlockquote: true,
     includeCallout: true,
     includeSuperBlock: true,
+    includeTabs: true,
     includeListUnordered: true,
     includeListOrdered: true,
     includeListTask: true,
@@ -184,6 +189,7 @@ export function coercePluginPrefs(
         includeBlockquote: base.includeBlockquote !== false,
         includeCallout: base.includeCallout !== false,
         includeSuperBlock: base.includeSuperBlock !== false,
+        includeTabs: base.includeTabs !== false,
         includeListUnordered: base.includeListUnordered !== false,
         includeListOrdered: base.includeListOrdered !== false,
         includeListTask: base.includeListTask !== false,
@@ -240,6 +246,9 @@ export function mergePrefs(
         includeSuperBlock: patch.includeSuperBlock !== undefined
             ? patch.includeSuperBlock
             : base.includeSuperBlock,
+        includeTabs: patch.includeTabs !== undefined
+            ? patch.includeTabs
+            : base.includeTabs,
         includeListUnordered: patch.includeListUnordered !== undefined
             ? patch.includeListUnordered
             : base.includeListUnordered,

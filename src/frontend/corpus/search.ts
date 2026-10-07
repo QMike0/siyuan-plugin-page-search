@@ -30,8 +30,9 @@ import {
     fetchImageTitleCandidateIds,
     fetchMemoCandidateIds,
 } from "./sql";
-import {isBlockTypeEnabled, invalidateDocMeta, loadDocMeta, type BlockMeta} from "./meta";
+import {isBlockTypeEnabled, invalidateDocMeta, isInTabsBlock, loadDocMeta, type BlockMeta} from "./meta";
 import {collectFocusScope, editorFocusId} from "./focus";
+import {buildListSnippet} from "../list-snippet";
 import {fetchDocBlocksOrders, invalidateDocOrder} from "./order";
 import {projectRanges} from "./project";
 import {freezeBlock, restrictSpanCovers, type CachedUnit} from "./units";
@@ -78,6 +79,7 @@ function collectionScope(options: SearchPipelineOptions): string {
         options.includeCodeBlock !== false,
         options.includeMermaid !== false,
         options.includeHtmlBlock !== false,
+        options.includeTabs !== false,
         options.includeInlineMemo === true,
     ].map((flag) => flag ? "1" : "0").join("");
     const restrict = normalizeRestrictInlineTypes(options.restrictInlineTypes, {
@@ -137,6 +139,7 @@ function collectOptions(options: SearchPipelineOptions) {
         includeCodeBlock: options.includeCodeBlock !== false,
         includeMermaid: options.includeMermaid !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeTabs: options.includeTabs !== false,
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,
     };
@@ -404,6 +407,9 @@ export async function searchCurrentDocument(
     const inFocus = (id: string) => !focusId || Boolean(focusScope?.has(id));
     const orderIndex = orderIndexOf(orders);
     const enabled = (item: BlockMeta) => {
+        if (options.includeTabs === false && isInTabsBlock(item.id, meta.links)) {
+            return false;
+        }
         if (!isBlockTypeEnabled(item, options)) {
             return false;
         }
@@ -605,6 +611,7 @@ export async function searchCurrentDocument(
             replaceable: nonReplaceable ? false : isHitReplaceableByUnit(unit, hit.start, hit.end),
             highlightKind: unit.highlightKind,
             snippet: unit.snippet,
+            ...buildListSnippet(unit.text, hit.start, hit.end, hit.matchedText),
             anchorOffset: unit.highlightKind === "inline-memo" ? unit.anchorOffset : undefined,
         });
     }

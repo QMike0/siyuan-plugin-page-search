@@ -320,6 +320,13 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 || "Cannot find Protyle editor; replace aborted to keep undo available",
             selectionOnlyNoScope: t.selectionOnlyNoScope
                 || "Selection-only mode is on, but there is no usable selection",
+            searchDegradedLoadedOnly: t.searchDegradedLoadedOnly
+                || "This environment cannot query unloaded content. Results include only what is already loaded.",
+            searchIndexingBadge: t.searchIndexingBadge || "Indexing",
+            searchUnrendered: t.searchUnrendered
+                || "{count} blocks failed to render and were not counted",
+            resultsPanelToggle: t.resultsPanelToggle || "Search results",
+            resultsPanelEmpty: t.resultsPanelEmpty || "No results",
             settingsTitle: t.settingsTitle || "Search scope",
             settingsRestrictInline: t.settingsRestrictInline || "Limit search",
             settingsRestrictInlineHint: t.settingsRestrictInlineHint
@@ -336,6 +343,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeBlockquote: t.settingsIncludeBlockquote || "Blockquote",
             settingsIncludeCallout: t.settingsIncludeCallout || "Callout",
             settingsIncludeSuperBlock: t.settingsIncludeSuperBlock || "Super block",
+            settingsIncludeTabs: t.settingsIncludeTabs || "Tabs",
             settingsIncludeList: t.settingsIncludeList || "List blocks",
             settingsIncludeListUnordered: t.settingsIncludeListUnordered || "Unordered list",
             settingsIncludeListOrdered: t.settingsIncludeListOrdered || "Ordered list",
@@ -452,6 +460,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeSuperBlock(value);
+        });
+    }
+
+    /** 将页签块匹配开关同步到其它已打开面板 */
+    syncIncludeTabs(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeTabs(value);
         });
     }
 
@@ -831,6 +849,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeBlockquote: prefs.includeBlockquote !== false,
                     includeCallout: prefs.includeCallout !== false,
                     includeSuperBlock: prefs.includeSuperBlock !== false,
+                    includeTabs: prefs.includeTabs !== false,
                     includeListUnordered: prefs.includeListUnordered !== false,
                     includeListOrdered: prefs.includeListOrdered !== false,
                     includeListTask: prefs.includeListTask !== false,

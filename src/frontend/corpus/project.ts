@@ -20,6 +20,7 @@ export function projectRanges(
         includeBlockquote: options.includeBlockquote !== false,
         includeCallout: options.includeCallout !== false,
         includeSuperBlock: options.includeSuperBlock !== false,
+        includeTabs: options.includeTabs !== false,
         includeListUnordered: options.includeListUnordered !== false,
         includeListOrdered: options.includeListOrdered !== false,
         includeListTask: options.includeListTask !== false,

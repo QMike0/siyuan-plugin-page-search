@@ -13,6 +13,7 @@ import {
     shouldCollectInlineMemoUnits,
     type RestrictInlineType,
 } from "../shared";
+import {buildListSnippet} from "./list-snippet";
 import {
     collectSearchableBlocks,
     isInlineMathSearchUnit,
@@ -87,6 +88,7 @@ export function enumerateRestrictInlineMatches(
     const includeBlockquote = options.includeBlockquote !== false;
     const includeCallout = options.includeCallout !== false;
     const includeSuperBlock = options.includeSuperBlock !== false;
+    const includeTabs = options.includeTabs !== false;
     const includeListUnordered = options.includeListUnordered !== false;
     const includeListOrdered = options.includeListOrdered !== false;
     const includeListTask = options.includeListTask !== false;
@@ -114,6 +116,7 @@ export function enumerateRestrictInlineMatches(
         includeBlockquote,
         includeCallout,
         includeSuperBlock,
+        includeTabs,
         includeListUnordered,
         includeListOrdered,
         includeListTask,
@@ -174,6 +177,7 @@ export function enumerateRestrictInlineMatches(
                     includeBlockquote,
                     includeCallout,
                     includeSuperBlock,
+                    includeTabs,
                     includeListUnordered,
                     includeListOrdered,
                     includeListTask,
@@ -350,6 +354,7 @@ export function enumerateRestrictInlineMatches(
             highlightKind: candidate.matchSource === "inline-memo"
                 ? "inline-memo"
                 : (candidate.matchSource === "inline-math" ? "inline-math" : "text"),
+            ...buildListSnippet(candidate.text, candidate.start, candidate.end, candidate.text),
         });
     }
 
@@ -407,6 +412,7 @@ function shouldSkipHostByIncludeGates(
         includeBlockquote: boolean;
         includeCallout: boolean;
         includeSuperBlock: boolean;
+        includeTabs: boolean;
         includeListUnordered: boolean;
         includeListOrdered: boolean;
         includeListTask: boolean;
@@ -456,6 +462,9 @@ function shouldSkipHostByIncludeGates(
         !options.includeSuperBlock
         && Boolean(host.closest(`[data-type="${SUPER_BLOCK_TYPE}"], .sb`))
     ) {
+        return true;
+    }
+    if (!options.includeTabs && Boolean(host.closest('[data-type="NodeTabs"]'))) {
         return true;
     }
     if (shouldSkipElementByListInclude(host, {

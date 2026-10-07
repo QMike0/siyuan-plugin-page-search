@@ -17,6 +17,7 @@ export interface BlockIncludeFlags {
     includeCodeBlock?: boolean;
     includeMermaid?: boolean;
     includeHtmlBlock?: boolean;
+    includeTabs?: boolean;
 }
 
 /** 容器块不单独计子块正文。思维导图等新叶子类型靠排除法保留。 */
@@ -260,5 +261,29 @@ export function isBlockTypeEnabled(meta: BlockMeta, options: BlockIncludeFlags):
         }
         return options.includeCodeBlock !== false;
     }
+    if ((type === "tabs" || type === "tab") && options.includeTabs === false) {
+        return false;
+    }
     return true;
+}
+
+/** 块自身或祖先是页签块 / 页签项。只在关闭页签搜索时调用。 */
+export function isInTabsBlock(
+    id: string,
+    links: Map<string, {parentId: string; type: string}>,
+): boolean {
+    const seen = new Set<string>();
+    let current = id;
+    while (current && !seen.has(current)) {
+        seen.add(current);
+        const node = links.get(current);
+        if (!node) {
+            return false;
+        }
+        if (node.type === "tabs" || node.type === "tab") {
+            return true;
+        }
+        current = node.parentId;
+    }
+    return false;
 }

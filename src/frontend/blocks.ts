@@ -35,11 +35,12 @@ const MERMAID_SUBTYPE = 'mermaid'
  * 正文 TreeWalker 排除：属性区 / 矢量 / 公式。
  * 行内公式和行级公式的可见字形单独采集。若正文再走一遍 .katex，同一个词会计两次。
  * MathML / annotation 与 .katex-html 字形重复，也不能计入。
+ * 页签导航 .tabs-header 是标题块的克隆，正文仍在 .tab-item-info 里，再计一次会重复。
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
  * @see https://github.com/KaTeX/KaTeX/blob/v0.16.9/src/buildTree.js
  */
 const TEXT_NODE_EXCLUDED_CLOSEST =
-  '.protyle-attr, svg, style, script, .katex, .katex-html, .katex-display, .katex-mathml, math, annotation, span[data-type~="inline-math"]'
+  '.protyle-attr, svg, style, script, .katex, .katex-html, .katex-display, .katex-mathml, math, annotation, span[data-type~="inline-math"], .tabs-header'
 /** 图片标题可见字（官方 imgTitle / `.protyle-action__title`） */
 const IMAGE_TITLE_TEXT_CLOSEST = '.img .protyle-action__title'
 /** Mermaid 搜索单元：源码在 data-content，无可替换 Text 节点 */
@@ -184,6 +185,8 @@ export interface CollectSearchableBlocksOptions {
   includeCallout?: boolean;
   /** 是否采集超级块（NodeSuperBlock）及其内部子块；默认 true */
   includeSuperBlock?: boolean;
+  /** 是否采集页签块（NodeTabs）及其内部、页签标题；默认 true */
+  includeTabs?: boolean;
   /**
    * 是否采集无序列表（data-subtype=u）及其内部；默认 true。
    * 嵌套列表按最近列表祖先 subtype；三者全关 = 列表区都不采。
@@ -246,6 +249,7 @@ export function collectSearchableBlocks(
   const includeBlockquote = options.includeBlockquote !== false;
   const includeCallout = options.includeCallout !== false;
   const includeSuperBlock = options.includeSuperBlock !== false;
+  const includeTabs = options.includeTabs !== false;
   const includeListUnordered = options.includeListUnordered !== false;
   const includeListOrdered = options.includeListOrdered !== false;
   const includeListTask = options.includeListTask !== false;
@@ -348,6 +352,16 @@ export function collectSearchableBlocks(
     const blockId = element.dataset.nodeId?.trim()
     const blockType = element.dataset.type?.trim() || 'unknown'
     if (!blockId) {
+      return
+    }
+
+    // 关掉页签块时，页签标题和页签内的块都不采集
+    if (!includeTabs && element.closest('[data-type="NodeTabs"]')) {
+      return
+    }
+
+    // 页签标题的可见文字在导航标签上。有可见标签时不再采集被隐藏的原文，避免同一个词计两次。
+    if (includeTabs && hiddenTabsTitleCoveredByLabel(element)) {
       return
     }
 
@@ -551,6 +565,9 @@ export function collectSearchableBlocks(
   })
 
   const attributeRoots = scoped ? scopeRoots : (docRoot ? [docRoot] : [])
+  if (includeTabs && collectBodyText) {
+    blocks.push(...collectTabsTitleUnits(attributeRoots))
+  }
   if (collectMemo) {
     attributeRoots.forEach((root) => {
       blocks.push(...filterAttributeUnitsByIncludeGates(
@@ -1465,6 +1482,101 @@ function collectTextNodesInContainer(
     },
   })
 
+  return collectWalkerTextNodes(walker)
+}
+
+function elementHasBox(element: HTMLElement): boolean {
+  return element.clientHeight > 0
+    || (typeof element.getClientRects === "function" && element.getClientRects().length > 0)
+}
+
+function hiddenTabsTitleCoveredByLabel(element: HTMLElement): boolean {
+  const info = element.closest(".tab-item-info")
+  if (!info) {
+    return false
+  }
+  const item = info.closest<HTMLElement>(".tab-item")
+  if (item?.getAttribute("data-tabs-editing") === "true") {
+    return false
+  }
+  const tabId = item?.getAttribute("data-node-id") || ""
+  const tabs = item?.parentElement
+  if (!tabId || !tabs?.classList.contains("tabs")) {
+    return false
+  }
+  const label = tabs.querySelector<HTMLElement>(
+    `:scope > .tabs-header [data-tab-id="${CSS.escape(tabId)}"] .tabs-tab-label`,
+  )
+  return Boolean(label && elementHasBox(label) && (label.textContent || "").length > 0)
+}
+
+/** 把可见的页签标题标签记到原标题块上，高亮才能画在导航栏里。 */
+function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
+  const units: SearchableBlock[] = []
+  const seenTabs = new Set<HTMLElement>()
+  const seenItems = new Set<string>()
+  const consider = (tabs: HTMLElement | null) => {
+    if (!tabs || seenTabs.has(tabs) || tabs.getAttribute("data-type") !== "NodeTabs") {
+      return
+    }
+    seenTabs.add(tabs)
+    tabs.querySelectorAll<HTMLElement>(":scope > .tabs-header [data-tab-id]").forEach((button) => {
+      const tabId = button.getAttribute("data-tab-id") || ""
+      if (!tabId || seenItems.has(tabId)) {
+        return
+      }
+      const item = tabs.querySelector<HTMLElement>(`:scope > .tab-item[data-node-id="${CSS.escape(tabId)}"]`)
+      const titleBlock = item?.querySelector<HTMLElement>(
+        ':scope > .tab-item-info [tabs-title="true"][data-node-id], :scope > .tab-item-info .tab-item-title',
+      )
+      const blockEl = titleBlock?.closest<HTMLElement>("[data-node-id][data-type]") ?? null
+      const blockId = blockEl?.getAttribute("data-node-id") || ""
+      if (!item || !blockId) {
+        return
+      }
+      const editing = item.getAttribute("data-tabs-editing") === "true"
+      const label = button.querySelector<HTMLElement>(".tabs-tab-label")
+      if (editing && blockEl && elementHasBox(blockEl)) {
+        return
+      }
+      if (!label || !elementHasBox(label)) {
+        return
+      }
+      const textNodes = collectElementTextNodes(label)
+      const text = textNodes.map((node) => node.nodeValue ?? "").join("")
+      if (!text) {
+        return
+      }
+      seenItems.add(tabId)
+      units.push({
+        blockId,
+        blockType: blockEl?.getAttribute("data-type") || "NodeParagraph",
+        blockIndex: 0,
+        element: label,
+        text,
+        textNodes,
+      })
+    })
+  }
+  for (const root of roots) {
+    if (root.getAttribute("data-type") === "NodeTabs") {
+      consider(root)
+    }
+    root.querySelectorAll<HTMLElement>('[data-type="NodeTabs"]').forEach((tabs) => consider(tabs))
+    consider(root.closest<HTMLElement>('[data-type="NodeTabs"]'))
+  }
+  return units
+}
+
+function collectElementTextNodes(root: HTMLElement): Text[] {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!(node instanceof Text) || !node.nodeValue?.length) {
+        return NodeFilter.FILTER_REJECT
+      }
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
   return collectWalkerTextNodes(walker)
 }
 
