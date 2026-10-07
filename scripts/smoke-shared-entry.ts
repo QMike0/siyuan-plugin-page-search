@@ -135,6 +135,46 @@ const wordUnits = [{
 const whole = matchTextUnits(wordUnits, "cat", {wholeWord: true});
 assert(whole.length === 1 && whole[0].start === 0, `wholeWord: expected 1 at start, got ${whole.length}`);
 
+const cjkUnits = [{
+    blockId: "w2",
+    blockType: "p",
+    blockIndex: 0,
+    text: "中国 中",
+    segmentLengths: [4],
+}];
+const cjkOpen = matchTextUnits(cjkUnits, "中");
+assert(cjkOpen.length === 2, `wholeWord off keeps both 中, got ${cjkOpen.length}`);
+const cjkWhole = matchTextUnits(cjkUnits, "中", {wholeWord: true});
+assert(cjkWhole.length === 1 && cjkWhole[0].start === 3, `wholeWord CJK boundary, got ${cjkWhole.length}`);
+
+const accentWhole = matchTextUnits(
+    [{blockId: "w3", blockType: "p", blockIndex: 0, text: "café caf", segmentLengths: [8]}],
+    "caf",
+    {wholeWord: true},
+);
+assert(accentWhole.length === 1 && accentWhole[0].start === 5, `wholeWord accent, got ${accentWhole.length}`);
+
+const hyphenWhole = matchTextUnits(
+    [{blockId: "w4", blockType: "p", blockIndex: 0, text: "hello-world", segmentLengths: [11]}],
+    "hello",
+    {wholeWord: true},
+);
+assert(hyphenWhole.length === 1 && hyphenWhole[0].start === 0, `wholeWord hyphen separator, got ${hyphenWhole.length}`);
+
+const underscoreWhole = matchTextUnits(
+    [{blockId: "w5", blockType: "p", blockIndex: 0, text: "foo_bar foo", segmentLengths: [11]}],
+    "foo",
+    {wholeWord: true},
+);
+assert(underscoreWhole.length === 1 && underscoreWhole[0].start === 8, `wholeWord underscore stays inside the word, got ${underscoreWhole.length}`);
+
+const zeroWidthWhole = matchTextUnits(
+    [{blockId: "w6", blockType: "p", blockIndex: 0, text: "\u200bcat", segmentLengths: [4]}],
+    "cat",
+    {wholeWord: true},
+);
+assert(zeroWidthWhole.length === 1 && zeroWidthWhole[0].start === 1, `wholeWord ignores adjacent zero-width, got ${zeroWidthWhole.length}`);
+
 const regexHits = matchTextUnits(
     [{blockId: "r1", blockType: "p", blockIndex: 0, text: "a1 b22 c3", segmentLengths: [9]}],
     "\\d+",

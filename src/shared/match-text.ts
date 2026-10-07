@@ -13,7 +13,12 @@ import type {
     TextOffsetMatch,
 } from "./types";
 
-const ASCII_WORD_CHAR = /[A-Za-z0-9_]/
+/**
+ * VS Code / Monaco 默认单词分隔符（不含空白；空白单独视为分隔）。
+ * 只在打开全字匹配时使用。
+ * @see https://github.com/microsoft/vscode/blob/main/src/vs/editor/common/core/wordHelper.ts
+ */
+const DEFAULT_WORD_SEPARATORS = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 
 /**
  * 生成搜索关键词变体（Issue #42：空白 / 零宽字符）
@@ -185,6 +190,14 @@ export function escapeForRegex(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** 非空白、且不在默认分隔符里。汉字和带声调的字母都算词的一部分。 */
+function isWordChar(ch: string): boolean {
+    if (!ch || ZERO_WIDTH_RE.test(ch) || /\s/.test(ch)) {
+        return false;
+    }
+    return DEFAULT_WORD_SEPARATORS.indexOf(ch) < 0;
+}
+
 export function isWholeWordMatch(
     text: string,
     start: number,
@@ -194,9 +207,16 @@ export function isWholeWordMatch(
     if (!enabled) {
         return true;
     }
-    const previousChar = start > 0 ? text[start - 1] : "";
-    const nextChar = end < text.length ? text[end] : "";
-    return !ASCII_WORD_CHAR.test(previousChar) && !ASCII_WORD_CHAR.test(nextChar);
+    if (start < 0 || end > text.length || start >= end) {
+        return false;
+    }
+    if (start > 0 && isWordChar(text.charAt(start - 1))) {
+        return false;
+    }
+    if (end < text.length && isWordChar(text.charAt(end))) {
+        return false;
+    }
+    return true;
 }
 
 function sortOffsetMatches(allMatches: TextOffsetMatch[]): TextOffsetMatch[] {
