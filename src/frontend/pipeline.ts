@@ -58,6 +58,8 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeSuperBlock?: boolean;
     /** 是否匹配页签块及其内部、页签标题；默认 true */
     includeTabs?: boolean;
+    /** 是否匹配思维导图块及其内部；默认 true。不含代码块里的思维导图。 */
+    includeMindmap?: boolean;
     /** 是否匹配无序列表及其内部；默认 true */
     includeListUnordered?: boolean;
     /** 是否匹配有序列表及其内部；默认 true */
@@ -307,6 +309,7 @@ async function calculateLoadedDomMatches(
                 includeCallout: options.includeCallout,
                 includeSuperBlock: options.includeSuperBlock,
                 includeTabs: options.includeTabs,
+                includeMindmap: options.includeMindmap,
                 includeListUnordered: options.includeListUnordered,
                 includeListOrdered: options.includeListOrdered,
                 includeListTask: options.includeListTask,
@@ -339,6 +342,7 @@ async function calculateLoadedDomMatches(
         includeCallout: options.includeCallout !== false,
         includeSuperBlock: options.includeSuperBlock !== false,
         includeTabs: options.includeTabs !== false,
+        includeMindmap: options.includeMindmap !== false,
         includeListUnordered: options.includeListUnordered !== false,
         includeListOrdered: options.includeListOrdered !== false,
         includeListTask: options.includeListTask !== false,

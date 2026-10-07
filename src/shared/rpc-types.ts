@@ -63,6 +63,11 @@ export interface PluginPrefs {
      */
     includeTabs: boolean;
     /**
+     * 是否匹配思维导图块（NodeMindmap，以及带 custom-sy-list-mindmap 的列表）及其内部；默认 true。
+     * 不含代码块子类型 mindmap，那一项仍由 includeMermaid 控制。
+     */
+    includeMindmap: boolean;
+    /**
      * 是否匹配无序列表（NodeList / NodeListItem，data-subtype=u）及其内部；默认 true。
      * 与有序 / 任务独立；三者全关 = 列表区都不搜（无单独「列表项」开关）。
      */
@@ -149,6 +154,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeCallout: true,
     includeSuperBlock: true,
     includeTabs: true,
+    includeMindmap: true,
     includeListUnordered: true,
     includeListOrdered: true,
     includeListTask: true,
@@ -190,6 +196,7 @@ export function coercePluginPrefs(
         includeCallout: base.includeCallout !== false,
         includeSuperBlock: base.includeSuperBlock !== false,
         includeTabs: base.includeTabs !== false,
+        includeMindmap: base.includeMindmap !== false,
         includeListUnordered: base.includeListUnordered !== false,
         includeListOrdered: base.includeListOrdered !== false,
         includeListTask: base.includeListTask !== false,
@@ -249,6 +256,9 @@ export function mergePrefs(
         includeTabs: patch.includeTabs !== undefined
             ? patch.includeTabs
             : base.includeTabs,
+        includeMindmap: patch.includeMindmap !== undefined
+            ? patch.includeMindmap
+            : base.includeMindmap,
         includeListUnordered: patch.includeListUnordered !== undefined
             ? patch.includeListUnordered
             : base.includeListUnordered,

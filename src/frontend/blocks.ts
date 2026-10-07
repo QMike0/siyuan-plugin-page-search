@@ -36,11 +36,13 @@ const MERMAID_SUBTYPE = 'mermaid'
  * 行内公式和行级公式的可见字形单独采集。若正文再走一遍 .katex，同一个词会计两次。
  * MathML / annotation 与 .katex-html 字形重复，也不能计入。
  * 页签导航 .tabs-header 是标题块的克隆，正文仍在 .tab-item-info 里，再计一次会重复。
+ * 思维导图画布 .mindmap-view 是源块的副本，源块仍单独计数，不能再把副本算进导图块。
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.7-alpha.5/app/src/protyle/render/listMindmap/view.ts
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
  * @see https://github.com/KaTeX/KaTeX/blob/v0.16.9/src/buildTree.js
  */
 const TEXT_NODE_EXCLUDED_CLOSEST =
-  '.protyle-attr, svg, style, script, .katex, .katex-html, .katex-display, .katex-mathml, math, annotation, span[data-type~="inline-math"], .tabs-header'
+  '.protyle-attr, svg, style, script, .katex, .katex-html, .katex-display, .katex-mathml, math, annotation, span[data-type~="inline-math"], .tabs-header, .mindmap-view'
 /** 图片标题可见字（官方 imgTitle / `.protyle-action__title`） */
 const IMAGE_TITLE_TEXT_CLOSEST = '.img .protyle-action__title'
 /** Mermaid 搜索单元：源码在 data-content，无可替换 Text 节点 */
@@ -188,6 +190,11 @@ export interface CollectSearchableBlocksOptions {
   /** 是否采集页签块（NodeTabs）及其内部、页签标题；默认 true */
   includeTabs?: boolean;
   /**
+   * 是否采集思维导图块（NodeMindmap，以及 custom-sy-list-mindmap="1" 的列表）及其内部；默认 true。
+   * 不含代码块子类型 mindmap。
+   */
+  includeMindmap?: boolean;
+  /**
    * 是否采集无序列表（data-subtype=u）及其内部；默认 true。
    * 嵌套列表按最近列表祖先 subtype；三者全关 = 列表区都不采。
    */
@@ -250,6 +257,7 @@ export function collectSearchableBlocks(
   const includeCallout = options.includeCallout !== false;
   const includeSuperBlock = options.includeSuperBlock !== false;
   const includeTabs = options.includeTabs !== false;
+  const includeMindmap = options.includeMindmap !== false;
   const includeListUnordered = options.includeListUnordered !== false;
   const includeListOrdered = options.includeListOrdered !== false;
   const includeListTask = options.includeListTask !== false;
@@ -304,6 +312,7 @@ export function collectSearchableBlocks(
     includeCodeBlock,
     includeMermaid,
     includeHtmlBlock,
+    includeMindmap,
   }
 
   const blocks: SearchableBlock[] = []
@@ -357,6 +366,11 @@ export function collectSearchableBlocks(
 
     // 关掉页签块时，页签标题和页签内的块都不采集
     if (!includeTabs && element.closest('[data-type="NodeTabs"]')) {
+      return
+    }
+
+    // 关掉思维导图时，导图内的源块都不采集。画布副本在后面单独收。
+    if (!includeMindmap && isInsideMindmapBlock(element)) {
       return
     }
 
@@ -568,6 +582,9 @@ export function collectSearchableBlocks(
   if (includeTabs && collectBodyText) {
     blocks.push(...collectTabsTitleUnits(attributeRoots))
   }
+  if (includeMindmap && collectBodyText) {
+    blocks.push(...collectMindmapPreviewUnits(attributeRoots))
+  }
   if (collectMemo) {
     attributeRoots.forEach((root) => {
       blocks.push(...filterAttributeUnitsByIncludeGates(
@@ -609,6 +626,7 @@ interface IncludeGates {
   includeCodeBlock: boolean
   includeMermaid: boolean
   includeHtmlBlock: boolean
+  includeMindmap: boolean
 }
 
 type HeadingIncludeGates = Pick<
@@ -764,6 +782,9 @@ function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeG
     !gates.includeSuperBlock
     && Boolean(element.closest(`[data-type="${SUPER_BLOCK_TYPE}"], .sb`))
   ) {
+    return true
+  }
+  if (!gates.includeMindmap && isInsideMindmapBlock(element)) {
     return true
   }
   if (shouldSkipElementByListInclude(element, gates)) {
@@ -1572,6 +1593,78 @@ function collectElementTextNodes(root: HTMLElement): Text[] {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       if (!(node instanceof Text) || !node.nodeValue?.length) {
+        return NodeFilter.FILTER_REJECT
+      }
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+  return collectWalkerTextNodes(walker)
+}
+
+/**
+ * 画布副本去掉了 data-node-id，只留 data-mindmap-source-id。
+ * 用源块 id 记这一份可见文字，避免和隐藏源块、导图容器各计一次。
+ */
+const MINDMAP_BLOCK_SELECTOR = '[data-type="NodeMindmap"], [data-type="NodeList"][custom-sy-list-mindmap="1"]'
+
+/** 节点落在思维导图块内。代码块子类型 mindmap 不是这种块。 */
+export function isInsideMindmapBlock(element: Element): boolean {
+  return Boolean(element.closest(MINDMAP_BLOCK_SELECTOR))
+}
+
+export function collectMindmapPreviewUnits(roots: HTMLElement[]): SearchableBlock[] {
+  const units: SearchableBlock[] = []
+  const seen = new Set<string>()
+  const views = new Set<HTMLElement>()
+  for (const root of roots) {
+    if (root.classList.contains("mindmap-view")) {
+      views.add(root)
+    }
+    root.querySelectorAll<HTMLElement>(".mindmap-view").forEach((view) => views.add(view))
+    const parent = root.closest<HTMLElement>(".mindmap-view")
+    if (parent) {
+      views.add(parent)
+    }
+  }
+  views.forEach((view) => {
+    view.querySelectorAll<HTMLElement>("[data-mindmap-source-id]").forEach((preview) => {
+      const blockId = preview.getAttribute("data-mindmap-source-id") || ""
+      if (!blockId || seen.has(blockId) || preview.closest("[hidden]")) {
+        return
+      }
+      if (!elementHasBox(preview)) {
+        return
+      }
+      const textNodes = collectMindmapOwnTextNodes(preview)
+      const text = textNodes.map((node) => node.nodeValue ?? "").join("")
+      if (!text.replace(/[\u200B-\u200D\uFEFF]/g, "").trim()) {
+        return
+      }
+      seen.add(blockId)
+      units.push({
+        blockId,
+        blockType: preview.getAttribute("data-type") || "NodeParagraph",
+        blockIndex: 0,
+        element: preview,
+        text,
+        textNodes,
+      })
+    })
+  })
+  return units
+}
+
+function collectMindmapOwnTextNodes(preview: HTMLElement): Text[] {
+  const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!(node instanceof Text) || !node.nodeValue?.length) {
+        return NodeFilter.FILTER_REJECT
+      }
+      const parent = node.parentElement
+      if (!parent || parent.closest(".protyle-attr, svg, style, script, .mindmap-view__fold, .mindmap-view__add-child")) {
+        return NodeFilter.FILTER_REJECT
+      }
+      if (parent.closest("[data-mindmap-source-id]") !== preview) {
         return NodeFilter.FILTER_REJECT
       }
       return NodeFilter.FILTER_ACCEPT

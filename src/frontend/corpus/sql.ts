@@ -1,7 +1,7 @@
 import {escSql, querySql} from "./api";
 import {isContainerType} from "./meta";
 
-const CONTAINER_SQL = ["d", "l", "i", "b", "s"].map((type) => `'${type}'`).join(", ");
+const CONTAINER_SQL = ["d", "l", "i", "b", "s", "mindmap", "mindmap_item"].map((type) => `'${type}'`).join(", ");
 
 function needleLiteral(needle: string, caseSensitive: boolean): {haystack: string; lit: string} {
     return {
@@ -73,7 +73,7 @@ export async function fetchImageTitleCandidateIds(
 }
 
 export function isSpecialRenderType(type: string, subtype: string): boolean {
-    if (type === "html" || type === "m" || type === "mindmap") {
+    if (type === "html" || type === "m") {
         return true;
     }
     if (type === "c" && (
@@ -91,7 +91,7 @@ export function isSpecialRenderType(type: string, subtype: string): boolean {
 }
 
 export function isDiagramBlock(type: string, subtype: string): boolean {
-    return type === "mindmap" || (type === "c" && (
+    return type === "c" && (
         subtype === "mermaid"
         || subtype === "flowchart"
         || subtype === "graphviz"
@@ -99,7 +99,7 @@ export function isDiagramBlock(type: string, subtype: string): boolean {
         || subtype === "chart"
         || subtype === "mindmap"
         || subtype === "abc"
-    ));
+    );
 }
 
 export function isEmbedType(type: string): boolean {

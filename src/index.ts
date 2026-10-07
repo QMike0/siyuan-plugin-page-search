@@ -344,6 +344,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeCallout: t.settingsIncludeCallout || "Callout",
             settingsIncludeSuperBlock: t.settingsIncludeSuperBlock || "Super block",
             settingsIncludeTabs: t.settingsIncludeTabs || "Tabs",
+            settingsIncludeMindmap: t.settingsIncludeMindmap || "Mind map",
             settingsIncludeList: t.settingsIncludeList || "List blocks",
             settingsIncludeListUnordered: t.settingsIncludeListUnordered || "Unordered list",
             settingsIncludeListOrdered: t.settingsIncludeListOrdered || "Ordered list",
@@ -470,6 +471,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeTabs(value);
+        });
+    }
+
+    /** 将思维导图块匹配开关同步到其它已打开面板 */
+    syncIncludeMindmap(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeMindmap(value);
         });
     }
 
@@ -850,6 +861,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeCallout: prefs.includeCallout !== false,
                     includeSuperBlock: prefs.includeSuperBlock !== false,
                     includeTabs: prefs.includeTabs !== false,
+                    includeMindmap: prefs.includeMindmap !== false,
                     includeListUnordered: prefs.includeListUnordered !== false,
                     includeListOrdered: prefs.includeListOrdered !== false,
                     includeListTask: prefs.includeListTask !== false,

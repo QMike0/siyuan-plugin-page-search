@@ -21,6 +21,7 @@ export function projectRanges(
         includeCallout: options.includeCallout !== false,
         includeSuperBlock: options.includeSuperBlock !== false,
         includeTabs: options.includeTabs !== false,
+        includeMindmap: options.includeMindmap !== false,
         includeListUnordered: options.includeListUnordered !== false,
         includeListOrdered: options.includeListOrdered !== false,
         includeListTask: options.includeListTask !== false,

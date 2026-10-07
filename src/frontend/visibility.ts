@@ -42,7 +42,7 @@ export function isElementVisible(
     if (
         isInsideProtyleHtmlShadow(htmlElement)
         || htmlElement.closest(
-            '.av, .callout, .callout-title, .callout-info, .protyle-title, .protyle-title__input, [data-subtype="mermaid"], svg, foreignObject, protyle-html, [data-type="NodeHTMLBlock"], .katex-html',
+            '.av, .callout, .callout-title, .callout-info, .protyle-title, .protyle-title__input, [data-subtype="mermaid"], svg, foreignObject, protyle-html, [data-type="NodeHTMLBlock"], .katex-html, .mindmap-view',
         )
     ) {
         if (isLooseUiElementVisible(htmlElement)) {

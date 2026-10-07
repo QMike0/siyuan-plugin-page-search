@@ -18,6 +18,7 @@ export interface BlockIncludeFlags {
     includeMermaid?: boolean;
     includeHtmlBlock?: boolean;
     includeTabs?: boolean;
+    includeMindmap?: boolean;
 }
 
 /** 容器块不单独计子块正文。思维导图等新叶子类型靠排除法保留。 */
@@ -211,7 +212,8 @@ function isUnderNonHeadingFold(
 }
 
 export function isContainerType(type: string): boolean {
-    return type === "d" || type === "l" || type === "i" || type === "b" || type === "s";
+    return type === "d" || type === "l" || type === "i" || type === "b" || type === "s"
+        || type === "mindmap" || type === "mindmap_item";
 }
 
 /** 用户关掉的块类型不进入候选。标题级别、列表子类型按 subtype 判断。 */
@@ -248,8 +250,8 @@ export function isBlockTypeEnabled(meta: BlockMeta, options: BlockIncludeFlags):
     if (type === "query_embed" && options.includeEmbedBlock === false) {
         return false;
     }
-    if (type === "mindmap") {
-        return options.includeMermaid !== false;
+    if (type === "mindmap" || type === "mindmap_item") {
+        return options.includeMindmap !== false;
     }
     if (type === "c") {
         if (subtype === "mermaid") {
@@ -265,6 +267,32 @@ export function isBlockTypeEnabled(meta: BlockMeta, options: BlockIncludeFlags):
         return false;
     }
     return true;
+}
+
+const LIST_MINDMAP_IAL = /(?:^|\s)custom-sy-list-mindmap="1"/;
+
+/** 块自身或祖先是思维导图，或是已转成思维导图的列表。只在关闭思维导图搜索时调用。 */
+export function isInMindmapBlock(
+    id: string,
+    links: Map<string, {parentId: string; type: string; ial?: string}>,
+): boolean {
+    const seen = new Set<string>();
+    let current = id;
+    while (current && !seen.has(current)) {
+        seen.add(current);
+        const node = links.get(current);
+        if (!node) {
+            return false;
+        }
+        if (node.type === "mindmap" || node.type === "mindmap_item") {
+            return true;
+        }
+        if (node.type === "l" && LIST_MINDMAP_IAL.test(node.ial || "")) {
+            return true;
+        }
+        current = node.parentId;
+    }
+    return false;
 }
 
 /** 块自身或祖先是页签块 / 页签项。只在关闭页签搜索时调用。 */

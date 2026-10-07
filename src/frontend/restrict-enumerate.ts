@@ -16,6 +16,7 @@ import {
 import {buildListSnippet} from "./list-snippet";
 import {
     collectSearchableBlocks,
+    isInsideMindmapBlock,
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
     shouldSkipElementByHeadingInclude,
@@ -89,6 +90,7 @@ export function enumerateRestrictInlineMatches(
     const includeCallout = options.includeCallout !== false;
     const includeSuperBlock = options.includeSuperBlock !== false;
     const includeTabs = options.includeTabs !== false;
+    const includeMindmap = options.includeMindmap !== false;
     const includeListUnordered = options.includeListUnordered !== false;
     const includeListOrdered = options.includeListOrdered !== false;
     const includeListTask = options.includeListTask !== false;
@@ -117,6 +119,7 @@ export function enumerateRestrictInlineMatches(
         includeCallout,
         includeSuperBlock,
         includeTabs,
+        includeMindmap,
         includeListUnordered,
         includeListOrdered,
         includeListTask,
@@ -178,6 +181,7 @@ export function enumerateRestrictInlineMatches(
                     includeCallout,
                     includeSuperBlock,
                     includeTabs,
+                    includeMindmap,
                     includeListUnordered,
                     includeListOrdered,
                     includeListTask,
@@ -413,6 +417,7 @@ function shouldSkipHostByIncludeGates(
         includeCallout: boolean;
         includeSuperBlock: boolean;
         includeTabs: boolean;
+        includeMindmap: boolean;
         includeListUnordered: boolean;
         includeListOrdered: boolean;
         includeListTask: boolean;
@@ -465,6 +470,9 @@ function shouldSkipHostByIncludeGates(
         return true;
     }
     if (!options.includeTabs && Boolean(host.closest('[data-type="NodeTabs"]'))) {
+        return true;
+    }
+    if (!options.includeMindmap && isInsideMindmapBlock(host)) {
         return true;
     }
     if (shouldSkipElementByListInclude(host, {

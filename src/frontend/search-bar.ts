@@ -17,6 +17,7 @@ import {confirm, Menu, showMessage} from "siyuan";
 import {rpcSetPrefs} from "./kernel-client";
 import {
     collectSearchableBlocks,
+    collectMindmapPreviewUnits,
     HTML_BLOCK_UNIT_ID,
     MERMAID_UNIT_ID,
     type CollectSearchableBlocksOptions,
@@ -26,6 +27,7 @@ import {calculateSearchMatches} from "./pipeline";
 import {fillLiveRanges} from "./corpus/project";
 import {blockIsInEditor, openBlockInEditor} from "./corpus/locate";
 import {revealHiddenTabs, mirrorTabsTitleRange} from "./tabs-reveal";
+import {panMindmapIntoView} from "./mindmap-pan";
 import {cancelBackgroundCorpusJobs, editorRootId, invalidateDocumentSearchCaches, subscribeIndexSettled} from "./corpus/search";
 import {
     isMatchWritable,
@@ -169,6 +171,7 @@ export interface SearchBarI18n {
     settingsIncludeCallout: string;
     settingsIncludeSuperBlock: string;
     settingsIncludeTabs: string;
+    settingsIncludeMindmap: string;
     settingsIncludeList: string;
     settingsIncludeListUnordered: string;
     settingsIncludeListOrdered: string;
@@ -235,6 +238,8 @@ export interface SearchBarHost {
     syncIncludeSuperBlock?(value: boolean, source?: SearchBar): void;
     /** 将页签块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeTabs?(value: boolean, source?: SearchBar): void;
+    /** 将思维导图块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeMindmap?(value: boolean, source?: SearchBar): void;
     /** 将无序列表匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeListUnordered?(value: boolean, source?: SearchBar): void;
     /** 将有序列表匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -313,6 +318,8 @@ export class SearchBar {
     private includeSuperBlock = true;
     /** 是否匹配页签块；全局 prefs，默认 true */
     private includeTabs = true;
+    /** 是否匹配思维导图块；全局 prefs，默认 true */
+    private includeMindmap = true;
     /** 是否匹配无序列表；全局 prefs，默认 true */
     private includeListUnordered = true;
     /** 是否匹配有序列表；全局 prefs，默认 true */
@@ -439,6 +446,8 @@ export class SearchBar {
         includeSuperBlock?: boolean;
         /** 是否匹配页签块（来自全局 prefs） */
         includeTabs?: boolean;
+        /** 是否匹配思维导图块（来自全局 prefs） */
+        includeMindmap?: boolean;
         /** 是否匹配无序列表（来自全局 prefs） */
         includeListUnordered?: boolean;
         /** 是否匹配有序列表（来自全局 prefs） */
@@ -489,6 +498,7 @@ export class SearchBar {
         this.includeCallout = options.includeCallout !== false;
         this.includeSuperBlock = options.includeSuperBlock !== false;
         this.includeTabs = options.includeTabs !== false;
+        this.includeMindmap = options.includeMindmap !== false;
         this.includeListUnordered = options.includeListUnordered !== false;
         this.includeListOrdered = options.includeListOrdered !== false;
         this.includeListTask = options.includeListTask !== false;
@@ -1019,6 +1029,7 @@ export class SearchBar {
             includeCallout: this.includeCallout,
             includeSuperBlock: this.includeSuperBlock,
             includeTabs: this.includeTabs,
+            includeMindmap: this.includeMindmap,
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
@@ -1056,6 +1067,7 @@ export class SearchBar {
             includeCallout: this.includeCallout,
             includeSuperBlock: this.includeSuperBlock,
             includeTabs: this.includeTabs,
+            includeMindmap: this.includeMindmap,
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
@@ -1085,7 +1097,8 @@ export class SearchBar {
                 includeBlockquote: this.includeBlockquote,
                 includeCallout: this.includeCallout,
                 includeSuperBlock: this.includeSuperBlock,
-            includeTabs: this.includeTabs,
+                includeTabs: this.includeTabs,
+                includeMindmap: this.includeMindmap,
                 includeListUnordered: this.includeListUnordered,
                 includeListOrdered: this.includeListOrdered,
                 includeListTask: this.includeListTask,
@@ -1516,6 +1529,7 @@ export class SearchBar {
             includeCallout: this.includeCallout,
             includeSuperBlock: this.includeSuperBlock,
             includeTabs: this.includeTabs,
+            includeMindmap: this.includeMindmap,
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
@@ -1911,6 +1925,12 @@ export class SearchBar {
         if (existing && revealHiddenTabs(existing)) {
             void existing.offsetHeight;
         }
+        if (!match.range && this.bindMindmapPreview(index)) {
+            void this.scrollIntoRangesAsync(index, scroll).then(() => {
+                window.requestAnimationFrame(() => this.applyResultHighlights());
+            });
+            return;
+        }
         const shown = existing
             && existing.clientHeight > 0
             && !isUnderNonHeadingCssFold(existing);
@@ -1918,6 +1938,12 @@ export class SearchBar {
             void this.scrollIntoRangesAsync(index, scroll).then(() => {
                 window.requestAnimationFrame(() => this.applyResultHighlights());
             });
+            return;
+        }
+        const renderedMindmap = existing?.closest<HTMLElement>("[data-mindmap-view-rendered=\"true\"]");
+        if (!shown && renderedMindmap) {
+            renderedMindmap.querySelector<HTMLElement>(":scope > .mindmap-view")
+                ?.scrollIntoView({block: "center", inline: "nearest"});
             return;
         }
         if (shown || (match.blockType === ATTRIBUTE_VIEW_TYPE && existing)) {
@@ -1988,6 +2014,20 @@ export class SearchBar {
         )?.scrollIntoView({block: "center", inline: "nearest"});
     }
 
+    /** 画布副本没有 data-node-id。按源块 id 把 Range 绑到当前可见节点上。 */
+    private bindMindmapPreview(index: number): boolean {
+        const match = this.resultMatches[index];
+        if (!match?.blockId || !(this.edit instanceof HTMLElement) || !this.edit.querySelector(".mindmap-view")) {
+            return false;
+        }
+        const units = collectMindmapPreviewUnits([this.edit]).filter((unit) => unit.blockId === match.blockId);
+        if (!units.length) {
+            return false;
+        }
+        this.resultMatches = fillLiveRanges(this.resultMatches, units, this.includeFoldedBlocks);
+        return Boolean(this.resultMatches[index]?.range);
+    }
+
     /** 当前这条已经在编辑器里时，只采集这一块并补上 Range，不重搜全文 */
     private tryBindUnfoldedMatch(index: number): boolean {
         const match = this.resultMatches[index - 1];
@@ -2009,7 +2049,10 @@ export class SearchBar {
             scopeRoots: [owner],
         });
         this.resultMatches = fillLiveRanges(this.resultMatches, live, this.includeFoldedBlocks);
-        const current = this.resultMatches[index - 1];
+        let current = this.resultMatches[index - 1];
+        if (!current?.range && this.bindMindmapPreview(index - 1)) {
+            current = this.resultMatches[index - 1];
+        }
         if (!current?.range) {
             return false;
         }
@@ -2054,6 +2097,7 @@ export class SearchBar {
             includeCallout: this.includeCallout,
             includeSuperBlock: this.includeSuperBlock,
             includeTabs: this.includeTabs,
+            includeMindmap: this.includeMindmap,
             includeListUnordered: this.includeListUnordered,
             includeListOrdered: this.includeListOrdered,
             includeListTask: this.includeListTask,
@@ -2137,7 +2181,7 @@ export class SearchBar {
             ? node as Element
             : node.parentElement;
         while (element) {
-            if (element.matches(selector)) {
+            if (element.getAttribute("data-mindmap-source-id") === blockId || element.matches(selector)) {
                 return true;
             }
             element = parentElementCrossingShadow(element);
@@ -2231,7 +2275,9 @@ export class SearchBar {
                 ? commonAncestor.parentElement
                 : commonAncestor as Element;
 
-            if (ancestorElement) {
+            if (ancestorElement?.closest(".mindmap-view")) {
+                panMindmapIntoView(range);
+            } else if (ancestorElement) {
                 const scrollContainers = findScrollContainers(ancestorElement);
                 scrollContainers.forEach((container) => {
                     scrollContainerToRange(range, container);
@@ -2829,6 +2875,15 @@ export class SearchBar {
                     },
                 }),
                 this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-mindmap",
+                    icon: "iconMindmap",
+                    label: this.i18n.settingsIncludeMindmap,
+                    checked: this.includeMindmap,
+                    onChange: (checked) => {
+                        void this.setIncludeMindmap(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
                     id: "page-search-include-embed-block",
                     icon: "iconSQL",
                     label: this.i18n.settingsIncludeEmbedBlock,
@@ -3265,6 +3320,16 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setIncludeMindmap(value: boolean) {
+        if (this.includeMindmap === value) {
+            return;
+        }
+        this.includeMindmap = value;
+        await rpcSetPrefs(this.plugin, {includeMindmap: value});
+        this.plugin.syncIncludeMindmap?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeListUnordered(value: boolean) {
         if (this.includeListUnordered === value) {
             return;
@@ -3477,6 +3542,14 @@ export class SearchBar {
             return;
         }
         this.includeTabs = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeMindmap(value: boolean) {
+        if (this.includeMindmap === value) {
+            return;
+        }
+        this.includeMindmap = value;
         void this.highlightHitResult(this.searchText, true);
     }
 

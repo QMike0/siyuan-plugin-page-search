@@ -919,6 +919,7 @@ export function captureSelectionScopeWithKind(
         includeCallout?: boolean;
         includeSuperBlock?: boolean;
         includeTabs?: boolean;
+        includeMindmap?: boolean;
         includeListUnordered?: boolean;
         includeListOrdered?: boolean;
         includeListTask?: boolean;
@@ -952,6 +953,7 @@ export function captureSelectionScopeWithKind(
         includeCallout: options?.includeCallout !== false,
         includeSuperBlock: options?.includeSuperBlock !== false,
         includeTabs: options?.includeTabs !== false,
+        includeMindmap: options?.includeMindmap !== false,
         includeListUnordered: options?.includeListUnordered !== false,
         includeListOrdered: options?.includeListOrdered !== false,
         includeListTask: options?.includeListTask !== false,
