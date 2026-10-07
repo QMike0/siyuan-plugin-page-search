@@ -9,6 +9,8 @@ import {
     coercePluginPrefs,
     expandRegexReplacement,
     extractRegexLiteralGroups,
+    avApiUnitShown,
+    collectAvDomCoverage,
     findOffsetMatchesInText,
     formatSearchCountLabel,
     generateSearchVariants,
@@ -223,6 +225,34 @@ assertLiterals("École", null, false);
 assertLiterals("fooÉ", null, false);
 assertLiterals("中文", [["中文"]], false);
 assertLiterals("foo", [["foo"]], false);
+
+const shownCell = collectAvDomCoverage([{
+    blockId: "db",
+    blockType: "NodeAttributeView",
+    unitId: "cell:nogroup:row1:col1",
+    text: "已显示",
+}]);
+const shown = shownCell.get("db");
+assert(Boolean(shown), "av coverage exists");
+const usedRows = new Set<string>();
+assert(
+    shown ? avApiUnitShown("av:row1:col1", "已显示", shown, usedRows) : false,
+    "visible cell is not added again from the api",
+);
+assert(
+    shown ? !avApiUnitShown("av:row2:col1", "未挂载", shown, usedRows) : true,
+    "unmounted row is kept",
+);
+const unstable = collectAvDomCoverage([{
+    blockId: "db",
+    blockType: "NodeAttributeView",
+    unitId: "cell:nogroup:norow:idx-0",
+    text: "无 id",
+}]).get("db");
+assert(
+    unstable ? avApiUnitShown("av:row9:col9", "别处", unstable, new Set<string>()) : false,
+    "unstable visible cell blocks the api merge",
+);
 
 // --- AV never replaceable ---
 const avUnit = {

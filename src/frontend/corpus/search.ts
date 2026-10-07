@@ -3,6 +3,8 @@ import type {Plugin} from "siyuan";
 import {
     createSearchPattern,
     extractRegexLiteralGroups,
+    avApiUnitShown,
+    collectAvDomCoverage,
     isHitReplaceableByUnit,
     isRestrictInlineActive,
     matchPassesRestrictInline,
@@ -728,10 +730,20 @@ export async function searchCurrentDocument(
             return (!item || enabled(item)) && inFocus(ref.blockId);
         });
         const peeked = peekAvUnits(refs);
+        const avDom = collectAvDomCoverage(units);
+        const usedRowLabels = new Map<string, Set<string>>();
         for (const unit of peeked.units) {
-            // 当前画面里的单元格已经计入，不再把接口结果叠上去
             if (liveIds.has(unit.blockId)) {
-                continue;
+                const coverage = avDom.get(unit.blockId);
+                // 画面上已有文字的格子保留 Range。接口只补没画出来的行、日历收起事件和图标格。
+                if (coverage && avApiUnitShown(
+                    unit.unitId ?? "",
+                    unit.text,
+                    coverage,
+                    rowLabelSkip(usedRowLabels, unit.blockId),
+                )) {
+                    continue;
+                }
             }
             units.push(avToCached(unit, orderIndex));
         }
@@ -825,6 +837,15 @@ function compareMatchOrder(left: SearchMatch, right: SearchMatch): number {
         return left.start - right.start;
     }
     return left.end - right.end;
+}
+
+function rowLabelSkip(sets: Map<string, Set<string>>, blockId: string): Set<string> {
+    let current = sets.get(blockId);
+    if (!current) {
+        current = new Set<string>();
+        sets.set(blockId, current);
+    }
+    return current;
 }
 
 function avToCached(

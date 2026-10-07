@@ -22,6 +22,7 @@ export {
     expandReplacementTemplate,
 } from "./regex-replace";
 export {extractRegexLiteralGroups} from "./regex-literals";
+export {avApiUnitShown, collectAvDomCoverage} from "./av-live";
 export type {ExpandRegexReplacementOptions} from "./regex-replace";
 export {
     plainTextFromInlineMemoContent,
