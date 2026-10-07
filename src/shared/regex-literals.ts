@@ -1,23 +1,30 @@
 /**
- * 从正则里抽出「每次命中都必然出现」的字面量，供 SQL instr 预筛。
- * 抽不出、或某个分支可以不包含这些字时返回 null，调用方保持全文抽块。
- * 前瞻、后顾和反向引用不贡献字面量；遇到无法确定的写法就放弃预筛。
+ * 从正则里抽出「每次命中都必然出现」的 SQL 条件。
+ * 字面量用 instr，数字和单词类用 GLOB。
+ * 抽不出、或某个分支可以什么都不含时返回 null，调用方保持全文抽块。
  */
 
 const MAX_GROUPS = 32;
 const MAX_REPEAT = 8;
 const MAX_LITERAL = 64;
 
+export type RegexPrefilterAtom =
+    | {kind: "lit"; text: string}
+    | {kind: "digit"}
+    | {kind: "word"};
+
 type Node =
     | {kind: "lit"; text: string}
+    | {kind: "digit"}
+    | {kind: "word"}
     | {kind: "eps"}
     | {kind: "wild"}
     | {kind: "seq"; items: Node[]}
     | {kind: "alt"; items: Node[]}
     | {kind: "rep"; node: Node; min: number};
 
-/** 空 alts 表示这一支提不出必现字面量。 */
-type Requirement = {alts: string[][]};
+/** 空 alts 表示这一支提不出必现条件。 */
+type Requirement = {alts: RegexPrefilterAtom[][]};
 
 function noConstraint(): Requirement {
     return {alts: []};
@@ -48,7 +55,11 @@ function litRequirement(text: string): Requirement {
     if (!usableLiteral(text)) {
         return noConstraint();
     }
-    return {alts: [[text]]};
+    return {alts: [[{kind: "lit", text}]]};
+}
+
+function classRequirement(kind: "digit" | "word"): Requirement {
+    return {alts: [[{kind}]]};
 }
 
 function unionRequirements(left: Requirement, right: Requirement): Requirement {
@@ -68,7 +79,7 @@ function intersectRequirements(left: Requirement, right: Requirement): Requireme
     if (left.alts.length * right.alts.length > MAX_GROUPS) {
         return left.alts.length <= right.alts.length ? left : right;
     }
-    const alts: string[][] = [];
+    const alts: RegexPrefilterAtom[][] = [];
     for (const group of left.alts) {
         for (const extra of right.alts) {
             alts.push(group.concat(extra));
@@ -109,6 +120,9 @@ function pureLiteral(node: Node): string | null {
 function summarize(node: Node): Requirement {
     if (node.kind === "lit") {
         return litRequirement(node.text);
+    }
+    if (node.kind === "digit" || node.kind === "word") {
+        return classRequirement(node.kind);
     }
     if (node.kind === "eps" || node.kind === "wild") {
         return noConstraint();
@@ -176,37 +190,52 @@ function summarizeSequence(items: Node[]): Requirement {
     return requirement;
 }
 
-function normalizeRequirement(requirement: Requirement): string[][] | null {
+function normalizeRequirement(requirement: Requirement): RegexPrefilterAtom[][] | null {
     if (requirement.alts.length === 0 || requirement.alts.length > MAX_GROUPS) {
         return null;
     }
     const seen = new Set<string>();
-    const groups: string[][] = [];
+    const groups: RegexPrefilterAtom[][] = [];
     for (const alt of requirement.alts) {
-        const literals: string[] = [];
+        const atoms: RegexPrefilterAtom[] = [];
         const local = new Set<string>();
-        for (const literal of alt) {
-            if (!usableLiteral(literal) || local.has(literal)) {
+        for (const atom of alt) {
+            if (atom.kind === "lit" && !usableLiteral(atom.text)) {
                 continue;
             }
-            local.add(literal);
-            literals.push(literal);
+            const key = atomKey(atom);
+            if (local.has(key)) {
+                continue;
+            }
+            local.add(key);
+            atoms.push(atom);
         }
-        if (literals.length === 0) {
+        if (atoms.length === 0) {
             return null;
         }
-        literals.sort();
-        const key = literals.join("\0");
+        atoms.sort((left, right) => atomKey(left) < atomKey(right) ? -1 : atomKey(left) > atomKey(right) ? 1 : 0);
+        const key = atoms.map(atomKey).join("\0");
         if (seen.has(key)) {
             continue;
         }
         seen.add(key);
-        groups.push(literals);
+        groups.push(atoms);
     }
     if (groups.length === 0 || groups.length > MAX_GROUPS) {
         return null;
     }
     return groups;
+}
+
+function atomKey(atom: RegexPrefilterAtom): string {
+    if (atom.kind === "lit") {
+        return "l:" + atom.text;
+    }
+    return atom.kind;
+}
+
+function isDigitChar(text: string): boolean {
+    return text.length === 1 && text >= "0" && text <= "9";
 }
 
 class PatternParser {
@@ -336,8 +365,15 @@ class PatternParser {
             this.index += 1;
         }
         const chars: string[] = [];
-        let wild = negated;
+        let digitOnly = !negated;
+        let sawDigit = false;
+        let wordOnly = !negated;
+        let sawWord = false;
         let first = true;
+        const noteOther = () => {
+            digitOnly = false;
+            wordOnly = false;
+        };
         while (this.index < this.source.length && !(this.peek() === "]" && !first)) {
             first = false;
             if (this.peek() === "\\") {
@@ -345,9 +381,19 @@ class PatternParser {
                 if (escaped === null) {
                     return null;
                 }
-                if (escaped === "wild") {
-                    wild = true;
+                if (escaped === "digit") {
+                    sawDigit = true;
+                    wordOnly = false;
+                } else if (escaped === "word") {
+                    sawWord = true;
+                    digitOnly = false;
+                } else if (escaped === "wild") {
+                    noteOther();
+                } else if (isDigitChar(escaped)) {
+                    sawDigit = true;
+                    chars.push(escaped);
                 } else {
+                    noteOther();
                     chars.push(escaped);
                 }
                 continue;
@@ -355,38 +401,73 @@ class PatternParser {
             const start = this.peek();
             this.index += 1;
             if (this.peek() === "-" && this.peek(1) && this.peek(1) !== "]") {
-                wild = true;
                 this.index += 1;
+                let end = "";
+                let endClass = false;
                 if (this.peek() === "\\") {
                     const escaped = this.parseClassEscape();
                     if (escaped === null) {
                         return null;
                     }
+                    if (escaped === "digit" || escaped === "word" || escaped === "wild") {
+                        endClass = true;
+                    } else {
+                        end = escaped;
+                    }
                 } else if (this.peek() && this.peek() !== "]") {
+                    end = this.peek();
                     this.index += 1;
+                }
+                if (!endClass && isDigitChar(start) && isDigitChar(end) && start <= end) {
+                    sawDigit = true;
+                    wordOnly = false;
+                } else {
+                    noteOther();
                 }
                 continue;
             }
-            chars.push(start);
+            if (isDigitChar(start)) {
+                sawDigit = true;
+                chars.push(start);
+            } else {
+                noteOther();
+                chars.push(start);
+            }
         }
         if (this.peek() !== "]") {
             return null;
         }
         this.index += 1;
-        if (wild || chars.length !== 1) {
+        if (negated) {
             return {kind: "wild"};
         }
-        return {kind: "lit", text: chars[0]};
+        if (digitOnly && sawDigit && !sawWord) {
+            return {kind: "digit"};
+        }
+        if (wordOnly && sawWord && chars.length === 0) {
+            return {kind: "word"};
+        }
+        // 数字区间再混一个别的字符时，不能收成那一个字符，否则只有数字的块会被漏掉。
+        if (chars.length === 1 && !sawDigit && !sawWord) {
+            return {kind: "lit", text: chars[0]};
+        }
+        return {kind: "wild"};
     }
 
-    private parseClassEscape(): string | "wild" | null {
+    private parseClassEscape(): string | "wild" | "digit" | "word" | null {
         this.index += 1;
         const current = this.peek();
         if (!current) {
             return null;
         }
         this.index += 1;
-        if ("dDwWsS".indexOf(current) >= 0) {
+        if (current === "d") {
+            return "digit";
+        }
+        if (current === "w") {
+            return "word";
+        }
+        if ("DWsS".indexOf(current) >= 0) {
             return "wild";
         }
         if (current === "b") {
@@ -405,7 +486,13 @@ class PatternParser {
         if (current === "b" || current === "B") {
             return {kind: "eps"};
         }
-        if ("dDwWsS".indexOf(current) >= 0 || current === "p" || current === "P") {
+        if (current === "d") {
+            return {kind: "digit"};
+        }
+        if (current === "w") {
+            return {kind: "word"};
+        }
+        if ("DWsS".indexOf(current) >= 0 || current === "p" || current === "P") {
             if ((current === "p" || current === "P") && this.peek() === "{") {
                 const close = this.source.indexOf("}", this.index);
                 if (close < 0) {
@@ -550,7 +637,7 @@ class PatternParser {
  * 外层是「或」，内层是「且」。null 表示不能安全预筛。
  * caseSensitive 为 false 时，字面量里若有 SQLite 无法折叠的字母，也返回 null。
  */
-export function extractRegexLiteralGroups(pattern: string, caseSensitive = true): string[][] | null {
+export function extractRegexLiteralGroups(pattern: string, caseSensitive = true): RegexPrefilterAtom[][] | null {
     if (!pattern || pattern.length > 2000) {
         return null;
     }
@@ -568,8 +655,13 @@ export function extractRegexLiteralGroups(pattern: string, caseSensitive = true)
     if (!groups) {
         return null;
     }
-    if (!caseSensitive && groups.some((group) => group.some(needsUnicodeCaseFold))) {
+    if (!caseSensitive && groups.some((group) => group.some((atom) => atom.kind === "lit" && needsUnicodeCaseFold(atom.text)))) {
         return null;
     }
     return groups;
+}
+
+/** 每一组都有字面量时才写入普通正文缓存。纯数字或单词类会命中很多块。 */
+export function regexPrefilterStoresPlainCache(groups: RegexPrefilterAtom[][]): boolean {
+    return groups.every((group) => group.some((atom) => atom.kind === "lit"));
 }

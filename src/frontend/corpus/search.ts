@@ -3,6 +3,7 @@ import type {Plugin} from "siyuan";
 import {
     createSearchPattern,
     extractRegexLiteralGroups,
+    regexPrefilterStoresPlainCache,
     avApiUnitShown,
     collectAvDomCoverage,
     isHitReplaceableByUnit,
@@ -302,6 +303,7 @@ async function loadPlainUnits(
     metas: BlockMeta[],
     options: SearchPipelineOptions,
     scope: string,
+    storeCache: boolean,
 ): Promise<{units: CachedUnit[]; unrendered: number}> {
     const hashes = await fetchBlockHashes(metas.filter(canCachePlainText).map((meta) => meta.id));
     const ready: CachedUnit[] = [];
@@ -326,7 +328,7 @@ async function loadPlainUnits(
     }
     const epoch = corpusEpoch;
     const extracted = await extractMetas(rootId, notebookId, missing, options, "light");
-    if (!extracted.failed && hashes && epoch === corpusEpoch) {
+    if (!extracted.failed && hashes && epoch === corpusEpoch && storeCache) {
         const after = await fetchBlockHashes(Array.from(hashAtFetch.keys()));
         if (after) {
             const byId = new Map<string, CachedUnit[]>();
@@ -639,9 +641,10 @@ export async function searchCurrentDocument(
         }
     };
 
+    let prefiltered = false;
+    let storePlainCache = !options.regex;
     if (options.regex) {
         const groups = extractRegexLiteralGroups(keyword, caseSensitive);
-        let prefiltered = false;
         if (groups) {
             const [contentIds, memoIds, titleIds] = await Promise.all([
                 fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "content"),
@@ -654,6 +657,7 @@ export async function searchCurrentDocument(
             ]);
             if (contentIds && memoIds && titleIds) {
                 prefiltered = true;
+                storePlainCache = regexPrefilterStoresPlainCache(groups);
                 for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
                     queueUnloaded(id);
                 }
@@ -694,7 +698,7 @@ export async function searchCurrentDocument(
     }
 
     const scope = collectionScope(options);
-    // 未加载普通正文按块哈希复用。抽取前后各对一次哈希，中途被改过或撤销的块不写入。
+    // 全文抽块的正则不写入普通正文缓存，避免把关键词缓存挤掉。
     if (plainTargets.length > 0) {
         const loaded = await loadPlainUnits(
             context.rootId,
@@ -702,6 +706,7 @@ export async function searchCurrentDocument(
             plainTargets,
             options,
             scope,
+            storePlainCache,
         );
         units.push(...loaded.units);
         unrendered += loaded.unrendered;

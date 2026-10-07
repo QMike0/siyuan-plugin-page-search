@@ -9,6 +9,7 @@ import {
     coercePluginPrefs,
     expandRegexReplacement,
     extractRegexLiteralGroups,
+    regexPrefilterStoresPlainCache,
     avApiUnitShown,
     collectAvDomCoverage,
     findOffsetMatchesInText,
@@ -38,6 +39,7 @@ import {
     shouldEnumerateRestrictInline,
     toggleRestrictInlineType,
 } from "../src/shared";
+import type {RegexPrefilterAtom} from "../src/shared/regex-literals";
 import {preserveReplacementCase} from "../src/frontend/preserve-case";
 
 function assert(condition: boolean, message: string) {
@@ -192,39 +194,58 @@ const badRegex = matchTextUnitsDetailed(
 );
 assert(badRegex.hits.length === 0 && badRegex.error.length > 0, "invalid regex returns error");
 
-function literalKey(groups: string[][] | null): string {
+function atomLabel(atom: RegexPrefilterAtom): string {
+    if (atom.kind === "lit") {
+        return atom.text;
+    }
+    return atom.kind === "digit" ? "#d" : "#w";
+}
+function literalKey(groups: RegexPrefilterAtom[][] | null): string {
     if (!groups) {
         return "none";
     }
-    return groups.map((group) => group.slice().sort().join("+")).sort().join("|");
+    return groups.map((group) => group.map(atomLabel).slice().sort().join("+")).sort().join("|");
 }
-function assertLiterals(pattern: string, expected: string[][] | null, caseSensitive = true) {
+const lit = (text: string): RegexPrefilterAtom => ({kind: "lit", text});
+const digit: RegexPrefilterAtom = {kind: "digit"};
+const word: RegexPrefilterAtom = {kind: "word"};
+function assertLiterals(pattern: string, expected: RegexPrefilterAtom[][] | null, caseSensitive = true) {
     const actual = extractRegexLiteralGroups(pattern, caseSensitive);
     assert(
         literalKey(actual) === literalKey(expected),
         `regex literals ${pattern}: expected ${literalKey(expected)}, got ${literalKey(actual)}`,
     );
 }
-assertLiterals("foo", [["foo"]]);
-assertLiterals("foo.*bar", [["foo", "bar"]]);
-assertLiterals("foo|bar", [["foo"], ["bar"]]);
-assertLiterals("https?://", [["http", "://"]]);
-assertLiterals("\\d+", null);
-assertLiterals("foo|\\d+", null);
-assertLiterals("中\\d+", [["中"]]);
-assertLiterals("a\\d+", null);
-assertLiterals("(foo|bar)baz", [["foo", "baz"], ["bar", "baz"]]);
-assertLiterals("(?:foo){2}", [["foofoo"]]);
-assertLiterals("^foo$", [["foo"]]);
-assertLiterals("(?=foo)bar", [["bar"]]);
-assertLiterals("[0-9]+", null);
-assertLiterals("colou?r", [["colo"]]);
+assertLiterals("foo", [[lit("foo")]]);
+assertLiterals("foo.*bar", [[lit("foo"), lit("bar")]]);
+assertLiterals("foo|bar", [[lit("foo")], [lit("bar")]]);
+assertLiterals("https?://", [[lit("http"), lit("://")]]);
+assertLiterals("\\d+", [[digit]]);
+assertLiterals("foo|\\d+", [[lit("foo")], [digit]]);
+assertLiterals("中\\d+", [[lit("中"), digit]]);
+assertLiterals("a\\d+", [[digit]]);
+assertLiterals("(foo|bar)baz", [[lit("foo"), lit("baz")], [lit("bar"), lit("baz")]]);
+assertLiterals("(?:foo){2}", [[lit("foofoo")]]);
+assertLiterals("^foo$", [[lit("foo")]]);
+assertLiterals("(?=foo)bar", [[lit("bar")]]);
+assertLiterals("[0-9]+", [[digit]]);
+assertLiterals("[0-9a]+", null);
+assertLiterals("[a0-9]", null);
+assertLiterals("[\\d.]", null);
+assertLiterals("[a]", null);
+assertLiterals("\\w+", [[word]]);
+assertLiterals(".*", null);
+assertLiterals("foo|.*", null);
+assertLiterals("colou?r", [[lit("colo")]]);
 assertLiterals("ab?", null);
-assertLiterals("École", [["École"]]);
+assertLiterals("École", [[lit("École")]]);
 assertLiterals("École", null, false);
 assertLiterals("fooÉ", null, false);
-assertLiterals("中文", [["中文"]], false);
-assertLiterals("foo", [["foo"]], false);
+assertLiterals("中文", [[lit("中文")]], false);
+assertLiterals("foo", [[lit("foo")]], false);
+assert(!regexPrefilterStoresPlainCache([[digit]]), "digit-only prefilter does not fill the plain cache");
+assert(!regexPrefilterStoresPlainCache([[lit("foo")], [digit]]), "a digit branch does not fill the plain cache");
+assert(regexPrefilterStoresPlainCache([[lit("中"), digit]]), "a literal plus digit may use the plain cache");
 
 const shownCell = collectAvDomCoverage([{
     blockId: "db",

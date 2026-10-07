@@ -1,5 +1,6 @@
 import {escSql, querySql} from "./api";
 import {isContainerType} from "./meta";
+import type {RegexPrefilterAtom} from "../../shared/regex-literals";
 
 const CONTAINER_SQL = ["d", "l", "i", "b", "s", "mindmap", "mindmap_item"].map((type) => `'${type}'`).join(", ");
 
@@ -52,15 +53,33 @@ export async function fetchMemoCandidateIds(
     return rows.map((row) => row.id).filter(Boolean);
 }
 
-function literalGroupPredicate(groups: string[][], column: string, caseSensitive: boolean): string {
+function literalGroupPredicate(
+    groups: RegexPrefilterAtom[][],
+    rawColumn: string,
+    foldedColumn: string,
+    caseSensitive: boolean,
+): string {
     const parts = groups.map((group) => {
-        const checks = group.map((literal) => {
-            const lit = escSql(caseSensitive ? literal : literal.toLowerCase());
-            return `instr(${column}, '${lit}') > 0`;
-        });
+        const checks = group.map((atom) => atomPredicate(atom, rawColumn, foldedColumn, caseSensitive));
         return checks.length === 1 ? checks[0] : `(${checks.join(" AND ")})`;
     });
     return parts.length === 1 ? parts[0] : `(${parts.join(" OR ")})`;
+}
+
+function atomPredicate(
+    atom: RegexPrefilterAtom,
+    rawColumn: string,
+    foldedColumn: string,
+    caseSensitive: boolean,
+): string {
+    if (atom.kind === "digit") {
+        return `${rawColumn} GLOB '*[0-9]*'`;
+    }
+    if (atom.kind === "word") {
+        return `${rawColumn} GLOB '*[A-Za-z0-9_]*'`;
+    }
+    const lit = escSql(caseSensitive ? atom.text : atom.text.toLowerCase());
+    return `instr(${foldedColumn}, '${lit}') > 0`;
 }
 
 /**
@@ -70,7 +89,7 @@ function literalGroupPredicate(groups: string[][], column: string, caseSensitive
  */
 export async function fetchLiteralGroupCandidateIds(
     rootId: string,
-    groups: string[][],
+    groups: RegexPrefilterAtom[][],
     caseSensitive: boolean,
     kind: "content" | "memo" | "imageTitle",
 ): Promise<string[] | null> {
@@ -79,19 +98,22 @@ export async function fetchLiteralGroupCandidateIds(
     }
     const root = escSql(rootId);
     const lowered = !caseSensitive;
-    let column = lowered ? "lower(content)" : "content";
+    let rawColumn = "content";
+    let foldedColumn = lowered ? "lower(content)" : "content";
     let scope = `AND type NOT IN (${CONTAINER_SQL}) `;
     let extra = " OR type = 'query_embed' OR instr(markdown, 'inline-math') > 0";
     if (kind === "memo") {
-        column = lowered ? "lower(markdown)" : "markdown";
+        rawColumn = "markdown";
+        foldedColumn = lowered ? "lower(markdown)" : "markdown";
         scope = "AND instr(markdown, 'data-inline-memo-content') > 0 ";
         extra = "";
     } else if (kind === "imageTitle") {
-        column = lowered ? "lower(markdown)" : "markdown";
+        rawColumn = "markdown";
+        foldedColumn = lowered ? "lower(markdown)" : "markdown";
         scope = "AND instr(markdown, 'protyle-action__title') > 0 ";
         extra = "";
     }
-    const predicate = literalGroupPredicate(groups, column, caseSensitive);
+    const predicate = literalGroupPredicate(groups, rawColumn, foldedColumn, caseSensitive);
     const rows = await querySql<{id: string}>(
         `SELECT id FROM blocks WHERE root_id = '${root}' `
         + scope
