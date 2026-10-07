@@ -124,6 +124,43 @@ export async function fetchImageTitleCandidateIds(
     return rows.map((row) => row.id).filter(Boolean);
 }
 
+const HASH_ID_CHUNK = 400;
+
+/** 直接读当前哈希，不走文档元数据缓存。查询失败返回 null。 */
+export async function fetchBlockHashes(ids: string[]): Promise<Map<string, string> | null> {
+    const unique: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+        if (!id || seen.has(id)) {
+            continue;
+        }
+        seen.add(id);
+        unique.push(id);
+    }
+    const hashes = new Map<string, string>();
+    if (unique.length === 0) {
+        return hashes;
+    }
+    for (let index = 0; index < unique.length; index += HASH_ID_CHUNK) {
+        const list = unique.slice(index, index + HASH_ID_CHUNK)
+            .map((id) => `'${escSql(id)}'`)
+            .join(", ");
+        const rows = await querySql<{id?: string; hash?: string}>(
+            `SELECT id, hash FROM blocks WHERE id IN (${list})`,
+        );
+        if (!rows) {
+            return null;
+        }
+        for (const row of rows) {
+            if (!row.id) {
+                continue;
+            }
+            hashes.set(row.id, String(row.hash ?? ""));
+        }
+    }
+    return hashes;
+}
+
 export function isSpecialRenderType(type: string, subtype: string): boolean {
     if (type === "html" || type === "m") {
         return true;

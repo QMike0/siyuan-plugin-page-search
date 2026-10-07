@@ -28,6 +28,7 @@ import {
     isSpecialRenderType,
 } from "./sql";
 import {
+    fetchBlockHashes,
     fetchContentCandidateIds,
     fetchImageTitleCandidateIds,
     fetchLiteralGroupCandidateIds,
@@ -42,15 +43,19 @@ import {freezeBlock, restrictSpanCovers, type CachedUnit} from "./units";
 import type {OffscreenRenderMode} from "./offscreen";
 
 const textCache = new Map<string, {hash: string; units: CachedUnit[]}>();
+/** 每个文档保留的普通正文缓存条数。图表缓存不走这条名单。 */
+const PLAIN_CACHE_LIMIT = 2000;
+const plainCacheKeys = new Map<string, string[]>();
 const jobs = new Map<string, Promise<void>>();
 let corpusEpoch = 0;
 
 export function invalidateTextCache(): void {
     textCache.clear();
+    plainCacheKeys.clear();
 }
 
 export function invalidateDocumentSearchCaches(): void {
-    textCache.clear();
+    invalidateTextCache();
     invalidateDocMeta();
     invalidateDocOrder();
     invalidateAvCache();
@@ -203,9 +208,9 @@ async function extractMetas(
     metas: BlockMeta[],
     options: SearchPipelineOptions,
     mode: OffscreenRenderMode,
-): Promise<{units: CachedUnit[]; unrendered: number; failed: boolean}> {
+): Promise<{units: CachedUnit[]; unrendered: number; unrenderedIds: string[]; failed: boolean}> {
     if (metas.length === 0) {
-        return {units: [], unrendered: 0, failed: false};
+        return {units: [], unrendered: 0, unrenderedIds: [], failed: false};
     }
     const epoch = corpusEpoch;
     const scope = collectionScope(options);
@@ -218,7 +223,7 @@ async function extractMetas(
         mode,
     );
     if (!extracted) {
-        return {units: [], unrendered: 0, failed: true};
+        return {units: [], unrendered: 0, unrenderedIds: [], failed: true};
     }
     const byId = new Map<string, CachedUnit[]>();
     for (const unit of extracted.units) {
@@ -235,7 +240,112 @@ async function extractMetas(
         }
         units.push(...list);
     }
-    return {units, unrendered: extracted.unrenderedIds.length, failed: false};
+    return {
+        units,
+        unrendered: extracted.unrenderedIds.length,
+        unrenderedIds: extracted.unrenderedIds,
+        failed: false,
+    };
+}
+
+function canCachePlainText(meta: BlockMeta): boolean {
+    return !isEmbedType(meta.type) && !isSpecialRenderType(meta.type, meta.subtype);
+}
+
+function readPlainCache(rootId: string, blockId: string, scope: string, hash: string): CachedUnit[] | null {
+    if (!hash) {
+        return null;
+    }
+    const cached = textCache.get(cacheKey(rootId, blockId, scope));
+    if (!cached || cached.hash !== hash || !cached.units.some((unit) => unit.text.trim())) {
+        return null;
+    }
+    return cached.units;
+}
+
+function rememberPlain(
+    rootId: string,
+    blockId: string,
+    scope: string,
+    hash: string,
+    units: CachedUnit[],
+): void {
+    if (!hash || !units.some((unit) => unit.text.trim())) {
+        return;
+    }
+    const key = cacheKey(rootId, blockId, scope);
+    textCache.set(key, {hash, units: units.slice()});
+    const order = plainCacheKeys.get(rootId) ?? [];
+    const existing = order.indexOf(key);
+    if (existing >= 0) {
+        order.splice(existing, 1);
+    }
+    order.push(key);
+    while (order.length > PLAIN_CACHE_LIMIT) {
+        const dropped = order.shift();
+        if (dropped) {
+            textCache.delete(dropped);
+        }
+    }
+    plainCacheKeys.set(rootId, order);
+}
+
+/**
+ * 未加载普通正文：哈希未变则复用上次抽出的文字。
+ * 嵌入块、公式、图表和 HTML 不进这份缓存。哈希查询失败时全部重抽且不写入。
+ */
+async function loadPlainUnits(
+    rootId: string,
+    notebookId: string,
+    metas: BlockMeta[],
+    options: SearchPipelineOptions,
+    scope: string,
+): Promise<{units: CachedUnit[]; unrendered: number}> {
+    const hashes = await fetchBlockHashes(metas.filter(canCachePlainText).map((meta) => meta.id));
+    const ready: CachedUnit[] = [];
+    const missing: BlockMeta[] = [];
+    const hashAtFetch = new Map<string, string>();
+    for (const meta of metas) {
+        const hash = hashes?.get(meta.id) ?? "";
+        const cached = hashes && canCachePlainText(meta)
+            ? readPlainCache(rootId, meta.id, scope, hash)
+            : null;
+        if (cached) {
+            ready.push(...cached);
+            continue;
+        }
+        missing.push(meta);
+        if (hashes && hash && canCachePlainText(meta)) {
+            hashAtFetch.set(meta.id, hash);
+        }
+    }
+    if (missing.length === 0) {
+        return {units: ready, unrendered: 0};
+    }
+    const epoch = corpusEpoch;
+    const extracted = await extractMetas(rootId, notebookId, missing, options, "light");
+    if (!extracted.failed && hashes && epoch === corpusEpoch) {
+        const after = await fetchBlockHashes(Array.from(hashAtFetch.keys()));
+        if (after) {
+            const byId = new Map<string, CachedUnit[]>();
+            for (const unit of extracted.units) {
+                const list = byId.get(unit.blockId) ?? [];
+                list.push(unit);
+                byId.set(unit.blockId, list);
+            }
+            const failed = new Set(extracted.unrenderedIds);
+            for (const [id, hash] of hashAtFetch) {
+                if (failed.has(id) || after.get(id) !== hash) {
+                    continue;
+                }
+                rememberPlain(rootId, id, scope, hash, byId.get(id) ?? []);
+            }
+        }
+    }
+    return {
+        units: ready.concat(extracted.units),
+        unrendered: extracted.unrendered,
+    };
 }
 
 function startJob(key: string, rootId: string, work: () => Promise<void>): void {
@@ -582,18 +692,17 @@ export async function searchCurrentDocument(
     }
 
     const scope = collectionScope(options);
-    // 未加载正文不走文本缓存。替换后再 Ctrl+Z，缓存里可能仍是替换后的字，
-    // 已加载块能从界面看到原文，未加载块就会对不上。每次按 SQL 候选重新读块，和 highlight-search 一样。
+    // 未加载普通正文按块哈希复用。抽取前后各对一次哈希，中途被改过或撤销的块不写入。
     if (plainTargets.length > 0) {
-        const extracted = await extractMetas(
+        const loaded = await loadPlainUnits(
             context.rootId,
             context.notebookId,
             plainTargets,
             options,
-            "light",
+            scope,
         );
-        units.push(...extracted.units);
-        unrendered += extracted.unrendered;
+        units.push(...loaded.units);
+        unrendered += loaded.unrendered;
     }
 
     const specialState = cachedUnits(context.rootId, specialTargets, scope);
