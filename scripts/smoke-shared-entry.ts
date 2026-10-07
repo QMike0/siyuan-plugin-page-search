@@ -10,9 +10,15 @@ import {
     expandRegexReplacement,
     extractRegexLiteralGroups,
     regexPrefilterStoresPlainCache,
+    avApiUnitInView,
     avApiUnitShown,
     collectAvDomCoverage,
+    countVirtualTableRows,
+    createTextMatchProbe,
     findOffsetMatchesInText,
+    mergeVirtualTableUnits,
+    tableCellNodeId,
+    tableCellPosition,
     formatSearchCountLabel,
     generateSearchVariants,
     hasRestrictInlineType,
@@ -60,6 +66,14 @@ assert(!tightVariants.includes("ab"), "tight skips no-whitespace variant");
 const zwText = "hello\u200Bworld";
 const matches = findOffsetMatchesInText(zwText.toLowerCase(), "helloworld");
 assert(matches.length >= 1, "finds zero-width-spanning match");
+const tagText = "\u200b#tag#\u200b";
+const tagMatches = findOffsetMatchesInText(tagText, "tag");
+assert(tagMatches.length === 1, `inline tag with boundary zero-width counts once, got ${tagMatches.length}`);
+const twoTags = "\u200btag\u200b and \u200btag\u200b";
+assert(
+    findOffsetMatchesInText(twoTags, "tag").length === 2,
+    "two inline tags still count separately",
+);
 assert(
     matches.some((m) => m.startIndex === 0 && m.endIndex === zwText.length),
     "maps to original span",
@@ -263,6 +277,18 @@ assert(
 assert(
     shown ? !avApiUnitShown("av:row2:col1", "未挂载", shown, usedRows) : true,
     "unmounted row is kept",
+);
+assert(
+    shown ? avApiUnitInView("av:row2:col1", shown, "table") : false,
+    "unmounted row of a visible column stays in a table view",
+);
+assert(
+    shown ? !avApiUnitInView("av:row2:colHidden", shown, "list") : true,
+    "list view does not add a column that is not on screen",
+);
+assert(
+    shown ? !avApiUnitInView("av:row1:colHidden", shown, "calendar") : true,
+    "calendar view does not add a field that is not on the card",
 );
 const unstable = collectAvDomCoverage([{
     blockId: "db",
@@ -766,5 +792,80 @@ assert(plainTextFromInlineMemoContent("plain memo") === "plain memo", "memo plai
 assert(plainTextFromInlineMemoContent("a <b>x</b> c") === "a x c", "memo strips tags");
 assert(plainTextFromInlineMemoContent("") === "", "memo empty");
 assert(sanitizeInlineMemoContentForWrite("keep") === "keep", "memo sanitize noop without DOMPurify");
+
+assert(tableCellPosition("table-cell:1:2") === "1:2", "table cell position without node id");
+assert(tableCellPosition("table-cell:1:2:abc") === "1:2", "table cell position ignores node id");
+assert(tableCellNodeId("table-cell:1:2:abc") === "abc", "table cell id");
+assert(tableCellNodeId("table-cell:1:2") === "", "table cell without id");
+assert(tableCellNodeId("table-cell:1:2:a:b") === "a:b", "table cell id may contain colons");
+assert(countVirtualTableRows("<tr><td>a</td></tr><tr><td>b</td></tr>") === 2, "count omitted rows");
+assert(countVirtualTableRows("<tr><td>&lt;tr</td></tr>") === 1, "escaped tr in a cell is not a row");
+assert(countVirtualTableRows("") === 0, "empty placeholder has no rows");
+assert(countVirtualTableRows("<TR><td></td></TR>") === 1, "uppercase row tag still counts");
+
+const looseProbe = createTextMatchProbe("ab", {});
+assert(looseProbe("a\u200bb"), "probe sees a match across a zero-width char");
+assert(!looseProbe("zz"), "probe rejects a miss");
+const spacedProbe = createTextMatchProbe("foo bar", {});
+assert(spacedProbe("foobar"), "probe keeps the no-whitespace variant");
+assert(spacedProbe("foo bar"), "probe keeps the original keyword");
+const wholeProbe = createTextMatchProbe("cat", {wholeWord: true});
+assert(wholeProbe("catalog"), "whole-word probe may over-include");
+assert(
+    findOffsetMatchesInText("catalog", "cat", {wholeWord: true}).length === 0,
+    "whole-word matcher still rejects catalog",
+);
+
+const tableCell = (unitId: string, text: string) => ({
+    blockId: "t",
+    blockType: "NodeTable",
+    unitId,
+    text,
+});
+const kernelCellA = tableCell("table-cell:0:0", "旧");
+const kernelCellB = tableCell("table-cell:0:1", "保持");
+const liveCellA = tableCell("table-cell:4:0", "新");
+const liveCellB = tableCell("table-cell:4:1", "保\u200b持");
+const liveCellE = tableCell("table-cell:8:0", "刚输入");
+const tableMerged = mergeVirtualTableUnits(
+    [
+        kernelCellA,
+        {blockId: "p", blockType: "NodeParagraph", text: "段落"},
+        kernelCellB,
+        tableCell("table-cell:1:0", "将被清空"),
+        tableCell("table-cell:9:0", "屏外"),
+    ],
+    new Map([["t", {
+        shownKeys: new Set(["0:0", "0:1", "1:0", "5:0"]),
+        liveByKey: new Map([
+            ["0:0", liveCellA],
+            ["0:1", liveCellB],
+            ["5:0", liveCellE],
+        ]),
+        unstable: false,
+    }]]),
+);
+const tableTexts = tableMerged.units.map((unit) => unit.text);
+assert(tableTexts.indexOf("新") >= 0, "edited virtual cell uses the live text");
+assert(tableTexts.indexOf("旧") < 0, "edited virtual cell drops the kernel text");
+assert(tableMerged.units.indexOf(kernelCellB) >= 0, "unchanged virtual cell keeps the kernel unit");
+assert(tableTexts.indexOf("将被清空") < 0, "cleared virtual cell drops the kernel text");
+assert(tableTexts.indexOf("屏外") >= 0, "unmounted virtual row stays on the kernel text");
+assert(tableTexts.indexOf("刚输入") >= 0, "new virtual cell text is searchable before commit");
+assert(tableTexts.indexOf("段落") >= 0, "virtual table merge keeps other blocks");
+assert(tableMerged.staleKeys.has("t\u0000table-cell:4:0"), "edited virtual cell is not replaceable from the old html");
+assert(!tableMerged.staleKeys.has("t\u0000table-cell:0:1"), "unchanged virtual cell stays replaceable");
+assert(tableMerged.staleKeys.has("t\u0000table-cell:8:0"), "cell missing from the kernel is not replaceable yet");
+
+const unstableTable = mergeVirtualTableUnits(
+    [tableCell("not-a-cell", "无位置"), tableCell("table-cell:0:0", "有")],
+    new Map([["t", {
+        shownKeys: new Set(["0:0"]),
+        liveByKey: new Map([["0:0", tableCell("table-cell:3:0", "改")]]),
+        unstable: false,
+    }]]),
+);
+assert(unstableTable.units.map((unit) => unit.text).indexOf("改") < 0, "a cell without a row and column keeps the kernel text");
+assert(unstableTable.staleKeys.size === 0, "kernel-only table does not mark cells stale");
 
 console.log("smoke:shared OK (match + restrict + selection + preserve-case + regex-replace + doc-title + inline-memo)");

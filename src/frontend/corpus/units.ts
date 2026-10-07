@@ -6,7 +6,7 @@ import {
     type RestrictInlineType,
 } from "../../shared";
 import {isInlineMathSearchUnit, isInlineMemoSearchUnit} from "../blocks";
-import type {SearchableBlock, SearchMatch} from "../dom-types";
+import type {SearchableBlock, SearchMatch, TableSlot} from "../dom-types";
 
 const HOST_TYPES = new Set<string>(
     RESTRICT_INLINE_TYPE_ALLOWLIST.filter((token) => token !== INLINE_MATH_TYPE && token !== INLINE_MEMO_TYPE),
@@ -25,8 +25,12 @@ export interface CachedUnit {
     restrictSpans: Array<{type: string; start: number; end: number}>;
     /** 行内备注宿主在所属块文本中的起始偏移。 */
     anchorOffset?: number;
+    /** 行内备注宿主在所属块文本中的结束偏移。 */
+    anchorEnd?: number;
     /** 数据库命中的视图名、列名和显示值。 */
     snippet?: string;
+    tableSlot?: TableSlot;
+    mathOrdinal?: number;
 }
 
 function nonReplaceable(block: SearchableBlock): boolean {
@@ -77,7 +81,11 @@ function collectRestrictSpans(block: SearchableBlock): CachedUnit["restrictSpans
     return spans;
 }
 
-export function freezeBlock(block: SearchableBlock, blockIndex = block.blockIndex): CachedUnit {
+export function freezeBlock(
+    block: SearchableBlock,
+    blockIndex = block.blockIndex,
+    includeRestrict = true,
+): CachedUnit {
     const lengths = nonReplaceable(block)
         ? undefined
         : block.textNodes.map((node) => node.nodeValue?.length ?? 0);
@@ -95,8 +103,11 @@ export function freezeBlock(block: SearchableBlock, blockIndex = block.blockInde
         unitId: block.unitId,
         segmentLengths: lengths?.some((length) => length > 0) ? lengths : undefined,
         highlightKind,
-        restrictSpans: collectRestrictSpans(block),
+        restrictSpans: includeRestrict ? collectRestrictSpans(block) : [],
         anchorOffset: block.anchorOffset,
+        anchorEnd: block.anchorEnd,
+        tableSlot: block.tableSlot,
+        mathOrdinal: block.mathOrdinal,
     };
 }
 

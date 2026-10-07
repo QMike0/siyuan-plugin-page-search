@@ -13,6 +13,7 @@ import {
     applyMatchesToSubmitClone,
 } from "./replacement";
 import {unitKey} from "./selection";
+import {tableHostOmitsRows} from "../shared";
 
 const DOC_TITLE_BLOCK_ID = "__doc-title__";
 
@@ -151,10 +152,13 @@ function editorTableOmitsRows(element: HTMLElement): boolean {
     if (type !== "NodeTable" && !element.classList.contains("table")) {
         return false;
     }
-    return element.hasAttribute("data-sy-table-virtual-id")
-        || element.querySelector(
-            "[data-sy-table-virtual-rows], [data-sy-table-virtual-columns], [data-sy-table-virtual-id]",
-        ) !== null;
+    if (tableHostOmitsRows(element)) {
+        return true;
+    }
+    // 嵌套大表仍虚拟着时，外层界面 HTML 不是完整内容。替换必须走 getBlockDOM。
+    return element.querySelector(
+        "[data-sy-table-virtual-rows], [data-sy-table-virtual-columns], [data-sy-table-virtual-id]",
+    ) !== null;
 }
 
 /** 思源 3.8 的块类型锁：更新后的根类型必须和原块一致。 */

@@ -2,11 +2,14 @@ import type {RestrictInlineType} from "../shared";
 import {collectSearchableBlocks} from "./blocks";
 import {createRangeFromBlockOffsets} from "./ranges";
 import {
+    collectAttributeViewSelectionHosts,
     getActiveTableSelectCells,
     getSelectionScope,
     hasActiveTableCellSelect,
+    selectionScopeFromTableCellText,
     unitKeyOf,
     type SelectionScope,
+    type TableCellTextSelection,
 } from "./selection";
 
 /** 与思源 .protyle-wysiwyg--select 对齐的冻结选区提示（仅用于清扫历史污染 class，不再写入内容块） */
@@ -51,6 +54,15 @@ export interface TableCellVisualRef {
     cellId?: string;
 }
 
+/** 冻结数据库格子、勾选行或画廊卡片。重绘时按 id 找回，不写进文档。 */
+export interface AvScopeVisualRef {
+    avBlockId: string;
+    groupId: string;
+    rowId: string;
+    colId?: string;
+    kind: "cell" | "row" | "gallery";
+}
+
 /**
  * 判别当前是行内文字选区还是块级/表格框选。
  * 与 getSelectionScope 一致：非空文本选区优先，否则看表格 .table__select 或 .protyle-wysiwyg--select。
@@ -87,11 +99,13 @@ export function applySelectionScopeVisual(
     kind?: SelectionScopeVisualKind | null,
     visualBlockIds?: string[] | null,
     tableCellRefs?: TableCellVisualRef[] | null,
+    avScopeRefs?: AvScopeVisualRef[] | null,
 ): void {
     clearSelectionScopeVisual(edit);
     const hasVisualIds = Boolean(visualBlockIds && visualBlockIds.length > 0);
     const hasTableCellRefs = Boolean(tableCellRefs && tableCellRefs.length > 0);
-    if (scope.size === 0 && !hasVisualIds && !hasTableCellRefs) {
+    const hasAvRefs = Boolean(avScopeRefs && avScopeRefs.length > 0);
+    if (scope.size === 0 && !hasVisualIds && !hasTableCellRefs && !hasAvRefs) {
         const liveSelect = edit.querySelector(".protyle-wysiwyg .protyle-wysiwyg--select");
         if (!liveSelect) {
             return;
@@ -104,7 +118,7 @@ export function applySelectionScopeVisual(
         return;
     }
     if (resolvedKind === "table-cells") {
-        applyTableCellScopeVisual(edit, scope, tableCellRefs);
+        applyTableCellScopeVisual(edit, scope, tableCellRefs, avScopeRefs);
         return;
     }
     if (resolvedKind === "text") {
@@ -112,8 +126,8 @@ export function applySelectionScopeVisual(
         return;
     }
 
-    if (hasTableCellRefs) {
-        applyTableCellScopeVisual(edit, scope, tableCellRefs);
+    if (hasTableCellRefs || hasAvRefs) {
+        applyTableCellScopeVisual(edit, scope, tableCellRefs, avScopeRefs);
     } else if (hasVisualIds || looksLikeFullBlockScope(edit, scope)) {
         applyBlockScopeVisual(edit, scope, visualBlockIds);
     } else {
@@ -184,25 +198,43 @@ function applyBlockScopeVisual(
 }
 
 /**
- * 表格单元格框选：底色只覆盖冻结的 td/th，右侧竖线仍归并到整张 NodeTable。
+ * 单元格选区：底色和右侧竖线都只覆盖选中的格子或行，不升到整张表或整个数据库。
  * 叠加层全部位于 .protyle-content，不给单元格写 class / 子节点。
  */
 function applyTableCellScopeVisual(
     edit: Element,
     scope: SelectionScope,
-    refs?: TableCellVisualRef[] | null,
+    tableRefs?: TableCellVisualRef[] | null,
+    avRefs?: AvScopeVisualRef[] | null,
 ): void {
-    const cells = resolveTableCellVisualElements(edit, scope, refs);
-    applySelectionScopeWash(edit, cells);
-    applySelectionScopeRails(edit, cells);
+    const nodes: HTMLElement[] = [];
+    const seen = new Set<HTMLElement>();
+    const push = (node: HTMLElement | null) => {
+        if (!node || seen.has(node)) {
+            return;
+        }
+        seen.add(node);
+        nodes.push(node);
+    };
+    if (tableRefs && tableRefs.length > 0) {
+        elementsForTableCellRefs(edit, tableRefs).forEach(push);
+    }
+    if (avRefs && avRefs.length > 0) {
+        resolveAvScopeVisualElements(edit, avRefs).forEach(push);
+    }
+    if (nodes.length === 0) {
+        resolveScopeCellElements(edit, scope).forEach(push);
+    }
+    applySelectionScopeWash(edit, nodes);
+    applySelectionScopeRails(edit, nodes, false);
 }
 
-/** 捕获当前 `.table__select` 命中的单元格位置，供光标移动后重建视觉提示。 */
-function captureTableCellVisualRefs(edit: Element): TableCellVisualRef[] {
+function tableCellRefsFromCells(cells: readonly HTMLTableCellElement[]): TableCellVisualRef[] {
     const refs: TableCellVisualRef[] = [];
     const seen = new Set<string>();
 
-    for (const cell of getActiveTableSelectCells(edit)) {
+    for (let index = 0; index < cells.length; index += 1) {
+        const cell = cells[index];
         const table = cell.closest<HTMLElement>('[data-type="NodeTable"], .table');
         const tableBlockId = table?.getAttribute("data-node-id")?.trim();
         const row = cell.closest<HTMLElement>(".table__row, tr");
@@ -231,55 +263,151 @@ function captureTableCellVisualRefs(edit: Element): TableCellVisualRef[] {
     return refs;
 }
 
-function resolveTableCellVisualElements(
+export function elementsForTableCellRefs(
     edit: Element,
-    scope: SelectionScope,
-    refs?: TableCellVisualRef[] | null,
+    refs: readonly TableCellVisualRef[],
 ): HTMLElement[] {
     const cells: HTMLElement[] = [];
     const seen = new Set<HTMLElement>();
-    const push = (cell: HTMLElement | null) => {
+    for (let index = 0; index < refs.length; index += 1) {
+        const cell = resolveOneTableCell(edit, refs[index]);
         if (!cell || seen.has(cell)) {
-            return;
+            continue;
         }
         seen.add(cell);
         cells.push(cell);
+    }
+    return cells;
+}
+
+function resolveOneTableCell(edit: Element, ref: TableCellVisualRef): HTMLElement | null {
+    const table = edit.querySelector<HTMLElement>(
+        `.protyle-wysiwyg [data-node-id="${cssEscapeAttr(ref.tableBlockId)}"][data-type="NodeTable"],`
+        + `.protyle-wysiwyg .table[data-node-id="${cssEscapeAttr(ref.tableBlockId)}"]`,
+    );
+    if (!table) {
+        return null;
+    }
+    if (ref.cellId) {
+        const byId = table.querySelector<HTMLElement>(
+            `[data-node-id="${cssEscapeAttr(ref.cellId)}"]`,
+        );
+        if (byId?.matches("td, th, .table__cell")) {
+            return byId;
+        }
+    }
+    const row = getOwnedTableRows(table)[ref.rowIndex];
+    return row ? getOwnedRowCells(row)[ref.columnIndex] ?? null : null;
+}
+
+function avScopeVisualRefsFromHosts(hosts: readonly HTMLElement[]): AvScopeVisualRef[] {
+    const refs: AvScopeVisualRef[] = [];
+    const seen = new Set<string>();
+    const push = (ref: AvScopeVisualRef) => {
+        const key = `${ref.kind}:${ref.avBlockId}:${ref.groupId}:${ref.rowId}:${ref.colId ?? ""}`;
+        if (seen.has(key)) {
+            return;
+        }
+        seen.add(key);
+        refs.push(ref);
     };
 
-    for (const ref of refs ?? []) {
-        const table = edit.querySelector<HTMLElement>(
-            `.protyle-wysiwyg [data-node-id="${cssEscapeAttr(ref.tableBlockId)}"][data-type="NodeTable"],`
-            + `.protyle-wysiwyg .table[data-node-id="${cssEscapeAttr(ref.tableBlockId)}"]`,
-        );
-        if (!table) {
+    for (let index = 0; index < hosts.length; index += 1) {
+        const host = hosts[index];
+        const av = host.closest<HTMLElement>('[data-type="NodeAttributeView"][data-node-id], .av[data-node-id]');
+        const avBlockId = av?.getAttribute("data-node-id")?.trim();
+        if (!avBlockId) {
             continue;
         }
-        if (ref.cellId) {
-            const byId = table.querySelector<HTMLElement>(
-                `[data-node-id="${cssEscapeAttr(ref.cellId)}"]`,
-            );
-            if (byId?.matches("td, th, .table__cell")) {
-                push(byId);
-                continue;
+        const groupId = host.closest<HTMLElement>(".av__body")?.getAttribute("data-group-id")?.trim() || "";
+        if (host.classList.contains("av__gallery-item")) {
+            const rowId = host.dataset.id?.trim();
+            if (rowId) {
+                push({avBlockId, groupId, rowId, kind: "gallery"});
             }
+            continue;
         }
-        const row = getOwnedTableRows(table)[ref.rowIndex];
-        push(row ? getOwnedRowCells(row)[ref.columnIndex] ?? null : null);
+        if (host.classList.contains("av__row")) {
+            const rowId = host.dataset.id?.trim();
+            if (rowId) {
+                push({avBlockId, groupId, rowId, kind: "row"});
+            }
+            continue;
+        }
+        const row = host.closest<HTMLElement>(".av__row[data-id], .av__gallery-item[data-id]");
+        const rowId = row?.dataset.id?.trim();
+        const colId = host.getAttribute("data-col-id")?.trim();
+        if (rowId && colId) {
+            push({avBlockId, groupId, rowId, colId, kind: "cell"});
+        }
     }
+    return refs;
+}
 
-    if (cells.length > 0) {
+function resolveAvScopeVisualElements(
+    edit: Element,
+    refs: readonly AvScopeVisualRef[],
+): HTMLElement[] {
+    const nodes: HTMLElement[] = [];
+    const seen = new Set<HTMLElement>();
+    for (let index = 0; index < refs.length; index += 1) {
+        const ref = refs[index];
+        const av = edit.querySelector<HTMLElement>(
+            `[data-node-id="${cssEscapeAttr(ref.avBlockId)}"]`,
+        );
+        if (!av) {
+            continue;
+        }
+        const root: ParentNode = ref.groupId
+            ? av.querySelector<HTMLElement>(`.av__body[data-group-id="${cssEscapeAttr(ref.groupId)}"]`) ?? av
+            : av;
+        let node: HTMLElement | null = null;
+        if (ref.kind === "gallery") {
+            node = root.querySelector<HTMLElement>(
+                `.av__gallery-item[data-id="${cssEscapeAttr(ref.rowId)}"]`,
+            );
+        } else if (ref.kind === "row") {
+            node = root.querySelector<HTMLElement>(
+                `.av__row[data-id="${cssEscapeAttr(ref.rowId)}"]`,
+            );
+        } else if (ref.colId) {
+            const row = root.querySelector<HTMLElement>(
+                `.av__row[data-id="${cssEscapeAttr(ref.rowId)}"], .av__gallery-item[data-id="${cssEscapeAttr(ref.rowId)}"]`,
+            );
+            node = row?.querySelector<HTMLElement>(
+                `.av__cell[data-col-id="${cssEscapeAttr(ref.colId)}"]`,
+            ) ?? null;
+        }
+        if (!node || seen.has(node)) {
+            continue;
+        }
+        seen.add(node);
+        nodes.push(node);
+    }
+    return nodes;
+}
+
+/** 坐标失效时，按冻结 scope 回放格子。只在没有可用 ref 时走，避免每次滚动都扫全文。 */
+function resolveScopeCellElements(edit: Element, scope: SelectionScope): HTMLElement[] {
+    const cells: HTMLElement[] = [];
+    if (scope.size === 0) {
         return cells;
     }
-
-    // 旧状态或 DOM 重建后无 refs 时，按冻结 scope 回放非空单元格。
     const scopedKeys = new Set(scope.keys());
+    const seen = new Set<HTMLElement>();
     for (const block of collectSearchableBlocks(edit)) {
         if (!scopedKeys.has(unitKeyOf(block))) {
             continue;
         }
-        if (block.element.matches("td, th, .table__cell")) {
-            push(block.element);
+        const element = block.element;
+        const cell = element.matches("td, th, .table__cell, .av__cell, .av__gallery-item, .av__row")
+            ? element
+            : element.closest<HTMLElement>("td, th, .av__cell, .av__gallery-item");
+        if (!cell || seen.has(cell)) {
+            continue;
         }
+        seen.add(cell);
+        cells.push(cell);
     }
     return cells;
 }
@@ -603,11 +731,15 @@ function releaseOverlayHostIfIdle(edit: Element): void {
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/getBlock.ts
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/ui/initUI.ts
  */
-function applySelectionScopeRails(edit: Element, blocks: HTMLElement[]): void {
+function applySelectionScopeRails(
+    edit: Element,
+    blocks: HTMLElement[],
+    collapseHosts = true,
+): void {
     clearSelectionScopeRails(edit);
-    const railHosts = collapseToOutermostHosts(
-        blocks.map((block) => resolveVisualHostElement(block)),
-    );
+    const railHosts = collapseHosts
+        ? collapseToOutermostHosts(blocks.map((block) => resolveVisualHostElement(block)))
+        : collapseToOutermostHosts(blocks);
     if (railHosts.length === 0) {
         return;
     }
@@ -938,11 +1070,15 @@ export function captureSelectionScopeWithKind(
         includeInlineMemo?: boolean;
         restrictInlineTypes?: RestrictInlineType[];
     },
+    tableCells?: readonly HTMLTableCellElement[],
+    includeAttributeViewCells = true,
+    tableCellText?: TableCellTextSelection | null,
 ): {
     scope: SelectionScope;
     kind: SelectionScopeVisualKind | null;
     visualBlockIds: string[];
     tableCellRefs: TableCellVisualRef[];
+    avScopeRefs: AvScopeVisualRef[];
 } {
     const blocks = collectSearchableBlocks(edit, {
         includeDocTitle: options?.includeDocTitle !== false,
@@ -972,9 +1108,53 @@ export function captureSelectionScopeWithKind(
         includeInlineMemo: options?.includeInlineMemo === true,
         restrictInlineTypes: options?.restrictInlineTypes,
     });
-    const kind = detectSelectionScopeKind(edit);
-    const scope = getSelectionScope(edit, blocks);
-    const visualBlockIds = kind === "text" ? [] : captureSelectedBlockIds(edit);
-    const tableCellRefs = kind === "table-cells" ? captureTableCellVisualRefs(edit) : [];
-    return {scope, kind, visualBlockIds, tableCellRefs};
+    if (tableCellText) {
+        const cellTextScope = selectionScopeFromTableCellText(blocks, tableCellText);
+        if (cellTextScope.size > 0) {
+            return {
+                scope: cellTextScope,
+                kind: "text",
+                visualBlockIds: [],
+                tableCellRefs: [],
+                avScopeRefs: [],
+            };
+        }
+    }
+    const selection = window.getSelection();
+    const preferText = Boolean(
+        selection
+        && selection.rangeCount > 0
+        && !selection.isCollapsed
+        && selection.toString().length > 0,
+    );
+    const snappedCells = preferText || !tableCells || tableCells.length === 0
+        ? []
+        : tableCells;
+    const legacyCells = !preferText && snappedCells.length === 0 && hasActiveTableCellSelect(edit)
+        ? getActiveTableSelectCells(edit)
+        : [];
+    const cells = snappedCells.length > 0 ? snappedCells : legacyCells;
+    const avHosts = preferText || !includeAttributeViewCells
+        ? []
+        : collectAttributeViewSelectionHosts(edit);
+    const scope = getSelectionScope(
+        edit,
+        blocks,
+        snappedCells.length > 0 ? snappedCells : undefined,
+        includeAttributeViewCells,
+    );
+    const cellMode = !preferText && (snappedCells.length > 0 || avHosts.length > 0);
+    const kind: SelectionScopeVisualKind | null = preferText && scope.size > 0
+        ? "text"
+        : cellMode || cells.length > 0
+            ? "table-cells"
+            : edit.querySelector(".protyle-wysiwyg .protyle-wysiwyg--select")
+                ? "block"
+                : null;
+    // 新的格子选区不能记下整块 id，否则刷新时会把整个数据库补进选区。
+    // 旧的 .table__select 仍记下块 id，和原来的块选合并保持一致。
+    const visualBlockIds = kind === "text" || cellMode ? [] : captureSelectedBlockIds(edit);
+    const tableCellRefs = kind === "table-cells" ? tableCellRefsFromCells(cells) : [];
+    const avScopeRefs = cellMode ? avScopeVisualRefsFromHosts(avHosts) : [];
+    return {scope, kind, visualBlockIds, tableCellRefs, avScopeRefs};
 }

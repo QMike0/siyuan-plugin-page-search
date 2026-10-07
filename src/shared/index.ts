@@ -7,6 +7,7 @@ export {
 export {
     createSearchPattern,
     escapeForRegex,
+    createTextMatchProbe,
     findOffsetMatchesInText,
     generateSearchVariants,
     isHitReplaceableByUnit,
@@ -22,7 +23,14 @@ export {
     expandReplacementTemplate,
 } from "./regex-replace";
 export {extractRegexLiteralGroups, regexPrefilterStoresPlainCache} from "./regex-literals";
-export {avApiUnitShown, collectAvDomCoverage} from "./av-live";
+export {avApiUnitInView, avApiUnitShown, collectAvDomCoverage} from "./av-live";
+export {
+    countVirtualTableRows,
+    mergeVirtualTableUnits,
+    tableCellNodeId,
+    tableCellPosition,
+    tableHostOmitsRows,
+} from "./table-live";
 export type {ExpandRegexReplacementOptions} from "./regex-replace";
 export {
     plainTextFromInlineMemoContent,

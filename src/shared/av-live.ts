@@ -6,6 +6,8 @@
 export interface AvDomCoverage {
     unstable: boolean;
     cells: Set<string>;
+    /** 当前视图画面上出现过的列。隐藏列和别的视图的字段不在这里。 */
+    columns: Set<string>;
     title: boolean;
     viewIds: Set<string>;
     /** 日历卡片上没有列 id 的标题文字，同一行只用来挡一次接口单元。 */
@@ -16,6 +18,7 @@ export function emptyAvDomCoverage(): AvDomCoverage {
     return {
         unstable: false,
         cells: new Set<string>(),
+        columns: new Set<string>(),
         title: false,
         viewIds: new Set<string>(),
         rowLabelText: new Map<string, string>(),
@@ -77,6 +80,30 @@ export function avApiUnitShown(
     return false;
 }
 
+/**
+ * 接口格子是否属于当前视图已经画出来的列。
+ * 列表 / 日历若画面上还没有列 id，不能把主键以外的字段补进来。
+ * 表头或任意可见格子出现过的列，未挂载行仍可以补。
+ */
+export function avApiUnitInView(unitId: string, coverage: AvDomCoverage, viewType: string): boolean {
+    if (coverage.unstable || !unitId.startsWith("av:")) {
+        return true;
+    }
+    const rest = unitId.slice(3);
+    const splitAt = rest.indexOf(":");
+    if (splitAt <= 0) {
+        return false;
+    }
+    const col = rest.slice(splitAt + 1);
+    if (!col) {
+        return false;
+    }
+    if (coverage.columns.size === 0) {
+        return viewType !== "list" && viewType !== "calendar";
+    }
+    return coverage.columns.has(col);
+}
+
 function noteAvDomUnit(coverage: AvDomCoverage, unitId: string, text: string): void {
     if (unitId === "title") {
         coverage.title = true;
@@ -102,6 +129,9 @@ function noteAvDomUnit(coverage: AvDomCoverage, unitId: string, text: string): v
             coverage.rowLabelText.set(cell.row, foldAvText(text));
         }
         return;
+    }
+    if (cell.col && cell.col.indexOf("idx-") !== 0) {
+        coverage.columns.add(cell.col);
     }
     if (cell.row.startsWith("header:")) {
         return;

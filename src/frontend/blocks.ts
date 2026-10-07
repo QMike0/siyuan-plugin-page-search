@@ -6,7 +6,7 @@ import {
   shouldCollectInlineMemoUnits,
   type RestrictInlineType,
 } from "../shared";
-import type {SearchableBlock} from "./dom-types";
+import type {SearchableBlock, TableSlot} from "./dom-types";
 
 const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/
 const PREVIEW_BLOCK_ID = '__preview__'
@@ -58,12 +58,23 @@ const INLINE_MEMO_UNIT_PREFIX = 'inline-memo:'
 const INLINE_MEMO_BLOCK_TYPE = 'inline-memo'
 /** 行内公式 unitId 前缀；text 来自 KaTeX 渲染可见文字 */
 const INLINE_MATH_UNIT_PREFIX = 'inline-math:'
+
+/** 与 mathOrdinal 使用同一段可见文字，补高亮时才能和全文采集对上。 */
+export function inlineMathIdentityText(text: string): string {
+  return text.replace(/[\u200B-\u200D\uFEFF]/g, '')
+}
 /** 合成块类型，便于 replaceable / 高亮分流 */
 const INLINE_MATH_BLOCK_TYPE = 'inline-math'
 export const DOC_TITLE_BLOCK_ID = '__doc-title__'
 export const DOC_TITLE_BLOCK_TYPE = 'doc-title'
 export const DOC_TITLE_UNIT_ID = 'doc-title'
 const TABLE_CELL_SELECTOR = '[data-type="NodeTableCell"], .table__cell, td, th'
+/**
+ * 单元格编辑器把格子内容放进临时段落，段落 id 由 Lute.NewNodeID() 现生成，内核里没有。
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/render/tableCellRichEditor.ts
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/util/tableCellRich.ts getTableCellRichBlockDOM
+ */
+const TABLE_CELL_EDITOR_SELECTOR = '.table__cell-editor'
 
 /** 数据库内不应参与搜索的 UI 节点（含 av__cursor 的 ZWSP，会干扰零宽变体匹配） */
 const AV_EXCLUDED_CLOSEST = [
@@ -86,7 +97,7 @@ const AV_EXCLUDED_CLOSEST = [
 /**
  * 解析当前编辑器内的可搜索文档根（编辑态 wysiwyg / 预览态 b3-typography）
  */
-function resolveDocRoot(edit: Element): HTMLElement | null {
+export function resolveDocRoot(edit: Element): HTMLElement | null {
   const offscreen = edit.closest('[data-page-search-offscreen]')
     ?? (edit.hasAttribute('data-page-search-offscreen') ? edit : null)
   if (offscreen) {
@@ -794,7 +805,7 @@ function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeG
   // 图片标题在关段落时走专项 unit，不依赖本过滤。
   if (
     !gates.includeParagraph
-    && Boolean(element.closest(`[data-type="${PARAGRAPH_TYPE}"], .p`))
+    && isInsideParagraphBlock(element)
     && !element.closest(IMAGE_TITLE_TEXT_CLOSEST)
   ) {
     return true
@@ -1170,7 +1181,7 @@ function collectTableSearchUnits(
       return
     }
 
-    const textNodes = collectDescendantTextNodes(cell, includeImageTitle, headingGates)
+    const textNodes = collectDescendantTextNodes(tableCellTextRoot(cell), includeImageTitle, headingGates)
     const text = textNodes.map((node) => node.nodeValue ?? '').join('')
     if (!text) {
       return
@@ -1189,6 +1200,21 @@ function collectTableSearchUnits(
   })
 
   return units
+}
+
+/** 正在编辑的格子只取编辑区正文。工具栏和公式面板也挂在格子里，隐藏后标题字还留在 DOM 上。 */
+function tableCellTextRoot(cell: HTMLElement): HTMLElement {
+  const editor = cell.querySelector<HTMLElement>(`:scope > ${TABLE_CELL_EDITOR_SELECTOR}`)
+  return editor?.querySelector<HTMLElement>('.protyle-wysiwyg') ?? cell
+}
+
+/** 与表格单元格搜索单元同一套正文节点，供划选偏移对齐。 */
+export function collectTableCellSearchTextNodes(cell: HTMLElement, includeImageTitle = true): Text[] {
+  return collectDescendantTextNodes(tableCellTextRoot(cell), includeImageTitle)
+}
+
+export function tableCellSearchRoot(cell: HTMLElement): HTMLElement {
+  return tableCellTextRoot(cell)
 }
 
 /** 当前表格内的行（文档序），排除嵌套表格中的行 */
@@ -1222,6 +1248,32 @@ function getTableCellElements(
   return allCells.filter((cell, index) => (
     !allCells.some((other, otherIndex) => otherIndex !== index && other.contains(cell))
   ))
+}
+
+/** 月历条目的阅读位置：周从上到下，一周内从左到右，同一天再从上到下。 */
+function calendarEventPlace(item: HTMLElement | null): {week: number; column: number; lane: number} {
+  const weekText = item?.closest<HTMLElement>('.av__calendar-week')?.getAttribute('data-calendar-week') || ''
+  const week = Number(weekText)
+  return {
+    week: weekText && !isNaN(week) ? week : 0,
+    column: gridLineIndex(item ? item.style.gridColumn || item.getAttribute('style') || '' : '', 'grid-column'),
+    lane: gridLineIndex(item ? item.style.gridRow || item.getAttribute('style') || '' : '', 'grid-row'),
+  }
+}
+
+function gridLineIndex(value: string, token: string): number {
+  const marked = value.indexOf(token)
+  const source = marked >= 0 ? value.slice(marked + token.length) : value
+  let index = 0
+  while (index < source.length) {
+    const code = source.charCodeAt(index)
+    if (code >= 48 && code <= 57) {
+      break
+    }
+    index += 1
+  }
+  const parsed = parseInt(source.slice(index), 10)
+  return parsed > 0 ? parsed : 0
 }
 
 /**
@@ -1301,8 +1353,26 @@ function collectAttributeViewSearchUnits(
   }
 
   // 日历视图不用 .av__cell，条目在 .av__calendar-item，字段在 .av__calendar-field。
-  // @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/av/calendar/render.ts
+  // 思源按数据库行序输出条目，不是月历上的从左到右。这里再按格子位置排。
+  // @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/render/av/calendar/render.ts
   const pushCalendarItems = () => {
+    const pending: Array<{
+      container: HTMLElement
+      unitId: string
+      week: number
+      column: number
+      lane: number
+      index: number
+    }> = []
+    const queue = (
+      container: HTMLElement,
+      unitId: string,
+      week: number,
+      column: number,
+      lane: number,
+    ) => {
+      pending.push({container, unitId, week, column, lane, index: pending.length})
+    }
     avBlock.querySelectorAll<HTMLElement>('.av__calendar-field').forEach((field, index) => {
       if (field.closest('.av__calendar-preview, .fn__none')) {
         return
@@ -1314,7 +1384,8 @@ function collectAttributeViewSearchUnits(
       const colId = field.dataset.colId?.trim()
         || field.dataset.fieldId?.trim()
         || `idx-${index}`
-      pushUnit(field, `calendar:${rowId}:${colId}`)
+      const place = calendarEventPlace(item)
+      queue(field, `calendar:${rowId}:${colId}`, place.week, place.column, place.lane)
     })
     avBlock.querySelectorAll<HTMLElement>('.av__calendar-item').forEach((item) => {
       if (item.closest('.av__calendar-preview, .fn__none')) {
@@ -1330,7 +1401,8 @@ function collectAttributeViewSearchUnits(
       const rowId = item.getAttribute('data-id')?.trim()
         || item.dataset.calendarItem?.trim()
         || 'norow'
-      pushUnit(content, `calendar:${rowId}:title`)
+      const place = calendarEventPlace(item)
+      queue(content, `calendar:${rowId}:title`, place.week, place.column, place.lane)
     })
     avBlock.querySelectorAll<HTMLElement>('.av__calendar-undated-item .b3-menu__label').forEach((label) => {
       if (label.closest('.fn__none')) {
@@ -1338,7 +1410,22 @@ function collectAttributeViewSearchUnits(
       }
       const item = label.closest<HTMLElement>('.av__calendar-undated-item')
       const rowId = item?.dataset.calendarUndatedRow?.trim() || 'undated'
-      pushUnit(label, `calendar:${rowId}:undated`)
+      queue(label, `calendar:${rowId}:undated`, Number.POSITIVE_INFINITY, 0, 0)
+    })
+    pending.sort((left, right) => {
+      if (left.week !== right.week) {
+        return left.week < right.week ? -1 : 1
+      }
+      if (left.column !== right.column) {
+        return left.column - right.column
+      }
+      if (left.lane !== right.lane) {
+        return left.lane - right.lane
+      }
+      return left.index - right.index
+    })
+    pending.forEach((item) => {
+      pushUnit(item.container, item.unitId)
     })
   }
 
@@ -1730,6 +1817,86 @@ function isOwnedByBlock(element: Element, ownerBlock: HTMLElement): boolean {
   return getOwnerBlock(element) === ownerBlock
 }
 
+/** 单元格编辑器的临时段落不算段落块，格子里的内容只随表格开关。 */
+export function isInsideParagraphBlock(element: Element): boolean {
+  const paragraph = element.closest(`[data-type="${PARAGRAPH_TYPE}"], .p`)
+  return Boolean(paragraph && !paragraph.closest(TABLE_CELL_EDITOR_SELECTOR))
+}
+
+/** 行内公式、备注归属的块。单元格编辑器里的临时段落不算，记到外面的表格上。 */
+export function searchOwnerBlock(element: Element): HTMLElement | null {
+  let owner = getOwnerBlock(element)
+  let editor = owner?.closest(TABLE_CELL_EDITOR_SELECTOR)
+  while (owner && editor) {
+    owner = getOwnerBlock(editor)
+    editor = owner?.closest(TABLE_CELL_EDITOR_SELECTOR)
+  }
+  return owner
+}
+
+interface TableSlotCache {
+  rows: Map<HTMLElement, Map<Element, number>>
+  cellText: Map<HTMLElement, Text[]>
+}
+
+function createTableSlotCache(): TableSlotCache {
+  return {rows: new Map(), cellText: new Map()}
+}
+
+/** 行列号与 collectTableSearchUnits 的 unitId 一致，offset 按格子正文计。 */
+function tableSlotOf(host: HTMLElement, table: HTMLElement, cache: TableSlotCache): TableSlot | undefined {
+  const cell = host.closest<HTMLElement>(TABLE_CELL_SELECTOR)
+  if (!cell || cell.closest(`[data-type="${TABLE_TYPE}"]`) !== table) {
+    return undefined
+  }
+  const row = cell.closest<HTMLElement>('.table__row, tr')
+  if (!row) {
+    return undefined
+  }
+  let rowIndexes = cache.rows.get(table)
+  if (!rowIndexes) {
+    const indexes = new Map<Element, number>()
+    getTableRowElements(table).forEach((item, index) => indexes.set(item, index))
+    cache.rows.set(table, indexes)
+    rowIndexes = indexes
+  }
+  const rowIndex = rowIndexes.get(row)
+  const column = Array.from(row.children)
+    .filter((child) => child instanceof HTMLElement && child.matches(TABLE_CELL_SELECTOR))
+    .indexOf(cell)
+  if (rowIndex === undefined || column < 0) {
+    return undefined
+  }
+  let nodes = cache.cellText.get(cell)
+  if (!nodes) {
+    nodes = collectDescendantTextNodes(tableCellTextRoot(cell))
+    cache.cellText.set(cell, nodes)
+  }
+  let offset = 0
+  let index = 0
+  for (; index < nodes.length; index += 1) {
+    const node = nodes[index]
+    if (host.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_PRECEDING) {
+      offset += node.nodeValue?.length ?? 0
+      continue
+    }
+    break
+  }
+  for (; index < nodes.length; index += 1) {
+    const node = nodes[index]
+    if (!host.contains(node)) {
+      break
+    }
+    const value = node.nodeValue ?? ''
+    const skipped = leadingZeroWidthLength(value)
+    offset += skipped
+    if (skipped < value.length) {
+      break
+    }
+  }
+  return {row: rowIndex, column, offset}
+}
+
 /** 预览合成块，或无归属宿主时的备注/公式伪 id（`__preview__-memo-N` 等） */
 export function isPreviewSyntheticBlockId(blockId: string): boolean {
   return blockId === PREVIEW_BLOCK_ID
@@ -1761,6 +1928,7 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
     }
   })
   const textNodesByOwner = new Map<HTMLElement, Text[]>()
+  const slotCache = createTableSlotCache()
   let memoIndex = 0
 
   for (const span of spans) {
@@ -1774,16 +1942,16 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
       continue
     }
 
-    const owner = getOwnerBlock(span)
+    const owner = searchOwnerBlock(span)
     const blockId = owner?.dataset.nodeId?.trim()
       || `${PREVIEW_BLOCK_ID}-memo-${memoIndex}`
     const blockType = owner?.dataset.type?.trim() || INLINE_MEMO_BLOCK_TYPE
     const blockIndex = owner?.dataset.nodeId
       ? (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? memoIndex)
       : memoIndex
-    const anchorOffset = owner
-      ? memoHostOffset(owner, span, includeImageTitle, textNodesByOwner)
-      : 0
+    const hostSpan = owner
+      ? memoHostSpan(owner, span, includeImageTitle, textNodesByOwner)
+      : {start: 0, end: 0}
 
     units.push({
       blockId,
@@ -1794,7 +1962,9 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
       textNodes: [],
       unitId: `${INLINE_MEMO_UNIT_PREFIX}${memoIndex}`,
       matchSource: 'inline-memo',
-      anchorOffset,
+      anchorOffset: hostSpan.start,
+      anchorEnd: hostSpan.end,
+      tableSlot: blockType === TABLE_TYPE && owner ? tableSlotOf(span, owner, slotCache) : undefined,
     })
     memoIndex += 1
   }
@@ -1802,29 +1972,52 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
   return units
 }
 
-/** 备注宿主在所属块已采集文本中的起始位置，同一宿主只扫一次正文。 */
-function memoHostOffset(
+/**
+ * 备注宿主在所属块已采集文本中的区间。
+ * 思源给行级代码/标签/备注光标留的零宽字符算在宿主开头，可见字从它后面算起。
+ */
+function memoHostSpan(
   owner: HTMLElement,
   span: HTMLElement,
   includeImageTitle: boolean,
   cache: Map<HTMLElement, Text[]>,
-): number {
+): {start: number; end: number} {
   let nodes = cache.get(owner)
   if (!nodes) {
     nodes = collectTextNodes(owner, owner, includeImageTitle)
     cache.set(owner, nodes)
   }
   let offset = 0
+  let start = -1
   for (const node of nodes) {
+    const value = node.nodeValue ?? ''
     if (span.contains(node)) {
-      return offset
+      if (start < 0) {
+        start = offset + leadingZeroWidthLength(value)
+      }
+      offset += value.length
+      continue
+    }
+    if (start >= 0) {
+      return {start, end: offset}
     }
     if (span.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING) {
-      return offset
+      return {start: offset, end: offset}
     }
-    offset += node.nodeValue?.length ?? 0
+    offset += value.length
   }
-  return offset
+  if (start >= 0) {
+    return {start, end: offset}
+  }
+  return {start: offset, end: offset}
+}
+
+function leadingZeroWidthLength(value: string): number {
+  let index = 0
+  while (index < value.length && /[\u200B-\u200D\uFEFF\u2060]/.test(value.charAt(index))) {
+    index += 1
+  }
+  return index
 }
 
 export function isInlineMemoSearchUnit(block: Pick<SearchableBlock, 'matchSource' | 'unitId'>): boolean {
@@ -1853,6 +2046,8 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
       ownerIndexById.set(id, index)
     }
   })
+  const slotCache = createTableSlotCache()
+  const ordinals = new Map<HTMLElement, Map<string, number>>()
   let mathIndex = 0
 
   for (const span of spans) {
@@ -1867,13 +2062,24 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
       continue
     }
 
-    const owner = getOwnerBlock(span)
+    const owner = searchOwnerBlock(span)
     const blockId = owner?.dataset.nodeId?.trim()
       || `${PREVIEW_BLOCK_ID}-math-${mathIndex}`
     const blockType = owner?.dataset.type?.trim() || INLINE_MATH_BLOCK_TYPE
     const blockIndex = owner?.dataset.nodeId
       ? (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? mathIndex)
       : mathIndex
+    let mathOrdinal: number | undefined
+    if (owner) {
+      let seen = ordinals.get(owner)
+      if (!seen) {
+        seen = new Map<string, number>()
+        ordinals.set(owner, seen)
+      }
+      const visible = inlineMathIdentityText(text)
+      mathOrdinal = seen.get(visible) ?? 0
+      seen.set(visible, mathOrdinal + 1)
+    }
 
     units.push({
       blockId,
@@ -1884,6 +2090,8 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
       textNodes,
       unitId: `${INLINE_MATH_UNIT_PREFIX}${mathIndex}`,
       matchSource: 'inline-math',
+      tableSlot: blockType === TABLE_TYPE && owner ? tableSlotOf(span, owner, slotCache) : undefined,
+      mathOrdinal,
     })
     mathIndex += 1
   }

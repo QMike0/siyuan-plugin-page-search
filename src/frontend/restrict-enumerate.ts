@@ -19,6 +19,8 @@ import {
     isInsideMindmapBlock,
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
+    isInsideParagraphBlock,
+    searchOwnerBlock,
     shouldSkipElementByHeadingInclude,
     shouldSkipElementByListInclude,
     type CollectSearchableBlocksOptions,
@@ -39,7 +41,6 @@ const TABLE_TYPE = "NodeTable";
 const BLOCKQUOTE_TYPE = "NodeBlockquote";
 const CALLOUT_TYPE = "NodeCallout";
 const SUPER_BLOCK_TYPE = "NodeSuperBlock";
-const PARAGRAPH_TYPE = "NodeParagraph";
 const MATH_BLOCK_TYPE = "NodeMathBlock";
 const EMBED_BLOCK_TYPE = "NodeBlockQueryEmbed";
 const WIDGET_TYPE = "NodeWidget";
@@ -208,7 +209,7 @@ export function enumerateRestrictInlineMatches(
                     continue;
                 }
 
-                const owner = span.closest<HTMLElement>("[data-node-id][data-type]");
+                const owner = searchOwnerBlock(span);
                 // 取包含宿主的最深 SearchableBlock（表格单元格 / Callout unit 等带 unitId）
                 const ownerBlock = findDeepestOwningBlock(scopeBlocks, span)
                     ?? (titleBlock && titleBlock.element.contains(span) ? titleBlock : undefined);
@@ -435,7 +436,7 @@ function shouldSkipHostByIncludeGates(
         includeHtmlBlock: boolean;
     },
 ): boolean {
-    const owner = host.closest<HTMLElement>("[data-node-id][data-type]");
+    const owner = searchOwnerBlock(host);
     if (!owner) {
         return false;
     }
@@ -482,10 +483,7 @@ function shouldSkipHostByIncludeGates(
     })) {
         return true;
     }
-    if (
-        !options.includeParagraph
-        && Boolean(host.closest(`[data-type="${PARAGRAPH_TYPE}"], .p`))
-    ) {
+    if (!options.includeParagraph && isInsideParagraphBlock(host)) {
         return true;
     }
     // 标题级别与容器门闩 AND：宿主在已关级别的 NodeHeading DOM 内则跳过
@@ -609,7 +607,7 @@ function compareEnumerateMatches(a: SearchMatch, b: SearchMatch): number {
     if (a.blockIndex !== b.blockIndex) {
         return a.blockIndex - b.blockIndex;
     }
-    if (a.range && b.range) {
+    if (a.range && b.range && !enumerateTextInsideMemo(a, b) && !enumerateTextInsideMemo(b, a)) {
         try {
             const startCmp = a.range.compareBoundaryPoints(Range.START_TO_START, b.range);
             if (startCmp !== 0) {
@@ -627,4 +625,20 @@ function compareEnumerateMatches(a: SearchMatch, b: SearchMatch): number {
         return a.start - b.start;
     }
     return a.end - b.end;
+}
+
+function enumerateTextInsideMemo(memo: SearchMatch, text: SearchMatch): boolean {
+    if (memo.highlightKind !== "inline-memo" || text.highlightKind === "inline-memo") {
+        return false;
+    }
+    if (!memo.range || !text.range) {
+        return false;
+    }
+    try {
+        const startsAtOrAfter = text.range.compareBoundaryPoints(Range.START_TO_START, memo.range) >= 0;
+        const startsBeforeEnd = text.range.compareBoundaryPoints(Range.END_TO_START, memo.range) < 0;
+        return startsAtOrAfter && startsBeforeEnd;
+    } catch {
+        return false;
+    }
 }

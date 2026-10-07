@@ -107,6 +107,69 @@ function usesAdvancedOptions(options: MatchOptions): boolean {
 /**
  * 无高级选项时的默认路径：小写 + 变体 indexOf（含去空白变体）。
  */
+/**
+ * 判断这段文字有没有可能命中。允许多放进一些格子，不能漏掉真正会命中的文字。
+ * 正则只编译一次，避免每个单元格各建一份。
+ */
+export function createTextMatchProbe(
+    keyword: string,
+    options: MatchOptions,
+): (text: string) => boolean {
+    const trimmed = keyword.trim();
+    if (!trimmed) {
+        return () => false;
+    }
+    if (usesAdvancedOptions(options)) {
+        let pattern: RegExp;
+        try {
+            pattern = createSearchPattern(trimmed, options);
+        } catch {
+            return () => false;
+        }
+        return (text: string) => {
+            if (!text) {
+                return false;
+            }
+            pattern.lastIndex = 0;
+            return pattern.test(text);
+        };
+    }
+    const needle = trimmed.toLowerCase();
+    const variants = generateSearchVariants(needle, true);
+    return (text: string) => {
+        if (!text) {
+            return false;
+        }
+        const haystack = text.toLowerCase();
+        let plainHay = "";
+        let plainReady = false;
+        for (let index = 0; index < variants.length; index += 1) {
+            const variant = variants[index];
+            if (!variant) {
+                continue;
+            }
+            if (haystack.indexOf(variant) >= 0) {
+                return true;
+            }
+            const plainNeedle = variant.replace(ZERO_WIDTH_GLOBAL_RE, "");
+            if (!plainNeedle) {
+                continue;
+            }
+            if (plainNeedle === variant && !ZERO_WIDTH_RE.test(haystack)) {
+                continue;
+            }
+            if (!plainReady) {
+                plainHay = haystack.replace(ZERO_WIDTH_GLOBAL_RE, "");
+                plainReady = true;
+            }
+            if (plainHay.indexOf(plainNeedle) >= 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+}
+
 export function findOffsetMatchesInText(
     blockText: string,
     keyword: string,
@@ -133,13 +196,21 @@ function findOffsetMatchesLegacy(blockText: string, keyword: string): TextOffset
         const normalizedDocText = blockText.replace(ZERO_WIDTH_GLOBAL_RE, "");
         const normalizedSearchStr = searchStr.replace(ZERO_WIDTH_GLOBAL_RE, "");
 
+        // 思源在行级标签 / 行级代码 / 键盘两侧各放一个零宽空格。
+        // 原文已经命中过的词，去掉零宽后再映射回来会多记一次。
+        // 零宽夹在词中间、原文对不上的，仍然保留。
+        // @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/util/inlineElementMarker.ts
         if (normalizedSearchStr !== searchStr || normalizedDocText !== blockText) {
             startIndex = 0;
             while ((startIndex = normalizedDocText.indexOf(normalizedSearchStr, startIndex)) !== -1) {
                 const endIndex = startIndex + normalizedSearchStr.length;
                 const originalStartIndex = findOriginalPosition(blockText, normalizedDocText, startIndex);
                 const originalEndIndex = findOriginalPosition(blockText, normalizedDocText, endIndex);
-                if (originalStartIndex !== -1 && originalEndIndex !== -1) {
+                if (
+                    originalStartIndex !== -1
+                    && originalEndIndex !== -1
+                    && !sameVisibleSpan(blockText, allMatches, originalStartIndex, originalEndIndex)
+                ) {
                     allMatches.push({
                         startIndex: originalStartIndex,
                         endIndex: originalEndIndex,
@@ -152,6 +223,41 @@ function findOffsetMatchesLegacy(blockText: string, keyword: string): TextOffset
     }
 
     return sortOffsetMatches(allMatches);
+}
+
+/** 去掉两端零宽后是否和已有命中是同一段可见文字。 */
+function sameVisibleSpan(
+    text: string,
+    matches: readonly TextOffsetMatch[],
+    start: number,
+    end: number,
+): boolean {
+    const visibleStart = skipZeroWidthForward(text, start);
+    const visibleEnd = skipZeroWidthBackward(text, end);
+    for (let index = 0; index < matches.length; index += 1) {
+        const match = matches[index];
+        if (
+            skipZeroWidthForward(text, match.startIndex) === visibleStart
+            && skipZeroWidthBackward(text, match.endIndex) === visibleEnd
+        ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function skipZeroWidthForward(text: string, index: number): number {
+    while (index < text.length && ZERO_WIDTH_RE.test(text.charAt(index))) {
+        index += 1;
+    }
+    return index;
+}
+
+function skipZeroWidthBackward(text: string, index: number): number {
+    while (index > 0 && ZERO_WIDTH_RE.test(text.charAt(index - 1))) {
+        index -= 1;
+    }
+    return index;
 }
 
 function findOffsetMatchesAdvanced(

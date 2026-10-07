@@ -1,4 +1,9 @@
-import {ATTRIBUTE_VIEW_TYPE, isAttributeInlineSearchUnit} from "./blocks";
+import {
+    ATTRIBUTE_VIEW_TYPE,
+    collectTableCellSearchTextNodes,
+    isAttributeInlineSearchUnit,
+    tableCellSearchRoot,
+} from "./blocks";
 import type {SearchableBlock} from "./dom-types";
 
 /** 单元内文本偏移区间 [start, end) */
@@ -89,18 +94,32 @@ function collectWholeSelectedAttributeViewIds(
 }
 
 /**
- * 从当前窗口选区 / 表格框选 / 块级选中构建相对 SearchableBlock 的选区范围。
+ * 从当前窗口选区 / 单元格选中 / 块级选中构建相对 SearchableBlock 的选区范围。
  * 键为 unitKey，与 pipeline 一致。
  *
- * 思源表格多选单元格不走原生 Selection，而是用 `.table__select` 矩形 + 几何命中；
- * mouseup 后还会 collapse 原生 Range，故必须单独采集。
- * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/util/table.ts
- * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/wysiwyg/index.ts
+ * 文字选区优先。否则数据库格子、勾选行、画廊卡片，以及表格单元格，只收录被选中的单元。
+ * 有单元格选中时不再并入整块，避免把整张表或整个数据库算进去。
+ *
+ * 思源 3.8.6 的表格选区在 TableControl 里，画面是 `.protyle-table-control__selection`。
+ * 点到表格外会清掉它，所以表格格子要在按下「仅在选区内查找」时先快照，经 tableCells 传入。
+ * 旧的 `.table__select` 仍作兜底。
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/util/tableControl.ts
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/render/av/rangeSelect.ts
  */
 export function getSelectionScope(
     edit: Element,
     blocks: SearchableBlock[],
+    tableCells?: readonly HTMLTableCellElement[],
+    includeAttributeViewCells = false,
+    tableCellText?: TableCellTextSelection | null,
 ): SelectionScope {
+    if (tableCellText) {
+        const fromCellText = selectionScopeFromTableCellText(blocks, tableCellText);
+        if (fromCellText.size > 0) {
+            return fromCellText;
+        }
+    }
+
     const selection = window.getSelection();
     if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
         const fromText = getSelectionScopeFromTextRanges(blocks, selection);
@@ -109,10 +128,360 @@ export function getSelectionScope(
         }
     }
 
+    const avHosts = includeAttributeViewCells ? collectAttributeViewSelectionHosts(edit) : [];
+    const snappedCells = tableCells && tableCells.length > 0 ? tableCells : [];
+    if (avHosts.length > 0 || snappedCells.length > 0) {
+        return mergeSelectionScopes(
+            selectionScopeFromHosts(blocks, avHosts),
+            selectionScopeFromHosts(blocks, snappedCells),
+        );
+    }
+
     return mergeSelectionScopes(
         getSelectionScopeFromTableSelect(edit, blocks),
         getSelectionScopeFromSelectedBlocks(edit, blocks),
     );
+}
+
+/**
+ * 数据库里当前选中的格子、整行或画廊卡片。
+ * 这些 class 在点编辑器外面时还在；点进编辑器会被思源清掉。
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/render/av/selectionState.ts restoreAVCellSelection
+ */
+export function collectAttributeViewSelectionHosts(edit: Element): HTMLElement[] {
+    const hosts: HTMLElement[] = [];
+    const seen = new Set<HTMLElement>();
+    const push = (host: HTMLElement | null) => {
+        if (!host || seen.has(host)) {
+            return;
+        }
+        seen.add(host);
+        hosts.push(host);
+    };
+
+    edit.querySelectorAll<HTMLElement>(
+        ".protyle-wysiwyg .av__row--select, .protyle-wysiwyg .av__gallery-item--select",
+    ).forEach((host) => {
+        push(host);
+    });
+    edit.querySelectorAll<HTMLElement>(
+        ".protyle-wysiwyg .av__cell--active, .protyle-wysiwyg .av__cell--select",
+    ).forEach((cell) => {
+        if (cell.closest(".av__row--select, .av__gallery-item--select")) {
+            return;
+        }
+        push(cell);
+    });
+    return hosts;
+}
+
+/**
+ * 读思源表格选区浮层，返回中心点落在浮层里的已挂载格子。
+ * 浮层是 position:fixed，坐标就是视口坐标。屏外的虚拟行没有格子 DOM，也不在搜索文本里。
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/util/tableControl.ts appendSelectionRect
+ */
+export function snapshotTableControlCells(edit: Element): HTMLTableCellElement[] {
+    const overlays = edit.querySelectorAll<HTMLElement>(
+        ".protyle-table-control__selection:not(.fn__none)",
+    );
+    if (overlays.length === 0) {
+        return [];
+    }
+    const rects: DOMRect[] = [];
+    for (let index = 0; index < overlays.length; index += 1) {
+        const rect = overlays[index].getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+            rects.push(rect);
+        }
+    }
+    if (rects.length === 0) {
+        return [];
+    }
+
+    const cells: HTMLTableCellElement[] = [];
+    const seen = new Set<HTMLTableCellElement>();
+    const candidates = edit.querySelectorAll<HTMLTableCellElement>(
+        ".protyle-wysiwyg td, .protyle-wysiwyg th",
+    );
+    for (let index = 0; index < candidates.length; index += 1) {
+        const cell = candidates[index];
+        if (seen.has(cell) || cell.classList.contains("fn__none")) {
+            continue;
+        }
+        if (cell.closest("tr[data-sy-table-virtual-rows], .protyle-custom, .mindmap-view__preview-block")) {
+            continue;
+        }
+        const rect = cell.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+            continue;
+        }
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        let hit = false;
+        for (let rectIndex = 0; rectIndex < rects.length; rectIndex += 1) {
+            const overlay = rects[rectIndex];
+            if (x >= overlay.left && x <= overlay.right && y >= overlay.top && y <= overlay.bottom) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) {
+            continue;
+        }
+        seen.add(cell);
+        cells.push(cell);
+    }
+    return cells;
+}
+
+/** 同一格子内的文字划选。编辑器关闭后 Range 会失效，所以提前记下偏移。 */
+export interface TableCellTextSelection {
+    cell: HTMLTableCellElement;
+    start: number;
+    end: number;
+    /** 去掉零宽字符后的正文，用来核对写回后的格子文本。 */
+    text: string;
+    inlineMarks: ReadonlyArray<{kind: "math" | "memo"; index: number}>;
+}
+
+/**
+ * 划选两端都在同一个 td/th 里时，按搜索用的正文节点记下偏移。
+ * 必须在单元格编辑器的 document pointerdown 调用 finish() 之前读取。
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/render/tableCellRichEditor.ts
+ */
+export function snapshotTableCellTextSelection(includeImageTitle = true): TableCellTextSelection | null {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+        return null;
+    }
+    const range = selection.getRangeAt(0);
+    const startCell = tableCellFromNode(range.startContainer);
+    const endCell = tableCellFromNode(range.endContainer);
+    if (!startCell || startCell !== endCell) {
+        return null;
+    }
+
+    const textNodes = collectTableCellSearchTextNodes(startCell, includeImageTitle);
+    const pieces = mergeTextOffsetRanges(getIntersectedTextRanges(textNodes, range));
+    const start = pieces.length > 0 ? pieces[0].start : 0;
+    const end = pieces.length > 0 ? pieces[pieces.length - 1].end : 0;
+    let selected = "";
+    if (end > start) {
+        let cursor = 0;
+        for (let index = 0; index < textNodes.length; index += 1) {
+            const text = textNodes[index].nodeValue ?? "";
+            const next = cursor + text.length;
+            if (next > start && cursor < end) {
+                selected += text.slice(Math.max(0, start - cursor), Math.min(text.length, end - cursor));
+            }
+            cursor = next;
+        }
+        selected = stripZwsp(selected);
+    }
+    const inlineMarks = inlineMarksInRange(startCell, range);
+    if (end <= start && inlineMarks.length === 0) {
+        return null;
+    }
+    return {cell: startCell, start, end, text: selected, inlineMarks};
+}
+
+/** 把划选偏移对到当前搜索单元。对不上选中文字时不猜范围。 */
+export function selectionScopeFromTableCellText(
+    blocks: readonly SearchableBlock[],
+    snap: TableCellTextSelection,
+): SelectionScope {
+    const scope: SelectionScope = new Map();
+    if (!snap.cell.isConnected) {
+        return scope;
+    }
+    for (let index = 0; index < blocks.length; index += 1) {
+        const block = blocks[index];
+        if (block.element !== snap.cell || isAttributeInlineSearchUnit(block) || block.text.length <= 0) {
+            continue;
+        }
+        const range = reconcileCellTextRange(block.text, snap.start, snap.end, snap.text);
+        if (!range) {
+            continue;
+        }
+        scope.set(unitKeyOf(block), [range]);
+    }
+    if (snap.inlineMarks.length === 0) {
+        return scope;
+    }
+    const mathHosts = inlineHostsInCell(snap.cell, "math");
+    const memoHosts = inlineHostsInCell(snap.cell, "memo");
+    for (let markIndex = 0; markIndex < snap.inlineMarks.length; markIndex += 1) {
+        const mark = snap.inlineMarks[markIndex];
+        const host = (mark.kind === "math" ? mathHosts : memoHosts)[mark.index];
+        if (!host) {
+            continue;
+        }
+        for (let index = 0; index < blocks.length; index += 1) {
+            const block = blocks[index];
+            if (block.element !== host || block.text.length <= 0) {
+                continue;
+            }
+            scope.set(unitKeyOf(block), [{start: 0, end: block.text.length}]);
+        }
+    }
+    return scope;
+}
+
+function tableCellFromNode(node: Node): HTMLTableCellElement | null {
+    const element = node instanceof Element ? node : node.parentElement;
+    const cell = element?.closest("td, th");
+    if (!(cell instanceof HTMLTableCellElement)) {
+        return null;
+    }
+    if (cell.closest(".protyle-custom, .mindmap-view__preview-block")) {
+        return null;
+    }
+    return cell;
+}
+
+function inlineMarksInRange(
+    cell: HTMLTableCellElement,
+    range: Range,
+): Array<{kind: "math" | "memo"; index: number}> {
+    const marks: Array<{kind: "math" | "memo"; index: number}> = [];
+    const kinds: Array<"math" | "memo"> = ["math", "memo"];
+    for (let kindIndex = 0; kindIndex < kinds.length; kindIndex += 1) {
+        const kind = kinds[kindIndex];
+        const hosts = inlineHostsInCell(cell, kind);
+        for (let index = 0; index < hosts.length; index += 1) {
+            if (!rangeIntersectsElement(range, hosts[index])) {
+                continue;
+            }
+            marks.push({kind, index});
+        }
+    }
+    return marks;
+}
+
+function inlineHostsInCell(cell: HTMLTableCellElement, kind: "math" | "memo"): HTMLElement[] {
+    const root = tableCellSearchRoot(cell);
+    const selector = kind === "math"
+        ? "span[data-type~=\"inline-math\"]"
+        : "span[data-type~=\"inline-memo\"]";
+    const hosts: HTMLElement[] = [];
+    const found = root.querySelectorAll<HTMLElement>(selector);
+    for (let index = 0; index < found.length; index += 1) {
+        const host = found[index];
+        if (host.closest(".protyle-attr, .fn__none")) {
+            continue;
+        }
+        hosts.push(host);
+    }
+    return hosts;
+}
+
+function rangeIntersectsElement(range: Range, element: Element): boolean {
+    try {
+        return typeof range.intersectsNode === "function" && range.intersectsNode(element);
+    } catch {
+        return false;
+    }
+}
+
+function reconcileCellTextRange(
+    blockText: string,
+    start: number,
+    end: number,
+    selected: string,
+): TextOffsetRange | null {
+    if (selected.length === 0) {
+        return null;
+    }
+    if (start >= 0 && end > start && end <= blockText.length
+        && stripZwsp(blockText.slice(start, end)) === selected) {
+        return {start, end};
+    }
+    return findClosestText(blockText, selected, start);
+}
+
+function findClosestText(text: string, needle: string, hint: number): TextOffsetRange | null {
+    const rawAt: number[] = [];
+    let stripped = "";
+    for (let index = 0; index < text.length; index += 1) {
+        if (isZwsp(text.charCodeAt(index))) {
+            continue;
+        }
+        rawAt.push(index);
+        stripped += text.charAt(index);
+    }
+    let from = 0;
+    let best: TextOffsetRange | null = null;
+    let bestDistance = -1;
+    while (from <= stripped.length - needle.length) {
+        const at = stripped.indexOf(needle, from);
+        if (at < 0 || at + needle.length > rawAt.length) {
+            break;
+        }
+        const rawStart = rawAt[at];
+        const rawEnd = rawAt[at + needle.length - 1] + 1;
+        const distance = rawStart > hint ? rawStart - hint : hint - rawStart;
+        if (!best || distance < bestDistance) {
+            best = {start: rawStart, end: rawEnd};
+            bestDistance = distance;
+        }
+        if (distance === 0) {
+            break;
+        }
+        from = at + 1;
+    }
+    return best;
+}
+
+function stripZwsp(value: string): string {
+    let out = "";
+    for (let index = 0; index < value.length; index += 1) {
+        if (isZwsp(value.charCodeAt(index))) {
+            continue;
+        }
+        out += value.charAt(index);
+    }
+    return out;
+}
+
+function isZwsp(code: number): boolean {
+    return code === 0x200B || code === 0x200C || code === 0x200D || code === 0xFEFF;
+}
+
+/**
+ * 宿主本身或其内部的搜索单元整段入选。不把包住宿主的父块算进去。
+ * 从单元往父节点走，避免选中很多格子时对全部单元做两两包含判断。
+ */
+export function selectionScopeFromHosts(
+    blocks: readonly SearchableBlock[],
+    hosts: readonly HTMLElement[],
+): SelectionScope {
+    const scope: SelectionScope = new Map();
+    if (hosts.length === 0) {
+        return scope;
+    }
+    const hostSet = new Set<HTMLElement>();
+    for (let index = 0; index < hosts.length; index += 1) {
+        hostSet.add(hosts[index]);
+    }
+    for (let index = 0; index < blocks.length; index += 1) {
+        const block = blocks[index];
+        if (block.text.length <= 0 || !elementInsideHost(block.element, hostSet)) {
+            continue;
+        }
+        scope.set(unitKeyOf(block), [{start: 0, end: block.text.length}]);
+    }
+    return scope;
+}
+
+function elementInsideHost(element: HTMLElement, hostSet: Set<HTMLElement>): boolean {
+    let current: HTMLElement | null = element;
+    while (current) {
+        if (hostSet.has(current)) {
+            return true;
+        }
+        current = current.parentElement;
+    }
+    return false;
 }
 
 /** 编辑器内是否存在有效的表格单元格框选（.table__select 有尺寸） */
@@ -227,7 +596,7 @@ function getSelectionScopeFromSelectedBlocks(
 
 /**
  * 思源表格 `.table__select` 框选：将命中的 td/th 对应搜索单元整段纳入选区。
- * 对齐 clearTableCell / isIncludeCell 的几何判定。
+ * 3.8.6 拖选结束后会删掉这块浮层，正常路径走 snapshotTableControlCells。
  */
 function getSelectionScopeFromTableSelect(
     edit: Element,
@@ -239,15 +608,23 @@ function getSelectionScopeFromTableSelect(
         return scope;
     }
 
-    for (const block of blocks) {
+    for (let index = 0; index < blocks.length; index += 1) {
+        const block = blocks[index];
         if (block.text.length <= 0) {
             continue;
         }
-        const covered = selectedCells.some((cell) =>
-            cell === block.element
-            || cell.contains(block.element)
-            || block.element.contains(cell)
-        );
+        let covered = false;
+        for (let cellIndex = 0; cellIndex < selectedCells.length; cellIndex += 1) {
+            const cell = selectedCells[cellIndex];
+            if (
+                cell === block.element
+                || cell.contains(block.element)
+                || block.element.contains(cell)
+            ) {
+                covered = true;
+                break;
+            }
+        }
         if (!covered) {
             continue;
         }
@@ -321,7 +698,7 @@ function isIncludeTableCell(options: {
             < tableSelectElement.offsetTop + scrollTop + tableSelectElement.clientHeight;
 }
 
-function mergeSelectionScopes(
+export function mergeSelectionScopes(
     ...scopes: SelectionScope[]
 ): SelectionScope {
     const merged: SelectionScope = new Map();

@@ -17,6 +17,7 @@ import {
     TABLE_TYPE,
     collectSearchableBlocks,
     isDocTitleSearchUnit,
+    inlineMathIdentityText,
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
     isPreviewSyntheticBlockId,
@@ -477,6 +478,13 @@ function attachRangesToHits(
             range,
             highlightKind: isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
             anchorOffset: isMemo ? block.anchorOffset : undefined,
+            anchorEnd: isMemo ? block.anchorEnd : undefined,
+            ...(isMath && block.mathOrdinal !== undefined
+                ? {
+                    mathOrdinal: block.mathOrdinal,
+                    mathUnitText: inlineMathIdentityText(block.text),
+                }
+                : {}),
             ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
         });
     }
@@ -500,7 +508,7 @@ function compareSearchMatches(a: SearchMatch, b: SearchMatch): number {
     if (a.blockIndex !== b.blockIndex) {
         return a.blockIndex - b.blockIndex;
     }
-    if (a.range && b.range) {
+    if (a.range && b.range && !textStartInsideMemoRange(a, b) && !textStartInsideMemoRange(b, a)) {
         try {
             const startCmp = a.range.compareBoundaryPoints(Range.START_TO_START, b.range);
             if (startCmp !== 0) {
@@ -509,6 +517,10 @@ function compareSearchMatches(a: SearchMatch, b: SearchMatch): number {
         } catch {
             // 跨文档等异常时回退
         }
+    }
+    const overlap = bodyBeforeOverlappingMemo(a, b);
+    if (overlap !== 0) {
+        return overlap;
     }
     const leftPos = a.highlightKind === "inline-memo" ? (a.anchorOffset ?? a.start) : a.start;
     const rightPos = b.highlightKind === "inline-memo" ? (b.anchorOffset ?? b.start) : b.start;
@@ -523,4 +535,41 @@ function compareSearchMatches(a: SearchMatch, b: SearchMatch): number {
         return a.start - b.start;
     }
     return a.end - b.end;
+}
+
+/** 正文 Range 的起点落在备注宿主里。selectNodeContents 的起点在文字前面，不能因此先跳备注。 */
+function textStartInsideMemoRange(memo: SearchMatch, text: SearchMatch): boolean {
+    if (memo.highlightKind !== "inline-memo" || text.highlightKind === "inline-memo" || text.highlightKind === "inline-math") {
+        return false;
+    }
+    if (!memo.range || !text.range) {
+        return false;
+    }
+    try {
+        const startsAtOrAfter = text.range.compareBoundaryPoints(Range.START_TO_START, memo.range) >= 0;
+        // END_TO_START：这段的起点相对备注宿主的终点
+        const startsBeforeEnd = text.range.compareBoundaryPoints(Range.END_TO_START, memo.range) < 0;
+        return startsAtOrAfter && startsBeforeEnd;
+    } catch {
+        return false;
+    }
+}
+
+function bodyBeforeOverlappingMemo(left: SearchMatch, right: SearchMatch): number {
+    if (left.blockId !== right.blockId) {
+        return 0;
+    }
+    const memo = left.highlightKind === "inline-memo"
+        ? left
+        : (right.highlightKind === "inline-memo" ? right : null);
+    const text = memo === left ? right : left;
+    if (!memo || text.highlightKind === "inline-memo" || text.highlightKind === "inline-math") {
+        return 0;
+    }
+    const anchor = memo.anchorOffset;
+    const anchorEnd = memo.anchorEnd;
+    if (anchor === undefined || anchorEnd === undefined || !(text.start < anchorEnd && text.end > anchor)) {
+        return 0;
+    }
+    return memo === left ? 1 : -1;
 }

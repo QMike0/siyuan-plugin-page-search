@@ -20,11 +20,13 @@ import {
     collectMindmapPreviewUnits,
     HTML_BLOCK_UNIT_ID,
     MERMAID_UNIT_ID,
+    resolveDocRoot,
     type CollectSearchableBlocksOptions,
 } from "./blocks";
 import {parentElementCrossingShadow} from "./dom-parent";
-import {calculateSearchMatches} from "./pipeline";
-import {fillLiveRanges} from "./corpus/project";
+import {calculateSearchMatches, type SearchPipelineResult} from "./pipeline";
+import {fillLiveRanges, rebindChangedRanges, type RebindTarget} from "./corpus/project";
+import {MAX_TOUCHED_BLOCKS, watchEditorDom, type EditorDomChange} from "./editor-dom-watch";
 import {blockIsInEditor, openBlockInEditor} from "./corpus/locate";
 import {revealHiddenTabs, mirrorTabsTitleRange} from "./tabs-reveal";
 import {panMindmapIntoView} from "./mindmap-pan";
@@ -38,8 +40,13 @@ import {isEditorReplaceModeBlocked} from "./editor-mode";
 import {
     cloneSelectionScope,
     getSelectionScope,
+    mergeSelectionScopes,
     refreshWholeAttributeViewSelectionScope,
+    selectionScopeFromHosts,
+    snapshotTableCellTextSelection,
+    snapshotTableControlCells,
     type SelectionScope,
+    type TableCellTextSelection,
 } from "./selection";
 import {SearchPanelFrame} from "./panel-frame";
 import {resolveSettingsMenuZIndex} from "./panel-layer";
@@ -54,6 +61,8 @@ import {
     applySelectionScopeVisual,
     captureSelectionScopeWithKind,
     clearSelectionScopeVisual,
+    elementsForTableCellRefs,
+    type AvScopeVisualRef,
     type SelectionScopeVisualKind,
     type TableCellVisualRef,
 } from "./selection-scope-visual";
@@ -62,7 +71,7 @@ import {
     clearMemoUnderlineVisual,
     pulseMemoFocusUnderline,
 } from "./memo-underline-visual";
-import type {SearchMatch} from "./dom-types";
+import type {SearchableBlock, SearchMatch} from "./dom-types";
 import {
     clearNonHeadingFoldLocally,
     collectNonHeadingFoldedAncestorIds,
@@ -92,6 +101,36 @@ const RESTRICT_INLINE_ICONS: Record<RestrictInlineType, string> = {
 };
 
 const DONE_TYPING_MS = 400;
+/** 补 Range 时按块采集的上限，超过就整篇采集一次。 */
+const MAX_SCOPED_REPAIR_BLOCKS = 64;
+
+/**
+ * Range 还连在文档上、没有缩成空点。思源换掉节点时，旧 Range 会缩到父节点上。
+ * 备注 Range 选的是宿主内容，宿主还在就算有效。
+ */
+function rangeStillPainted(match: SearchMatch): boolean {
+    const range = match.range;
+    if (!range) {
+        return false;
+    }
+    try {
+        if (!range.startContainer.isConnected || !range.endContainer.isConnected) {
+            return false;
+        }
+    } catch {
+        return false;
+    }
+    if (!range.collapsed || match.end <= match.start) {
+        return true;
+    }
+    if (match.highlightKind !== "inline-memo") {
+        return false;
+    }
+    const host = range.startContainer;
+    return host.nodeType === Node.ELEMENT_NODE
+        && (host as Element).matches(`[data-type~="${INLINE_MEMO_TYPE}"]`);
+}
+
 /** 结果列表：固定行高，只渲染视口附近的行。 */
 const RESULTS_ITEM_HEIGHT = 26;
 const RESULTS_LIST_PADDING = 4;
@@ -272,6 +311,10 @@ export interface SearchBarHost {
 
 type MatchOptionKey = "caseSensitive" | "wholeWord" | "preserveCase" | "selectionOnly";
 
+function avScopeRefKey(ref: AvScopeVisualRef): string {
+    return `${ref.kind}\0${ref.avBlockId}\0${ref.groupId}\0${ref.rowId}\0${ref.colId ?? ""}`;
+}
+
 export class SearchBar {
     readonly root: HTMLElement;
     private readonly edit: Element;
@@ -293,6 +336,7 @@ export class SearchBar {
     private indexSettledTimer: number | null = null;
     private unsubscribeIndexSettled: (() => void) | null = null;
     private locatePending = false;
+    private staleRefreshPending = false;
     private typingTimer: number | undefined;
     private searchGeneration = 0;
 
@@ -357,8 +401,30 @@ export class SearchBar {
     private selectionScopeVisualKind: SelectionScopeVisualKind | null = null;
     /** 块选冻结时的顶层块 id（空块/容器/数据库），供 --select 消失后重绘竖线 */
     private rememberedVisualBlockIds: string[] = [];
-    /** 表格框选冻结时的单元格坐标；底色按格绘制、竖线按整表绘制 */
+    /** 表格框选冻结时的单元格坐标。按下选区按钮时从浮层快照，之后浮层会被思源清掉。 */
     private rememberedTableCellRefs: TableCellVisualRef[] = [];
+    /** 数据库格子、勾选行、画廊卡片的冻结坐标。 */
+    private rememberedAvScopeRefs: AvScopeVisualRef[] = [];
+    /** window 捕获阶段记下的表格格子。click 时思源已经清掉浮层。 */
+    private pendingTableCells: HTMLTableCellElement[] | null = null;
+    /** 格子内文字划选。编辑器在 document 捕获阶段关闭后，现场 Range 会失效。 */
+    private pendingTableCellText: TableCellTextSelection | null = null;
+    private readonly onCaptureSelectionPointerDown = (event: PointerEvent) => {
+        const target = event.target;
+        if (!(target instanceof Element)) {
+            this.pendingTableCells = null;
+            this.pendingTableCellText = null;
+            return;
+        }
+        const button = target.closest("[data-option=\"selectionOnly\"]");
+        if (!button || !this.root.contains(button)) {
+            this.pendingTableCells = null;
+            this.pendingTableCellText = null;
+            return;
+        }
+        this.pendingTableCellText = snapshotTableCellTextSelection(this.includeImageTitle);
+        this.pendingTableCells = snapshotTableControlCells(this.edit);
+    };
     private replaceBusy = false;
 
     private readonly eventBusHandle: (event: CustomEvent) => void;
@@ -370,6 +436,18 @@ export class SearchBar {
     private panelFrame: SearchPanelFrame | null = null;
     private stopAvDomWatch: (() => void) | null = null;
     private avRefreshTimer: number | undefined;
+    private stopEditorDomWatch: (() => void) | null = null;
+    /** 正文 DOM 突变计数。搜索期间变过，结果里的 Range 可能落在旧节点上。 */
+    private domEpoch = 0;
+    /** 最近一次搜索开始时的 domEpoch。 */
+    private searchEpoch = 0;
+    private searchesInFlight = 0;
+    private repairAfterSearch = false;
+    /** 还没核对过的插入节点所在块。null 表示变动太大，按整篇核对。 */
+    private pendingAddedBlocks: Set<string> | null = new Set();
+    /** 嵌入块一次渲染出太多子块，补 Range 盖不住，等停下来重搜一次。 */
+    private embedRefreshPending = false;
+    private domRefreshTimer: number | undefined;
     /** 跳转滚动期间抑制 AV DOM 观察触发的重搜，避免把索引打回 1 */
     private avWatchPausedUntil = 0;
     /** 折叠展开或装载块期间，禁止把当前序号清成 0 */
@@ -573,6 +651,15 @@ export class SearchBar {
         this.stopAvDomWatch = watchAttributeViewDom(this.edit, () => {
             this.scheduleAttrViewResearch();
         });
+        this.stopEditorDomWatch = watchEditorDom(this.edit, {
+            onMutate: () => {
+                this.domEpoch += 1;
+            },
+            onSettled: (change) => {
+                this.noteAddedBlocks(change);
+                this.repairHighlightRanges();
+            },
+        });
         this.plugin.onSearchComponentMounted(this.eventBusHandle);
         this.syncOptionButtons();
         this.syncReplaceVisibility();
@@ -619,6 +706,9 @@ export class SearchBar {
         cancelBackgroundCorpusJobs();
         clearTimeout(this.typingTimer);
         clearTimeout(this.avRefreshTimer);
+        clearTimeout(this.domRefreshTimer);
+        this.stopEditorDomWatch?.();
+        this.stopEditorDomWatch = null;
         if (this.indexSettledTimer != null) {
             window.clearTimeout(this.indexSettledTimer);
             this.indexSettledTimer = null;
@@ -634,6 +724,7 @@ export class SearchBar {
         this.clearHighlight();
         this.closeResultsPanel();
         document.removeEventListener("pointerdown", this.onResultsPanelOutsidePointerDown, true);
+        window.removeEventListener("pointerdown", this.onCaptureSelectionPointerDown, true);
         this.stopAvDomWatch?.();
         this.stopAvDomWatch = null;
         this.panelFrame?.destroy();
@@ -794,6 +885,7 @@ export class SearchBar {
             this.searchText = this.input.value;
             clearTimeout(this.typingTimer);
             this.typingTimer = window.setTimeout(() => {
+                this.typingTimer = undefined;
                 void this.highlightHitResult(this.searchText, true);
             }, DONE_TYPING_MS);
         });
@@ -866,6 +958,7 @@ export class SearchBar {
         });
         this.resultsListEl?.addEventListener("scroll", this.onResultsListScroll);
         document.addEventListener("pointerdown", this.onResultsPanelOutsidePointerDown, true);
+        window.addEventListener("pointerdown", this.onCaptureSelectionPointerDown, true);
     }
 
     /**
@@ -995,12 +1088,11 @@ export class SearchBar {
             case "selectionOnly":
                 this.selectionOnly = !this.selectionOnly;
                 if (this.selectionOnly) {
-                    this.captureSelectionScope();
-                    if (
-                        this.rememberedSelectionScope.size === 0
-                        && this.rememberedVisualBlockIds.length === 0
-                        && this.rememberedTableCellRefs.length === 0
-                    ) {
+                    this.captureSelectionScope(
+                        this.pendingTableCells ?? undefined,
+                        this.pendingTableCellText,
+                    );
+                    if (!this.hasRememberedScopeVisual()) {
                         this.clearSelectionScopeVisual();
                         showMessage(this.i18n.selectionOnlyNoScope, 3000, "info");
                     } else {
@@ -1011,16 +1103,48 @@ export class SearchBar {
                     this.selectionScopeVisualKind = null;
                     this.rememberedVisualBlockIds = [];
                     this.rememberedTableCellRefs = [];
+                    this.rememberedAvScopeRefs = [];
+                    this.pendingTableCells = null;
+                    this.pendingTableCellText = null;
                     this.clearSelectionScopeVisual();
                 }
                 break;
         }
         this.syncOptionButtons();
         void this.highlightHitResult(this.searchText, true);
+        this.pendingTableCells = null;
+        this.pendingTableCellText = null;
     }
 
-    private captureSelectionScope() {
-        const {scope, kind, visualBlockIds, tableCellRefs} = captureSelectionScopeWithKind(this.edit, {
+    private hasRememberedScopeVisual(): boolean {
+        return this.rememberedSelectionScope.size > 0
+            || this.rememberedVisualBlockIds.length > 0
+            || this.rememberedTableCellRefs.length > 0
+            || this.rememberedAvScopeRefs.length > 0;
+    }
+
+    private avScopeRefsSame(next: readonly AvScopeVisualRef[]): boolean {
+        const previous = this.rememberedAvScopeRefs;
+        if (previous.length !== next.length) {
+            return false;
+        }
+        const keys = new Set<string>();
+        for (let index = 0; index < previous.length; index += 1) {
+            keys.add(avScopeRefKey(previous[index]));
+        }
+        for (let index = 0; index < next.length; index += 1) {
+            if (!keys.has(avScopeRefKey(next[index]))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private captureSelectionScope(
+        tableCells?: readonly HTMLTableCellElement[],
+        tableCellText?: TableCellTextSelection | null,
+    ) {
+        const {scope, kind, visualBlockIds, tableCellRefs, avScopeRefs} = captureSelectionScopeWithKind(this.edit, {
             includeDocTitle: this.includeDocTitle,
             includeImageTitle: this.includeImageTitle,
             includeAttributeView: this.includeAttributeView,
@@ -1047,11 +1171,12 @@ export class SearchBar {
             includeHtmlBlock: this.includeHtmlBlock,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
-        });
+        }, tableCells, true, tableCellText);
         this.rememberedSelectionScope = cloneSelectionScope(scope);
         this.selectionScopeVisualKind = kind;
         this.rememberedVisualBlockIds = visualBlockIds;
         this.rememberedTableCellRefs = tableCellRefs;
+        this.rememberedAvScopeRefs = avScopeRefs;
     }
 
     private resolveScopeForSearch(): SelectionScope {
@@ -1086,9 +1211,24 @@ export class SearchBar {
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
         });
-        const live = getSelectionScope(this.edit, blocks);
+        const pendingCells = this.pendingTableCells && this.pendingTableCells.length > 0
+            ? this.pendingTableCells
+            : undefined;
+        const pendingCellText = this.pendingTableCellText;
+        // 已经是整块选区时，不因随后点中的数据库格子把范围收成那一格。
+        const followCellSelection = Boolean(pendingCells)
+            || this.selectionScopeVisualKind === "table-cells"
+            || this.rememberedAvScopeRefs.length > 0;
+        const live = getSelectionScope(
+            this.edit,
+            blocks,
+            pendingCells,
+            followCellSelection,
+            pendingCellText,
+        );
         if (live.size > 0) {
-            // 仍有现场选区时同步提示（用户改选了范围）；光标挪走后 live 为空则保持冻结提示
+            // 仍有现场选区时同步提示（用户改选了范围）；光标挪走后 live 为空则保持冻结提示。
+            // 表格浮层在按下按钮时就被清掉，所以这里把刚快照的格子再并进去。
             const captured = captureSelectionScopeWithKind(this.edit, {
                 includeDocTitle: this.includeDocTitle,
                 includeImageTitle: this.includeImageTitle,
@@ -1116,14 +1256,32 @@ export class SearchBar {
                 includeHtmlBlock: this.includeHtmlBlock,
                 includeInlineMemo: this.includeInlineMemo,
                 restrictInlineTypes: this.restrictInlineTypes,
-            });
+            }, pendingCells, followCellSelection, pendingCellText);
+            let scope = captured.scope;
+            let tableRefs = captured.tableCellRefs;
+            // 数据库选区没变时，补回同时冻结的表格格子，避免打字把表格丢掉。
+            // 数据库又选了别的格子时，只跟新的数据库选区，不再并上一次的表格。
+            if (
+                captured.kind === "table-cells"
+                && !pendingCells
+                && this.rememberedTableCellRefs.length > 0
+                && this.rememberedAvScopeRefs.length > 0
+                && this.avScopeRefsSame(captured.avScopeRefs)
+            ) {
+                const keptCells = elementsForTableCellRefs(this.edit, this.rememberedTableCellRefs);
+                if (keptCells.length > 0) {
+                    scope = mergeSelectionScopes(scope, selectionScopeFromHosts(blocks, keptCells));
+                    tableRefs = this.rememberedTableCellRefs.slice();
+                }
+            }
             this.selectionScopeVisualKind = captured.kind ?? this.selectionScopeVisualKind;
             this.rememberedVisualBlockIds = captured.visualBlockIds;
-            this.rememberedTableCellRefs = captured.tableCellRefs;
-            // 整库块选：按当前 AV DOM 刷新 unitKey（视图/布局切换后 id 会变）
+            this.rememberedTableCellRefs = tableRefs;
+            this.rememberedAvScopeRefs = captured.avScopeRefs;
+            // 整库块选才按当前 AV DOM 刷新 unitKey。格子选区的 visualBlockIds 是空的，不会扩成整库。
             const refreshed = refreshWholeAttributeViewSelectionScope(
                 this.edit,
-                live,
+                scope,
                 this.rememberedVisualBlockIds,
                 blocks,
             );
@@ -1143,14 +1301,7 @@ export class SearchBar {
     }
 
     private syncSelectionScopeVisual() {
-        if (
-            !this.selectionOnly
-            || (
-                this.rememberedSelectionScope.size === 0
-                && this.rememberedVisualBlockIds.length === 0
-                && this.rememberedTableCellRefs.length === 0
-            )
-        ) {
+        if (!this.selectionOnly || !this.hasRememberedScopeVisual()) {
             this.teardownSelectionScopeLayoutSync();
             this.clearSelectionScopeVisual();
             return;
@@ -1162,6 +1313,7 @@ export class SearchBar {
                 this.selectionScopeVisualKind,
                 this.rememberedVisualBlockIds,
                 this.rememberedTableCellRefs,
+                this.rememberedAvScopeRefs,
             );
             this.setupSelectionScopeLayoutSync();
         } catch (error) {
@@ -1201,6 +1353,7 @@ export class SearchBar {
                         this.selectionScopeVisualKind,
                         this.rememberedVisualBlockIds,
                         this.rememberedTableCellRefs,
+                        this.rememberedAvScopeRefs,
                     );
                 } catch (error) {
                     console.warn("[page-search] selection scope visual relayout failed", error);
@@ -1515,40 +1668,15 @@ export class SearchBar {
         }
 
         const generation = ++this.searchGeneration;
-        const {matches, error, degraded, partial, unrendered} = await calculateSearchMatches(this.plugin, this.edit, value, {
-            caseSensitive: this.caseSensitive,
-            wholeWord: this.wholeWord,
-            regex: this.regex,
-            selectionOnly: this.selectionOnly,
-            selectionScope: this.resolveScopeForSearch(),
-            includeDocTitle: this.includeDocTitle,
-            includeImageTitle: this.includeImageTitle,
-            includeAttributeView: this.includeAttributeView,
-            includeTable: this.includeTable,
-            includeBlockquote: this.includeBlockquote,
-            includeCallout: this.includeCallout,
-            includeSuperBlock: this.includeSuperBlock,
-            includeTabs: this.includeTabs,
-            includeMindmap: this.includeMindmap,
-            includeListUnordered: this.includeListUnordered,
-            includeListOrdered: this.includeListOrdered,
-            includeListTask: this.includeListTask,
-            includeParagraph: this.includeParagraph,
-            includeHeadingH1: this.includeHeadingH1,
-            includeHeadingH2: this.includeHeadingH2,
-            includeHeadingH3: this.includeHeadingH3,
-            includeHeadingH4: this.includeHeadingH4,
-            includeHeadingH5: this.includeHeadingH5,
-            includeHeadingH6: this.includeHeadingH6,
-            includeMathBlock: this.includeMathBlock,
-            includeEmbedBlock: this.includeEmbedBlock,
-            includeCodeBlock: this.includeCodeBlock,
-            includeMermaid: this.includeMermaid,
-            includeHtmlBlock: this.includeHtmlBlock,
-            includeFoldedBlocks: this.includeFoldedBlocks,
-            includeInlineMemo: this.includeInlineMemo,
-            restrictInlineTypes: this.restrictInlineTypes,
-        });
+        this.searchEpoch = this.domEpoch;
+        this.searchesInFlight += 1;
+        let result: SearchPipelineResult;
+        try {
+            result = await this.runSearchPipeline(value);
+        } finally {
+            this.searchesInFlight -= 1;
+        }
+        const {matches, error, degraded, partial, unrendered} = result;
         if (generation !== this.searchGeneration) {
             return this.resultMatches;
         }
@@ -1593,6 +1721,43 @@ export class SearchBar {
         return matches;
     }
 
+    private runSearchPipeline(value: string): Promise<SearchPipelineResult> {
+        return calculateSearchMatches(this.plugin, this.edit, value, {
+            caseSensitive: this.caseSensitive,
+            wholeWord: this.wholeWord,
+            regex: this.regex,
+            selectionOnly: this.selectionOnly,
+            selectionScope: this.resolveScopeForSearch(),
+            includeDocTitle: this.includeDocTitle,
+            includeImageTitle: this.includeImageTitle,
+            includeAttributeView: this.includeAttributeView,
+            includeTable: this.includeTable,
+            includeBlockquote: this.includeBlockquote,
+            includeCallout: this.includeCallout,
+            includeSuperBlock: this.includeSuperBlock,
+            includeTabs: this.includeTabs,
+            includeMindmap: this.includeMindmap,
+            includeListUnordered: this.includeListUnordered,
+            includeListOrdered: this.includeListOrdered,
+            includeListTask: this.includeListTask,
+            includeParagraph: this.includeParagraph,
+            includeHeadingH1: this.includeHeadingH1,
+            includeHeadingH2: this.includeHeadingH2,
+            includeHeadingH3: this.includeHeadingH3,
+            includeHeadingH4: this.includeHeadingH4,
+            includeHeadingH5: this.includeHeadingH5,
+            includeHeadingH6: this.includeHeadingH6,
+            includeMathBlock: this.includeMathBlock,
+            includeEmbedBlock: this.includeEmbedBlock,
+            includeCodeBlock: this.includeCodeBlock,
+            includeMermaid: this.includeMermaid,
+            includeHtmlBlock: this.includeHtmlBlock,
+            includeFoldedBlocks: this.includeFoldedBlocks,
+            includeInlineMemo: this.includeInlineMemo,
+            restrictInlineTypes: this.restrictInlineTypes,
+        });
+    }
+
     private noteSearchCoverage(degraded?: boolean, partial?: boolean, unrendered?: number) {
         if (degraded && !this.degradedNotified) {
             this.degradedNotified = true;
@@ -1634,10 +1799,12 @@ export class SearchBar {
     }
 
     async highlightHitResult(value: string, change: boolean) {
+        const epoch = this.domEpoch;
         const matches = await this.calculateSearchResults(value, change);
         const trimmed = value.trim();
 
         // 空查询且未限制：清空高亮（旧行为）。限制激活的空查询走下方枚举高亮。
+        // 保持原有高亮归属。清空时改归属的话，别的窗口之后只更新计数、不再重画。
         if (!trimmed && !shouldEnumerateRestrictInline(value, this.restrictInlineTypes)) {
             this.clearHighlight();
             return;
@@ -1646,6 +1813,8 @@ export class SearchBar {
         const hasAnyRange = matches.some((match) => Boolean(match.range));
         if (!hasAnyRange) {
             this.clearHighlight();
+            this.plugin.updateLastHighlightComponent(this.root);
+            this.repairAfterSearchIfNeeded(epoch);
             return;
         }
 
@@ -1675,6 +1844,7 @@ export class SearchBar {
 
         this.syncMemoUnderlineVisual();
         this.plugin.updateLastHighlightComponent(this.root);
+        this.repairAfterSearchIfNeeded(epoch);
 
         if (change && this.resultIndex >= 1) {
             this.scrollIntoRanges(this.resultIndex - 1, false);
@@ -1682,6 +1852,8 @@ export class SearchBar {
             const current = this.getCurrentMatch();
             if (current?.range && current.highlightKind !== "inline-memo") {
                 this.applyFocusHighlight(current.range);
+            } else if (current?.highlightKind === "inline-memo") {
+                this.clearSearchFocus();
             }
         }
     }
@@ -1808,6 +1980,7 @@ export class SearchBar {
         if (["savedoc", "rename"].includes(event.detail?.cmd)) {
             clearTimeout(this.typingTimer);
             this.typingTimer = window.setTimeout(() => {
+                this.typingTimer = undefined;
                 if (this.plugin.isLastHighlightComponent(this.root)) {
                     void this.highlightHitResult(this.searchText, false).then(() => {
                         if (this.resultIndex >= 1) {
@@ -1840,6 +2013,7 @@ export class SearchBar {
 
             clearTimeout(this.typingTimer);
             this.typingTimer = window.setTimeout(() => {
+                this.typingTimer = undefined;
                 const preserveIndex = event.type === "loaded-protyle-dynamic"
                     || this.locatePending
                     || Date.now() < this.indexResetPausedUntil;
@@ -1926,7 +2100,7 @@ export class SearchBar {
             void existing.offsetHeight;
         }
         if (!match.range && this.bindMindmapPreview(index)) {
-            void this.scrollIntoRangesAsync(index, scroll).then(() => {
+            void this.scrollIntoRangesAsync(index, scroll, false, false, false).then(() => {
                 window.requestAnimationFrame(() => this.applyResultHighlights());
             });
             return;
@@ -1935,7 +2109,7 @@ export class SearchBar {
             && existing.clientHeight > 0
             && !isUnderNonHeadingCssFold(existing);
         if (shown && !match.range && this.tryBindUnfoldedMatch(index + 1)) {
-            void this.scrollIntoRangesAsync(index, scroll).then(() => {
+            void this.scrollIntoRangesAsync(index, scroll, false, false, false).then(() => {
                 window.requestAnimationFrame(() => this.applyResultHighlights());
             });
             return;
@@ -1984,7 +2158,7 @@ export class SearchBar {
                 this.updateCountLabel();
             }
             if (scroll) {
-                await this.scrollIntoRangesAsync(index - 1, true, false, true);
+                await this.scrollIntoRangesAsync(index - 1, true, false, true, false);
             }
             await new Promise<void>((resolve) => {
                 window.requestAnimationFrame(() => resolve());
@@ -2003,7 +2177,7 @@ export class SearchBar {
         }
         const current = this.resultMatches[this.resultIndex - 1];
         if (current?.range) {
-            await this.scrollIntoRangesAsync(this.resultIndex - 1, true);
+            await this.scrollIntoRangesAsync(this.resultIndex - 1, true, false, false, false);
             return;
         }
         if (!current?.blockId) {
@@ -2147,13 +2321,205 @@ export class SearchBar {
         }
         if (textRanges.length) {
             (CSS as any).highlights.set("search-results", new HighlightCtor(...textRanges));
+        } else {
+            (CSS as any).highlights.delete("search-results");
         }
         const current = this.getCurrentMatch();
         if (current?.range && current.highlightKind !== "inline-memo") {
             this.applyFocusHighlight(current.range);
+        } else if (current?.highlightKind === "inline-memo") {
+            this.clearSearchFocus();
         }
         this.syncMemoUnderlineVisual();
         this.plugin.updateLastHighlightComponent(this.root);
+    }
+
+    private noteAddedBlocks(change: EditorDomChange) {
+        if (change.embedOverflow) {
+            this.embedRefreshPending = true;
+        }
+        const pending = this.pendingAddedBlocks;
+        if (!pending) {
+            return;
+        }
+        if (!change.addedInBlocks) {
+            this.pendingAddedBlocks = null;
+            return;
+        }
+        change.addedInBlocks.forEach((id) => pending.add(id));
+        if (pending.size > MAX_TOUCHED_BLOCKS) {
+            this.pendingAddedBlocks = null;
+        }
+    }
+
+    /**
+     * 搜索进行时正文变过，结果里的 Range 可能建在已经换掉的节点上。
+     * 期间记下的插入块在这里核对；还没停下来的变化，稍后由 DOM 观察再核对。
+     */
+    private repairAfterSearchIfNeeded(epoch: number) {
+        if (!this.repairAfterSearch && this.domEpoch === epoch) {
+            return;
+        }
+        this.repairAfterSearch = false;
+        this.repairHighlightRanges();
+    }
+
+    /**
+     * 思源换掉正文节点后，按原偏移把 Range 补到新节点上，不等 savedoc 重搜。
+     * 原来亮着、偏移处文字变了的不补，安排一次重搜。开关单元格编辑器不产生事务，收不到 savedoc。
+     * 没有 Range 的命中，只在所在块插入了节点时核对：大表虚拟滚动挂出新行、嵌入块渲染完成等。
+     */
+    private repairHighlightRanges() {
+        if (this.replaceBusy || this.locatePending || !this.plugin.isLastHighlightComponent(this.root)) {
+            this.pendingAddedBlocks = new Set();
+            this.embedRefreshPending = false;
+            return;
+        }
+        if (this.searchesInFlight > 0) {
+            this.repairAfterSearch = true;
+            return;
+        }
+        const embedRefresh = this.embedRefreshPending;
+        this.embedRefreshPending = false;
+        if (!this.resultMatches.length) {
+            this.pendingAddedBlocks = new Set();
+            this.scheduleEmbedRepair(embedRefresh);
+            return;
+        }
+        const added = this.pendingAddedBlocks;
+        this.pendingAddedBlocks = new Set();
+        const wholeDocument = added === null;
+        const targets = new Map<SearchMatch, RebindTarget>();
+        const blockIds = new Set<string>();
+        let brokenCount = 0;
+        for (const match of this.resultMatches) {
+            // 文档标题在正文外面，改名走 savedoc / rename 重搜
+            if (!wholeDocument && match.blockId === "__doc-title__") {
+                continue;
+            }
+            const broken = Boolean(match.range) && !rangeStillPainted(match);
+            if (broken) {
+                brokenCount += 1;
+            } else if (match.range || !(added === null || added.has(match.blockId))) {
+                continue;
+            }
+            targets.set(match, {broken, blockShown: false});
+            blockIds.add(match.blockId);
+        }
+        // 只插入了大量块（滚动装载、文档重载）由 loaded-protyle 事件重搜。
+        // 嵌入块溢出不走那条事件，单独重搜一次。
+        if (!targets.size || (wholeDocument && brokenCount === 0)) {
+            this.scheduleEmbedRepair(embedRefresh);
+            return;
+        }
+        if (this.isRestrictEnumerateMode()) {
+            // 枚举结果的 unitId 按出现序号编，换过节点后对不回去，直接重新枚举。
+            // 嵌入溢出走保存刷新同一个计时器，避免和动态加载各搜一遍。
+            if (!this.scheduleEmbedRepair(embedRefresh) && brokenCount > 0) {
+                this.scheduleDomRefresh();
+            }
+            return;
+        }
+        const docRoot = resolveDocRoot(this.edit);
+        if (!docRoot) {
+            this.scheduleEmbedRepair(embedRefresh);
+            return;
+        }
+
+        const shown = new Set<string>();
+        let live: SearchableBlock[];
+        if (wholeDocument || blockIds.size > MAX_SCOPED_REPAIR_BLOCKS) {
+            live = collectSearchableBlocks(this.edit, this.searchCollectOptions());
+            if (brokenCount > 0) {
+                docRoot.querySelectorAll<HTMLElement>("[data-node-id]").forEach((element) => {
+                    const id = element.getAttribute("data-node-id");
+                    if (id && blockIds.has(id)) {
+                        shown.add(id);
+                    }
+                });
+            }
+        } else {
+            const roots: HTMLElement[] = [];
+            for (const id of blockIds) {
+                docRoot.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`).forEach((element) => {
+                    roots.push(element);
+                    shown.add(id);
+                });
+            }
+            live = roots.length
+                ? collectSearchableBlocks(this.edit, {
+                    ...this.searchCollectOptions(),
+                    includeDocTitle: false,
+                    scopeRoots: roots,
+                })
+                : [];
+        }
+        for (const [match, target] of targets) {
+            target.blockShown = shown.has(match.blockId);
+        }
+
+        const rebound = rebindChangedRanges(this.resultMatches, live, targets, {
+            allowFoldedHidden: this.includeFoldedBlocks,
+            restrictInlineTypes: this.restrictInlineTypes,
+        });
+        if (rebound.changed) {
+            this.resultMatches = rebound.matches;
+            this.applyResultHighlights();
+            this.syncReplaceButtons();
+        }
+        if (!this.scheduleEmbedRepair(embedRefresh) && rebound.textChanged > 0) {
+            this.scheduleDomRefresh();
+        }
+    }
+
+    /**
+     * 嵌入块内部一次渲染出太多子块时，并进输入框 / 保存 / 动态加载共用的那次刷新。
+     * 已经排上了就不再另开计时器。返回 true 表示这次全文刷新已经覆盖嵌入。
+     */
+    private scheduleEmbedRepair(embedRefresh: boolean): boolean {
+        if (!embedRefresh) {
+            return false;
+        }
+        if (!this.searchText.trim() && !this.isRestrictEnumerateMode()) {
+            return false;
+        }
+        if (this.typingTimer != null) {
+            return true;
+        }
+        this.typingTimer = window.setTimeout(() => {
+            this.typingTimer = undefined;
+            if (this.replaceBusy || this.locatePending || !this.plugin.isLastHighlightComponent(this.root)) {
+                return;
+            }
+            void this.highlightHitResult(this.searchText, false).then(() => {
+                if (this.resultIndex >= 1) {
+                    this.scrollIntoRanges(this.resultIndex - 1, false);
+                }
+            });
+        }, DONE_TYPING_MS);
+        return true;
+    }
+
+    /**
+     * 节点换过、偏移处文字也变了时重搜一次。
+     * 编辑会带来 savedoc 刷新；它先跑了就不再重复。撤销的 savedoc 早于本地回放，单元格编辑器开关没有 savedoc。
+     */
+    private scheduleDomRefresh() {
+        window.clearTimeout(this.domRefreshTimer);
+        const generation = this.searchGeneration;
+        this.domRefreshTimer = window.setTimeout(() => {
+            if (this.searchGeneration !== generation) {
+                return;
+            }
+            if (this.replaceBusy || this.locatePending || !this.plugin.isLastHighlightComponent(this.root)) {
+                return;
+            }
+            void this.highlightHitResult(this.searchText, false).then(() => {
+                if (this.resultIndex >= 1) {
+                    this.scrollIntoRanges(this.resultIndex - 1, false);
+                }
+            });
+        }, DONE_TYPING_MS);
     }
 
     private scrollIntoRanges(index: number, scroll: boolean = true, pulseMemoFocus = false) {
@@ -2162,8 +2528,10 @@ export class SearchBar {
 
     /**
      * 折叠标题删块后，Range 仍可能连在文首。只有起点还在原块里才算有效。
+     * 思源开关单元格编辑器会整格换掉子节点，Range 缩成格子开头的空点，也算失效。
      */
-    private rangeStillInMatchBlock(range: Range, blockId: string): boolean {
+    private rangeStillInMatchBlock(range: Range, match: SearchMatch): boolean {
+        const blockId = match.blockId;
         let node: Node | null = null;
         try {
             node = range.startContainer;
@@ -2176,6 +2544,9 @@ export class SearchBar {
         if (!blockId || blockId === "__doc-title__") {
             return true;
         }
+        if (range.collapsed && match.end > match.start && match.highlightKind !== "inline-memo") {
+            return false;
+        }
         const selector = `[data-node-id="${CSS.escape(blockId)}"]`;
         let element: Element | null = node.nodeType === Node.ELEMENT_NODE
             ? node as Element
@@ -2187,6 +2558,32 @@ export class SearchBar {
             element = parentElementCrossingShadow(element);
         }
         return false;
+    }
+
+    private matchBlockShown(match: SearchMatch): boolean {
+        if (!match.blockId || match.blockId === "__doc-title__") {
+            return false;
+        }
+        const block = this.edit.querySelector<HTMLElement>(
+            `[data-node-id="${CSS.escape(match.blockId)}"]`,
+        );
+        return Boolean(block && block.clientHeight > 0 && !isUnderNonHeadingCssFold(block));
+    }
+
+    /** 重搜一遍再跳到当前序号。重搜期间用户继续翻页时，以最后的序号为准。 */
+    private async refreshStaleMatch(pulseMemoFocus: boolean) {
+        if (this.staleRefreshPending) {
+            return;
+        }
+        this.staleRefreshPending = true;
+        try {
+            await this.highlightHitResult(this.searchText, false);
+        } finally {
+            this.staleRefreshPending = false;
+        }
+        if (this.resultIndex >= 1 && this.resultIndex <= this.resultMatches.length) {
+            await this.scrollIntoRangesAsync(this.resultIndex - 1, true, pulseMemoFocus, false, false);
+        }
     }
 
     /** 当前命中立刻标成橙色。标题展开路径在滚动之前调用。 */
@@ -2209,6 +2606,16 @@ export class SearchBar {
         this.plugin.updateLastHighlightComponent(this.root);
     }
 
+    /** 当前项是备注虚线时，去掉正文上的橙色，让它回到 search-results 的黄色。 */
+    private clearSearchFocus() {
+        const highlights = (CSS as any).highlights;
+        if (!highlights) {
+            return;
+        }
+        highlights.delete("search-focus");
+        highlights.delete("search-math-focus");
+    }
+
     /**
      * 跳转命中：已在编辑器里的折叠列表/提示先展开再滚动。
      * 折叠标题下的命中不在 DOM 里，展开后仍停在当前序号，不进入聚焦。
@@ -2220,6 +2627,7 @@ export class SearchBar {
         scroll: boolean = true,
         pulseMemoFocus = false,
         immediate = false,
+        refreshStale = true,
     ) {
         // 滚动可能触发 AV 虚拟滚动 DOM 突变；短暂暂停观察，防止重搜重置索引
         if (scroll) {
@@ -2231,9 +2639,14 @@ export class SearchBar {
         }
         let range = match?.range;
         // 折叠标题会删掉后面的块，浏览器把旧 Range 缩到文首。跳转时不能再滚到那里。
-        if (range && match && !this.rangeStillInMatchBlock(range, match.blockId)) {
+        if (range && match && !this.rangeStillInMatchBlock(range, match)) {
             match.range = undefined;
             range = undefined;
+            // 块还在画面上，只是块内 DOM 被重建，格内文字也可能改过，旧偏移不能再用来补 Range。
+            if (scroll && refreshStale && this.matchBlockShown(match)) {
+                await this.refreshStaleMatch(pulseMemoFocus);
+                return;
+            }
         }
         if (!range) {
             if (!scroll) {
@@ -2295,6 +2708,8 @@ export class SearchBar {
 
         if (match.highlightKind !== "inline-memo") {
             this.applyFocusHighlight(range);
+        } else {
+            this.clearSearchFocus();
         }
         if (backgroundFoldIds.length) {
             void unfoldNonHeadingFoldedBlocks(backgroundFoldIds);
