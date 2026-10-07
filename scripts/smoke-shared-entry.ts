@@ -8,6 +8,7 @@ import {
     canRestrictInlineMemo,
     coercePluginPrefs,
     expandRegexReplacement,
+    extractRegexLiteralGroups,
     findOffsetMatchesInText,
     formatSearchCountLabel,
     generateSearchVariants,
@@ -188,6 +189,40 @@ const badRegex = matchTextUnitsDetailed(
     {regex: true},
 );
 assert(badRegex.hits.length === 0 && badRegex.error.length > 0, "invalid regex returns error");
+
+function literalKey(groups: string[][] | null): string {
+    if (!groups) {
+        return "none";
+    }
+    return groups.map((group) => group.slice().sort().join("+")).sort().join("|");
+}
+function assertLiterals(pattern: string, expected: string[][] | null, caseSensitive = true) {
+    const actual = extractRegexLiteralGroups(pattern, caseSensitive);
+    assert(
+        literalKey(actual) === literalKey(expected),
+        `regex literals ${pattern}: expected ${literalKey(expected)}, got ${literalKey(actual)}`,
+    );
+}
+assertLiterals("foo", [["foo"]]);
+assertLiterals("foo.*bar", [["foo", "bar"]]);
+assertLiterals("foo|bar", [["foo"], ["bar"]]);
+assertLiterals("https?://", [["http", "://"]]);
+assertLiterals("\\d+", null);
+assertLiterals("foo|\\d+", null);
+assertLiterals("中\\d+", [["中"]]);
+assertLiterals("a\\d+", null);
+assertLiterals("(foo|bar)baz", [["foo", "baz"], ["bar", "baz"]]);
+assertLiterals("(?:foo){2}", [["foofoo"]]);
+assertLiterals("^foo$", [["foo"]]);
+assertLiterals("(?=foo)bar", [["bar"]]);
+assertLiterals("[0-9]+", null);
+assertLiterals("colou?r", [["colo"]]);
+assertLiterals("ab?", null);
+assertLiterals("École", [["École"]]);
+assertLiterals("École", null, false);
+assertLiterals("fooÉ", null, false);
+assertLiterals("中文", [["中文"]], false);
+assertLiterals("foo", [["foo"]], false);
 
 // --- AV never replaceable ---
 const avUnit = {

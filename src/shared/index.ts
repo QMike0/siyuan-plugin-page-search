@@ -21,6 +21,7 @@ export {
     expandRegexReplacement,
     expandReplacementTemplate,
 } from "./regex-replace";
+export {extractRegexLiteralGroups} from "./regex-literals";
 export type {ExpandRegexReplacementOptions} from "./regex-replace";
 export {
     plainTextFromInlineMemoContent,

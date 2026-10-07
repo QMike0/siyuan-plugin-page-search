@@ -52,6 +52,58 @@ export async function fetchMemoCandidateIds(
     return rows.map((row) => row.id).filter(Boolean);
 }
 
+function literalGroupPredicate(groups: string[][], column: string, caseSensitive: boolean): string {
+    const parts = groups.map((group) => {
+        const checks = group.map((literal) => {
+            const lit = escSql(caseSensitive ? literal : literal.toLowerCase());
+            return `instr(${column}, '${lit}') > 0`;
+        });
+        return checks.length === 1 ? checks[0] : `(${checks.join(" AND ")})`;
+    });
+    return parts.length === 1 ? parts[0] : `(${parts.join(" OR ")})`;
+}
+
+/**
+ * 正则预筛。groups 外层是或、内层是且。
+ * 返回 null 表示查询失败，调用方应退回全文抽块。
+ * 正文查询还会带上嵌入块，以及含行内公式的块：这些正文不一定出现在 content 里。
+ */
+export async function fetchLiteralGroupCandidateIds(
+    rootId: string,
+    groups: string[][],
+    caseSensitive: boolean,
+    kind: "content" | "memo" | "imageTitle",
+): Promise<string[] | null> {
+    if (groups.length === 0) {
+        return [];
+    }
+    const root = escSql(rootId);
+    const lowered = !caseSensitive;
+    let column = lowered ? "lower(content)" : "content";
+    let scope = `AND type NOT IN (${CONTAINER_SQL}) `;
+    let extra = " OR type = 'query_embed' OR instr(markdown, 'inline-math') > 0";
+    if (kind === "memo") {
+        column = lowered ? "lower(markdown)" : "markdown";
+        scope = "AND instr(markdown, 'data-inline-memo-content') > 0 ";
+        extra = "";
+    } else if (kind === "imageTitle") {
+        column = lowered ? "lower(markdown)" : "markdown";
+        scope = "AND instr(markdown, 'protyle-action__title') > 0 ";
+        extra = "";
+    }
+    const predicate = literalGroupPredicate(groups, column, caseSensitive);
+    const rows = await querySql<{id: string}>(
+        `SELECT id FROM blocks WHERE root_id = '${root}' `
+        + scope
+        + `AND (${predicate}${extra}) `
+        + `LIMIT ${SQL_CANDIDATE_LIMIT}`,
+    );
+    if (!rows) {
+        return null;
+    }
+    return rows.map((row) => row.id).filter((id) => typeof id === "string" && id);
+}
+
 export async function fetchImageTitleCandidateIds(
     rootId: string,
     needle: string,

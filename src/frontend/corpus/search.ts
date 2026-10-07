@@ -1,6 +1,8 @@
 import {getAllEditor} from "siyuan";
 import type {Plugin} from "siyuan";
 import {
+    createSearchPattern,
+    extractRegexLiteralGroups,
     isHitReplaceableByUnit,
     isRestrictInlineActive,
     matchPassesRestrictInline,
@@ -28,6 +30,7 @@ import {
 import {
     fetchContentCandidateIds,
     fetchImageTitleCandidateIds,
+    fetchLiteralGroupCandidateIds,
     fetchMemoCandidateIds,
 } from "./sql";
 import {isBlockTypeEnabled, invalidateDocMeta, isInMindmapBlock, isInTabsBlock, loadDocMeta, type BlockMeta} from "./meta";
@@ -391,6 +394,22 @@ export async function searchCurrentDocument(
     if (!keyword) {
         return null;
     }
+    if (options.regex) {
+        try {
+            createSearchPattern(keyword, {
+                regex: true,
+                caseSensitive: options.caseSensitive === true,
+            });
+        } catch (error) {
+            return {
+                matches: [],
+                error: error instanceof Error ? error.message : "正则表达式无效",
+                degraded: false,
+                partial: false,
+                unrendered: 0,
+            };
+        }
+    }
 
     const meta = await loadDocMeta(context.rootId) ?? {
         byId: new Map<string, BlockMeta>(),
@@ -464,12 +483,74 @@ export async function searchCurrentDocument(
     const plainTargets: BlockMeta[] = [];
     const specialTargets: BlockMeta[] = [];
 
-    if (options.regex) {
+    const queueUnloaded = (id: string) => {
+        if (liveIds.has(id) || !inFocus(id)) {
+            return;
+        }
+        const item = meta.byId.get(id) ?? {
+            id,
+            parentId: "",
+            type: "",
+            subtype: "",
+            ial: "",
+            hash: "",
+            updated: "",
+        };
+        if (meta.byId.has(id) && (!enabled(item) || isAttributeViewType(item.type))) {
+            return;
+        }
+        if (isSpecialRenderType(item.type, item.subtype)) {
+            specialTargets.push(item);
+        } else {
+            plainTargets.push(item);
+        }
+    };
+    const queueRemainingSpecials = () => {
+        const queued = new Set(specialTargets.map((item) => item.id));
+        for (const item of meta.byId.values()) {
+            if (!enabled(item) || liveIds.has(item.id) || queued.has(item.id) || !inFocus(item.id)) {
+                continue;
+            }
+            if (!isSpecialRenderType(item.type, item.subtype)) {
+                continue;
+            }
+            specialTargets.push(item);
+        }
+    };
+
+    const queueEveryUnloaded = () => {
         for (const item of meta.byId.values()) {
             if (!enabled(item) || isAttributeViewType(item.type) || liveIds.has(item.id) || !inFocus(item.id)) {
                 continue;
             }
             (isSpecialRenderType(item.type, item.subtype) ? specialTargets : plainTargets).push(item);
+        }
+    };
+
+    if (options.regex) {
+        const groups = extractRegexLiteralGroups(keyword, caseSensitive);
+        let prefiltered = false;
+        if (groups) {
+            const [contentIds, memoIds, titleIds] = await Promise.all([
+                fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "content"),
+                options.includeInlineMemo === true
+                    ? fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "memo")
+                    : Promise.resolve([] as string[]),
+                options.includeImageTitle !== false
+                    ? fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "imageTitle")
+                    : Promise.resolve([] as string[]),
+            ]);
+            if (contentIds && memoIds && titleIds) {
+                prefiltered = true;
+                for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
+                    queueUnloaded(id);
+                }
+                // 公式、图表、HTML 的可见文字常常不在 content 里，不能靠字面量丢掉。
+                queueRemainingSpecials();
+            }
+        }
+        if (!prefiltered) {
+            queueEveryUnloaded();
         }
     } else {
         const [contentIds, memoIds, titleIds] = await Promise.all([
@@ -481,28 +562,8 @@ export async function searchCurrentDocument(
                 ? fetchImageTitleCandidateIds(context.rootId, keyword, caseSensitive)
                 : Promise.resolve([] as string[]),
         ]);
-        const wanted = new Set<string>([...contentIds, ...memoIds, ...titleIds]);
-        for (const id of wanted) {
-            if (liveIds.has(id) || !inFocus(id)) {
-                continue;
-            }
-            const item = meta.byId.get(id) ?? {
-                id,
-                parentId: "",
-                type: "",
-                subtype: "",
-                ial: "",
-                hash: "",
-                updated: "",
-            };
-            if (meta.byId.has(id) && (!enabled(item) || isAttributeViewType(item.type))) {
-                continue;
-            }
-            if (isSpecialRenderType(item.type, item.subtype)) {
-                specialTargets.push(item);
-            } else {
-                plainTargets.push(item);
-            }
+        for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
+            queueUnloaded(id);
         }
         const queuedSpecials = new Set(specialTargets.map((item) => item.id));
         const restSpecials: BlockMeta[] = [];
