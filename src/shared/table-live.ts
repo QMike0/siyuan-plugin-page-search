@@ -15,6 +15,8 @@ export interface VirtualTableLiveState<T extends {unitId?: string; text: string}
 }
 
 const TABLE_CELL_PREFIX = "table-cell:";
+/** 思源把屏外行的 outerHTML 收在这个属性里，占位行本身不是数据行。 */
+export const TABLE_VIRTUAL_ROWS_ATTR = "data-sy-table-virtual-rows";
 
 /**
  * 占位行属性是若干行 outerHTML 拼起来的。
@@ -80,7 +82,7 @@ export function tableHostOmitsRows(element: HTMLElement): boolean {
     }
     const rows = table.rows;
     for (let index = 0; index < rows.length; index += 1) {
-        if (rows[index].hasAttribute("data-sy-table-virtual-rows")) {
+        if (rows[index].hasAttribute(TABLE_VIRTUAL_ROWS_ATTR)) {
             return true;
         }
     }
@@ -144,22 +146,126 @@ function isDigits(value: string): boolean {
     return true;
 }
 
+function isVirtualTableSideUnit(unitId: string | undefined): boolean {
+    if (!unitId) {
+        return false;
+    }
+    return unitId.startsWith("inline-memo:")
+        || unitId.startsWith("inline-math:")
+        || unitId.startsWith("table-memo:");
+}
+
 function sameCellText(left: string, right: string): boolean {
     return stripZw(left) === stripZw(right);
 }
 
 function stripZw(text: string): string {
-    return text.replace(/[\u200B-\u200D\uFEFF]/g, "");
+    return text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");
 }
 
 function unitKey(blockId: string, unitId: string | undefined): string {
     return blockId + "\u0000" + (unitId ?? "");
 }
 
+export interface LogicalTableRow {
+    /** 这一 DOM 行对应的逻辑行号。占位行是它收起的第一行。 */
+    logical: number;
+    /** 占位行收起的行数。0 表示这一行就在画面上。 */
+    omitted: number;
+}
+
+export interface LogicalTableLayout {
+    rows: LogicalTableRow[];
+    /** 某个占位行数不清时为 false。此时 rows 只保留它之前的行，后面的行号不再使用。 */
+    stable: boolean;
+}
+
+/**
+ * 把画面上的 tr 换成完整表的行号。
+ * 占位行按属性里的 tr 个数展开，本身不占一个数据行。
+ * 数不清时停住：前缀仍然和完整表对齐，后面的行不猜。
+ */
+export function logicalTableRows(rows: readonly {getAttribute(name: string): string | null}[]): LogicalTableLayout {
+    const placed: LogicalTableRow[] = [];
+    let logical = 0;
+    for (let index = 0; index < rows.length; index += 1) {
+        const source = rows[index].getAttribute(TABLE_VIRTUAL_ROWS_ATTR);
+        if (source !== null) {
+            const count = countVirtualTableRows(source);
+            if (count <= 0) {
+                return {rows: placed, stable: false};
+            }
+            placed.push({logical, omitted: count});
+            logical += count;
+            continue;
+        }
+        placed.push({logical, omitted: 0});
+        logical += 1;
+    }
+    return {rows: placed, stable: true};
+}
+
+/** 逻辑行号落在哪一个 DOM 行上。找不到时返回 -1。 */
+export function logicalRowOffset(rows: readonly LogicalTableRow[], logicalRow: number): number {
+    for (let index = 0; index < rows.length; index += 1) {
+        const row = rows[index];
+        const span = row.omitted > 0 ? row.omitted : 1;
+        if (logicalRow >= row.logical && logicalRow < row.logical + span) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+/**
+ * 这块表格自己的 table.rows。嵌套表的行不算进来，和思源虚拟化用的行集合一致。
+ * 没有 html table 时返回 null，调用方再走宽松的 tr 扫描。
+ */
+/**
+ * 已挂载格子的逻辑位置。占位行不产生格子。
+ * 行号数不清时返回 null，调用方继续用内核 HTML，不猜位置。
+ */
+export function logicalTableCells(tableBlock: HTMLElement): Map<string, HTMLTableCellElement> | null {
+    const rows = ownTableRows(tableBlock);
+    if (!rows) {
+        return null;
+    }
+    const placed = logicalTableRows(rows);
+    if (!placed.stable) {
+        return null;
+    }
+    const cells = new Map<string, HTMLTableCellElement>();
+    for (let index = 0; index < placed.rows.length; index += 1) {
+        const place = placed.rows[index];
+        if (!place || place.omitted !== 0) {
+            continue;
+        }
+        const children = rows[index].children;
+        let column = 0;
+        for (let childIndex = 0; childIndex < children.length; childIndex += 1) {
+            const child = children[childIndex];
+            if (!(child instanceof HTMLTableCellElement)) {
+                continue;
+            }
+            cells.set(place.logical + ":" + column, child);
+            column += 1;
+        }
+    }
+    return cells;
+}
+
+export function ownTableRows(element: HTMLElement): HTMLTableRowElement[] | null {
+    const table = ownHtmlTable(element);
+    if (!table) {
+        return null;
+    }
+    return Array.from(table.rows);
+}
+
 /**
  * 把虚拟表的内核单元和画面单元合成一份。
  * 画面单元不要放进 units：文字相同的格子必须留下内核单元。
- * 键是逻辑 `行:列`。画面 unitId 含占位行，行号和完整表不一致。
+ * 键是逻辑 `行:列`。对齐用这个键，不拿 unitId 里的字面行号互相比。
  */
 export function mergeVirtualTableUnits<T extends {
     blockId: string;
@@ -187,7 +293,8 @@ export function mergeVirtualTableUnits<T extends {
         if (unit.blockType !== "NodeTable") {
             continue;
         }
-        if (!tableCellPosition(unit.unitId)) {
+        // 备注和公式不是格子。它们的 unitId 没有行列号，不能因此放弃整张表的画面文字。
+        if (!tableCellPosition(unit.unitId) && !isVirtualTableSideUnit(unit.unitId)) {
             unstable.add(unit.blockId);
         }
     }

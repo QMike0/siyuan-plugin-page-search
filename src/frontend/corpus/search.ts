@@ -8,9 +8,12 @@ import {
     avApiUnitInView,
     avApiUnitShown,
     collectAvDomCoverage,
+    isBlockTreeEnabled,
     isHitReplaceableByUnit,
-    countVirtualTableRows,
+    logicalTableRows,
     mergeVirtualTableUnits,
+    ownTableRows,
+    TABLE_VIRTUAL_ROWS_ATTR,
     tableCellPosition,
     tableHostOmitsRows,
     isRestrictInlineActive,
@@ -21,12 +24,14 @@ import {
 } from "../../shared";
 import {
     collectSearchableBlocks,
+    directTableCellColumn,
+    isDirectTableCell,
     inlineMathIdentityText,
     isInlineMathSearchUnit,
     MERMAID_UNIT_ID,
     HTML_BLOCK_UNIT_ID,
 } from "../blocks";
-import type {SearchableBlock, SearchMatch} from "../dom-types";
+import type {SearchableBlock, SearchMatch, TableReplaceLock} from "../dom-types";
 import type {SearchPipelineOptions, SearchPipelineResult} from "../pipeline";
 import {invalidateAvCache, loadAvUnits, peekAvUnits, resolveMissingAvIds, type AvBlockRef} from "./av";
 import {escSql, querySqlAll} from "./api";
@@ -52,7 +57,15 @@ import {projectRanges} from "./project";
 import {freezeBlock, restrictSpanCovers, type CachedUnit} from "./units";
 import type {OffscreenRenderMode} from "./offscreen";
 
-const textCache = new Map<string, {hash: string; units: CachedUnit[]}>();
+interface TextCacheEntry {
+    hash: string;
+    units: CachedUnit[];
+    /** 渲染失败的短期负缓存；到期后允许用户下一次搜索重试。 */
+    retryAfter?: number;
+}
+
+const textCache = new Map<string, TextCacheEntry>();
+const SPECIAL_FAILURE_RETRY_MS = 5000;
 /** 每个文档保留的普通正文缓存条数。图表缓存不走这条名单。 */
 const PLAIN_CACHE_LIMIT = 2000;
 const plainCacheKeys = new Map<string, string[]>();
@@ -187,29 +200,45 @@ function passesRestrict(unit: CachedUnit, start: number, end: number, options: S
 }
 
 function remember(rootId: string, meta: BlockMeta, units: CachedUnit[], scope: string): void {
-    if (!units.some((unit) => unit.text.trim())) {
-        return;
-    }
+    // 成功但没有可见文字也是稳定结果；缓存空数组可避免无限重渲染。
     textCache.set(cacheKey(rootId, meta.id, scope), {hash: meta.hash, units});
+}
+
+function rememberUnrendered(rootId: string, meta: BlockMeta, scope: string): void {
+    textCache.set(cacheKey(rootId, meta.id, scope), {
+        hash: meta.hash,
+        units: [],
+        retryAfter: Date.now() + SPECIAL_FAILURE_RETRY_MS,
+    });
 }
 
 function cachedUnits(
     rootId: string,
     metas: BlockMeta[],
     scope: string,
-): {ready: CachedUnit[]; missing: BlockMeta[]} {
+): {ready: CachedUnit[]; missing: BlockMeta[]; unrendered: number} {
     const ready: CachedUnit[] = [];
     const missing: BlockMeta[] = [];
+    let unrendered = 0;
+    const now = Date.now();
     for (const meta of metas) {
         const key = cacheKey(rootId, meta.id, scope);
         const cached = textCache.get(key);
-        if (cached && cached.hash === meta.hash && cached.units.some((unit) => unit.text.trim())) {
-            ready.push(...cached.units);
-            continue;
+        if (cached && cached.hash === meta.hash) {
+            if (cached.retryAfter !== undefined) {
+                if (cached.retryAfter > now) {
+                    unrendered += 1;
+                    continue;
+                }
+                textCache.delete(key);
+            } else {
+                ready.push(...cached.units);
+                continue;
+            }
         }
         missing.push(meta);
     }
-    return {ready, missing};
+    return {ready, missing, unrendered};
 }
 
 async function extractMetas(
@@ -233,7 +262,22 @@ async function extractMetas(
         mode,
     );
     if (!extracted) {
-        return {units: [], unrendered: 0, unrenderedIds: [], failed: true};
+        const failedIds = metas
+            .filter((meta) => isSpecialRenderType(meta.type, meta.subtype))
+            .map((meta) => meta.id);
+        if (epoch === corpusEpoch) {
+            for (const meta of metas) {
+                if (isSpecialRenderType(meta.type, meta.subtype)) {
+                    rememberUnrendered(rootId, meta, scope);
+                }
+            }
+        }
+        return {
+            units: [],
+            unrendered: failedIds.length,
+            unrenderedIds: failedIds,
+            failed: true,
+        };
     }
     const byId = new Map<string, CachedUnit[]>();
     for (const unit of extracted.units) {
@@ -243,10 +287,16 @@ async function extractMetas(
     }
     const units: CachedUnit[] = [];
     const keep = epoch === corpusEpoch;
+    const unrenderedIds = new Set(extracted.unrenderedIds);
     for (const meta of metas) {
         const list = byId.get(meta.id) ?? [];
-        if (keep && mode !== "light") {
-            remember(rootId, meta, list, scope);
+        const cacheSpecial = mode !== "light" || isSpecialRenderType(meta.type, meta.subtype);
+        if (keep && cacheSpecial) {
+            if (unrenderedIds.has(meta.id)) {
+                rememberUnrendered(rootId, meta, scope);
+            } else {
+                remember(rootId, meta, list, scope);
+            }
         }
         units.push(...list);
     }
@@ -416,15 +466,21 @@ function scheduleSpecialWarmup(
     notebookId: string,
     metas: BlockMeta[],
     options: SearchPipelineOptions,
-): void {
+): number {
+    const scope = collectionScope(options);
+    const initial = cachedUnits(rootId, metas, scope);
+    if (initial.missing.length === 0) {
+        return initial.unrendered;
+    }
     const previous = warmupTimers.get(rootId);
     if (previous != null) {
         window.clearTimeout(previous);
     }
     const timer = window.setTimeout(() => {
         warmupTimers.delete(rootId);
-        const missing = cachedUnits(rootId, metas, collectionScope(options)).missing;
+        const missing = cachedUnits(rootId, metas, scope).missing;
         if (missing.length === 0) {
+            notifyIndexSettled(rootId);
             return;
         }
         const diagrams = missing.filter((item) => isDiagramBlock(item.type, item.subtype));
@@ -442,6 +498,7 @@ function scheduleSpecialWarmup(
         });
     }, SPECIAL_WARMUP_MS);
     warmupTimers.set(rootId, timer);
+    return initial.unrendered;
 }
 
 function jobRunning(prefix: string): boolean {
@@ -470,32 +527,11 @@ async function loadAvRefs(rootId: string): Promise<AvBlockRef[]> {
  * 与 highlight-search 一致：只有当前能看见的块才用编辑器里的文本。
  * 高度为 0、或落在非标题折叠里的块，DOM 里往往没有正文，必须再读 getBlockDOMs。
  */
-const TABLE_ZW_RE = /[\u200B-\u200D\uFEFF]/g;
+const TABLE_ZW_RE = /[\u200B-\u200D\u2060\uFEFF]/g;
 const TABLE_CELL_UNIT = "table-cell:";
-const TABLE_CELL_ELEMENT = "td, th, [data-type=\"NodeTableCell\"], .table__cell";
 
 function stripTableZw(text: string): string {
     return text.replace(TABLE_ZW_RE, "");
-}
-
-function isTableCellElement(element: HTMLElement): boolean {
-    return element.matches(TABLE_CELL_ELEMENT);
-}
-
-function columnAmongCells(row: HTMLTableRowElement, cell: HTMLElement): number {
-    const children = row.children;
-    let column = 0;
-    for (let index = 0; index < children.length; index += 1) {
-        const child = children[index];
-        if (!(child instanceof HTMLElement) || !isTableCellElement(child)) {
-            continue;
-        }
-        if (child === cell) {
-            return column;
-        }
-        column += 1;
-    }
-    return -1;
 }
 
 function tableBlockElement(element: HTMLElement): HTMLElement | null {
@@ -511,7 +547,7 @@ function tableBlockElement(element: HTMLElement): HTMLElement | null {
 
 function isVirtualTablePlaceholder(element: HTMLElement): boolean {
     const row = element.closest<HTMLElement>("tr, .table__row");
-    return Boolean(row && row.hasAttribute("data-sy-table-virtual-rows"));
+    return Boolean(row && row.hasAttribute(TABLE_VIRTUAL_ROWS_ATTR));
 }
 
 /**
@@ -525,47 +561,31 @@ function indexMountedTableRows(tableBlock: HTMLElement): {
 } {
     const shownKeys = new Set<string>();
     const rowIndex = new Map<HTMLTableRowElement, number>();
-    const tables = tableBlock.querySelectorAll("table");
-    let table: HTMLTableElement | null = null;
-    for (let index = 0; index < tables.length; index += 1) {
-        const candidate = tables[index];
-        if (candidate instanceof HTMLTableElement
-            && candidate.closest('[data-type="NodeTable"]') === tableBlock) {
-            table = candidate;
-            break;
-        }
-    }
-    if (!table && tableBlock instanceof HTMLTableElement) {
-        table = tableBlock;
-    }
-    if (!table) {
+    const rows = ownTableRows(tableBlock);
+    if (!rows) {
         return {shownKeys, rowIndex, unstable: true};
     }
-    const rows = table.rows;
-    let logical = 0;
+    const placed = logicalTableRows(rows);
+    if (!placed.stable) {
+        return {shownKeys, rowIndex, unstable: true};
+    }
     for (let index = 0; index < rows.length; index += 1) {
-        const row = rows[index];
-        const source = row.getAttribute("data-sy-table-virtual-rows");
-        if (source !== null) {
-            const count = countVirtualTableRows(source);
-            if (count <= 0) {
-                return {shownKeys, rowIndex, unstable: true};
-            }
-            logical += count;
+        const place = placed.rows[index];
+        if (!place || place.omitted > 0) {
             continue;
         }
-        rowIndex.set(row, logical);
+        const row = rows[index];
+        rowIndex.set(row, place.logical);
         const children = row.children;
         let column = 0;
         for (let childIndex = 0; childIndex < children.length; childIndex += 1) {
             const child = children[childIndex];
-            if (!(child instanceof HTMLElement) || !isTableCellElement(child)) {
+            if (!isDirectTableCell(child)) {
                 continue;
             }
-            shownKeys.add(logical + ":" + column);
+            shownKeys.add(place.logical + ":" + column);
             column += 1;
         }
-        logical += 1;
     }
     return {shownKeys, rowIndex, unstable: false};
 }
@@ -649,6 +669,9 @@ export async function searchCurrentDocument(
     const inFocus = (id: string) => !focusId || Boolean(focusScope?.has(id));
     const orderIndex = orderIndexOf(orders);
     const enabled = (item: BlockMeta) => {
+        if (!isBlockTreeEnabled(item.id, meta.links, options)) {
+            return false;
+        }
         if (options.includeTabs === false && isInTabsBlock(item.id, meta.links)) {
             return false;
         }
@@ -713,7 +736,7 @@ export async function searchCurrentDocument(
         }
         const row = block.element.closest("tr");
         const logicalRow = row instanceof HTMLTableRowElement ? state.rowIndex.get(row) : undefined;
-        const column = row instanceof HTMLTableRowElement ? columnAmongCells(row, block.element) : -1;
+        const column = row instanceof HTMLTableRowElement ? directTableCellColumn(row, block.element) : -1;
         if (logicalRow === undefined || column < 0) {
             if (stripTableZw(block.text)) {
                 virtualTables.delete(block.blockId);
@@ -894,8 +917,13 @@ export async function searchCurrentDocument(
                 ? fetchImageTitleCandidateIds(context.rootId, keyword, caseSensitive)
                 : Promise.resolve([] as string[]),
         ]);
-        for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
-            queueUnloaded(id);
+        if (!contentIds || !memoIds || !titleIds) {
+            // SQL 不可用时由文档元数据扩大到全部未加载叶子，保持结果完整性。
+            queueEveryUnloaded();
+        } else {
+            for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
+                queueUnloaded(id);
+            }
         }
         const queuedSpecials = new Set(specialTargets.map((item) => item.id));
         const restSpecials: BlockMeta[] = [];
@@ -909,7 +937,7 @@ export async function searchCurrentDocument(
             restSpecials.push(item);
         }
         if (restSpecials.length > 0) {
-            scheduleSpecialWarmup(context.rootId, context.notebookId, restSpecials, options);
+            unrendered += scheduleSpecialWarmup(context.rootId, context.notebookId, restSpecials, options);
         }
     }
 
@@ -930,6 +958,7 @@ export async function searchCurrentDocument(
 
     const specialState = cachedUnits(context.rootId, specialTargets, scope);
     units.push(...specialState.ready);
+    unrendered += specialState.unrendered;
     const specialMissing = specialState.missing;
     if (specialMissing.length > 0) {
         const diagrams = specialMissing.filter((item) => isDiagramBlock(item.type, item.subtype));
@@ -1021,6 +1050,7 @@ export async function searchCurrentDocument(
             || hit.unitId === "diagram-rendered"
             || isInlineMathSearchUnit(unit)
             || hit.unitId?.startsWith("embed:");
+        const replaceLock = nonReplaceable ? undefined : virtualTableReplaceLock(virtualTables, unit);
         matches.push({
             id: hit.id,
             blockId: hit.blockId,
@@ -1031,9 +1061,10 @@ export async function searchCurrentDocument(
             start: hit.start,
             end: hit.end,
             matchedText: hit.matchedText,
-            replaceable: (nonReplaceable || tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`))
+            replaceable: (nonReplaceable || Boolean(replaceLock) || tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`))
                 ? false
                 : isHitReplaceableByUnit(unit, hit.start, hit.end),
+            replaceLock,
             highlightKind: unit.highlightKind,
             ...(unit.highlightKind === "inline-math" && unit.mathOrdinal !== undefined
                 ? {
@@ -1050,6 +1081,8 @@ export async function searchCurrentDocument(
     matches.sort(compareMatchOrder);
 
     const partial = jobRunning(`special:${context.rootId}`)
+        || jobRunning(`special-rest:${context.rootId}`)
+        || warmupTimers.has(context.rootId)
         || jobRunning(`av:${context.rootId}`);
     return {
         matches: projectRanges(edit, matches, options, liveAll),
@@ -1058,6 +1091,28 @@ export async function searchCurrentDocument(
         partial,
         unrendered,
     };
+}
+
+/**
+ * 文字没变时合并会留下内核单元，编辑器是否还开着只存在于画面单元上。
+ * 按逻辑行列把画面上的锁定带过来。公式等本来就不能替换，不再盖上这条原因。
+ */
+function virtualTableReplaceLock(
+    tables: ReadonlyMap<string, {unstable: boolean; liveByKey: ReadonlyMap<string, CachedUnit>}>,
+    unit: CachedUnit,
+): TableReplaceLock | undefined {
+    if (unit.replaceLock) {
+        return unit.replaceLock;
+    }
+    const state = tables.get(unit.blockId);
+    if (!state || state.unstable) {
+        return undefined;
+    }
+    const position = tableCellPosition(unit.unitId);
+    if (!position) {
+        return undefined;
+    }
+    return state.liveByKey.get(position)?.replaceLock;
 }
 
 function compareMatchOrder(left: SearchMatch, right: SearchMatch): number {
@@ -1310,7 +1365,7 @@ function dedupeMathUnits(units: CachedUnit[]): CachedUnit[] {
             kept.push(unit);
             continue;
         }
-        const text = unit.text.replace(/[\u200B-\u200D\uFEFF]/g, "");
+        const text = unit.text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");
         const key = `${unit.blockId}\0${text}\0${unit.mathOrdinal ?? ""}`;
         if (seen.has(key)) {
             continue;

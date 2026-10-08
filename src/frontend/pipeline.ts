@@ -17,6 +17,7 @@ import {
     TABLE_TYPE,
     collectSearchableBlocks,
     isDocTitleSearchUnit,
+    tableCellReplaceLock,
     inlineMathIdentityText,
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
@@ -459,7 +460,12 @@ function attachRangesToHits(
         acceptedByUnit.set(key, accepted);
 
         // 文档标题只参与查找。编辑中 Protyle 常把连续字拆成多个相邻 Text。
-        const replaceable = !isDocTitle
+        // 富文本格和开着的单元格编辑器单独标原因，公式等仍走原来的不可替换。
+        const replaceLock = hit.blockType === TABLE_TYPE && !isDocTitle && !isMath
+            ? tableCellReplaceLock(block.element)
+            : undefined;
+        const replaceable = !replaceLock
+            && !isDocTitle
             && !isMath
             && !modeBlocked
             && isDomReplaceable(range, hit.blockType, hit.blockId)
@@ -475,6 +481,7 @@ function attachRangesToHits(
             end: hit.end,
             matchedText: hit.matchedText,
             replaceable,
+            replaceLock,
             range,
             highlightKind: isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
             anchorOffset: isMemo ? block.anchorOffset : undefined,

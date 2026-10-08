@@ -14,6 +14,8 @@ import {
     avApiUnitShown,
     collectAvDomCoverage,
     countVirtualTableRows,
+    logicalRowOffset,
+    logicalTableRows,
     createTextMatchProbe,
     findOffsetMatchesInText,
     mergeVirtualTableUnits,
@@ -23,6 +25,7 @@ import {
     generateSearchVariants,
     hasRestrictInlineType,
     isHitReplaceableByUnit,
+    isBlockTreeEnabled,
     isOffsetReplaceable,
     isRestrictInlineActive,
     isValidDocTitle,
@@ -57,7 +60,10 @@ function assert(condition: boolean, message: string) {
 const variants = generateSearchVariants("  foo\u200B  ");
 assert(variants.includes("  foo\u200B  "), "keeps original");
 assert(variants.includes("foo\u200B"), "trims");
-assert(variants.some((v) => !/[\u200B-\u200D\uFEFF]/.test(v)), "has no-zw variant");
+assert(variants.some((v) => !/[\u200B-\u200D\u2060\uFEFF]/.test(v)), "has no-zw variant");
+assert(generateSearchVariants("\u200B").length === 0, "marker-only query has no variants");
+assert(generateSearchVariants("\u2060").length === 0, "word-joiner-only query has no variants");
+assert(findOffsetMatchesInText("abc", "\u200B").length === 0, "marker-only query returns immediately");
 
 const tightVariants = generateSearchVariants("a b", false);
 assert(tightVariants.includes("a b"), "tight keeps spaced");
@@ -77,6 +83,33 @@ assert(
 assert(
     matches.some((m) => m.startIndex === 0 && m.endIndex === zwText.length),
     "maps to original span",
+);
+const wordJoinerText = "hello\u2060world";
+const wordJoinerMatches = findOffsetMatchesInText(wordJoinerText, "helloworld");
+assert(
+    wordJoinerMatches.length === 1
+    && wordJoinerMatches[0].startIndex === 0
+    && wordJoinerMatches[0].endIndex === wordJoinerText.length,
+    "v3.8.6 word joiner maps back to the original span",
+);
+
+const ancestorLinks = new Map([
+    ["quote", {parentId: "root", type: "b", subtype: "", ial: ""}],
+    ["list", {parentId: "quote", type: "l", subtype: "t", ial: ""}],
+    ["item", {parentId: "list", type: "i", subtype: "t", ial: ""}],
+    ["leaf", {parentId: "item", type: "p", subtype: "", ial: ""}],
+]);
+assert(
+    !isBlockTreeEnabled("leaf", ancestorLinks, {includeBlockquote: false}),
+    "cold leaf follows disabled blockquote ancestor",
+);
+assert(
+    !isBlockTreeEnabled("leaf", ancestorLinks, {includeListTask: false}),
+    "cold leaf follows disabled task-list ancestor",
+);
+assert(
+    isBlockTreeEnabled("leaf", ancestorLinks, {includeBlockquote: true, includeListTask: true}),
+    "cold leaf stays enabled when all ancestors are enabled",
 );
 
 const units = [
@@ -143,6 +176,30 @@ assert(insensitive.length === 3, `default case-insensitive: expected 3, got ${in
 
 const sensitive = matchTextUnits(caseUnits, "foo", {caseSensitive: true});
 assert(sensitive.length === 1 && sensitive[0].matchedText === "foo", "caseSensitive finds exact foo");
+
+const orthogonalUnits = [{
+    blockId: "orthogonal",
+    blockType: "p",
+    blockIndex: 0,
+    text: "a b ab a\u200Bb",
+    segmentLengths: [12],
+}];
+const sensitiveLoose = matchTextUnits(orthogonalUnits, "a b", {caseSensitive: true});
+assert(sensitiveLoose.length === 3, `caseSensitive keeps loose variants, got ${sensitiveLoose.length}`);
+const wholeLoose = matchTextUnits(orthogonalUnits, "a b", {wholeWord: true});
+assert(wholeLoose.length === 3, `wholeWord keeps loose variants, got ${wholeLoose.length}`);
+
+const unicodeOffset = matchTextUnits(
+    [{blockId: "unicode", blockType: "p", blockIndex: 0, text: "İx", segmentLengths: [2]}],
+    "x",
+);
+assert(
+    unicodeOffset.length === 1
+    && unicodeOffset[0].start === 1
+    && unicodeOffset[0].end === 2
+    && unicodeOffset[0].matchedText === "x",
+    "case folding keeps original UTF-16 offsets",
+);
 
 const wordUnits = [{
     blockId: "w1",
@@ -803,6 +860,28 @@ assert(countVirtualTableRows("<tr><td>&lt;tr</td></tr>") === 1, "escaped tr in a
 assert(countVirtualTableRows("") === 0, "empty placeholder has no rows");
 assert(countVirtualTableRows("<TR><td></td></TR>") === 1, "uppercase row tag still counts");
 
+const tableRow = (virtualHtml: string | null) => ({
+    getAttribute(name: string) {
+        return name === "data-sy-table-virtual-rows" ? virtualHtml : null;
+    },
+});
+const logicalRows = logicalTableRows([
+    tableRow(null),
+    tableRow("<tr><td>a</td></tr><tr><td>b</td></tr>"),
+    tableRow(null),
+]);
+assert(logicalRows.stable, "placeholder with two rows stays countable");
+assert(logicalRows.rows.length === 3, "logical layout keeps every dom row");
+assert(logicalRows.rows[0].logical === 0 && logicalRows.rows[0].omitted === 0, "first mounted row is logical 0");
+assert(logicalRows.rows[1].logical === 1 && logicalRows.rows[1].omitted === 2, "placeholder covers the next two logical rows");
+assert(logicalRows.rows[2].logical === 3 && logicalRows.rows[2].omitted === 0, "row after a placeholder keeps the full-table index");
+assert(logicalRowOffset(logicalRows.rows, 2) === 1, "a hidden row maps onto its placeholder");
+assert(logicalRowOffset(logicalRows.rows, 3) === 2, "a mounted row maps onto itself");
+assert(logicalRowOffset(logicalRows.rows, 4) === -1, "a row past the table is not invented");
+const brokenRows = logicalTableRows([tableRow(null), tableRow("")]);
+assert(!brokenRows.stable && brokenRows.rows.length === 1, "an unreadable placeholder stops the count");
+assert(brokenRows.rows[0].logical === 0, "rows before the bad placeholder keep their index");
+
 const looseProbe = createTextMatchProbe("ab", {});
 assert(looseProbe("a\u200bb"), "probe sees a match across a zero-width char");
 assert(!looseProbe("zz"), "probe rejects a miss");
@@ -867,5 +946,21 @@ const unstableTable = mergeVirtualTableUnits(
 );
 assert(unstableTable.units.map((unit) => unit.text).indexOf("改") < 0, "a cell without a row and column keeps the kernel text");
 assert(unstableTable.staleKeys.size === 0, "kernel-only table does not mark cells stale");
+
+const memoTable = mergeVirtualTableUnits(
+    [
+        tableCell("table-cell:0:0", "旧"),
+        {blockId: "t", blockType: "NodeTable", unitId: "table-memo:0:0:1", text: "备注"},
+        {blockId: "t", blockType: "NodeTable", unitId: "inline-math:0", text: "公式"},
+    ],
+    new Map([["t", {
+        shownKeys: new Set(["0:0"]),
+        liveByKey: new Map([["0:0", tableCell("table-cell:0:0", "新")]]),
+        unstable: false,
+    }]]),
+);
+assert(memoTable.units.map((unit) => unit.text).indexOf("新") >= 0, "a memo in the table still uses the live cell text");
+assert(memoTable.units.map((unit) => unit.text).indexOf("备注") >= 0, "table memo stays searchable");
+assert(memoTable.staleKeys.has("t\u0000table-cell:0:0"), "edited cell stays non-replaceable when the table also has a memo");
 
 console.log("smoke:shared OK (match + restrict + selection + preserve-case + regex-replace + doc-title + inline-memo)");

@@ -1,7 +1,8 @@
 import {escSql, querySqlAll} from "./api";
+import type {BlockAncestorIncludeFlags} from "../../shared";
 
 /** 与搜索面板的块类型开关对齐，避免 corpus 反向依赖 pipeline。 */
-export interface BlockIncludeFlags {
+export interface BlockIncludeFlags extends BlockAncestorIncludeFlags {
     includeImageTitle?: boolean;
     includeAttributeView?: boolean;
     includeTable?: boolean;

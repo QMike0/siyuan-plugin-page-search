@@ -9,7 +9,11 @@ import {
     isRestrictInlineActive,
     normalizeRestrictInlineTypes,
     toggleRestrictInlineType,
+    logicalRowOffset,
+    logicalTableRows,
+    ownTableRows,
     shouldEnumerateRestrictInline,
+    tableCellPosition,
     type RestrictInlineType,
 } from "../shared";
 import type {IMenu, Plugin} from "siyuan";
@@ -21,10 +25,12 @@ import {
     HTML_BLOCK_UNIT_ID,
     MERMAID_UNIT_ID,
     resolveDocRoot,
+    TABLE_TYPE,
     type CollectSearchableBlocksOptions,
 } from "./blocks";
 import {parentElementCrossingShadow} from "./dom-parent";
 import {calculateSearchMatches, type SearchPipelineResult} from "./pipeline";
+import {createRangeFromBlockOffsets} from "./ranges";
 import {fillLiveRanges, rebindChangedRanges, type RebindTarget} from "./corpus/project";
 import {MAX_TOUCHED_BLOCKS, watchEditorDom, type EditorDomChange} from "./editor-dom-watch";
 import {blockIsInEditor, openBlockInEditor} from "./corpus/locate";
@@ -131,6 +137,29 @@ function rangeStillPainted(match: SearchMatch): boolean {
         && (host as Element).matches(`[data-type~="${INLINE_MEMO_TYPE}"]`);
 }
 
+/**
+ * 命中很多时不能把全部 Range 一次传给构造函数，参数个数超过引擎上限会整轮高亮失败。
+ * 先建空的 Highlight，再逐个 add。
+ */
+function newHighlight(ranges: readonly Range[]): any | null {
+    const HighlightCtor = (window as any).Highlight;
+    if (typeof HighlightCtor !== "function" || !(CSS as any).highlights) {
+        return null;
+    }
+    try {
+        const highlight = new HighlightCtor();
+        if (typeof highlight.add === "function") {
+            for (let index = 0; index < ranges.length; index += 1) {
+                highlight.add(ranges[index]);
+            }
+            return highlight;
+        }
+    } catch {
+        // 空构造不可用时退回分批传入
+    }
+    return new HighlightCtor(...ranges.slice(0, 4096));
+}
+
 /** 结果列表：固定行高，只渲染视口附近的行。 */
 const RESULTS_ITEM_HEIGHT = 26;
 const RESULTS_LIST_PADDING = 4;
@@ -174,6 +203,12 @@ export interface SearchBarI18n {
     replaceAttributeViewUnsupported: string;
     replaceMermaidUnsupported: string;
     replaceHtmlBlockUnsupported: string;
+    /** 富文本单元格：源码在属性里，改画面文字不会被保存 */
+    replaceTableRichUnsupported: string;
+    /** 单元格编辑器还开着 */
+    replaceTableCellEditingUnsupported: string;
+    /** 同一张虚拟表里另有格子还在编辑，写回会盖掉它 */
+    replaceTablePendingEdit: string;
     replaceModeUnsupported: string;
     /** 文档标题替换失败（重命名校验/接口） */
     replaceDocTitleFailed: string;
@@ -336,6 +371,8 @@ export class SearchBar {
     private indexSettledTimer: number | null = null;
     private unsubscribeIndexSettled: (() => void) | null = null;
     private locatePending = false;
+    /** 跳到大表屏外行时的等待序号。新的跳转会作废上一次。 */
+    private tableRevealSerial = 0;
     private staleRefreshPending = false;
     private typingTimer: number | undefined;
     private searchGeneration = 0;
@@ -703,6 +740,8 @@ export class SearchBar {
     }
 
     destroy() {
+        // 关掉面板时作废还在等大表分段挂出的跳转，避免关闭后仍滚动正文。
+        this.tableRevealSerial += 1;
         cancelBackgroundCorpusJobs();
         clearTimeout(this.typingTimer);
         clearTimeout(this.avRefreshTimer);
@@ -1819,9 +1858,6 @@ export class SearchBar {
         }
 
         this.clearHighlight();
-        const HighlightCtor = (window as any).Highlight as {
-            new (...ranges: Range[]): Highlight;
-        };
         // 正文与行内公式统一黄/橙 CSS Highlight；备注仍用虚线下划线
         const textRanges: Range[] = [];
         for (const match of matches) {
@@ -1834,12 +1870,13 @@ export class SearchBar {
                 textRanges.push(mirror);
             }
         }
-        if (typeof HighlightCtor === "function" && (CSS as any).highlights) {
-            if (textRanges.length) {
-                (CSS as any).highlights.set("search-results", new HighlightCtor(...textRanges));
+        if (textRanges.length) {
+            const highlight = newHighlight(textRanges);
+            if (highlight) {
+                (CSS as any).highlights.set("search-results", highlight);
+            } else {
+                console.warn("[page-search] CSS Custom Highlight API unavailable");
             }
-        } else if (textRanges.length) {
-            console.warn("[page-search] CSS Custom Highlight API unavailable");
         }
 
         this.syncMemoUnderlineVisual();
@@ -2086,6 +2123,172 @@ export class SearchBar {
         this.indexResetPausedUntil = Math.max(this.indexResetPausedUntil, Date.now() + ms);
     }
 
+    /**
+     * 大表屏外行没有格子 DOM。先把盖住它的占位行滚进视口，等思源把这一段挂出来，再按逻辑行号补 Range。
+     * 普通表的行本来就在，这里只是补一次对得上文字的 Range。
+     */
+    private async revealVirtualTableMatch(
+        index: number,
+        match: SearchMatch,
+        table: HTMLElement,
+        serial: number,
+    ) {
+        const generation = this.searchGeneration;
+        const mounted = await this.prepareTableMatchRow(table, match, serial);
+        if (serial !== this.tableRevealSerial || generation !== this.searchGeneration || this.replaceBusy) {
+            return;
+        }
+        if (mounted === "ready" && this.bindShownTableMatch(index, match, table)) {
+            await this.scrollIntoRangesAsync(index, true, false, false, false);
+            return;
+        }
+        if (mounted !== "pending") {
+            table.scrollIntoView({block: "center", inline: "nearest"});
+        }
+    }
+
+    /** ready：目标行已在画面上。pending：只滚到了占位行，分段还没挂出来。missing：对不上行。 */
+    private async prepareTableMatchRow(
+        table: HTMLElement,
+        match: SearchMatch,
+        serial: number,
+    ): Promise<"missing" | "ready" | "pending"> {
+        const logicalRow = this.logicalRowOfMatch(match);
+        if (logicalRow === null) {
+            return "missing";
+        }
+        const located = this.locateLogicalTableRow(table, logicalRow);
+        if (!located) {
+            return "missing";
+        }
+        if (!located.placeholder) {
+            return "ready";
+        }
+        located.row.scrollIntoView({block: "center", inline: "nearest"});
+        // 占位行已经在视口里时，scrollIntoView 不会再触发滚动。补一次 scroll，让思源虚拟化把这一段挂出来。
+        located.row.dispatchEvent(new Event("scroll"));
+        const appeared = await this.waitForLogicalTableRow(table, logicalRow, serial, 1000);
+        if (serial !== this.tableRevealSerial) {
+            return "pending";
+        }
+        return appeared ? "ready" : "pending";
+    }
+
+    /** 表格命中的逻辑行号。不是表格格子时返回 null。 */
+    private logicalRowOfMatch(match: SearchMatch): number | null {
+        if (match.blockType !== TABLE_TYPE) {
+            return null;
+        }
+        const position = tableCellPosition(match.unitId);
+        if (!position) {
+            return null;
+        }
+        const colon = position.indexOf(":");
+        const logicalRow = Number(position.slice(0, colon));
+        if (!Number.isInteger(logicalRow) || logicalRow < 0) {
+            return null;
+        }
+        return logicalRow;
+    }
+
+    /**
+     * 这一行被思源收进占位行，表节点还在，格子 DOM 已经卸掉。
+     * 旧偏移仍然对得上完整表，不必为了跳转整篇重搜。
+     * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/wysiwyg/tableVirtualization.ts refresh
+     */
+    private tableMatchRowVirtualizedAway(match: SearchMatch): boolean {
+        const logicalRow = this.logicalRowOfMatch(match);
+        if (logicalRow === null || !match.blockId) {
+            return false;
+        }
+        const table = this.edit.querySelector<HTMLElement>(
+            `[data-node-id="${CSS.escape(match.blockId)}"]`,
+        );
+        if (!table) {
+            return false;
+        }
+        return this.locateLogicalTableRow(table, logicalRow)?.placeholder === true;
+    }
+
+    private locateLogicalTableRow(
+        table: HTMLElement,
+        logicalRow: number,
+    ): {row: HTMLElement; placeholder: boolean} | null {
+        if (!table.isConnected) {
+            return null;
+        }
+        const rows = ownTableRows(table);
+        if (!rows) {
+            return null;
+        }
+        const placed = logicalTableRows(rows);
+        const offset = logicalRowOffset(placed.rows, logicalRow);
+        if (offset < 0) {
+            return null;
+        }
+        return {row: rows[offset], placeholder: placed.rows[offset].omitted > 0};
+    }
+
+    private waitForLogicalTableRow(
+        table: HTMLElement,
+        logicalRow: number,
+        serial: number,
+        timeoutMs: number,
+    ): Promise<boolean> {
+        const started = Date.now();
+        return new Promise((resolve) => {
+            const tick = () => {
+                if (serial !== this.tableRevealSerial) {
+                    resolve(false);
+                    return;
+                }
+                const located = this.locateLogicalTableRow(table, logicalRow);
+                if (located && !located.placeholder) {
+                    resolve(true);
+                    return;
+                }
+                if (!table.isConnected || Date.now() - started >= timeoutMs) {
+                    resolve(false);
+                    return;
+                }
+                window.requestAnimationFrame(tick);
+            };
+            window.requestAnimationFrame(tick);
+        });
+    }
+
+    /** 只补这一条，并且偏移处的文字必须还是命中文字。对不上就保持没有 Range。 */
+    private bindShownTableMatch(index: number, match: SearchMatch, table: HTMLElement): boolean {
+        const host = table.isConnected
+            ? table
+            : this.edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(match.blockId)}"]`);
+        if (!host?.isConnected) {
+            return false;
+        }
+        const live = collectSearchableBlocks(this.edit, {
+            ...this.searchCollectOptions(),
+            includeDocTitle: false,
+            scopeRoots: [host],
+        });
+        const block = live.find((item) => item.blockId === match.blockId && item.unitId === match.unitId);
+        if (!block || block.text.slice(match.start, match.end) !== match.matchedText) {
+            return false;
+        }
+        const range = createRangeFromBlockOffsets(block, match.start, match.end, {
+            allowFoldedHidden: this.includeFoldedBlocks,
+        });
+        if (!range) {
+            return false;
+        }
+        const current = this.resultMatches[index];
+        if (!current || current.id !== match.id) {
+            return false;
+        }
+        current.range = range;
+        this.applyResultHighlights();
+        return true;
+    }
+
     private revealUnloadedMatch(index: number, match: SearchMatch | undefined, scroll: boolean) {
         if (!match || match.blockId === "__doc-title__") {
             return;
@@ -2118,6 +2321,11 @@ export class SearchBar {
         if (!shown && renderedMindmap) {
             renderedMindmap.querySelector<HTMLElement>(":scope > .mindmap-view")
                 ?.scrollIntoView({block: "center", inline: "nearest"});
+            return;
+        }
+        if (shown && existing && match.blockType === TABLE_TYPE && tableCellPosition(match.unitId)) {
+            const serial = ++this.tableRevealSerial;
+            void this.revealVirtualTableMatch(index, match, existing, serial);
             return;
         }
         if (shown || (match.blockType === ATTRIBUTE_VIEW_TYPE && existing)) {
@@ -2320,7 +2528,12 @@ export class SearchBar {
             }
         }
         if (textRanges.length) {
-            (CSS as any).highlights.set("search-results", new HighlightCtor(...textRanges));
+            const highlight = newHighlight(textRanges);
+            if (!highlight) {
+                this.syncMemoUnderlineVisual();
+                return;
+            }
+            (CSS as any).highlights.set("search-results", highlight);
         } else {
             (CSS as any).highlights.delete("search-results");
         }
@@ -2594,15 +2807,19 @@ export class SearchBar {
         if (typeof HighlightCtor !== "function" || !(CSS as any).highlights) {
             return;
         }
-        const highlights = (CSS as any).highlights;
-        highlights.delete("search-focus");
-        highlights.delete("search-math-focus");
         const ranges = [range];
         const mirror = mirrorTabsTitleRange(range);
         if (mirror) {
             ranges.push(mirror);
         }
-        highlights.set("search-focus", new HighlightCtor(...ranges));
+        const highlight = newHighlight(ranges);
+        if (!highlight) {
+            return;
+        }
+        const highlights = (CSS as any).highlights;
+        highlights.delete("search-focus");
+        highlights.delete("search-math-focus");
+        highlights.set("search-focus", highlight);
         this.plugin.updateLastHighlightComponent(this.root);
     }
 
@@ -2643,7 +2860,13 @@ export class SearchBar {
             match.range = undefined;
             range = undefined;
             // 块还在画面上，只是块内 DOM 被重建，格内文字也可能改过，旧偏移不能再用来补 Range。
-            if (scroll && refreshStale && this.matchBlockShown(match)) {
+            // 大表只是把这一行收进占位行，文字没变。直接挂出分段，不整篇重搜。
+            if (
+                scroll
+                && refreshStale
+                && this.matchBlockShown(match)
+                && !this.tableMatchRowVirtualizedAway(match)
+            ) {
                 await this.refreshStaleMatch(pulseMemoFocus);
                 return;
             }
@@ -2902,6 +3125,26 @@ export class SearchBar {
         return null;
     }
 
+    /** 不可替换时的提示。表格两类单独说明，其余保持原来的文案。 */
+    private unsupportedReplaceMessage(match: SearchMatch): string {
+        if (match.blockType === ATTRIBUTE_VIEW_TYPE) {
+            return this.i18n.replaceAttributeViewUnsupported;
+        }
+        if (match.unitId === MERMAID_UNIT_ID) {
+            return this.i18n.replaceMermaidUnsupported;
+        }
+        if (match.unitId === HTML_BLOCK_UNIT_ID) {
+            return this.i18n.replaceHtmlBlockUnsupported;
+        }
+        if (match.replaceLock === "table-rich") {
+            return this.i18n.replaceTableRichUnsupported;
+        }
+        if (match.replaceLock === "table-cell-editor") {
+            return this.i18n.replaceTableCellEditingUnsupported;
+        }
+        return this.i18n.replaceCurrentUnsupported;
+    }
+
     /**
      * 替换当前：不可替则提示并跳到下一项；可替走 Protyle transaction。
      */
@@ -2926,14 +3169,7 @@ export class SearchBar {
             return;
         }
         if (!match.replaceable) {
-            const msg = match.blockType === ATTRIBUTE_VIEW_TYPE
-                ? this.i18n.replaceAttributeViewUnsupported
-                : match.unitId === MERMAID_UNIT_ID
-                    ? this.i18n.replaceMermaidUnsupported
-                    : match.unitId === HTML_BLOCK_UNIT_ID
-                        ? this.i18n.replaceHtmlBlockUnsupported
-                        : this.i18n.replaceCurrentUnsupported;
-            showMessage(msg, 3000, "info");
+            showMessage(this.unsupportedReplaceMessage(match), 3000, "info");
             this.clickNext();
             return;
         }
@@ -2984,6 +3220,10 @@ export class SearchBar {
             if (result.error === "regex-expand-failed") {
                 showMessage(this.i18n.replaceRegexExpandFailed, 3000, "info");
                 this.clickNext();
+                return;
+            }
+            if (result.error === "table-pending-edit") {
+                showMessage(this.i18n.replaceTablePendingEdit, 4000, "info");
                 return;
             }
             if (result.error === "title-invalid") {
@@ -3059,6 +3299,10 @@ export class SearchBar {
             }
             if (result.error === "protyle-missing") {
                 showMessage(this.i18n.replaceProtyleMissing, 4000, "error");
+                return;
+            }
+            if (result.replacedCount === 0 && result.error === "table-pending-edit") {
+                showMessage(this.i18n.replaceTablePendingEdit, 4000, "info");
                 return;
             }
             if (

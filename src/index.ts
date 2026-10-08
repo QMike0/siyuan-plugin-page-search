@@ -305,6 +305,12 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 || "Mermaid diagrams support search and highlight only, not replace",
             replaceHtmlBlockUnsupported: t.replaceHtmlBlockUnsupported
                 || "HTML blocks support search and highlight of rendered text only; replacement is not supported",
+            replaceTableRichUnsupported: t.replaceTableRichUnsupported
+                || "Rich-text table cells support search and highlight only; replacement is not supported",
+            replaceTableCellEditingUnsupported: t.replaceTableCellEditingUnsupported
+                || "This cell is being edited. Click outside the cell to finish editing, then replace",
+            replaceTablePendingEdit: t.replaceTablePendingEdit
+                || "This table still has an edit that has not been saved. Click outside the cell, then replace",
             replaceModeUnsupported: t.replaceModeUnsupported
                 || "Replacement is unavailable in publish, export preview, or read-only mode",
             replaceDocTitleFailed: t.replaceDocTitleFailed

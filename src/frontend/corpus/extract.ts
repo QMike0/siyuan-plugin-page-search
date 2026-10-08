@@ -45,7 +45,7 @@ function diagramTextUnit(element: HTMLElement, blockId: string, blockIndex: numb
     const nodes: Text[] = [];
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
-            if (!(node instanceof Text) || !node.nodeValue?.replace(/[\u200B-\u200D\uFEFF]/g, "").trim()) {
+            if (!(node instanceof Text) || !node.nodeValue?.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim()) {
                 return NodeFilter.FILTER_REJECT;
             }
             const parent = node.parentElement;
@@ -64,7 +64,7 @@ function diagramTextUnit(element: HTMLElement, blockId: string, blockIndex: numb
         current = walker.nextNode();
     }
     const text = nodes.map((node) => node.nodeValue ?? "").join("");
-    if (!text.replace(/[\u200B-\u200D\uFEFF]/g, "").trim()) {
+    if (!text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim()) {
         return null;
     }
     return {
@@ -111,7 +111,7 @@ function rewriteSpecialUnits(blocks: SearchableBlock[], unrendered: Set<string>,
     }
     if (subtype === "mermaid" || type === "NodeHTMLBlock" || type === "NodeMathBlock") {
         const owned = blocks.filter((block) => block.blockId === ownerId);
-        const meaningful = owned.some((block) => block.text.replace(/[\u200B-\u200D\uFEFF]/g, "").trim());
+        const meaningful = owned.some((block) => block.text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim());
         if (!meaningful) {
             unrendered.add(ownerId);
         }
@@ -165,7 +165,7 @@ export async function extractUnitsFromDoms(
             const owned = keepOwnedUnits(collected, id, embedIds.has(id));
             const rewritten = rewriteSpecialUnits(owned, unrendered, id);
             for (const block of rewritten) {
-                if (!block.text.replace(/[\u200B-\u200D\uFEFF]/g, "").trim()) {
+                if (!block.text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim()) {
                     continue;
                 }
                 blocks.push(block);

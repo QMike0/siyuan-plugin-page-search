@@ -5,8 +5,8 @@ import {
     parseDataTypeTokens,
     type RestrictInlineType,
 } from "../../shared";
-import {isInlineMathSearchUnit, isInlineMemoSearchUnit} from "../blocks";
-import type {SearchableBlock, SearchMatch, TableSlot} from "../dom-types";
+import {isInlineMathSearchUnit, isInlineMemoSearchUnit, tableCellReplaceLock} from "../blocks";
+import type {SearchableBlock, SearchMatch, TableReplaceLock, TableSlot} from "../dom-types";
 
 const HOST_TYPES = new Set<string>(
     RESTRICT_INLINE_TYPE_ALLOWLIST.filter((token) => token !== INLINE_MATH_TYPE && token !== INLINE_MEMO_TYPE),
@@ -31,6 +31,8 @@ export interface CachedUnit {
     snippet?: string;
     tableSlot?: TableSlot;
     mathOrdinal?: number;
+    /** 富文本格或正在编辑的格子。命中仍可搜索，但不能替换。 */
+    replaceLock?: TableReplaceLock;
 }
 
 function nonReplaceable(block: SearchableBlock): boolean {
@@ -89,6 +91,7 @@ export function freezeBlock(
     const lengths = nonReplaceable(block)
         ? undefined
         : block.textNodes.map((node) => node.nodeValue?.length ?? 0);
+    const replaceLock = block.blockType === "NodeTable" ? tableCellReplaceLock(block.element) : undefined;
     let highlightKind: CachedUnit["highlightKind"] = "text";
     if (isInlineMemoSearchUnit(block)) {
         highlightKind = "inline-memo";
@@ -108,6 +111,7 @@ export function freezeBlock(
         anchorEnd: block.anchorEnd,
         tableSlot: block.tableSlot,
         mathOrdinal: block.mathOrdinal,
+        replaceLock,
     };
 }
 

@@ -45,7 +45,7 @@ export interface MatchHit {
 export interface MatchOptions {
     /** 区分大小写；默认 false（与历史行为一致：强制小写子串） */
     caseSensitive?: boolean;
-    /** 全字匹配（ASCII 词边界）；默认 false */
+    /** 按 VS Code 风格分隔符判断全字边界；默认 false */
     wholeWord?: boolean;
     /** 正则搜索（仅搜索，不做正则替换）；默认 false */
     regex?: boolean;

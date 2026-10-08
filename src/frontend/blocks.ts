@@ -1,14 +1,17 @@
 import {
+  logicalTableRows,
   normalizeRestrictInlineTypes,
+  ownTableRows,
   plainTextFromInlineMemoContent,
   shouldCollectBodyTextForRestrict,
   shouldCollectInlineMathUnits,
   shouldCollectInlineMemoUnits,
+  TABLE_VIRTUAL_ROWS_ATTR,
   type RestrictInlineType,
 } from "../shared";
-import type {SearchableBlock, TableSlot} from "./dom-types";
+import type {SearchableBlock, TableReplaceLock, TableSlot} from "./dom-types";
 
-const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/
+const ZERO_WIDTH_RE = /[\u200B-\u200D\u2060\uFEFF]/
 const PREVIEW_BLOCK_ID = '__preview__'
 const PREVIEW_BLOCK_TYPE = 'preview'
 const ATTRIBUTE_VIEW_TYPE = 'NodeAttributeView'
@@ -61,7 +64,7 @@ const INLINE_MATH_UNIT_PREFIX = 'inline-math:'
 
 /** 与 mathOrdinal 使用同一段可见文字，补高亮时才能和全文采集对上。 */
 export function inlineMathIdentityText(text: string): string {
-  return text.replace(/[\u200B-\u200D\uFEFF]/g, '')
+  return text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
 }
 /** 合成块类型，便于 replaceable / 高亮分流 */
 const INLINE_MATH_BLOCK_TYPE = 'inline-math'
@@ -1150,9 +1153,10 @@ function collectDescendantTextNodes(
  * 将表格拆成按单元格的搜索单元。
  * NodeTable 下相邻 td/th 文本首尾相接，整块拼接会把「传感器」+「2026」误匹配成「传感器20」。
  *
- * 注意：不能用 `row.parentElement.children` 算行号。
- * HTML 表格常见结构是 thead/tbody 分开，表头与首行数据都会得到 rowIndex=0，
- * unitId 冲突后数据格会被跳过（表现为「列名 AAA 时首行 AAA 搜不到」）。
+ * 行号按 table.rows 的逻辑行计，不用 `row.parentElement.children`：
+ * thead 和 tbody 分开时，局部行号会撞车，数据格会被跳过。
+ * 大表的占位行按属性里的 tr 个数展开，不把占位行本身算成一行，
+ * 这样画面 unitId 和 getBlockDOM 的完整表使用同一套行号。
  */
 function collectTableSearchUnits(
   tableBlock: HTMLElement,
@@ -1161,45 +1165,193 @@ function collectTableSearchUnits(
   includeImageTitle = true,
   headingGates?: HeadingIncludeGates,
 ): SearchableBlock[] {
+  const htmlRows = ownTableRows(tableBlock)
+  if (htmlRows) {
+    const collected = collectHtmlTableUnits(
+      htmlRows,
+      blockId,
+      blockIndex,
+      includeImageTitle,
+      headingGates,
+    )
+    const virtual = htmlRows.some((row) => row.hasAttribute(TABLE_VIRTUAL_ROWS_ATTR))
+    if (collected.length || virtual) {
+      return collected
+    }
+  }
+  return collectLooseTableUnits(tableBlock, blockId, blockIndex, includeImageTitle, headingGates)
+}
+
+function collectHtmlTableUnits(
+  htmlRows: readonly HTMLTableRowElement[],
+  blockId: string,
+  blockIndex: number,
+  includeImageTitle: boolean,
+  headingGates?: HeadingIncludeGates,
+): SearchableBlock[] {
+  const placed = logicalTableRows(htmlRows)
+  const units: SearchableBlock[] = []
+  const seenUnitKeys = new Set<string>()
+  for (let index = 0; index < placed.rows.length; index += 1) {
+    const place = placed.rows[index]
+    if (place.omitted !== 0) {
+      continue
+    }
+    const row = htmlRows[index]
+    const children = row.children
+    let column = 0
+    for (let childIndex = 0; childIndex < children.length; childIndex += 1) {
+      const child = children[childIndex]
+      if (!isDirectTableCell(child)) {
+        continue
+      }
+      pushTableCellUnit(
+        units,
+        seenUnitKeys,
+        child,
+        place.logical,
+        column,
+        blockId,
+        blockIndex,
+        includeImageTitle,
+        headingGates,
+      )
+      column += 1
+    }
+  }
+  return units
+}
+
+/** 没有 html table 时的兜底。这种结构不会被思源虚拟化，行号就是 DOM 顺序。 */
+function collectLooseTableUnits(
+  tableBlock: HTMLElement,
+  blockId: string,
+  blockIndex: number,
+  includeImageTitle: boolean,
+  headingGates?: HeadingIncludeGates,
+): SearchableBlock[] {
   const units: SearchableBlock[] = []
   const seenUnitKeys = new Set<string>()
   const rows = getTableRowElements(tableBlock)
+  const rowIndex = new Map<HTMLElement, number>()
+  for (let index = 0; index < rows.length; index += 1) {
+    rowIndex.set(rows[index], index)
+  }
   const cells = getTableCellElements(tableBlock, rows)
-
-  cells.forEach((cell, index) => {
+  for (let index = 0; index < cells.length; index += 1) {
+    const cell = cells[index]
     const row = cell.closest<HTMLElement>('.table__row, tr')
-    const rowIndex = row ? rows.indexOf(row) : -1
-    const columnIndex = row
-      ? Array.from(row.children).filter((child) => child instanceof HTMLElement && child.matches(TABLE_CELL_SELECTOR)).indexOf(cell)
-      : index
-    // 以全表行号+列号为主键，避免 thead/tbody 局部行号冲突；node-id 仅作辅助
-    const cellId = cell.dataset.nodeId?.trim() || ''
-    const unitId = cellId
-      ? `table-cell:${rowIndex}:${columnIndex}:${cellId}`
-      : `table-cell:${rowIndex}:${columnIndex}`
-    if (seenUnitKeys.has(unitId)) {
-      return
+    if (!row || row.hasAttribute(TABLE_VIRTUAL_ROWS_ATTR)) {
+      continue
     }
-
-    const textNodes = collectDescendantTextNodes(tableCellTextRoot(cell), includeImageTitle, headingGates)
-    const text = textNodes.map((node) => node.nodeValue ?? '').join('')
-    if (!text) {
-      return
+    const logical = rowIndex.get(row)
+    const column = directTableCellColumn(row, cell)
+    if (logical === undefined || column < 0) {
+      continue
     }
-
-    seenUnitKeys.add(unitId)
-    units.push({
+    pushTableCellUnit(
+      units,
+      seenUnitKeys,
+      cell,
+      logical,
+      column,
       blockId,
-      blockType: TABLE_TYPE,
       blockIndex,
-      element: cell,
-      text,
-      textNodes,
-      unitId,
-    })
-  })
-
+      includeImageTitle,
+      headingGates,
+    )
+  }
   return units
+}
+
+function pushTableCellUnit(
+  units: SearchableBlock[],
+  seenUnitKeys: Set<string>,
+  cell: HTMLElement,
+  logicalRow: number,
+  columnIndex: number,
+  blockId: string,
+  blockIndex: number,
+  includeImageTitle: boolean,
+  headingGates?: HeadingIncludeGates,
+): void {
+  if (logicalRow < 0 || columnIndex < 0) {
+    return
+  }
+  const cellId = cell.dataset.nodeId?.trim() || ''
+  const unitId = cellId
+    ? `table-cell:${logicalRow}:${columnIndex}:${cellId}`
+    : `table-cell:${logicalRow}:${columnIndex}`
+  if (seenUnitKeys.has(unitId)) {
+    return
+  }
+  const textNodes = collectDescendantTextNodes(tableCellTextRoot(cell), includeImageTitle, headingGates)
+  const text = textNodes.map((node) => node.nodeValue ?? '').join('')
+  if (!text) {
+    return
+  }
+  seenUnitKeys.add(unitId)
+  units.push({
+    blockId,
+    blockType: TABLE_TYPE,
+    blockIndex,
+    element: cell,
+    text,
+    textNodes,
+    unitId,
+  })
+}
+
+/** 行的直接子节点里，算作单元格的元素。嵌套表的格子不在 children 里。 */
+export function isDirectTableCell(element: Element): element is HTMLElement {
+  return element instanceof HTMLElement && element.matches(TABLE_CELL_SELECTOR)
+}
+
+/** 格子在本行直接子单元格里的序号。嵌套表的格子不在 children 里，不会被数进来。 */
+export function directTableCellColumn(row: HTMLElement, cell: HTMLElement): number {
+  const children = row.children
+  let column = 0
+  for (let index = 0; index < children.length; index += 1) {
+    const child = children[index]
+    if (!isDirectTableCell(child)) {
+      continue
+    }
+    if (child === cell) {
+      return column
+    }
+    column += 1
+  }
+  return -1
+}
+
+const RICH_TABLE_CELL_SELECTOR = 'td[data-sy-table-cell-rich], th[data-sy-table-cell-rich], [data-type="NodeTableCell"][data-sy-table-cell-rich], .table__cell[data-sy-table-cell-rich]'
+
+/**
+ * 富文本格和正在编辑的格子不能按画面文字替换。
+ * 富文本的源码在属性里，思源写回时会按属性重画。
+ * 编辑器开着时，提交要等它自己结束；这之前整表被换掉，这次修改就丢了。
+ */
+export function tableCellReplaceLock(element: Element | null | undefined): TableReplaceLock | undefined {
+  if (!element || typeof element.closest !== 'function') {
+    return undefined
+  }
+  // 不在格子里的块到这里就结束，避免每个段落都再往下查编辑器。
+  const cell = element.closest('td, th, [data-type="NodeTableCell"], .table__cell')
+  if (!(cell instanceof HTMLElement)) {
+    return undefined
+  }
+  // 富文本属性在 td/th 上。嵌套内容也算在外层富文本格里。
+  if (cell.closest(RICH_TABLE_CELL_SELECTOR)) {
+    return 'table-rich'
+  }
+  // 编辑器是格子的直接子节点。格内 span 能 closest 到它；格子单元本身只看这一层。
+  if (
+    element.closest(TABLE_CELL_EDITOR_SELECTOR)
+    || cell.querySelector(`:scope > ${TABLE_CELL_EDITOR_SELECTOR}`)
+  ) {
+    return 'table-cell-editor'
+  }
+  return undefined
 }
 
 /** 正在编辑的格子只取编辑区正文。工具栏和公式面板也挂在格子里，隐藏后标题字还留在 DOM 上。 */
@@ -1724,7 +1876,7 @@ export function collectMindmapPreviewUnits(roots: HTMLElement[]): SearchableBloc
       }
       const textNodes = collectMindmapOwnTextNodes(preview)
       const text = textNodes.map((node) => node.nodeValue ?? "").join("")
-      if (!text.replace(/[\u200B-\u200D\uFEFF]/g, "").trim()) {
+      if (!text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim()) {
         return
       }
       seen.add(blockId)
@@ -1843,6 +1995,28 @@ function createTableSlotCache(): TableSlotCache {
   return {rows: new Map(), cellText: new Map()}
 }
 
+/** 和 collectTableSearchUnits 同一套逻辑行号。占位行不进入这张表。 */
+function logicalRowIndexes(table: HTMLElement): Map<Element, number> {
+  const indexes = new Map<Element, number>()
+  const htmlRows = ownTableRows(table)
+  if (htmlRows) {
+    const placed = logicalTableRows(htmlRows)
+    for (let index = 0; index < placed.rows.length; index += 1) {
+      const place = placed.rows[index]
+      if (place.omitted === 0) {
+        indexes.set(htmlRows[index], place.logical)
+      }
+    }
+    return indexes
+  }
+  getTableRowElements(table).forEach((item, index) => {
+    if (!item.hasAttribute(TABLE_VIRTUAL_ROWS_ATTR)) {
+      indexes.set(item, index)
+    }
+  })
+  return indexes
+}
+
 /** 行列号与 collectTableSearchUnits 的 unitId 一致，offset 按格子正文计。 */
 function tableSlotOf(host: HTMLElement, table: HTMLElement, cache: TableSlotCache): TableSlot | undefined {
   const cell = host.closest<HTMLElement>(TABLE_CELL_SELECTOR)
@@ -1855,15 +2029,11 @@ function tableSlotOf(host: HTMLElement, table: HTMLElement, cache: TableSlotCach
   }
   let rowIndexes = cache.rows.get(table)
   if (!rowIndexes) {
-    const indexes = new Map<Element, number>()
-    getTableRowElements(table).forEach((item, index) => indexes.set(item, index))
-    cache.rows.set(table, indexes)
-    rowIndexes = indexes
+    rowIndexes = logicalRowIndexes(table)
+    cache.rows.set(table, rowIndexes)
   }
   const rowIndex = rowIndexes.get(row)
-  const column = Array.from(row.children)
-    .filter((child) => child instanceof HTMLElement && child.matches(TABLE_CELL_SELECTOR))
-    .indexOf(cell)
+  const column = directTableCellColumn(row, cell)
   if (rowIndex === undefined || column < 0) {
     return undefined
   }
@@ -1929,6 +2099,7 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
   })
   const textNodesByOwner = new Map<HTMLElement, Text[]>()
   const slotCache = createTableSlotCache()
+  const hostSpans = memoHostSpansByOwner(spans, includeImageTitle)
   let memoIndex = 0
 
   for (const span of spans) {
@@ -1949,9 +2120,14 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
     const blockIndex = owner?.dataset.nodeId
       ? (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? memoIndex)
       : memoIndex
+    const tableSlot = blockType === TABLE_TYPE && owner ? tableSlotOf(span, owner, slotCache) : undefined
     const hostSpan = owner
-      ? memoHostSpan(owner, span, includeImageTitle, textNodesByOwner)
+      ? (hostSpans.get(owner)?.get(span) ?? memoHostSpan(owner, span, includeImageTitle, textNodesByOwner))
       : {start: 0, end: 0}
+    // 表格备注用逻辑行列加格内偏移。全文序号在内核整表和画面已挂出行之间对不上。
+    const unitId = tableSlot
+      ? `table-memo:${tableSlot.row}:${tableSlot.column}:${tableSlot.offset}`
+      : `${INLINE_MEMO_UNIT_PREFIX}${memoIndex}`
 
     units.push({
       blockId,
@@ -1960,16 +2136,92 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
       element: span,
       text,
       textNodes: [],
-      unitId: `${INLINE_MEMO_UNIT_PREFIX}${memoIndex}`,
+      unitId,
       matchSource: 'inline-memo',
       anchorOffset: hostSpan.start,
       anchorEnd: hostSpan.end,
-      tableSlot: blockType === TABLE_TYPE && owner ? tableSlotOf(span, owner, slotCache) : undefined,
+      tableSlot,
     })
     memoIndex += 1
   }
 
   return units
+}
+
+/**
+ * 同一宿主块里的备注一次扫完。
+ * 先只走每条备注自己的文字，再沿块的文本节点记偏移，避免每条备注都从块头重扫。
+ */
+function memoHostSpansByOwner(
+  spans: readonly HTMLElement[],
+  includeImageTitle: boolean,
+): Map<HTMLElement, Map<HTMLElement, {start: number; end: number}>> {
+  const byOwner = new Map<HTMLElement, HTMLElement[]>()
+  for (let index = 0; index < spans.length; index += 1) {
+    const span = spans[index]
+    if (span.closest('.protyle-attr, .fn__none')) {
+      continue
+    }
+    const owner = searchOwnerBlock(span)
+    if (!owner) {
+      continue
+    }
+    const list = byOwner.get(owner)
+    if (list) {
+      list.push(span)
+      continue
+    }
+    byOwner.set(owner, [span])
+  }
+  const result = new Map<HTMLElement, Map<HTMLElement, {start: number; end: number}>>()
+  for (const [owner, list] of byOwner) {
+    result.set(owner, memoHostSpansInOwner(owner, list, includeImageTitle))
+  }
+  return result
+}
+
+function memoHostSpansInOwner(
+  owner: HTMLElement,
+  spans: readonly HTMLElement[],
+  includeImageTitle: boolean,
+): Map<HTMLElement, {start: number; end: number}> {
+  const nodeHost = new Map<Text, HTMLElement>()
+  for (let index = 0; index < spans.length; index += 1) {
+    const span = spans[index]
+    const walker = document.createTreeWalker(span, NodeFilter.SHOW_TEXT)
+    let current = walker.nextNode()
+    while (current) {
+      const text = current as Text
+      const existing = nodeHost.get(text)
+      // 嵌套时保留更内层的备注。
+      if (!existing || existing.contains(span)) {
+        nodeHost.set(text, span)
+      }
+      current = walker.nextNode()
+    }
+  }
+  const nodes = collectTextNodes(owner, owner, includeImageTitle)
+  const spansOut = new Map<HTMLElement, {start: number; end: number}>()
+  const startOf = new Map<HTMLElement, number>()
+  let offset = 0
+  for (let index = 0; index < nodes.length; index += 1) {
+    const node = nodes[index]
+    const value = node.nodeValue ?? ''
+    const span = nodeHost.get(node)
+    if (span) {
+      if (!startOf.has(span)) {
+        startOf.set(span, offset + leadingZeroWidthLength(value))
+      }
+      offset += value.length
+      const start = startOf.get(span)
+      if (start !== undefined) {
+        spansOut.set(span, {start, end: offset})
+      }
+      continue
+    }
+    offset += value.length
+  }
+  return spansOut
 }
 
 /**
