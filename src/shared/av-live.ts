@@ -26,7 +26,7 @@ export function emptyAvDomCoverage(): AvDomCoverage {
 }
 
 export function collectAvDomCoverage(
-    units: Array<{blockId: string; blockType: string; unitId?: string; text: string}>,
+    units: Array<{blockId: string; blockType: string; unitId?: string; text: string;}>,
 ): Map<string, AvDomCoverage> {
     const coverage = new Map<string, AvDomCoverage>();
     for (const unit of units) {
@@ -85,7 +85,11 @@ export function avApiUnitShown(
  * 列表 / 日历若画面上还没有列 id，不能把主键以外的字段补进来。
  * 表头或任意可见格子出现过的列，未挂载行仍可以补。
  */
-export function avApiUnitInView(unitId: string, coverage: AvDomCoverage, viewType: string): boolean {
+export function avApiUnitInView(
+    unitId: string,
+    coverage: AvDomCoverage,
+    viewType: string,
+): boolean {
     if (coverage.unstable || !unitId.startsWith("av:")) {
         return true;
     }
@@ -139,7 +143,7 @@ function noteAvDomUnit(coverage: AvDomCoverage, unitId: string, text: string): v
     coverage.cells.add(cell.row + ":" + cell.col);
 }
 
-function parseShownCell(unitId: string): {row: string; col: string; unstable: boolean; label: boolean} | null {
+function parseShownCell(unitId: string): {row: string; col: string; unstable: boolean; label: boolean;} | null {
     let row = "";
     let col = "";
     if (unitId.startsWith("cell:")) {

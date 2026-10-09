@@ -38,7 +38,9 @@ export function projectRanges(
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeMermaid: options.includeMermaid !== false,
+        includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeFoldedBlocks: options.includeFoldedBlocks === true,
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,
     });

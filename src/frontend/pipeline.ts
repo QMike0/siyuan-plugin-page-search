@@ -2,15 +2,16 @@ import type {Plugin} from "siyuan";
 import {
     ATTRIBUTE_VIEW_TYPE,
     NON_REPLACEABLE_DOM_CLOSEST,
+    effectiveSearchQuery,
     isRestrictInlineActive,
-    rangesOverlap,
     shouldEnumerateRestrictInline,
     type RestrictInlineType,
 } from "../shared";
-import type {MatchHit, MatchOptions, SearchableUnit} from "../shared";
-import {searchCurrentDocument} from "./corpus/search";
-import {editorFocusId} from "./corpus/focus";
-import {buildListSnippet} from "./list-snippet";
+import type {
+    MatchHit,
+    MatchOptions,
+    SearchableUnit,
+} from "../shared";
 import {matchTextUnitsDetailed} from "../shared";
 import {
     CALLOUT_TYPE,
@@ -23,11 +24,21 @@ import {
     isInlineMemoSearchUnit,
     isPreviewSyntheticBlockId,
 } from "./blocks";
+import {editorFocusId} from "./corpus/focus";
+import {searchCurrentDocument} from "./corpus/search";
+import type {
+    SearchableBlock,
+    SearchMatch,
+} from "./dom-types";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
-import {createRangeFromBlockOffsets, isRangePlainTextOnly} from "./ranges";
-import {matchRangePassesRestrictInline} from "./restrict-inline-dom";
+import {buildListSnippet} from "./list-snippet";
+import {
+    createRangeFromBlockOffsets,
+    isRangePlainTextOnly,
+} from "./ranges";
+import type {RegexTextMatcher} from "./regex-matcher";
 import {enumerateRestrictInlineMatches} from "./restrict-enumerate";
-import type {SearchableBlock, SearchMatch} from "./dom-types";
+import {matchRangePassesRestrictInline} from "./restrict-inline-dom";
 import {
     cloneSelectionScope,
     getSelectionScope,
@@ -37,6 +48,10 @@ import {
 } from "./selection";
 
 export interface SearchPipelineOptions extends MatchOptions {
+    /** 当前搜索框的正则隔离器；未提供时保留纯函数/内核调用的同步行为。 */
+    regexMatcher?: RegexTextMatcher;
+    /** 新输入或销毁 SearchBar 后作废本轮正则任务。 */
+    signal?: AbortSignal;
     /** 仅在选区内查找；与打开时预填选区关键词无关 */
     selectionOnly?: boolean;
     /**
@@ -80,15 +95,17 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeMathBlock?: boolean;
     /** 是否匹配嵌入块及其内部渲染内容；默认 true */
     includeEmbedBlock?: boolean;
-    /** 是否匹配代码块（非 Mermaid）；默认 true */
+    /** 是否匹配普通代码块；默认 true。不含 Mermaid、flowchart。 */
     includeCodeBlock?: boolean;
     /** 是否匹配 Mermaid；默认 true */
     includeMermaid?: boolean;
+    /** 是否匹配 flowchart；默认 true */
+    includeFlowchart?: boolean;
     /** 是否匹配 HTML 块渲染可见文字；默认 true；不可替换 */
     includeHtmlBlock?: boolean;
     /**
-     * 是否匹配非标题 CSS 折叠块内的隐藏内容；默认 false（与历史行为一致）。
-     * 匹配时不展开；跳转时再展开。
+     * 是否匹配折叠块内的隐藏内容；默认 false（与历史行为一致）。
+     * 非标题 CSS 折叠与折叠标题后代都受此控制；匹配时不展开，跳转时再展开。
      */
     includeFoldedBlocks?: boolean;
     /** 是否匹配行内备注；默认 false */
@@ -110,6 +127,10 @@ export interface SearchPipelineResult {
     partial?: boolean;
     /** 图表 / HTML / 公式渲染失败、未计入命中的块数 */
     unrendered?: number;
+    /** 属性视图达到安全分页上限，结果未写入缓存且当前覆盖不完整 */
+    truncated?: number;
+    /** 已被较新的搜索作废；调用方应保留现有 UI 状态。 */
+    cancelled?: boolean;
 }
 
 const TABLE_CELL_CLOSEST = '[data-type="NodeTableCell"], .table__cell, td, th';
@@ -193,23 +214,23 @@ function isDomReplaceable(
         return false;
     }
     if (
-        blockType === PREVIEW_BLOCK_TYPE
-        || (blockId != null && isPreviewSyntheticBlockId(blockId))
+        blockType === PREVIEW_BLOCK_TYPE ||
+        (blockId != null && isPreviewSyntheticBlockId(blockId))
     ) {
         return false;
     }
     // 文档标题：不走块 transaction，由 renameDoc 写回
     if (
-        blockType === DOC_TITLE_BLOCK_TYPE
-        || blockId === DOC_TITLE_BLOCK_ID
+        blockType === DOC_TITLE_BLOCK_TYPE ||
+        blockId === DOC_TITLE_BLOCK_ID
     ) {
         return true;
     }
 
     const node = range.commonAncestorContainer;
-    const element = node.nodeType === Node.ELEMENT_NODE
-        ? node as Element
-        : node.parentElement;
+    const element = node.nodeType === Node.ELEMENT_NODE ?
+        node as Element :
+        node.parentElement;
     if (!element) {
         return false;
     }
@@ -217,10 +238,10 @@ function isDomReplaceable(
         return false;
     }
     // 兜底：Range 落在 Mermaid / HTML 块壳上时（Shadow 内 closest 可能穿不出）
-    if (element.closest(`[data-type="NodeCodeBlock"][data-subtype="mermaid"]`)) {
+    if (element.closest('[data-type="NodeCodeBlock"][data-subtype="mermaid"]')) {
         return false;
     }
-    if (element.closest(`[data-type="NodeHTMLBlock"], protyle-html`)) {
+    if (element.closest('[data-type="NodeHTMLBlock"], protyle-html')) {
         return false;
     }
     if (isStructurallyWritableDespiteFalseAncestor(element, blockType)) {
@@ -251,14 +272,14 @@ function resolveSelectionScope(
     if (live.size > 0) {
         return live;
     }
-    return options.selectionScope
-        ? cloneSelectionScope(options.selectionScope)
-        : new Map();
+    return options.selectionScope ?
+        cloneSelectionScope(options.selectionScope) :
+        new Map();
 }
 
 /**
  * 采集 DOM 单元 → 内核/本地匹配 → 选区过滤 → 可见 Range 去重。
- * 空查询 + 限制激活时改为枚举行内宿主（不可替换）。
+ * 无有效查询 + 限制激活时改为枚举行内宿主（不可替换）。纯空白按字面量搜索。
  */
 export async function calculateSearchMatches(
     plugin: Plugin,
@@ -266,8 +287,7 @@ export async function calculateSearchMatches(
     value: string,
     options: SearchPipelineOptions = {},
 ): Promise<SearchPipelineResult> {
-    const keyword = value.trim();
-    const restrictInlineTypes = options.restrictInlineTypes;
+    const keyword = effectiveSearchQuery(value);
 
     if (keyword && options.selectionOnly !== true) {
         const full = await searchCurrentDocument(plugin, edit, value, options);
@@ -291,7 +311,7 @@ async function calculateLoadedDomMatches(
     value: string,
     options: SearchPipelineOptions,
 ): Promise<SearchPipelineResult> {
-    const keyword = value.trim();
+    const keyword = effectiveSearchQuery(value);
     const restrictInlineTypes = options.restrictInlineTypes;
     const includeDocTitle = options.includeDocTitle !== false && !editorFocusId(edit);
 
@@ -326,6 +346,7 @@ async function calculateLoadedDomMatches(
                 includeEmbedBlock: options.includeEmbedBlock,
                 includeCodeBlock: options.includeCodeBlock,
                 includeMermaid: options.includeMermaid,
+                includeFlowchart: options.includeFlowchart,
                 includeHtmlBlock: options.includeHtmlBlock,
                 includeFoldedBlocks: options.includeFoldedBlocks,
                 includeInlineMemo: options.includeInlineMemo,
@@ -359,7 +380,9 @@ async function calculateLoadedDomMatches(
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeMermaid: options.includeMermaid !== false,
+        includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeFoldedBlocks: options.includeFoldedBlocks === true,
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,
     });
@@ -376,19 +399,29 @@ async function calculateLoadedDomMatches(
     const blockMap = buildBlockMap(blocks);
     const units = blocks.map(toSearchableUnit);
 
-    const matched = matchTextUnitsDetailed(units, value, {
+    const matchOptions = {
         dedupeOverlaps: false,
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
         regex: options.regex,
-    });
+        regexUnicode: options.regexUnicode,
+        regexMultiline: options.regexMultiline,
+        regexDotAll: options.regexDotAll,
+    };
+    const matched = options.regexMatcher ?
+        await options.regexMatcher.match(units, value, matchOptions, options.signal) :
+        matchTextUnitsDetailed(units, value, matchOptions);
+
+    if (matched.cancelled) {
+        return {matches: [], error: "", cancelled: true};
+    }
 
     if (matched.error) {
         return {matches: [], error: matched.error};
     }
 
-    const scopedHits = selectionOnly
-        ? matched.hits.filter((hit) =>
+    const scopedHits = selectionOnly ?
+        matched.hits.filter((hit) =>
             isMatchWithinSelection(
                 unitKey(hit.blockId, hit.unitId),
                 hit.start,
@@ -396,8 +429,8 @@ async function calculateLoadedDomMatches(
                 true,
                 selectionScope,
             )
-        )
-        : matched.hits;
+        ) :
+        matched.hits;
 
     return {
         matches: attachRangesToHits(blockMap, scopedHits, edit, {
@@ -418,7 +451,8 @@ function attachRangesToHits(
     } = {},
 ): SearchMatch[] {
     const result: SearchMatch[] = [];
-    const acceptedByUnit = new Map<string, Array<{start: number; end: number}>>();
+    /** 每个单元的 hits 已按偏移排序；记录最后接受的终点即可线性去重。 */
+    const acceptedEndByUnit = new Map<string, number>();
     // 1) 模式级：导出预览 / 只读 → 全部不可替
     const modeBlocked = edit ? isEditorReplaceModeBlocked(edit) : false;
     const restrictInlineTypes = visibility.restrictInlineTypes;
@@ -432,8 +466,8 @@ function attachRangesToHits(
             continue;
         }
 
-        const accepted = acceptedByUnit.get(key) ?? [];
-        if (accepted.some((range) => rangesOverlap(hit.start, hit.end, range.start, range.end))) {
+        const acceptedEnd = acceptedEndByUnit.get(key) ?? -1;
+        if (hit.start < acceptedEnd) {
             continue;
         }
 
@@ -448,28 +482,27 @@ function attachRangesToHits(
         // 限制查找：块级采集之后，仅保留落在所选行内类型内的命中（OR）；与选区过滤独立叠加
         // 文档标题不是行内类型：限制激活时自然被滤掉
         if (
-            restrictActive
-            && !matchRangePassesRestrictInline(range, restrictInlineTypes, {
+            restrictActive &&
+            !matchRangePassesRestrictInline(range, restrictInlineTypes, {
                 attributeKind: isMemo ? "inline-memo" : (isMath ? "inline-math" : null),
             })
         ) {
             continue;
         }
 
-        accepted.push({start: hit.start, end: hit.end});
-        acceptedByUnit.set(key, accepted);
+        acceptedEndByUnit.set(key, hit.end);
 
         // 文档标题只参与查找。编辑中 Protyle 常把连续字拆成多个相邻 Text。
         // 富文本格和开着的单元格编辑器单独标原因，公式等仍走原来的不可替换。
-        const replaceLock = hit.blockType === TABLE_TYPE && !isDocTitle && !isMath
-            ? tableCellReplaceLock(block.element)
-            : undefined;
-        const replaceable = !replaceLock
-            && !isDocTitle
-            && !isMath
-            && !modeBlocked
-            && isDomReplaceable(range, hit.blockType, hit.blockId)
-            && (isMemo || isRangePlainTextOnly(range));
+        const replaceLock = hit.blockType === TABLE_TYPE && !isDocTitle && !isMath ?
+            tableCellReplaceLock(block.element) :
+            undefined;
+        const replaceable = !replaceLock &&
+            !isDocTitle &&
+            !isMath &&
+            !modeBlocked &&
+            isDomReplaceable(range, hit.blockType, hit.blockId) &&
+            (isMemo || isRangePlainTextOnly(range));
 
         result.push({
             id: hit.id,
@@ -486,12 +519,12 @@ function attachRangesToHits(
             highlightKind: isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
             anchorOffset: isMemo ? block.anchorOffset : undefined,
             anchorEnd: isMemo ? block.anchorEnd : undefined,
-            ...(isMath && block.mathOrdinal !== undefined
-                ? {
+            ...(isMath && block.mathOrdinal !== undefined ?
+                {
                     mathOrdinal: block.mathOrdinal,
                     mathUnitText: inlineMathIdentityText(block.text),
-                }
-                : {}),
+                } :
+                {}),
             ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
         });
     }
@@ -546,7 +579,10 @@ function compareSearchMatches(a: SearchMatch, b: SearchMatch): number {
 
 /** 正文 Range 的起点落在备注宿主里。selectNodeContents 的起点在文字前面，不能因此先跳备注。 */
 function textStartInsideMemoRange(memo: SearchMatch, text: SearchMatch): boolean {
-    if (memo.highlightKind !== "inline-memo" || text.highlightKind === "inline-memo" || text.highlightKind === "inline-math") {
+    if (
+        memo.highlightKind !== "inline-memo" || text.highlightKind === "inline-memo" ||
+        text.highlightKind === "inline-math"
+    ) {
         return false;
     }
     if (!memo.range || !text.range) {
@@ -566,9 +602,9 @@ function bodyBeforeOverlappingMemo(left: SearchMatch, right: SearchMatch): numbe
     if (left.blockId !== right.blockId) {
         return 0;
     }
-    const memo = left.highlightKind === "inline-memo"
-        ? left
-        : (right.highlightKind === "inline-memo" ? right : null);
+    const memo = left.highlightKind === "inline-memo" ?
+        left :
+        (right.highlightKind === "inline-memo" ? right : null);
     const text = memo === left ? right : left;
     if (!memo || text.highlightKind === "inline-memo" || text.highlightKind === "inline-math") {
         return 0;

@@ -1,14 +1,23 @@
-import {fetchSyncPost} from "siyuan";
 import type {SearchableUnit} from "../../shared";
 import {postJson} from "./api";
 
 const PAGE_SIZE = 200;
 const MAX_PAGES = 500;
 
+/** 内核没有 hasMore 字段时的本地保险上限，不能把截断结果写成完整缓存。 */
+export class AttributeViewTruncatedError extends Error {
+    constructor() {
+        super("renderAttributeView exceeded page limit");
+        this.name = "AttributeViewTruncatedError";
+    }
+}
+
 export interface AvBlockRef {
     blockId: string;
     avId: string;
     updated: string;
+    /** 载体块 IAL 持久化的当前视图；空值才允许兼容性全视图回退。 */
+    carrierViewId: string;
 }
 
 interface AvCell {
@@ -42,10 +51,21 @@ export function readAvIdFromMarkdown(markdown: string): string {
     return readAvId(markdown);
 }
 
+/** IAL 和块 DOM 都使用同名属性；只接受非空、未转义的属性值。 */
+export function readAvCarrierViewId(...sources: string[]): string {
+    for (const source of sources) {
+        const matched = /custom-sy-av-view="([^"]+)"/.exec(source);
+        if (matched?.[1]) {
+            return matched[1].trim();
+        }
+    }
+    return "";
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
-    return value && typeof value === "object" && !Array.isArray(value)
-        ? value as Record<string, unknown>
-        : null;
+    return value && typeof value === "object" && !Array.isArray(value) ?
+        value as Record<string, unknown> :
+        null;
 }
 
 function textOf(value: unknown): string {
@@ -66,7 +86,23 @@ function textOf(value: unknown): string {
         return record.content;
     }
     const parts: string[] = [];
-    for (const key of ["text", "block", "number", "date", "url", "email", "phone", "template", "rollup", "mSelect", "mAsset", "relation", "checkbox"]) {
+    for (
+        const key of [
+            "text",
+            "block",
+            "number",
+            "date",
+            "url",
+            "email",
+            "phone",
+            "template",
+            "rollup",
+            "mSelect",
+            "mAsset",
+            "relation",
+            "checkbox",
+        ]
+    ) {
         if (key in record) {
             const piece = textOf(record[key]);
             if (piece) {
@@ -108,7 +144,7 @@ function cellDisplay(
     rowId: string,
     viewName: string,
     columns: Map<string, string>,
-): {itemId: string; keyId: string; cell: AvCell} | null {
+): {itemId: string; keyId: string; cell: AvCell;} | null {
     const record = asRecord(cell);
     if (!record) {
         return null;
@@ -130,6 +166,10 @@ function rowList(view: Record<string, unknown>): unknown[] {
     return Array.isArray(rows) ? rows : [];
 }
 
+function cellKey(itemId: string, keyId: string): string {
+    return `${itemId}:${keyId}`;
+}
+
 function absorbRows(
     target: Map<string, AvCell>,
     view: Record<string, unknown>,
@@ -142,7 +182,7 @@ function absorbRows(
         if (!parsed) {
             return;
         }
-        const key = `${parsed.itemId}:${parsed.keyId}`;
+        const key = cellKey(parsed.itemId, parsed.keyId);
         if (overwrite || !target.has(key)) {
             target.set(key, parsed.cell);
         }
@@ -173,11 +213,11 @@ function absorbRows(
     }
 }
 
-function groupSnapshots(view: Record<string, unknown>): Array<{id: string; rows: number; total: number}> {
+function groupSnapshots(view: Record<string, unknown>): Array<{id: string; rows: number; total: number;}> {
     if (!Array.isArray(view.groups)) {
         return [];
     }
-    const snapshots: Array<{id: string; rows: number; total: number}> = [];
+    const snapshots: Array<{id: string; rows: number; total: number;}> = [];
     for (const group of view.groups) {
         const record = asRecord(group);
         if (!record) {
@@ -206,7 +246,12 @@ async function renderView(
     viewId: string,
     viewName: string,
     target: Map<string, AvCell>,
-): Promise<void> {
+    shouldContinue: () => boolean,
+    signal?: AbortSignal,
+): Promise<boolean> {
+    if (!shouldContinue()) {
+        return false;
+    }
     const first = await postJson<Record<string, unknown>>("/api/av/renderAttributeView", {
         id: avId,
         blockID: blockId,
@@ -216,10 +261,16 @@ async function renderView(
         query: "",
         groupPaging: {},
         createIfNotExist: false,
-    });
+    }, signal);
+    if (!shouldContinue()) {
+        return false;
+    }
+    if (first === null) {
+        throw new Error("renderAttributeView failed");
+    }
     const firstView = asRecord(first?.view);
     if (!firstView) {
-        return;
+        return true;
     }
     const seenRows = new Set<string>();
     const noteRows = (view: Record<string, unknown>): number => {
@@ -253,7 +304,7 @@ async function renderView(
             }
         }
         for (let round = 0; round < MAX_PAGES; round += 1) {
-            const groupPaging: Record<string, {page: number; pageSize: number}> = {};
+            const groupPaging: Record<string, {page: number; pageSize: number;}> = {};
             let pending = false;
             for (const group of groups) {
                 if (!group.id) {
@@ -267,7 +318,10 @@ async function renderView(
                 }
             }
             if (!pending) {
-                return;
+                return true;
+            }
+            if (!shouldContinue()) {
+                return false;
             }
             const data = await postJson<Record<string, unknown>>("/api/av/renderAttributeView", {
                 id: avId,
@@ -278,19 +332,25 @@ async function renderView(
                 query: "",
                 groupPaging,
                 createIfNotExist: false,
-            });
+            }, signal);
+            if (!shouldContinue()) {
+                return false;
+            }
+            if (data === null) {
+                throw new Error("renderAttributeView page failed");
+            }
             const view = asRecord(data?.view);
             if (!view || noteRows(view) === 0) {
-                return;
+                return true;
             }
             absorbRows(target, view, viewName, true);
             const next = groupSnapshots(view);
             groups.splice(0, groups.length, ...next.filter((group) => pages.has(group.id)));
             if (!groups.length) {
-                return;
+                return true;
             }
         }
-        return;
+        throw new AttributeViewTruncatedError();
     }
 
     let page = 1;
@@ -298,6 +358,9 @@ async function renderView(
     let total = Number(firstView.rowCount ?? firstView.cardCount ?? 0) || 0;
     const pageCount = Number(firstView.pageCount ?? 0) || 0;
     while (!pageDone(rows, page, total) && (pageCount === 0 || page < pageCount) && page < MAX_PAGES) {
+        if (!shouldContinue()) {
+            return false;
+        }
         page += 1;
         const data = await postJson<Record<string, unknown>>("/api/av/renderAttributeView", {
             id: avId,
@@ -308,22 +371,35 @@ async function renderView(
             query: "",
             groupPaging: {},
             createIfNotExist: false,
-        });
+        }, signal);
+        if (!shouldContinue()) {
+            return false;
+        }
+        if (data === null) {
+            throw new Error("renderAttributeView page failed");
+        }
         const view = asRecord(data?.view);
         if (!view || noteRows(view) === 0) {
-            return;
+            return true;
         }
         absorbRows(target, view, viewName, true);
         rows = rowList(view).length;
         total = Number(view.rowCount ?? view.cardCount ?? total) || total;
     }
+    if (!pageDone(rows, page, total) && (pageCount === 0 || page < pageCount) && page >= MAX_PAGES) {
+        throw new AttributeViewTruncatedError();
+    }
+    return true;
 }
 
-function absorbRaw(target: Map<string, AvCell>, data: unknown): {name: string; views: Array<{id: string; name: string}>} {
+function absorbRaw(
+    target: Map<string, AvCell>,
+    data: unknown,
+): {name: string; views: Array<{id: string; name: string;}>;} {
     const root = asRecord(data);
     const av = asRecord(root?.av) ?? root;
     const name = typeof av?.name === "string" ? av.name : "";
-    const views: Array<{id: string; name: string}> = [];
+    const views: Array<{id: string; name: string;}> = [];
     if (Array.isArray(av?.views)) {
         for (const view of av.views) {
             const record = asRecord(view);
@@ -353,7 +429,7 @@ function absorbRaw(target: Map<string, AvCell>, data: unknown): {name: string; v
             if (!itemId || !text) {
                 continue;
             }
-            const mapKey = `${itemId}:${keyId}`;
+            const mapKey = cellKey(itemId, keyId);
             if (target.has(mapKey)) {
                 continue;
             }
@@ -366,7 +442,7 @@ function absorbRaw(target: Map<string, AvCell>, data: unknown): {name: string; v
     return {name, views};
 }
 
-function toUnits(blockId: string, drafts: AvUnitDraft[]): Array<SearchableUnit & {snippet?: string}> {
+function toUnits(blockId: string, drafts: AvUnitDraft[]): Array<SearchableUnit & {snippet?: string;}> {
     return drafts.map((draft) => ({
         blockId,
         blockType: "NodeAttributeView",
@@ -377,11 +453,33 @@ function toUnits(blockId: string, drafts: AvUnitDraft[]): Array<SearchableUnit &
     }));
 }
 
-export function peekAvUnits(refs: AvBlockRef[]): {units: Array<SearchableUnit & {snippet?: string}>; missing: AvBlockRef[]} {
-    const units: Array<SearchableUnit & {snippet?: string}> = [];
+/** 打开中的数据库按载体 viewID 缓存；未挂载时按内核规则使用默认首个可用视图。 */
+function cacheKey(ref: AvBlockRef, viewId = ""): string {
+    return `${ref.blockId}:${ref.avId}:${ref.updated}:${viewId ? `view:${viewId}` : "default"}`;
+}
+
+function selectedViewId(ref: AvBlockRef, viewIds: ReadonlyMap<string, string>): string {
+    return viewIds.get(ref.blockId) ?? ref.carrierViewId;
+}
+
+function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUnit[]): void {
+    const prefix = `${ref.blockId}:${ref.avId}:${ref.updated}:`;
+    for (const key of cache.keys()) {
+        if (key.startsWith(prefix)) {
+            cache.delete(key);
+        }
+    }
+    cache.set(cacheKey(ref, viewId), units);
+}
+
+export function peekAvUnits(
+    refs: AvBlockRef[],
+    viewIds: ReadonlyMap<string, string> = new Map(),
+): {units: Array<SearchableUnit & {snippet?: string;}>; missing: AvBlockRef[];} {
+    const units: Array<SearchableUnit & {snippet?: string;}> = [];
     const missing: AvBlockRef[] = [];
     for (const ref of refs) {
-        const cached = cache.get(`${ref.blockId}:${ref.avId}:${ref.updated}`);
+        const cached = cache.get(cacheKey(ref, selectedViewId(ref, viewIds)));
         if (cached) {
             units.push(...cached);
         } else {
@@ -391,44 +489,73 @@ export function peekAvUnits(refs: AvBlockRef[]): {units: Array<SearchableUnit & 
     return {units, missing};
 }
 
-export async function loadAvUnits(refs: AvBlockRef[]): Promise<Array<SearchableUnit & {snippet?: string}>> {
-    const units: Array<SearchableUnit & {snippet?: string}> = [];
+export async function loadAvUnits(
+    refs: AvBlockRef[],
+    shouldContinue: () => boolean = () => true,
+    viewIds: ReadonlyMap<string, string> = new Map(),
+    signal?: AbortSignal,
+): Promise<Array<SearchableUnit & {snippet?: string;}>> {
+    const units: Array<SearchableUnit & {snippet?: string;}> = [];
     for (const ref of refs) {
-        const cacheKey = `${ref.blockId}:${ref.avId}:${ref.updated}`;
-        const cached = cache.get(cacheKey);
+        if (!shouldContinue()) {
+            return units;
+        }
+        const viewId = selectedViewId(ref, viewIds);
+        const cached = cache.get(cacheKey(ref, viewId));
         if (cached) {
             units.push(...cached);
             continue;
         }
         const cells = new Map<string, AvCell>();
-        const raw = await postJson<unknown>("/api/av/getAttributeView", {id: ref.avId});
+        const raw = await postJson<unknown>("/api/av/getAttributeView", {id: ref.avId}, signal);
+        if (!shouldContinue()) {
+            return units;
+        }
+        if (raw === null) {
+            throw new Error("getAttributeView failed");
+        }
         const info = absorbRaw(new Map(), raw);
         const drafts: AvUnitDraft[] = [];
         if (info.name) {
             drafts.push({unitId: "av-title", text: info.name, snippet: info.name});
         }
-        for (const view of info.views) {
+        const views = viewId ?
+            info.views.filter((view) => view.id === viewId) :
+            info.views.slice(0, 1);
+        // 载体写入过期 viewID 时，内核会退回该数据库的首个可用视图。这里采用相同
+        // 的单视图回退，不能退化成全库并把隐藏列/筛选外行重新纳入搜索。
+        if (viewId && views.length === 0) {
+            const fallback = info.views[0];
+            if (fallback) {
+                views.push(fallback);
+            }
+        }
+        for (const view of views) {
             if (view.name) {
                 drafts.push({unitId: `av-view:${view.id}`, text: view.name, snippet: view.name});
             }
-            await renderView(ref.avId, ref.blockId, view.id, view.name, cells);
+            if (!await renderView(ref.avId, ref.blockId, view.id, view.name, cells, shouldContinue, signal)) {
+                return units;
+            }
         }
-        if (info.views.length === 0) {
-            await renderView(ref.avId, ref.blockId, "", info.name, cells);
+        if (views.length === 0) {
+            if (!await renderView(ref.avId, ref.blockId, "", info.name, cells, shouldContinue, signal)) {
+                return units;
+            }
         }
-        absorbRaw(cells, raw);
         for (const [key, cell] of cells) {
             drafts.push({unitId: `av:${key}`, text: cell.text, snippet: cell.snippet});
         }
         const built = toUnits(ref.blockId, drafts);
-        cache.set(cacheKey, built);
+        replaceCachedUnits(ref, viewId, built);
         units.push(...built);
     }
     return units;
 }
 
 export async function resolveMissingAvIds(
-    rows: Array<{id: string; updated?: string; markdown?: string; ial?: string}>,
+    rows: Array<{id: string; updated?: string; markdown?: string; ial?: string;}>,
+    signal?: AbortSignal,
 ): Promise<AvBlockRef[]> {
     const refs: AvBlockRef[] = [];
     const missing: string[] = [];
@@ -438,7 +565,12 @@ export async function resolveMissingAvIds(
         }
         const avId = readAvId(String(row.markdown ?? ""), String(row.ial ?? ""));
         if (avId) {
-            refs.push({blockId: row.id, avId, updated: String(row.updated ?? "")});
+            refs.push({
+                blockId: row.id,
+                avId,
+                updated: String(row.updated ?? ""),
+                carrierViewId: readAvCarrierViewId(String(row.ial ?? ""), String(row.markdown ?? "")),
+            });
         } else {
             missing.push(row.id);
         }
@@ -447,17 +579,23 @@ export async function resolveMissingAvIds(
         return refs;
     }
     try {
-        const response = await fetchSyncPost("/api/block/getBlockDOMs", {ids: missing});
-        const doms = response?.code === 0 && response.data && typeof response.data === "object"
-            ? response.data as Record<string, string>
-            : {};
+        const doms = await postJson<Record<string, string>>("/api/block/getBlockDOMs", {ids: missing}, signal) ?? {};
         for (const id of missing) {
             const avId = readAvId(String(doms[id] ?? ""));
             if (!avId) {
                 continue;
             }
             const row = rows.find((item) => item.id === id);
-            refs.push({blockId: id, avId, updated: String(row?.updated ?? "")});
+            refs.push({
+                blockId: id,
+                avId,
+                updated: String(row?.updated ?? ""),
+                carrierViewId: readAvCarrierViewId(
+                    String(row?.ial ?? ""),
+                    String(row?.markdown ?? ""),
+                    String(doms[id] ?? ""),
+                ),
+            });
         }
     } catch {
         return refs;

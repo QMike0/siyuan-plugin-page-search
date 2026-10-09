@@ -6,9 +6,30 @@ export function escSql(value: string): string {
     return value.replace(/'/g, "''");
 }
 
-export async function querySql<T>(stmt: string): Promise<T[] | null> {
+/**
+ * 思源当前宿主的 fetchSyncPost 已支持第五个 AbortSignal 参数；插件 SDK 的旧声明仍
+ * 只有两个参数。集中在这里兼容调用，未传 signal 时保持旧版本完全相同的调用方式。
+ */
+function postWithSignal(url: string, body: Record<string, unknown>, signal?: AbortSignal) {
+    if (!signal) {
+        return fetchSyncPost(url, body);
+    }
+    const post = fetchSyncPost as unknown as (
+        url: string,
+        data?: Record<string, unknown>,
+        headers?: Record<string, string>,
+        process?: boolean,
+        abortSignal?: AbortSignal,
+    ) => ReturnType<typeof fetchSyncPost>;
+    return post(url, body, undefined, undefined, signal);
+}
+
+export async function querySql<T>(stmt: string, signal?: AbortSignal): Promise<T[] | null> {
+    if (signal?.aborted) {
+        return null;
+    }
     try {
-        const response = await fetchSyncPost("/api/query/sql", {stmt, mode: "readonly"});
+        const response = await postWithSignal("/api/query/sql", {stmt, mode: "readonly"}, signal);
         if (!response || response.code !== 0 || !Array.isArray(response.data)) {
             return null;
         }
@@ -19,13 +40,17 @@ export async function querySql<T>(stmt: string): Promise<T[] | null> {
 }
 
 /** 自带 LIMIT，并按 id 翻页，避免内核默认条数把结果截断。 */
-export async function querySqlAll<T extends {id?: string}>(
+export async function querySqlAll<T extends {id?: string;}>(
     buildStmt: (afterId: string, limit: number) => string,
+    signal?: AbortSignal,
 ): Promise<T[] | null> {
     const rows: T[] = [];
     let afterId = "";
     for (;;) {
-        const batch = await querySql<T>(buildStmt(afterId, PAGE_SIZE));
+        if (signal?.aborted) {
+            return null;
+        }
+        const batch = await querySql<T>(buildStmt(afterId, PAGE_SIZE), signal);
         if (!batch) {
             return null;
         }
@@ -41,9 +66,12 @@ export async function querySqlAll<T extends {id?: string}>(
     }
 }
 
-export async function postJson<T>(url: string, body: Record<string, unknown>): Promise<T | null> {
+export async function postJson<T>(url: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<T | null> {
+    if (signal?.aborted) {
+        return null;
+    }
     try {
-        const response = await fetchSyncPost(url, body);
+        const response = await postWithSignal(url, body, signal);
         if (!response || response.code !== 0) {
             return null;
         }

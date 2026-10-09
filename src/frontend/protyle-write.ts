@@ -1,20 +1,39 @@
-import type {IOperation, Protyle} from "siyuan";
-import {fetchSyncPost, getAllEditor} from "siyuan";
-import {ATTRIBUTE_VIEW_TYPE, isPreviewSyntheticBlock, isPreviewSyntheticBlockId} from "./blocks";
+import type {
+    IOperation,
+    Protyle,
+} from "siyuan";
+import {
+    fetchSyncPost,
+    getAllEditor,
+} from "siyuan";
+import {
+    effectiveSearchQuery,
+    logicalTableCells,
+    tableHostOmitsRows,
+} from "../shared";
+import {
+    ATTRIBUTE_VIEW_TYPE,
+    isPreviewSyntheticBlock,
+    isPreviewSyntheticBlockId,
+} from "./blocks";
 import {collectSearchableBlocks} from "./blocks";
 import {extractUnitsFromDoms} from "./corpus/extract";
-import {fetchBlockHashes} from "./corpus/sql";
 import {invalidateDocumentSearchCaches} from "./corpus/search";
+import {fetchBlockHashes} from "./corpus/sql";
+import {isDocTitleMatch} from "./doc-title-replace";
 import type {SearchableBlock} from "./dom-types";
 import type {SearchMatch} from "./dom-types";
-import {isDocTitleMatch} from "./doc-title-replace";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
+import type {RegexTextMatcher} from "./regex-matcher";
 import {
     applyMatchesToLiveUnits,
     applyMatchesToSubmitClone,
+    createReplacementUnitLookup,
+    collectRegexReplacementRequests,
+    createRegexReplacementPlan,
+    type RegexReplacementPlan,
 } from "./replacement";
 import {unitKey} from "./selection";
-import {logicalTableCells, tableHostOmitsRows} from "../shared";
 
 const DOC_TITLE_BLOCK_ID = "__doc-title__";
 
@@ -24,6 +43,11 @@ export interface ReplaceWriteOptions {
     regex?: boolean;
     searchQuery?: string;
     caseSensitive?: boolean;
+    regexUnicode?: boolean;
+    regexMultiline?: boolean;
+    regexDotAll?: boolean;
+    /** 正则模板展开必须通过 SearchBar 的 Worker，禁止退回主线程 RegExp.exec。 */
+    regexMatcher?: RegexTextMatcher;
 }
 
 export interface ReplaceWriteResult {
@@ -39,10 +63,10 @@ export interface ReplaceWriteResult {
  * 拿不到则拒绝写回（不静默 updateBlock）。
  */
 function resolveProtyleFromEdit(edit: Element): Protyle | null {
-    const protyleElement = edit.classList.contains("protyle")
-        ? edit as HTMLElement
-        : edit.querySelector<HTMLElement>(".protyle:not(.fn__none)")
-            ?? edit.closest(".protyle");
+    const protyleElement = edit.classList.contains("protyle") ?
+        edit as HTMLElement :
+        edit.querySelector<HTMLElement>(".protyle:not(.fn__none)") ??
+            edit.closest(".protyle");
 
     if (!protyleElement) {
         return null;
@@ -65,9 +89,9 @@ function resolveSubmitBlockElement(
     if (!blockId || blockId === DOC_TITLE_BLOCK_ID) {
         return null;
     }
-    const root = edit.classList.contains("protyle")
-        ? edit
-        : edit.querySelector(".protyle:not(.fn__none)") ?? edit;
+    const root = edit.classList.contains("protyle") ?
+        edit :
+        edit.querySelector(".protyle:not(.fn__none)") ?? edit;
 
     const candidates = Array.from(
         root.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"][data-type]`),
@@ -84,9 +108,9 @@ function resolveSubmitBlockElement(
         if (currentRendered !== bestRendered) {
             return currentRendered ? current : best;
         }
-        return (current.textContent?.length ?? 0) > (best.textContent?.length ?? 0)
-            ? current
-            : best;
+        return (current.textContent?.length ?? 0) > (best.textContent?.length ?? 0) ?
+            current :
+            best;
     });
 }
 
@@ -190,12 +214,62 @@ function replaceOptionsFrom(
     regex?: boolean;
     searchQuery?: string;
     caseSensitive?: boolean;
+    regexUnicode?: boolean;
+    regexMultiline?: boolean;
+    regexDotAll?: boolean;
 } {
     return {
         preserveCase: options.preserveCase,
         regex: options.regex,
         searchQuery: options.searchQuery,
         caseSensitive: options.caseSensitive,
+        regexUnicode: options.regexUnicode,
+        regexMultiline: options.regexMultiline,
+        regexDotAll: options.regexDotAll,
+    };
+}
+
+type PreparedReplaceOptions = ReturnType<typeof replaceOptionsFrom> & {
+    regexPlan?: RegexReplacementPlan;
+};
+
+/**
+ * 把捕获组/命名组展开限制在 Worker。主线程只接收纯文本计划，随后仍逐处核对文本快照。
+ * 计划失败时整次替换不写入，避免“部分替换 + 用户以为已全部完成”。
+ */
+async function prepareRegexReplaceOptions(
+    unitsByKey: Map<string, SearchableBlock>,
+    matches: Array<Pick<SearchMatch, "id" | "blockId" | "unitId" | "start" | "end" | "matchedText">>,
+    replacementText: string,
+    options: ReplaceWriteOptions,
+): Promise<{options: PreparedReplaceOptions; error?: string;}> {
+    const base = replaceOptionsFrom(options);
+    if (!options.regex) {
+        return {options: base};
+    }
+    const patternSource = effectiveSearchQuery(options.searchQuery ?? "");
+    if (!patternSource || !options.regexMatcher) {
+        return {options: base, error: "regex-expand-failed"};
+    }
+    const result = await options.regexMatcher.expandReplacements(
+        collectRegexReplacementRequests(unitsByKey, matches),
+        patternSource,
+        replacementText,
+        {
+            caseSensitive: options.caseSensitive === true,
+            regexUnicode: options.regexUnicode === true,
+            regexMultiline: options.regexMultiline === true,
+            regexDotAll: options.regexDotAll === true,
+        },
+    );
+    if (result.cancelled || result.error) {
+        return {options: base, error: "regex-expand-failed"};
+    }
+    return {
+        options: {
+            ...base,
+            regexPlan: createRegexReplacementPlan(result.expansions),
+        },
     };
 }
 
@@ -242,9 +316,18 @@ export async function replaceCurrentMatchInEditor(
     })
         .filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks);
-    const unit = unitsByKey.get(unitKey(match.blockId, match.unitId));
+    const unit = createReplacementUnitLookup(unitsByKey)(match);
     if (!unit) {
         return {replacedCount: 0, skippedCount: 1, error: "unit-missing"};
+    }
+    const preparedOptions = await prepareRegexReplaceOptions(
+        unitsByKey,
+        [match],
+        replacementText,
+        options,
+    );
+    if (preparedOptions.error) {
+        return {replacedCount: 0, skippedCount: 1, error: preparedOptions.error};
     }
 
     const typeBefore = submit.getAttribute("data-type");
@@ -253,15 +336,15 @@ export async function replaceCurrentMatchInEditor(
         unitsByKey,
         [match],
         replacementText,
-        replaceOptionsFrom(options),
+        preparedOptions.options,
     );
     if (outcome.appliedCount === 0) {
         return {
             replacedCount: 0,
             skippedCount: Math.max(1, outcome.skippedCount),
-            error: outcome.regexExpandFailedCount > 0
-                ? "regex-expand-failed"
-                : "apply-failed",
+            error: outcome.regexExpandFailedCount > 0 ?
+                "regex-expand-failed" :
+                "apply-failed",
         };
     }
     if ((submit.getAttribute("data-type") ?? "") !== (typeBefore ?? "")) {
@@ -551,7 +634,7 @@ function mergeKernelHtmlWithLiveTable(
     liveRoot: ParentNode | null,
     blockId: string,
     kernelHtml: string,
-): {html: string; conflict: boolean} {
+): {html: string; conflict: boolean;} {
     if (!liveRoot) {
         return {html: kernelHtml, conflict: false};
     }
@@ -576,8 +659,9 @@ async function prepareFetchedBlockUpdates(
     replacementText: string,
     options: ReplaceWriteOptions,
     liveRoot: ParentNode | null,
-): Promise<{updates: PreparedBlockUpdate[]; skippedCount: number; error?: string}> {
+): Promise<{updates: PreparedBlockUpdate[]; skippedCount: number; error?: string; fatal?: boolean;}> {
     const ids = Array.from(matchesById.keys());
+    const totalMatches = Array.from(matchesById.values()).reduce((count, items) => count + items.length, 0);
     const updates: PreparedBlockUpdate[] = [];
     let skippedCount = 0;
     let error: string | undefined;
@@ -585,7 +669,6 @@ async function prepareFetchedBlockUpdates(
         return {updates, skippedCount};
     }
 
-    const replaceOpts = replaceOptionsFrom(options);
     for (let index = 0; index < ids.length; index += BLOCK_DOM_BATCH_SIZE) {
         const batch = ids.slice(index, index + BLOCK_DOM_BATCH_SIZE);
         const htmlById = await fetchBlockHtmlBatch(batch);
@@ -632,6 +715,21 @@ async function prepareFetchedBlockUpdates(
 
         try {
             const unitsByKey = buildUnitMap(extracted.blocks);
+            const batchMatches = present.flatMap((id) => matchesById.get(id) ?? []);
+            const preparedOptions = await prepareRegexReplaceOptions(
+                unitsByKey,
+                batchMatches,
+                replacementText,
+                options,
+            );
+            if (preparedOptions.error) {
+                return {
+                    updates: [],
+                    skippedCount: totalMatches,
+                    error: preparedOptions.error,
+                    fatal: true,
+                };
+            }
             for (const id of present) {
                 const blockMatches = matchesById.get(id) ?? [];
                 const unit = extracted.blocks.find((block) => block.blockId === id);
@@ -650,7 +748,7 @@ async function prepareFetchedBlockUpdates(
                     unitsByKey,
                     blockMatches,
                     replacementText,
-                    replaceOpts,
+                    preparedOptions.options,
                 );
                 skippedCount += prepared.skippedCount;
                 if (prepared.update) {
@@ -688,7 +786,6 @@ export async function replaceAllMatchesInEditor(
         return {replacedCount: 0, skippedCount: matches.length, error: "readonly-or-preview"};
     }
 
-    const replaceOpts = replaceOptionsFrom(options);
     const bodyMatches: SearchMatch[] = [];
     let skippedCount = 0;
 
@@ -716,6 +813,19 @@ export async function replaceAllMatchesInEditor(
     })
         .filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks);
+    const loadedOptions = await prepareRegexReplaceOptions(
+        unitsByKey,
+        bodyMatches,
+        replacementText,
+        options,
+    );
+    if (loadedOptions.error) {
+        return {
+            replacedCount: 0,
+            skippedCount: skippedCount + bodyMatches.length,
+            error: loadedOptions.error,
+        };
+    }
 
     const grouped = new Map<string, SearchMatch[]>();
     for (const match of bodyMatches) {
@@ -743,7 +853,7 @@ export async function replaceAllMatchesInEditor(
             unitsByKey,
             blockMatches,
             replacementText,
-            replaceOpts,
+            loadedOptions.options,
         );
         bodySkipped += prepared.skippedCount;
         if (prepared.update) {
@@ -760,6 +870,13 @@ export async function replaceAllMatchesInEditor(
         edit,
     );
     bodySkipped += fetched.skippedCount;
+    if (fetched.fatal) {
+        return {
+            replacedCount: 0,
+            skippedCount: skippedBeforeBody + bodyMatches.length,
+            error: fetched.error,
+        };
+    }
     if (fetched.error) {
         firstError ??= fetched.error;
     }

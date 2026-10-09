@@ -1,7 +1,12 @@
-import {ZERO_WIDTH_GLOBAL_RE, ZERO_WIDTH_RE} from "./constants";
+import {
+    effectiveSearchQuery,
+    ZERO_WIDTH_GLOBAL_RE,
+    ZERO_WIDTH_RE,
+} from "./constants";
+import {isRendererUnitId} from "./renderer-units";
 import {ATTRIBUTE_VIEW_TYPE} from "./replaceable";
 
-/** 与 frontend/blocks MERMAID_UNIT_ID / HTML_BLOCK_UNIT_ID 对齐 */
+/** 旧缓存/旧 RPC 单元兼容；新单元统一使用 renderer: 前缀。 */
 const MERMAID_UNIT_ID = "mermaid-source";
 const HTML_BLOCK_UNIT_ID = "html-block-rendered";
 import type {
@@ -88,10 +93,18 @@ export function isHitReplaceableByUnit(
     if (unit.blockType === ATTRIBUTE_VIEW_TYPE) {
         return false;
     }
-    if (unit.unitId === MERMAID_UNIT_ID || unit.unitId === HTML_BLOCK_UNIT_ID) {
+    if (
+        isRendererUnitId(unit.unitId) ||
+        unit.unitId === MERMAID_UNIT_ID ||
+        unit.unitId === HTML_BLOCK_UNIT_ID
+    ) {
         return false;
     }
-    return isOffsetReplaceable(unit.segmentLengths, start, end);
+    if (!isOffsetReplaceable(unit.segmentLengths, start, end)) {
+        return false;
+    }
+    // 跨内部标记的替换会删除该字符。搜索可保持透明，写回必须等 DOM 身份能证明它是思源标记。
+    return !ZERO_WIDTH_RE.test(unit.text.slice(start, end));
 }
 
 export function rangesOverlap(
@@ -138,14 +151,14 @@ export function createTextMatchProbe(
     keyword: string,
     options: MatchOptions,
 ): (text: string) => boolean {
-    const trimmed = keyword.trim();
-    if (!trimmed) {
+    const query = effectiveSearchQuery(keyword);
+    if (!query) {
         return () => false;
     }
     if (usesRegex(options)) {
         let pattern: RegExp;
         try {
-            pattern = createSearchPattern(trimmed, options);
+            pattern = createSearchPattern(query, options);
         } catch {
             return () => false;
         }
@@ -157,7 +170,7 @@ export function createTextMatchProbe(
             return pattern.test(text);
         };
     }
-    const plan = createLiteralSearchPlan(trimmed, options.caseSensitive === true);
+    const plan = createLiteralSearchPlan(query, options.caseSensitive === true);
     if (plan.variants.length === 0) {
         return () => false;
     }
@@ -170,10 +183,14 @@ export function findOffsetMatchesInText(
     keyword: string,
     options: MatchOptions = {},
 ): TextOffsetMatch[] {
-    if (usesRegex(options)) {
-        return findOffsetMatchesAdvanced(blockText, keyword, options);
+    const query = effectiveSearchQuery(keyword);
+    if (!query) {
+        return [];
     }
-    return findOffsetMatchesLegacy(blockText, keyword, options);
+    if (usesRegex(options)) {
+        return findOffsetMatchesAdvanced(blockText, query, options);
+    }
+    return findOffsetMatchesLegacy(blockText, query, options);
 }
 
 function findOffsetMatchesLegacy(
@@ -192,20 +209,25 @@ function findLiteralMatches(
     stopAfterFirst: boolean,
 ): TextOffsetMatch[] {
     const allMatches: TextOffsetMatch[] = [];
-    const visibleSpans = new Set<string>();
     if (!blockText || plan.variants.length === 0) {
         return allMatches;
     }
+    const normalizeMarkers = ZERO_WIDTH_RE.test(blockText) ||
+        plan.variants.some((variant) => ZERO_WIDTH_RE.test(variant.value));
+    // 普通文本不需要 span 去重，避免给高频词的每个命中分配字符串 key。
+    const visibleSpans = normalizeMarkers ? new Set<string>() : null;
 
     const addDirect = (startIndex: number, endIndex: number, searchStr: string): boolean => {
         if (!isWholeWordMatch(blockText, startIndex, endIndex, wholeWord)) {
             return false;
         }
-        const spanKey = visibleSpanKey(blockText, startIndex, endIndex);
-        if (visibleSpans.has(spanKey)) {
-            return false;
+        if (visibleSpans) {
+            const spanKey = visibleSpanKey(blockText, startIndex, endIndex);
+            if (visibleSpans.has(spanKey)) {
+                return false;
+            }
+            visibleSpans.add(spanKey);
         }
-        visibleSpans.add(spanKey);
         allMatches.push({startIndex, endIndex, searchStr});
         return stopAfterFirst;
     };
@@ -218,8 +240,7 @@ function findLiteralMatches(
         }
     }
 
-    if (!ZERO_WIDTH_RE.test(blockText)
-        && !plan.variants.some((variant) => ZERO_WIDTH_RE.test(variant.value))) {
+    if (!normalizeMarkers) {
         return sortOffsetMatches(allMatches);
     }
 
@@ -245,10 +266,10 @@ function findLiteralMatches(
                     return false;
                 }
                 const spanKey = visibleSpanKey(blockText, originalStart, originalEnd);
-                if (visibleSpans.has(spanKey)) {
+                if ((visibleSpans as Set<string>).has(spanKey)) {
                     return false;
                 }
-                visibleSpans.add(spanKey);
+                (visibleSpans as Set<string>).add(spanKey);
                 allMatches.push({
                     startIndex: originalStart,
                     endIndex: originalEnd,
@@ -340,7 +361,7 @@ function forEachLiteralOccurrence(
     return false;
 }
 
-function stripInternalMarkers(text: string): {text: string; positions: number[]} {
+function stripInternalMarkers(text: string): {text: string; positions: number[];} {
     let normalized = "";
     const positions: number[] = [];
     for (let index = 0; index < text.length; index += 1) {
@@ -391,6 +412,18 @@ function findOffsetMatchesAdvanced(
     options: MatchOptions,
 ): TextOffsetMatch[] {
     const pattern = createSearchPattern(keyword, options);
+    return findOffsetMatchesWithPattern(blockText, pattern, options);
+}
+
+/**
+ * RegExp 带有 lastIndex 状态，但同一查询的 pattern 可以在每个单元开始时重置后安全复用。
+ * 这让整轮搜索只编译一次正则，同时保留原有的 g/u/m/s 和零长度命中语义。
+ */
+function findOffsetMatchesWithPattern(
+    blockText: string,
+    pattern: RegExp,
+    options: MatchOptions,
+): TextOffsetMatch[] {
     const allMatches: TextOffsetMatch[] = [];
     pattern.lastIndex = 0;
     let match = pattern.exec(blockText);
@@ -413,8 +446,31 @@ function findOffsetMatchesAdvanced(
 
 export function createSearchPattern(query: string, options: MatchOptions): RegExp {
     const source = options.regex ? query : escapeForRegex(query);
-    const flags = options.caseSensitive ? "g" : "gi";
+    const flags = regexSearchFlags(options);
     return new RegExp(source, flags);
+}
+
+/**
+ * 正则查找与替换捕获组展开共用的 flags。
+ * 仅在正则模式接受 u/m/s，避免普通关键词搜索因 UI 残留选项改变历史行为。
+ */
+export function regexSearchFlags(options: MatchOptions, global = true): string {
+    let flags = global ? "g" : "";
+    if (!options.caseSensitive) {
+        flags += "i";
+    }
+    if (options.regex) {
+        if (options.regexUnicode) {
+            flags += "u";
+        }
+        if (options.regexMultiline) {
+            flags += "m";
+        }
+        if (options.regexDotAll) {
+            flags += "s";
+        }
+    }
+    return flags;
 }
 
 export function escapeForRegex(value: string): string {
@@ -441,10 +497,18 @@ export function isWholeWordMatch(
     if (start < 0 || end > text.length || start >= end) {
         return false;
     }
-    if (start > 0 && isWordChar(text.charAt(start - 1))) {
+    let visibleStart = start;
+    while (visibleStart > 0 && ZERO_WIDTH_RE.test(text.charAt(visibleStart - 1))) {
+        visibleStart -= 1;
+    }
+    if (visibleStart > 0 && isWordChar(text.charAt(visibleStart - 1))) {
         return false;
     }
-    if (end < text.length && isWordChar(text.charAt(end))) {
+    let visibleEnd = end;
+    while (visibleEnd < text.length && ZERO_WIDTH_RE.test(text.charAt(visibleEnd))) {
+        visibleEnd += 1;
+    }
+    if (visibleEnd < text.length && isWordChar(text.charAt(visibleEnd))) {
         return false;
     }
     return true;
@@ -477,21 +541,22 @@ export function matchTextUnitsDetailed(
     query: string,
     options: MatchTextUnitsOptions = {},
 ): MatchTextUnitsResult {
-    const trimmed = query.trim();
-    if (!trimmed || !units.length) {
+    const effectiveQuery = effectiveSearchQuery(query);
+    if (!effectiveQuery || !units.length) {
         return {hits: [], error: ""};
     }
 
     const regex = usesRegex(options);
     let literalPlan: LiteralSearchPlan | null = null;
+    let regexPattern: RegExp | null = null;
     if (!regex) {
-        literalPlan = createLiteralSearchPlan(trimmed, options.caseSensitive === true);
+        literalPlan = createLiteralSearchPlan(effectiveQuery, options.caseSensitive === true);
         if (literalPlan.variants.length === 0) {
             return {hits: [], error: ""};
         }
     } else {
         try {
-            createSearchPattern(trimmed, options);
+            regexPattern = createSearchPattern(effectiveQuery, options);
         } catch (error) {
             return {
                 hits: [],
@@ -504,23 +569,20 @@ export function matchTextUnitsDetailed(
     const result: MatchHit[] = [];
 
     for (const unit of units) {
-        const offsetMatches = regex
-            ? findOffsetMatchesAdvanced(unit.text, trimmed, options)
-            : findLiteralMatches(unit.text, literalPlan as LiteralSearchPlan, options.wholeWord === true, false);
-        const acceptedRanges: Array<{start: number; end: number}> = [];
+        const offsetMatches = regex ?
+            findOffsetMatchesWithPattern(unit.text, regexPattern as RegExp, options) :
+            findLiteralMatches(unit.text, literalPlan as LiteralSearchPlan, options.wholeWord === true, false);
+        // offsetMatches 已按 start/end 排序。被接受的区间两两不重叠，
+        // 所以只需同最近区间的终点比较，不需要对每个命中重复扫描整个数组。
+        let acceptedEnd = -1;
 
         for (const match of offsetMatches) {
-            if (
-                dedupeOverlaps
-                && acceptedRanges.some((range) =>
-                    rangesOverlap(match.startIndex, match.endIndex, range.start, range.end)
-                )
-            ) {
+            if (dedupeOverlaps && match.startIndex < acceptedEnd) {
                 continue;
             }
 
             if (dedupeOverlaps) {
-                acceptedRanges.push({start: match.startIndex, end: match.endIndex});
+                acceptedEnd = match.endIndex;
             }
 
             result.push(offsetMatchToHit(unit, match));

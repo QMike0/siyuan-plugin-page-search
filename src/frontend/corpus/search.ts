@@ -3,13 +3,17 @@ import type {Plugin} from "siyuan";
 import {
     createSearchPattern,
     createTextMatchProbe,
+    effectiveSearchQuery,
     extractRegexLiteralGroups,
     regexPrefilterStoresPlainCache,
     avApiUnitInView,
     avApiUnitShown,
     collectAvDomCoverage,
+    collectHeadingFoldedIds,
     isBlockTreeEnabled,
     isHitReplaceableByUnit,
+    isRendererUnitId,
+    isSelfFoldedIal,
     logicalTableRows,
     mergeVirtualTableUnits,
     ownTableRows,
@@ -20,6 +24,9 @@ import {
     matchPassesRestrictInline,
     matchTextUnitsDetailed,
     normalizeRestrictInlineTypes,
+    shouldCollectBodyTextForRestrict,
+    shouldCollectInlineMathUnits,
+    shouldCollectInlineMemoUnits,
     type SearchableUnit,
 } from "../../shared";
 import {
@@ -28,14 +35,53 @@ import {
     isDirectTableCell,
     inlineMathIdentityText,
     isInlineMathSearchUnit,
-    MERMAID_UNIT_ID,
-    HTML_BLOCK_UNIT_ID,
+    resolveDocRoot,
 } from "../blocks";
-import type {SearchableBlock, SearchMatch, TableReplaceLock} from "../dom-types";
-import type {SearchPipelineOptions, SearchPipelineResult} from "../pipeline";
-import {invalidateAvCache, loadAvUnits, peekAvUnits, resolveMissingAvIds, type AvBlockRef} from "./av";
-import {escSql, querySqlAll} from "./api";
+import type {
+    SearchableBlock,
+    SearchMatch,
+    TableReplaceLock,
+} from "../dom-types";
+import {buildListSnippet} from "../list-snippet";
+import type {
+    SearchPipelineOptions,
+    SearchPipelineResult,
+} from "../pipeline";
+import {
+    escSql,
+    querySqlAll,
+} from "./api";
+import {
+    AttributeViewTruncatedError,
+    invalidateAvCache,
+    loadAvUnits,
+    peekAvUnits,
+    resolveMissingAvIds,
+    type AvBlockRef,
+} from "./av";
 import {fetchAndExtractUnits} from "./extract";
+import {
+    collectFocusScope,
+    editorFocusId,
+} from "./focus";
+import {
+    codeBlockLanguagesNeeded,
+    ensureCodeBlockLanguages,
+    isBlockTypeEnabled,
+    invalidateDocMeta,
+    isInMindmapBlock,
+    isInTabsBlock,
+    loadDocMeta,
+    noteLiveCodeLanguage,
+    type BlockMeta,
+} from "./meta";
+import type {OffscreenRenderMode} from "./offscreen";
+import {
+    fetchDocBlocksOrders,
+    fetchHeadingChildrenIds,
+    invalidateDocOrder,
+} from "./order";
+import {projectRanges} from "./project";
 import {
     isAttributeViewType,
     isDiagramBlock,
@@ -49,39 +95,81 @@ import {
     fetchLiteralGroupCandidateIds,
     fetchMemoCandidateIds,
 } from "./sql";
-import {isBlockTypeEnabled, invalidateDocMeta, isInMindmapBlock, isInTabsBlock, loadDocMeta, type BlockMeta} from "./meta";
-import {collectFocusScope, editorFocusId} from "./focus";
-import {buildListSnippet} from "../list-snippet";
-import {fetchDocBlocksOrders, invalidateDocOrder} from "./order";
-import {projectRanges} from "./project";
-import {freezeBlock, restrictSpanCovers, type CachedUnit} from "./units";
-import type {OffscreenRenderMode} from "./offscreen";
+import {
+    freezeBlock,
+    restrictSpanCovers,
+    type CachedUnit,
+} from "./units";
 
 interface TextCacheEntry {
     hash: string;
     units: CachedUnit[];
+    /** 近似保留大小；用于跨文档的全局缓存预算。 */
+    bytes: number;
     /** 渲染失败的短期负缓存；到期后允许用户下一次搜索重试。 */
     retryAfter?: number;
 }
 
 const textCache = new Map<string, TextCacheEntry>();
+/** 所有文本缓存共用的 LRU。Map 的插入顺序就是从最久未使用到最新。 */
+const textCacheLru = new Map<string, true>();
+let textCacheBytes = 0;
+/** 缓存内容主要是 UTF-16 字符串；12 MiB 让频繁切页仍有命中，同时封顶长会话内存。 */
+const TEXT_CACHE_LIMIT_BYTES = 12 * 1024 * 1024;
 const SPECIAL_FAILURE_RETRY_MS = 5000;
-/** 每个文档保留的普通正文缓存条数。图表缓存不走这条名单。 */
+/** 特殊渲染结果跨文档、跨范围共用一份全局预算，避免长会话持续增长。 */
+const SPECIAL_CACHE_LIMIT = 2000;
+const specialCacheKeys = new Map<string, true>();
+/** 当前搜索涉及的特殊块不能在补全过程中互相淘汰；超出预算时暂时允许软溢出。 */
+const activeSpecialCacheKeys = new Set<string>();
+const activeSpecialCacheKeysByRoot = new Map<string, Set<string>>();
+let specialCacheTrimBlocked = false;
+/** 普通正文缓存也使用跨文档全局 LRU，避免每篇文档各存一份而无限增长。 */
 const PLAIN_CACHE_LIMIT = 2000;
-const plainCacheKeys = new Map<string, string[]>();
-const jobs = new Map<string, Promise<void>>();
-let corpusEpoch = 0;
+const plainCacheKeys = new Map<string, true>();
+interface CorpusJob {
+    task: Promise<void>;
+    epoch: number;
+    rootId: string;
+    controller: AbortController;
+}
+const jobs = new Map<string, CorpusJob>();
+const corpusEpochs = new Map<string, number>();
+/** 打开的查找框按文档计数；最后一个关闭时才停止该文档的后台补全。 */
+const backgroundRootUsers = new Map<string, number>();
+const JOB_FAILURE_RETRY_MS = 5000;
+const JOB_FAILURE_LIMIT = 100;
+const jobFailures = new Map<string, {rootId: string; retryAfter: number; truncated?: boolean;}>();
+
+function currentCorpusEpoch(rootId: string): number {
+    return corpusEpochs.get(rootId) ?? 0;
+}
 
 export function invalidateTextCache(): void {
     textCache.clear();
+    textCacheLru.clear();
+    textCacheBytes = 0;
+    specialCacheKeys.clear();
+    activeSpecialCacheKeys.clear();
+    activeSpecialCacheKeysByRoot.clear();
+    specialCacheTrimBlocked = false;
     plainCacheKeys.clear();
 }
 
 export function invalidateDocumentSearchCaches(): void {
+    // 清缓存时必须同时作废旧任务，否则旧任务完成后会把刚清掉的数据写回。
+    cancelBackgroundCorpusJobs();
     invalidateTextCache();
     invalidateDocMeta();
     invalidateDocOrder();
     invalidateAvCache();
+    jobFailures.clear();
+}
+
+/** savedoc 后只作废结构信息，保留哈希校验过的正文与特殊块缓存。 */
+export function invalidateDocumentStructureCaches(rootId?: string): void {
+    invalidateDocMeta(rootId);
+    invalidateDocOrder(rootId);
 }
 
 /**
@@ -109,6 +197,7 @@ function collectionScope(options: SearchPipelineOptions): string {
         options.includeEmbedBlock !== false,
         options.includeCodeBlock !== false,
         options.includeMermaid !== false,
+        options.includeFlowchart !== false,
         options.includeHtmlBlock !== false,
         options.includeTabs !== false,
         options.includeMindmap !== false,
@@ -124,18 +213,158 @@ function cacheKey(rootId: string, blockId: string, scope: string): string {
     return `${rootId}:${blockId}:${scope}`;
 }
 
-function readContext(edit: Element): {rootId: string; notebookId: string} | null {
-    const protyleEl = edit.classList.contains("protyle") && !edit.hasAttribute("data-page-search-offscreen")
-        ? edit
-        : edit.querySelector(".protyle:not(.fn__none):not([data-page-search-offscreen])");
+function textBytes(value: string | undefined): number {
+    return (value?.length ?? 0) * 2;
+}
+
+/**
+ * 不追求引擎对象的精确 heap size，只为 LRU 提供稳定的上界估算。
+ * 文本占主要部分；偏移数组和限制范围按数字/对象的保守固定成本计入。
+ */
+function estimateCacheEntryBytes(hash: string, units: readonly CachedUnit[]): number {
+    let bytes = 64 + textBytes(hash);
+    for (const unit of units) {
+        bytes += 96 +
+            textBytes(unit.blockId) +
+            textBytes(unit.blockType) +
+            textBytes(unit.text) +
+            textBytes(unit.unitId) +
+            textBytes(unit.highlightKind) +
+            textBytes(unit.snippet);
+        bytes += (unit.segmentLengths?.length ?? 0) * 8;
+        bytes += unit.restrictSpans.length * 40;
+    }
+    return bytes;
+}
+
+function touchTextCache(key: string): void {
+    if (textCacheLru.has(key)) {
+        textCacheLru.delete(key);
+    }
+    textCacheLru.set(key, true);
+}
+
+function dropTextCache(key: string): void {
+    const cached = textCache.get(key);
+    if (cached) {
+        textCacheBytes = Math.max(0, textCacheBytes - cached.bytes);
+        textCache.delete(key);
+    }
+    textCacheLru.delete(key);
+    specialCacheKeys.delete(key);
+    plainCacheKeys.delete(key);
+}
+
+function trimTextCacheBudget(): void {
+    if (textCacheBytes <= TEXT_CACHE_LIMIT_BYTES) {
+        return;
+    }
+    for (const key of Array.from(textCacheLru.keys())) {
+        if (textCacheBytes <= TEXT_CACHE_LIMIT_BYTES) {
+            return;
+        }
+        // 正在为活动文档补全的特殊块不能中途淘汰；释放活动键时会再整理。
+        if (activeSpecialCacheKeys.has(key)) {
+            continue;
+        }
+        dropTextCache(key);
+    }
+}
+
+function writeTextCache(key: string, entry: Omit<TextCacheEntry, "bytes">): void {
+    dropTextCache(key);
+    const cached: TextCacheEntry = {
+        ...entry,
+        bytes: estimateCacheEntryBytes(entry.hash, entry.units),
+    };
+    textCache.set(key, cached);
+    textCacheBytes += cached.bytes;
+    touchTextCache(key);
+}
+
+function touchSpecialCache(key: string): void {
+    if (specialCacheKeys.has(key)) {
+        specialCacheKeys.delete(key);
+    }
+    specialCacheKeys.set(key, true);
+}
+
+function pinSpecialCacheKeys(rootId: string, keys: string[]): void {
+    let owned = activeSpecialCacheKeysByRoot.get(rootId);
+    if (!owned) {
+        owned = new Set<string>();
+        activeSpecialCacheKeysByRoot.set(rootId, owned);
+    }
+    for (const key of keys) {
+        owned.add(key);
+        activeSpecialCacheKeys.add(key);
+    }
+}
+
+function releaseSpecialCacheKeys(rootId: string): void {
+    const owned = activeSpecialCacheKeysByRoot.get(rootId);
+    if (owned) {
+        for (const key of owned) {
+            activeSpecialCacheKeys.delete(key);
+        }
+        activeSpecialCacheKeysByRoot.delete(rootId);
+    }
+    // 工作集已释放后立即回到全局预算；仍被其他文档使用的键会由 trimSpecialCache 跳过。
+    specialCacheTrimBlocked = false;
+    trimSpecialCache();
+    trimTextCacheBudget();
+}
+
+function trimSpecialCache(): void {
+    if (specialCacheTrimBlocked || specialCacheKeys.size <= SPECIAL_CACHE_LIMIT) {
+        return;
+    }
+    for (const key of Array.from(specialCacheKeys.keys())) {
+        if (specialCacheKeys.size <= SPECIAL_CACHE_LIMIT) {
+            return;
+        }
+        if (activeSpecialCacheKeys.has(key)) {
+            continue;
+        }
+        dropTextCache(key);
+    }
+    // 整个超额部分都属于当前工作集时保留它，避免每次写入都 O(N) 扫描。
+    specialCacheTrimBlocked = specialCacheKeys.size > SPECIAL_CACHE_LIMIT;
+}
+
+function writeSpecialCache(key: string, entry: Omit<TextCacheEntry, "bytes">): void {
+    writeTextCache(key, entry);
+    touchSpecialCache(key);
+    trimSpecialCache();
+    trimTextCacheBudget();
+}
+
+function readContext(edit: Element): {rootId: string; notebookId: string;} | null {
+    const protyleSelector = ".protyle:not(.fn__none):not([data-page-search-offscreen])";
+    // 桌面端的 SearchBar 挂在 layout-tab-container 上。页签过渡时其中可能短暂
+    // 同时保留旧/新的 Protyle；思源其它前端路径也优先取直属可见 Protyle，避免
+    // querySelector 因旧的深层节点先出现而绑定到错误文档。
+    const protyleEl = edit.classList.contains("protyle") &&
+            !edit.classList.contains("fn__none") &&
+            !edit.hasAttribute("data-page-search-offscreen") ?
+        edit :
+        edit.querySelector<HTMLElement>(`:scope > ${protyleSelector}`) ??
+            edit.querySelector<HTMLElement>(protyleSelector);
+    // 过渡帧中没有已显示的 Protyle 时，不能按 edit 容器去猜 getAllEditor()
+    // 的第一项：旧页签的包装对象还在数组中，会把结果或索引归到错误文档。
+    if (!protyleEl) {
+        return null;
+    }
     const editors = getAllEditor();
-    const exact = protyleEl
-        ? editors.find((editor) => editor?.protyle?.element === protyleEl)
-        : undefined;
+    const exact = protyleEl ?
+        editors.find((editor) => editor?.protyle?.element === protyleEl) :
+        undefined;
     const found = exact ?? editors.find((editor) => {
         const el = editor?.protyle?.element;
-        return el === edit || (el instanceof Element && !el.hasAttribute("data-page-search-offscreen")
-            && (el.contains(edit) || edit.contains(el)));
+        return el instanceof Element &&
+            !el.classList.contains("fn__none") &&
+            !el.hasAttribute("data-page-search-offscreen") &&
+            (el.contains(protyleEl) || protyleEl.contains(el));
     });
     const rootId = found?.protyle?.block?.rootID || "";
     if (!rootId) {
@@ -170,12 +399,171 @@ function collectOptions(options: SearchPipelineOptions) {
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeMermaid: options.includeMermaid !== false,
+        includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeFoldedBlocks: options.includeFoldedBlocks === true,
         includeTabs: options.includeTabs !== false,
         includeMindmap: options.includeMindmap !== false,
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,
     };
+}
+
+/**
+ * 未加载块的缓存保存原始可搜索文字，折叠只在候选阶段过滤。
+ * 若把折叠开关放进缓存范围，切换开关会让同一段正文失去命中缓存并重新请求 DOM，
+ * 即使当前文档已经完整加载也会出现明显的 0/0 停顿。
+ */
+function extractionCollectOptions(options: SearchPipelineOptions) {
+    return {
+        ...collectOptions(options),
+        includeFoldedBlocks: true,
+    };
+}
+
+/** 当前文档已挂载块的即时折叠状态；卸载的块继续使用 SQL IAL。 */
+function mountedFoldState(edit: Element): {
+    headings: {mountedIds: Set<string>; foldedIds: Set<string>;};
+    nonHeadings: {mountedIds: Set<string>; foldedIds: Set<string>;};
+} {
+    const headings = {mountedIds: new Set<string>(), foldedIds: new Set<string>()};
+    const nonHeadings = {mountedIds: new Set<string>(), foldedIds: new Set<string>()};
+    const root = resolveDocRoot(edit);
+    if (!root) {
+        return {headings, nonHeadings};
+    }
+    root.querySelectorAll<HTMLElement>("[data-node-id][data-type]").forEach((element) => {
+        // 嵌入块会把另一处文档的块副本挂进当前编辑器；它的 fold 状态不能覆盖
+        // 当前文档同 ID 的 SQL 元数据。嵌入块自身仍是本文件的真实块，予以保留。
+        const embed = element.closest<HTMLElement>('[data-type="NodeBlockQueryEmbed"]');
+        if (embed && embed !== element) {
+            return;
+        }
+        const id = element.dataset.nodeId?.trim();
+        if (!id) {
+            return;
+        }
+        const state = element.dataset.type === "NodeHeading" ? headings : nonHeadings;
+        state.mountedIds.add(id);
+        if (element.getAttribute("fold") === "1") {
+            state.foldedIds.add(id);
+        }
+    });
+    return {headings, nonHeadings};
+}
+
+/**
+ * SQL IAL 在折叠手势后可能稍晚才刷新。已挂载非标题块按 DOM 覆盖该旧值，
+ * 但不能把这套规则外推到未加载区域，否则会漏掉它们真实的折叠状态。
+ */
+function isUnderNonHeadingFold(
+    id: string,
+    links: ReadonlyMap<string, {parentId: string; type: string; subtype: string; ial: string;}>,
+    state: {mountedIds: ReadonlySet<string>; foldedIds: ReadonlySet<string>;},
+    memo: Map<string, boolean>,
+    resolving: Set<string> = new Set<string>(),
+): boolean {
+    const known = memo.get(id);
+    if (known !== undefined) {
+        return known;
+    }
+    // blocks.parent_id 理论上是一棵树；损坏数据不能让搜索陷入递归。
+    if (resolving.has(id)) {
+        memo.set(id, false);
+        return false;
+    }
+    resolving.add(id);
+    const node = links.get(id);
+    const selfFolded = node && node.type !== "h" && (state.mountedIds.has(id) ?
+        state.foldedIds.has(id) :
+        isSelfFoldedIal(node.ial));
+    const value = Boolean(
+        selfFolded ||
+            (node?.parentId && links.has(node.parentId) &&
+                isUnderNonHeadingFold(node.parentId, links, state, memo, resolving)),
+    );
+    resolving.delete(id);
+    memo.set(id, value);
+    return value;
+}
+
+/**
+ * 已知处于折叠状态的标题交给内核确认下辖块；复杂容器不再靠 SQL 父子关系猜边界。
+ *
+ * 已挂载标题的状态来自 DOM；未挂载标题则先用 blocks.ial 找到 `fold="1"` 的
+ * 标题，再由内核给出真实的 HeadingChildren。后一步不能只做已挂载标题：动态
+ * 加载会卸掉折叠标题本身，而 SQL 的 parent_id 不能完整表达标题的逻辑后代。
+ */
+async function collectExactHeadingHiddenIds(
+    rootId: string,
+    signature: string,
+    foldedHeadingIds: ReadonlySet<string>,
+    links: ReadonlyMap<string, {parentId: string; type: string; subtype: string; ial: string;}>,
+    signal?: AbortSignal,
+): Promise<Set<string>> {
+    const hiddenRoots = new Set<string>();
+    // 调用方对当前画面里大量同时折叠的标题保留原有上限；这里的未挂载
+    // 标题不截断，否则第 33 个及以后的未加载标题会重新漏进结果。四路并发
+    // 既避免请求峰值，也能在被取消时尽快停下。
+    const ids = Array.from(foldedHeadingIds);
+    const responses: Array<{headingId: string; children: string[] | null;}> = [];
+    for (let start = 0; start < ids.length; start += 4) {
+        if (signal?.aborted) {
+            return hiddenRoots;
+        }
+        const wave = await Promise.all(
+            ids.slice(start, start + 4).map(async (headingId) => {
+                return {
+                    headingId,
+                    children: await fetchHeadingChildrenIds(rootId, headingId, signature, signal),
+                };
+            }),
+        );
+        responses.push(...wave);
+    }
+    if (signal?.aborted) {
+        return hiddenRoots;
+    }
+    for (const {headingId, children} of responses) {
+        if (!children) {
+            continue;
+        }
+        for (const id of children) {
+            // 内核接口按版本可能包含标题自身；折叠标题自身始终可见。
+            if (id && id !== headingId) {
+                hiddenRoots.add(id);
+            }
+        }
+    }
+    if (hiddenRoots.size === 0) {
+        return hiddenRoots;
+    }
+    // HeadingChildren 对容器给出根节点时，blocks 表里的后代也应一并隐藏。
+    const memo = new Map<string, boolean>();
+    const resolving = new Set<string>();
+    const hidden = (id: string): boolean => {
+        const known = memo.get(id);
+        if (known !== undefined) {
+            return known;
+        }
+        if (resolving.has(id)) {
+            memo.set(id, false);
+            return false;
+        }
+        resolving.add(id);
+        const node = links.get(id);
+        const value = hiddenRoots.has(id) ||
+            Boolean(node?.parentId && links.has(node.parentId) && hidden(node.parentId));
+        resolving.delete(id);
+        memo.set(id, value);
+        return value;
+    };
+    for (const id of links.keys()) {
+        if (hidden(id)) {
+            hiddenRoots.add(id);
+        }
+    }
+    return hiddenRoots;
 }
 
 function passesRestrict(unit: CachedUnit, start: number, end: number, options: SearchPipelineOptions): boolean {
@@ -201,11 +589,11 @@ function passesRestrict(unit: CachedUnit, start: number, end: number, options: S
 
 function remember(rootId: string, meta: BlockMeta, units: CachedUnit[], scope: string): void {
     // 成功但没有可见文字也是稳定结果；缓存空数组可避免无限重渲染。
-    textCache.set(cacheKey(rootId, meta.id, scope), {hash: meta.hash, units});
+    writeSpecialCache(cacheKey(rootId, meta.id, scope), {hash: meta.hash, units});
 }
 
 function rememberUnrendered(rootId: string, meta: BlockMeta, scope: string): void {
-    textCache.set(cacheKey(rootId, meta.id, scope), {
+    writeSpecialCache(cacheKey(rootId, meta.id, scope), {
         hash: meta.hash,
         units: [],
         retryAfter: Date.now() + SPECIAL_FAILURE_RETRY_MS,
@@ -216,21 +604,24 @@ function cachedUnits(
     rootId: string,
     metas: BlockMeta[],
     scope: string,
-): {ready: CachedUnit[]; missing: BlockMeta[]; unrendered: number} {
+): {ready: CachedUnit[]; missing: BlockMeta[]; unrendered: number;} {
     const ready: CachedUnit[] = [];
     const missing: BlockMeta[] = [];
     let unrendered = 0;
     const now = Date.now();
+    pinSpecialCacheKeys(rootId, metas.map((meta) => cacheKey(rootId, meta.id, scope)));
     for (const meta of metas) {
         const key = cacheKey(rootId, meta.id, scope);
         const cached = textCache.get(key);
         if (cached && cached.hash === meta.hash) {
+            touchSpecialCache(key);
+            touchTextCache(key);
             if (cached.retryAfter !== undefined) {
                 if (cached.retryAfter > now) {
                     unrendered += 1;
                     continue;
                 }
-                textCache.delete(key);
+                dropTextCache(key);
             } else {
                 ready.push(...cached.units);
                 continue;
@@ -247,25 +638,36 @@ async function extractMetas(
     metas: BlockMeta[],
     options: SearchPipelineOptions,
     mode: OffscreenRenderMode,
-): Promise<{units: CachedUnit[]; unrendered: number; unrenderedIds: string[]; failed: boolean}> {
+    shouldContinue: () => boolean = () => true,
+    signal?: AbortSignal,
+): Promise<{units: CachedUnit[]; unrendered: number; unrenderedIds: string[]; failed: boolean;}> {
     if (metas.length === 0) {
         return {units: [], unrendered: 0, unrenderedIds: [], failed: false};
     }
-    const epoch = corpusEpoch;
+    const epoch = currentCorpusEpoch(rootId);
+    const canContinue = () => shouldContinue() && !signal?.aborted;
     const scope = collectionScope(options);
     const embedIds = new Set(metas.filter((meta) => isEmbedType(meta.type)).map((meta) => meta.id));
-    const extracted = await fetchAndExtractUnits(
-        metas.map((meta) => meta.id),
-        notebookId,
-        collectOptions(options),
-        embedIds,
-        mode,
-    );
+    let extracted: Awaited<ReturnType<typeof fetchAndExtractUnits>>;
+    try {
+        extracted = await fetchAndExtractUnits(
+            metas.map((meta) => meta.id),
+            notebookId,
+            extractionCollectOptions(options),
+            embedIds,
+            mode,
+            canContinue,
+            signal,
+        );
+    } catch {
+        // 渲染器异常与接口失败使用同一条有限重试路径，不能让后台任务永久停在 partial。
+        extracted = null;
+    }
     if (!extracted) {
         const failedIds = metas
             .filter((meta) => isSpecialRenderType(meta.type, meta.subtype))
             .map((meta) => meta.id);
-        if (epoch === corpusEpoch) {
+        if (epoch === currentCorpusEpoch(rootId)) {
             for (const meta of metas) {
                 if (isSpecialRenderType(meta.type, meta.subtype)) {
                     rememberUnrendered(rootId, meta, scope);
@@ -286,7 +688,7 @@ async function extractMetas(
         byId.set(unit.blockId, list);
     }
     const units: CachedUnit[] = [];
-    const keep = epoch === corpusEpoch;
+    const keep = canContinue() && epoch === currentCorpusEpoch(rootId);
     const unrenderedIds = new Set(extracted.unrenderedIds);
     for (const meta of metas) {
         const list = byId.get(meta.id) ?? [];
@@ -320,6 +722,12 @@ function readPlainCache(rootId: string, blockId: string, scope: string, hash: st
     if (!cached || cached.hash !== hash || !cached.units.some((unit) => unit.text.trim())) {
         return null;
     }
+    const key = cacheKey(rootId, blockId, scope);
+    touchTextCache(key);
+    if (plainCacheKeys.has(key)) {
+        plainCacheKeys.delete(key);
+        plainCacheKeys.set(key, true);
+    }
     return cached.units;
 }
 
@@ -334,20 +742,17 @@ function rememberPlain(
         return;
     }
     const key = cacheKey(rootId, blockId, scope);
-    textCache.set(key, {hash, units: units.slice()});
-    const order = plainCacheKeys.get(rootId) ?? [];
-    const existing = order.indexOf(key);
-    if (existing >= 0) {
-        order.splice(existing, 1);
-    }
-    order.push(key);
-    while (order.length > PLAIN_CACHE_LIMIT) {
-        const dropped = order.shift();
-        if (dropped) {
-            textCache.delete(dropped);
+    specialCacheKeys.delete(key);
+    writeTextCache(key, {hash, units: units.slice()});
+    plainCacheKeys.set(key, true);
+    while (plainCacheKeys.size > PLAIN_CACHE_LIMIT) {
+        const dropped = plainCacheKeys.keys().next().value as string | undefined;
+        if (!dropped) {
+            break;
         }
+        dropTextCache(dropped);
     }
-    plainCacheKeys.set(rootId, order);
+    trimTextCacheBudget();
 }
 
 /**
@@ -361,16 +766,22 @@ async function loadPlainUnits(
     options: SearchPipelineOptions,
     scope: string,
     storeCache: boolean,
-): Promise<{units: CachedUnit[]; unrendered: number}> {
-    const hashes = await fetchBlockHashes(metas.filter(canCachePlainText).map((meta) => meta.id));
+    mode: OffscreenRenderMode = "light",
+    shouldContinue: () => boolean = () => true,
+    signal?: AbortSignal,
+): Promise<{units: CachedUnit[]; unrendered: number; failed: boolean;}> {
+    if (!shouldContinue()) {
+        return {units: [], unrendered: 0, failed: false};
+    }
+    const hashes = await fetchBlockHashes(metas.filter(canCachePlainText).map((meta) => meta.id), signal);
     const ready: CachedUnit[] = [];
     const missing: BlockMeta[] = [];
     const hashAtFetch = new Map<string, string>();
     for (const meta of metas) {
         const hash = hashes?.get(meta.id) ?? "";
-        const cached = hashes && canCachePlainText(meta)
-            ? readPlainCache(rootId, meta.id, scope, hash)
-            : null;
+        const cached = hashes && canCachePlainText(meta) ?
+            readPlainCache(rootId, meta.id, scope, hash) :
+            null;
         if (cached) {
             ready.push(...cached);
             continue;
@@ -381,12 +792,12 @@ async function loadPlainUnits(
         }
     }
     if (missing.length === 0) {
-        return {units: ready, unrendered: 0};
+        return {units: ready, unrendered: 0, failed: false};
     }
-    const epoch = corpusEpoch;
-    const extracted = await extractMetas(rootId, notebookId, missing, options, "light");
-    if (!extracted.failed && hashes && epoch === corpusEpoch && storeCache) {
-        const after = await fetchBlockHashes(Array.from(hashAtFetch.keys()));
+    const epoch = currentCorpusEpoch(rootId);
+    const extracted = await extractMetas(rootId, notebookId, missing, options, mode, shouldContinue, signal);
+    if (!extracted.failed && hashes && shouldContinue() && epoch === currentCorpusEpoch(rootId) && storeCache) {
+        const after = await fetchBlockHashes(Array.from(hashAtFetch.keys()), signal);
         if (after) {
             const byId = new Map<string, CachedUnit[]>();
             for (const unit of extracted.units) {
@@ -406,37 +817,139 @@ async function loadPlainUnits(
     return {
         units: ready.concat(extracted.units),
         unrendered: extracted.unrendered,
+        failed: extracted.failed,
     };
 }
 
-function startJob(key: string, rootId: string, work: () => Promise<void>): void {
-    const epoch = corpusEpoch;
-    const task = work().then(() => {
-        if (jobs.get(key) === task) {
+function pruneJobFailures(now: number): void {
+    for (const [key, failure] of jobFailures) {
+        if (failure.retryAfter <= now) {
+            jobFailures.delete(key);
+        }
+    }
+    while (jobFailures.size > JOB_FAILURE_LIMIT) {
+        const oldest = jobFailures.keys().next().value as string | undefined;
+        if (!oldest) {
+            break;
+        }
+        jobFailures.delete(oldest);
+    }
+}
+
+function startJob(
+    key: string,
+    rootId: string,
+    work: (isCurrent: () => boolean, signal: AbortSignal) => Promise<void>,
+): void {
+    const now = Date.now();
+    pruneJobFailures(now);
+    const epoch = currentCorpusEpoch(rootId);
+    const existing = jobs.get(key);
+    if (existing) {
+        // 相同文档、相同版本的工作本身就是可复用的。特别是输入过程中，多次搜索
+        // 都会看到同一批未缓存图表/属性视图；重启只会重复请求与离屏渲染。
+        if (existing.rootId === rootId && existing.epoch === epoch && !existing.controller.signal.aborted) {
+            return;
+        }
+        existing.controller.abort();
+        jobs.delete(key);
+    }
+    const previousFailure = jobFailures.get(key);
+    if (previousFailure && previousFailure.retryAfter > now) {
+        return;
+    }
+    const controller = new AbortController();
+    const isCurrent = () => !controller.signal.aborted && epoch === currentCorpusEpoch(rootId);
+    const task = Promise.resolve().then(() => work(isCurrent, controller.signal)).then(() => {
+        if (jobs.get(key)?.task === task) {
             jobs.delete(key);
         }
-        if (epoch === corpusEpoch) {
+        if (isCurrent()) {
+            jobFailures.delete(key);
             notifyIndexSettled(rootId);
         }
-    }, () => {
-        if (jobs.get(key) === task) {
+    }, (error) => {
+        if (jobs.get(key)?.task === task) {
             jobs.delete(key);
         }
+        if (isCurrent()) {
+            jobFailures.delete(key);
+            jobFailures.set(key, {
+                rootId,
+                retryAfter: Date.now() + JOB_FAILURE_RETRY_MS,
+                truncated: error instanceof AttributeViewTruncatedError,
+            });
+            pruneJobFailures(Date.now());
+            // 只通知一次；退避期内不会再次启动同一失败任务，避免监听器形成快速重试环。
+            notifyIndexSettled(rootId);
+        }
     });
-    jobs.set(key, task);
+    jobs.set(key, {task, epoch, rootId, controller});
 }
 
 const listeners = new Set<(rootId: string) => void>();
 const warmupTimers = new Map<string, number>();
 const SPECIAL_WARMUP_MS = 800;
 
-/** 关掉搜索框或开始下一次搜索时，停掉上一轮后台拉取，避免它占住接口或在结束后用旧结果覆盖。 */
-export function cancelBackgroundCorpusJobs(): void {
-    corpusEpoch += 1;
-    for (const timer of warmupTimers.values()) {
-        window.clearTimeout(timer);
+function cancelRootBackgroundCorpusJobs(rootId: string): void {
+    corpusEpochs.set(rootId, currentCorpusEpoch(rootId) + 1);
+    // Promise 无法强制中断在途请求；epoch 检查会停止后续批次，也不允许旧结果写入缓存。
+    for (const [key, job] of jobs) {
+        if (job.rootId === rootId) {
+            job.controller.abort();
+            jobs.delete(key);
+        }
     }
-    warmupTimers.clear();
+    const timer = warmupTimers.get(rootId);
+    if (timer != null) {
+        window.clearTimeout(timer);
+        warmupTimers.delete(rootId);
+    }
+    releaseSpecialCacheKeys(rootId);
+}
+
+/**
+ * 直接停止对应文档的后台补全。无参数保留全局清理语义。
+ * 常规 SearchBar 生命周期应使用 retain/release，避免一个同文档面板关闭时中断另一个。
+ */
+export function cancelBackgroundCorpusJobs(rootId?: string): void {
+    if (rootId) {
+        cancelRootBackgroundCorpusJobs(rootId);
+        return;
+    }
+    const roots = new Set<string>([
+        ...corpusEpochs.keys(),
+        ...warmupTimers.keys(),
+        ...activeSpecialCacheKeysByRoot.keys(),
+        ...Array.from(jobs.values(), (job) => job.rootId),
+    ]);
+    for (const currentRoot of roots) {
+        cancelRootBackgroundCorpusJobs(currentRoot);
+    }
+    jobs.clear();
+}
+
+/** 声明一个查找框正在使用该文档的可复用后台索引。 */
+export function retainBackgroundCorpusRoot(rootId: string): void {
+    if (!rootId) {
+        return;
+    }
+    backgroundRootUsers.set(rootId, (backgroundRootUsers.get(rootId) ?? 0) + 1);
+}
+
+/** 最后一个查找框离开文档后，才取消仍在运行的补全工作。 */
+export function releaseBackgroundCorpusRoot(rootId: string): void {
+    const users = backgroundRootUsers.get(rootId) ?? 0;
+    if (users <= 1) {
+        backgroundRootUsers.delete(rootId);
+        cancelRootBackgroundCorpusJobs(rootId);
+        return;
+    }
+    backgroundRootUsers.set(rootId, users - 1);
+}
+
+function hasBackgroundCorpusUser(rootId: string): boolean {
+    return (backgroundRootUsers.get(rootId) ?? 0) > 0;
 }
 
 /** 后台索引结束时通知一次。搜索栏用来刷新结果，不再轮询。 */
@@ -466,11 +979,11 @@ function scheduleSpecialWarmup(
     notebookId: string,
     metas: BlockMeta[],
     options: SearchPipelineOptions,
-): number {
+): {units: CachedUnit[]; unrendered: number;} {
     const scope = collectionScope(options);
     const initial = cachedUnits(rootId, metas, scope);
     if (initial.missing.length === 0) {
-        return initial.unrendered;
+        return {units: initial.ready, unrendered: initial.unrendered};
     }
     const previous = warmupTimers.get(rootId);
     if (previous != null) {
@@ -485,42 +998,70 @@ function scheduleSpecialWarmup(
         }
         const diagrams = missing.filter((item) => isDiagramBlock(item.type, item.subtype));
         const lights = missing.filter((item) => !isDiagramBlock(item.type, item.subtype));
-        startJob(`special-rest:${rootId}`, rootId, async () => {
+        startJob(`special-rest:${rootId}`, rootId, async (isCurrent, signal) => {
             if (lights.length > 0) {
-                await extractMetas(rootId, notebookId, lights, options, "light");
+                await extractMetas(rootId, notebookId, lights, options, "light", isCurrent, signal);
             }
             for (let index = 0; index < diagrams.length; index += 2) {
+                if (!isCurrent()) {
+                    return;
+                }
                 const pair = diagrams.slice(index, index + 2);
                 await Promise.all(pair.map((item) => {
-                    return extractMetas(rootId, notebookId, [item], options, "diagram");
+                    return extractMetas(rootId, notebookId, [item], options, "diagram", isCurrent, signal);
                 }));
             }
         });
     }, SPECIAL_WARMUP_MS);
     warmupTimers.set(rootId, timer);
-    return initial.unrendered;
+    return {units: initial.ready, unrendered: initial.unrendered};
 }
 
 function jobRunning(prefix: string): boolean {
-    for (const key of jobs.keys()) {
-        if (key.startsWith(prefix)) {
+    for (const [key, job] of jobs) {
+        if (job.epoch === currentCorpusEpoch(job.rootId) && key.startsWith(prefix)) {
             return true;
         }
     }
     return false;
 }
 
-async function loadAvRefs(rootId: string): Promise<AvBlockRef[]> {
+function jobFailed(prefix: string): boolean {
+    const now = Date.now();
+    pruneJobFailures(now);
+    for (const [key, failure] of jobFailures) {
+        if (failure.retryAfter > now && key.startsWith(prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function jobTruncated(prefix: string): boolean {
+    const now = Date.now();
+    pruneJobFailures(now);
+    for (const [key, failure] of jobFailures) {
+        if (failure.truncated && failure.retryAfter > now && key.startsWith(prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+async function loadAvRefs(rootId: string, signal?: AbortSignal): Promise<AvBlockRef[]> {
     const root = escSql(rootId);
-    const rows = await querySqlAll<{id: string; updated?: string; markdown?: string; ial?: string}>((afterId, limit) => {
-        const after = afterId ? ` AND id > '${escSql(afterId)}'` : "";
-        return `SELECT id, updated, markdown, ial FROM blocks WHERE root_id = '${root}' AND type = 'av'${after} `
-            + `ORDER BY id LIMIT ${limit}`;
-    });
+    const rows = await querySqlAll<{id: string; updated?: string; markdown?: string; ial?: string;}>(
+        (afterId, limit) => {
+            const after = afterId ? ` AND id > '${escSql(afterId)}'` : "";
+            return `SELECT id, updated, markdown, ial FROM blocks WHERE root_id = '${root}' AND type = 'av'${after} ` +
+                `ORDER BY id LIMIT ${limit}`;
+        },
+        signal,
+    );
     if (!rows) {
         return [];
     }
-    return resolveMissingAvIds(rows);
+    return resolveMissingAvIds(rows, signal);
 }
 
 /**
@@ -592,8 +1133,8 @@ function indexMountedTableRows(tableBlock: HTMLElement): {
 
 function isVisuallyInEditor(element: HTMLElement): boolean {
     // 行内公式是 inline，clientHeight 为 0，但仍然占位。用客户区矩形判断。
-    const hasBox = element.clientHeight > 0
-        || (typeof element.getClientRects === "function" && element.getClientRects().length > 0);
+    const hasBox = element.clientHeight > 0 ||
+        (typeof element.getClientRects === "function" && element.getClientRects().length > 0);
     if (!hasBox) {
         return false;
     }
@@ -626,20 +1167,29 @@ export async function searchCurrentDocument(
     value: string,
     options: SearchPipelineOptions,
 ): Promise<SearchPipelineResult | null> {
-    cancelBackgroundCorpusJobs();
+    const cancelled = () => options.signal?.aborted === true;
+    if (cancelled()) {
+        return {matches: [], error: "", cancelled: true};
+    }
     const context = readContext(edit);
     if (!context) {
         return null;
     }
-    const keyword = value.trim();
+    const keyword = effectiveSearchQuery(value);
     if (!keyword) {
         return null;
     }
+    // 异步的全文查询可能在查找框关闭或切换文档后才走到后台补全分支。
+    // 这时保留本次前台结果即可，不能重新启动已经取消的后台任务。
+    const allowBackgroundJobs = hasBackgroundCorpusUser(context.rootId);
     if (options.regex) {
         try {
             createSearchPattern(keyword, {
                 regex: true,
                 caseSensitive: options.caseSensitive === true,
+                regexUnicode: options.regexUnicode === true,
+                regexMultiline: options.regexMultiline === true,
+                regexDotAll: options.regexDotAll === true,
             });
         } catch (error) {
             return {
@@ -652,36 +1202,85 @@ export async function searchCurrentDocument(
         }
     }
 
-    const meta = await loadDocMeta(context.rootId) ?? {
-        byId: new Map<string, BlockMeta>(),
-        foldedHidden: new Set<string>(),
-        links: new Map(),
-        signature: "",
-        fallbackOrder: [] as string[],
-    };
-    const remoteOrder = await fetchDocBlocksOrders(context.rootId, meta.signature);
-    const orders = remoteOrder && (remoteOrder.length > 0 || meta.byId.size === 0)
-        ? remoteOrder
-        : meta.fallbackOrder;
+    const meta = await loadDocMeta(context.rootId, options.signal);
+    if (cancelled()) {
+        return {matches: [], error: "", cancelled: true};
+    }
+    if (!meta) {
+        // 元数据失败时不能把“只查到已加载 DOM”伪装成完整结果；交给调用方走显式降级路径。
+        return null;
+    }
+    // 三个开关一致时语言不影响结果，不读 markdown。不一致时才补围栏语言，
+    // 这样关掉普通代码块不会把未加载的 Mermaid / flowchart 一起排除。
+    if (codeBlockLanguagesNeeded(options)) {
+        await ensureCodeBlockLanguages(context.rootId, meta, options.signal);
+        if (cancelled()) {
+            return {matches: [], error: "", cancelled: true};
+        }
+    }
+    const remoteOrder = await fetchDocBlocksOrders(context.rootId, meta.signature, options.signal);
+    if (cancelled()) {
+        return {matches: [], error: "", cancelled: true};
+    }
+    const reliableOrder = remoteOrder && (remoteOrder.length > 0 || meta.byId.size === 0) ?
+        remoteOrder :
+        null;
+    const orders = reliableOrder ?? meta.fallbackOrder;
+    // fallbackOrder 的同级块按 id 排列，只能用于稳定展示，不能据此推断标题折叠边界。
+    // getDocBlocksOrders 不可用时保守放行，避免把实际可见块误判成隐藏而漏召回。
+    const mountedFolds = options.includeFoldedBlocks === true ? null : mountedFoldState(edit);
+    const headingFoldedHidden = options.includeFoldedBlocks === true || !reliableOrder ?
+        new Set<string>() :
+        collectHeadingFoldedIds(reliableOrder, meta.links, mountedFolds?.headings);
+    if (mountedFolds) {
+        // 标题被动态卸载后已经没有 DOM 可供 mountedFoldState 读取，但它的 IAL
+        // 仍能指出该标题自身折叠。getHeadingChildrenIDs 由内核树判断后代范围，
+        // 能覆盖 SQL parent_id 不足以表达的标题/容器组合。
+        // 当前画面可能同时挂着大量折叠标题；保留既有 32 条精确校正上限。
+        // 未挂载标题没有这条精确链路就会漏召回，不能套用这个上限。
+        const exactFoldedHeadingIds = new Set(Array.from(mountedFolds.headings.foldedIds).slice(0, 32));
+        for (const [id, node] of meta.links) {
+            if (
+                node.type === "h" &&
+                !mountedFolds.headings.mountedIds.has(id) &&
+                isSelfFoldedIal(node.ial)
+            ) {
+                exactFoldedHeadingIds.add(id);
+            }
+        }
+        const exactHeadingHidden = await collectExactHeadingHiddenIds(
+            context.rootId,
+            meta.signature,
+            exactFoldedHeadingIds,
+            meta.links,
+            options.signal,
+        );
+        if (cancelled()) {
+            return {matches: [], error: "", cancelled: true};
+        }
+        exactHeadingHidden.forEach((id) => headingFoldedHidden.add(id));
+    }
     const focusId = editorFocusId(edit);
     const focusScope = focusId ? collectFocusScope(focusId, meta, orders) : null;
     // 聚焦但关系表里还没有这个块时，不把文档其余未加载块算进来。
     const inFocus = (id: string) => !focusId || Boolean(focusScope?.has(id));
     const orderIndex = orderIndexOf(orders);
+    const enabledCache = new Map<string, boolean>();
+    const nonHeadingFoldedCache = new Map<string, boolean>();
     const enabled = (item: BlockMeta) => {
-        if (!isBlockTreeEnabled(item.id, meta.links, options)) {
-            return false;
+        const known = enabledCache.get(item.id);
+        if (known !== undefined) {
+            return known;
         }
-        if (options.includeTabs === false && isInTabsBlock(item.id, meta.links)) {
-            return false;
-        }
-        if (options.includeMindmap === false && isInMindmapBlock(item.id, meta.links)) {
-            return false;
-        }
-        if (!isBlockTypeEnabled(item, options)) {
-            return false;
-        }
-        return options.includeFoldedBlocks === true || !meta.foldedHidden.has(item.id);
+        const value = isBlockTreeEnabled(item.id, meta.links, options) &&
+            !(options.includeTabs === false && isInTabsBlock(item.id, meta.links)) &&
+            !(options.includeMindmap === false && isInMindmapBlock(item.id, meta.links)) &&
+            isBlockTypeEnabled(item, options) &&
+            (options.includeFoldedBlocks === true ||
+                (!isUnderNonHeadingFold(item.id, meta.links, mountedFolds!.nonHeadings, nonHeadingFoldedCache) &&
+                    !headingFoldedHidden.has(item.id)));
+        enabledCache.set(item.id, value);
+        return value;
     };
 
     // 数据库单元格跟 highlight-search 一样走当前编辑器里的可见文字。
@@ -696,11 +1295,26 @@ export async function searchCurrentDocument(
     const liveIds = new Set<string>();
     let units: CachedUnit[] = [];
     const keepRestrict = isRestrictInlineActive(options.restrictInlineTypes);
-    const cellMayMatch = createTextMatchProbe(keyword, {
-        caseSensitive: options.caseSensitive === true,
-        wholeWord: options.wholeWord === true,
-        regex: options.regex === true,
+    // 限制只含备注时，正文、图片标题和行内公式都不会进入最终结果。
+    // 不能仍按正文关键词把大量无关块取回并离屏渲染；Memo 自身的 SQL 候选
+    // 已是完整超集（富文本属性可能把关键词拆开，故不能再按关键词缩窄）。
+    const collectBodyText = shouldCollectBodyTextForRestrict(options.restrictInlineTypes);
+    const collectMemo = shouldCollectInlineMemoUnits({
+        includeInlineMemo: options.includeInlineMemo === true,
+        restrictTypes: options.restrictInlineTypes,
     });
+    const collectInlineMath = shouldCollectInlineMathUnits(options.restrictInlineTypes);
+    const memoOnlyRestriction = collectMemo && !collectBodyText && !collectInlineMath;
+    const needContentCandidates = collectBodyText || collectInlineMath;
+    const needImageTitleCandidates = !keepRestrict && options.includeImageTitle !== false;
+    // 预筛选若执行正则，灾难性回溯仍会卡住主线程。正则模式宁可多传几个表格单元给 Worker，
+    // 也不能在此处调用 RegExp.test；最终匹配仍由 Worker 给出精确结果。
+    const cellMayMatch = options.regex ?
+        () => true :
+        createTextMatchProbe(keyword, {
+            caseSensitive: options.caseSensitive === true,
+            wholeWord: options.wholeWord === true,
+        });
     const freezeLive = (block: SearchableBlock, blockIndex = block.blockIndex) => {
         return freezeBlock(block, blockIndex, keepRestrict);
     };
@@ -766,6 +1380,11 @@ export async function searchCurrentDocument(
             continue;
         }
         const item = meta.byId.get(block.blockId);
+        // 数据库不记录代码块语言。先用编辑器 data-subtype 覆盖，
+        // 否则 Mermaid / flowchart 会被普通代码块开关一起丢掉。
+        if (item && noteLiveCodeLanguage(item, block.element)) {
+            enabledCache.delete(item.id);
+        }
         if (item && item.type === "t") {
             if (!enabled(item) || isVirtualTablePlaceholder(block.element)) {
                 continue;
@@ -832,6 +1451,8 @@ export async function searchCurrentDocument(
     }
 
     let unrendered = 0;
+    let truncated = 0;
+    let degraded = false;
     const caseSensitive = options.caseSensitive === true;
     const plainTargets: BlockMeta[] = [];
     const specialTargets: BlockMeta[] = [];
@@ -886,14 +1507,19 @@ export async function searchCurrentDocument(
         const groups = extractRegexLiteralGroups(keyword, caseSensitive);
         if (groups) {
             const [contentIds, memoIds, titleIds] = await Promise.all([
-                fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "content"),
-                options.includeInlineMemo === true
-                    ? fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "memo")
-                    : Promise.resolve([] as string[]),
-                options.includeImageTitle !== false
-                    ? fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "imageTitle")
-                    : Promise.resolve([] as string[]),
+                needContentCandidates ?
+                    fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "content", options.signal) :
+                    Promise.resolve([] as string[]),
+                collectMemo ?
+                    fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "memo", options.signal) :
+                    Promise.resolve([] as string[]),
+                needImageTitleCandidates ?
+                    fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "imageTitle", options.signal) :
+                    Promise.resolve([] as string[]),
             ]);
+            if (cancelled()) {
+                return {matches: [], error: "", cancelled: true};
+            }
             if (contentIds && memoIds && titleIds) {
                 prefiltered = true;
                 storePlainCache = regexPrefilterStoresPlainCache(groups);
@@ -901,22 +1527,45 @@ export async function searchCurrentDocument(
                     queueUnloaded(id);
                 }
                 // 公式、图表、HTML 的可见文字常常不在 content 里，不能靠字面量丢掉。
-                queueRemainingSpecials();
+                // 仅备注时 memoIds 已覆盖全部备注宿主，额外预热无备注的特殊块只会争用前台请求。
+                if (!memoOnlyRestriction) {
+                    queueRemainingSpecials();
+                }
             }
         }
         if (!prefiltered) {
-            queueEveryUnloaded();
+            // 没有可用于正则预筛的字面量时，普通正文仍只能全量抽取。
+            // 但“仅备注”已知所有候选都带 data-inline-memo-content，可保持完整召回
+            // 的同时避开与备注无关的块。
+            if (memoOnlyRestriction) {
+                const memoIds = await fetchMemoCandidateIds(context.rootId, options.signal);
+                if (cancelled()) {
+                    return {matches: [], error: "", cancelled: true};
+                }
+                if (memoIds) {
+                    memoIds.forEach(queueUnloaded);
+                } else {
+                    queueEveryUnloaded();
+                }
+            } else {
+                queueEveryUnloaded();
+            }
         }
     } else {
         const [contentIds, memoIds, titleIds] = await Promise.all([
-            fetchContentCandidateIds(context.rootId, keyword, caseSensitive),
-            options.includeInlineMemo === true
-                ? fetchMemoCandidateIds(context.rootId, keyword, caseSensitive)
-                : Promise.resolve([] as string[]),
-            options.includeImageTitle !== false
-                ? fetchImageTitleCandidateIds(context.rootId, keyword, caseSensitive)
-                : Promise.resolve([] as string[]),
+            needContentCandidates ?
+                fetchContentCandidateIds(context.rootId, keyword, caseSensitive, options.signal) :
+                Promise.resolve([] as string[]),
+            collectMemo ?
+                fetchMemoCandidateIds(context.rootId, options.signal) :
+                Promise.resolve([] as string[]),
+            needImageTitleCandidates ?
+                fetchImageTitleCandidateIds(context.rootId, keyword, caseSensitive, options.signal) :
+                Promise.resolve([] as string[]),
         ]);
+        if (cancelled()) {
+            return {matches: [], error: "", cancelled: true};
+        }
         if (!contentIds || !memoIds || !titleIds) {
             // SQL 不可用时由文档元数据扩大到全部未加载叶子，保持结果完整性。
             queueEveryUnloaded();
@@ -925,19 +1574,23 @@ export async function searchCurrentDocument(
                 queueUnloaded(id);
             }
         }
-        const queuedSpecials = new Set(specialTargets.map((item) => item.id));
-        const restSpecials: BlockMeta[] = [];
-        for (const item of meta.byId.values()) {
-            if (!enabled(item) || liveIds.has(item.id) || queuedSpecials.has(item.id) || !inFocus(item.id)) {
-                continue;
+        if (!memoOnlyRestriction) {
+            const queuedSpecials = new Set(specialTargets.map((item) => item.id));
+            const restSpecials: BlockMeta[] = [];
+            for (const item of meta.byId.values()) {
+                if (!enabled(item) || liveIds.has(item.id) || queuedSpecials.has(item.id) || !inFocus(item.id)) {
+                    continue;
+                }
+                if (!isSpecialRenderType(item.type, item.subtype)) {
+                    continue;
+                }
+                restSpecials.push(item);
             }
-            if (!isSpecialRenderType(item.type, item.subtype)) {
-                continue;
+            if (restSpecials.length > 0 && allowBackgroundJobs) {
+                const warmup = scheduleSpecialWarmup(context.rootId, context.notebookId, restSpecials, options);
+                units.push(...warmup.units);
+                unrendered += warmup.unrendered;
             }
-            restSpecials.push(item);
-        }
-        if (restSpecials.length > 0) {
-            unrendered += scheduleSpecialWarmup(context.rootId, context.notebookId, restSpecials, options);
         }
     }
 
@@ -951,38 +1604,69 @@ export async function searchCurrentDocument(
             options,
             scope,
             storePlainCache,
+            memoOnlyRestriction ? "none" : "light",
+            () => !cancelled(),
+            options.signal,
         );
+        if (cancelled()) {
+            return {matches: [], error: "", cancelled: true};
+        }
         units.push(...loaded.units);
         unrendered += loaded.unrendered;
+        degraded ||= loaded.failed;
     }
 
     const specialState = cachedUnits(context.rootId, specialTargets, scope);
     units.push(...specialState.ready);
     unrendered += specialState.unrendered;
     const specialMissing = specialState.missing;
-    if (specialMissing.length > 0) {
+    if (specialMissing.length > 0 && allowBackgroundJobs) {
         const diagrams = specialMissing.filter((item) => isDiagramBlock(item.type, item.subtype));
         const lights = specialMissing.filter((item) => !isDiagramBlock(item.type, item.subtype));
-        startJob(`special:${context.rootId}`, context.rootId, async () => {
-            await extractMetas(context.rootId, context.notebookId, lights, options, "light");
+        startJob(`special:${context.rootId}`, context.rootId, async (isCurrent, signal) => {
+            await extractMetas(context.rootId, context.notebookId, lights, options, "light", isCurrent, signal);
             for (let index = 0; index < diagrams.length; index += 2) {
+                if (!isCurrent()) {
+                    return;
+                }
                 const pair = diagrams.slice(index, index + 2);
                 await Promise.all(pair.map((item) => {
-                    return extractMetas(context.rootId, context.notebookId, [item], options, "diagram");
+                    return extractMetas(
+                        context.rootId,
+                        context.notebookId,
+                        [item],
+                        options,
+                        "diagram",
+                        isCurrent,
+                        signal,
+                    );
                 }));
             }
         });
     }
 
     if (options.includeAttributeView !== false) {
-        const refs = (await loadAvRefs(context.rootId)).filter((ref) => {
+        const refs = (await loadAvRefs(context.rootId, options.signal)).filter((ref) => {
             const item = meta.byId.get(ref.blockId);
             return (!item || enabled(item)) && inFocus(ref.blockId);
         });
-        const peeked = peekAvUnits(refs);
+        if (cancelled()) {
+            return {matches: [], error: "", cancelled: true};
+        }
         const avDom = collectAvDomCoverage(units);
         const usedRowLabels = new Map<string, Set<string>>();
         const avViewTypes = new Map<string, string>();
+        const avViewIds = new Map<string, string>();
+        for (const ref of refs) {
+            if (!liveIds.has(ref.blockId)) {
+                continue;
+            }
+            const viewId = avViewIdOf(edit, ref.blockId, avViewIds);
+            if (viewId) {
+                avViewIds.set(ref.blockId, viewId);
+            }
+        }
+        const peeked = peekAvUnits(refs, avViewIds);
         for (const unit of peeked.units) {
             if (liveIds.has(unit.blockId)) {
                 const coverage = avDom.get(unit.blockId);
@@ -992,22 +1676,32 @@ export async function searchCurrentDocument(
                     continue;
                 }
                 // 画面上已有文字的格子保留 Range。接口只补同一视图里没画出来的行。
-                if (coverage && avApiUnitShown(
-                    unit.unitId ?? "",
-                    unit.text,
-                    coverage,
-                    rowLabelSkip(usedRowLabels, unit.blockId),
-                )) {
+                if (
+                    coverage && avApiUnitShown(
+                        unit.unitId ?? "",
+                        unit.text,
+                        coverage,
+                        rowLabelSkip(usedRowLabels, unit.blockId),
+                    )
+                ) {
                     continue;
                 }
             }
             units.push(avToCached(unit, orderIndex));
         }
-        if (peeked.missing.length > 0) {
+        if (peeked.missing.length > 0 && allowBackgroundJobs) {
             const missing = peeked.missing;
-            startJob(`av:${context.rootId}:${meta.signature}`, context.rootId, async () => {
-                await loadAvUnits(missing);
+            const avJobPrefix = `av:${context.rootId}`;
+            startJob(`${avJobPrefix}:${meta.signature}`, context.rootId, async (isCurrent, signal) => {
+                await loadAvUnits(missing, isCurrent, avViewIds, signal);
             });
+            if (jobFailed(avJobPrefix)) {
+                const unavailable = new Set(missing.map((ref) => ref.blockId)).size;
+                unrendered += unavailable;
+                if (jobTruncated(avJobPrefix)) {
+                    truncated += unavailable;
+                }
+            }
         }
     }
 
@@ -1018,12 +1712,26 @@ export async function searchCurrentDocument(
         tableStale = merged.staleKeys;
     }
 
-    const matched = matchTextUnitsDetailed(toSearchUnits(dedupeMathUnits(units), orderIndex), value, {
+    const matchOptions = {
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
         regex: options.regex,
+        regexUnicode: options.regexUnicode,
+        regexMultiline: options.regexMultiline,
+        regexDotAll: options.regexDotAll,
         dedupeOverlaps: false,
-    });
+    };
+    const matched = options.regexMatcher ?
+        await options.regexMatcher.match(
+            toSearchUnits(dedupeMathUnits(units), orderIndex),
+            value,
+            matchOptions,
+            options.signal,
+        ) :
+        matchTextUnitsDetailed(toSearchUnits(dedupeMathUnits(units), orderIndex), value, matchOptions);
+    if (matched.cancelled) {
+        return {matches: [], error: "", cancelled: true};
+    }
     if (matched.error) {
         return {matches: [], error: matched.error, degraded: false, partial: false, unrendered: 0};
     }
@@ -1039,17 +1747,18 @@ export async function searchCurrentDocument(
         if (!unit || !passesRestrict(unit, hit.start, hit.end, options)) {
             continue;
         }
-        const nonReplaceable = hit.blockId === "__doc-title__"
-            || hit.unitId === "doc-title"
-            || hit.blockType === "doc-title"
-            || hit.blockType === "NodeAttributeView"
-            || hit.blockType === "NodeMathBlock"
-            || hit.blockType === "NodeHTMLBlock"
-            || hit.unitId === MERMAID_UNIT_ID
-            || hit.unitId === HTML_BLOCK_UNIT_ID
-            || hit.unitId === "diagram-rendered"
-            || isInlineMathSearchUnit(unit)
-            || hit.unitId?.startsWith("embed:");
+        const nonReplaceable = hit.blockId === "__doc-title__" ||
+            hit.unitId === "doc-title" ||
+            hit.blockType === "doc-title" ||
+            hit.blockType === "NodeAttributeView" ||
+            hit.blockType === "NodeMathBlock" ||
+            hit.blockType === "NodeHTMLBlock" ||
+            isRendererUnitId(hit.unitId) ||
+            hit.unitId === "mermaid-source" ||
+            hit.unitId === "html-block-rendered" ||
+            hit.unitId === "diagram-rendered" ||
+            isInlineMathSearchUnit(unit) ||
+            hit.unitId?.startsWith("embed:");
         const replaceLock = nonReplaceable ? undefined : virtualTableReplaceLock(virtualTables, unit);
         matches.push({
             id: hit.id,
@@ -1061,17 +1770,18 @@ export async function searchCurrentDocument(
             start: hit.start,
             end: hit.end,
             matchedText: hit.matchedText,
-            replaceable: (nonReplaceable || Boolean(replaceLock) || tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`))
-                ? false
-                : isHitReplaceableByUnit(unit, hit.start, hit.end),
+            replaceable:
+                (nonReplaceable || Boolean(replaceLock) || tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`)) ?
+                    false :
+                    isHitReplaceableByUnit(unit, hit.start, hit.end),
             replaceLock,
             highlightKind: unit.highlightKind,
-            ...(unit.highlightKind === "inline-math" && unit.mathOrdinal !== undefined
-                ? {
+            ...(unit.highlightKind === "inline-math" && unit.mathOrdinal !== undefined ?
+                {
                     mathOrdinal: unit.mathOrdinal,
                     mathUnitText: inlineMathIdentityText(unit.text),
-                }
-                : {}),
+                } :
+                {}),
             snippet: unit.snippet,
             ...buildListSnippet(unit.text, hit.start, hit.end, hit.matchedText),
             anchorOffset: unit.highlightKind === "inline-memo" ? unit.anchorOffset : undefined,
@@ -1080,16 +1790,17 @@ export async function searchCurrentDocument(
     }
     matches.sort(compareMatchOrder);
 
-    const partial = jobRunning(`special:${context.rootId}`)
-        || jobRunning(`special-rest:${context.rootId}`)
-        || warmupTimers.has(context.rootId)
-        || jobRunning(`av:${context.rootId}`);
+    const partial = jobRunning(`special:${context.rootId}`) ||
+        jobRunning(`special-rest:${context.rootId}`) ||
+        warmupTimers.has(context.rootId) ||
+        jobRunning(`av:${context.rootId}`);
     return {
         matches: projectRanges(edit, matches, options, liveAll),
         error: "",
-        degraded: false,
+        degraded,
         partial,
         unrendered,
+        truncated,
     };
 }
 
@@ -1098,7 +1809,7 @@ export async function searchCurrentDocument(
  * 按逻辑行列把画面上的锁定带过来。公式等本来就不能替换，不再盖上这条原因。
  */
 function virtualTableReplaceLock(
-    tables: ReadonlyMap<string, {unstable: boolean; liveByKey: ReadonlyMap<string, CachedUnit>}>,
+    tables: ReadonlyMap<string, {unstable: boolean; liveByKey: ReadonlyMap<string, CachedUnit>;}>,
     unit: CachedUnit,
 ): TableReplaceLock | undefined {
     if (unit.replaceLock) {
@@ -1119,22 +1830,24 @@ function compareMatchOrder(left: SearchMatch, right: SearchMatch): number {
     if (left.blockIndex !== right.blockIndex) {
         return left.blockIndex - right.blockIndex;
     }
-    if (sameStructuralBlock(left, right)
-        && left.unitSeq !== undefined
-        && right.unitSeq !== undefined
-        && left.unitSeq !== right.unitSeq) {
+    if (
+        sameStructuralBlock(left, right) &&
+        left.unitSeq !== undefined &&
+        right.unitSeq !== undefined &&
+        left.unitSeq !== right.unitSeq
+    ) {
         return left.unitSeq - right.unitSeq;
     }
     const overlap = bodyBeforeOverlappingMemo(left, right);
     if (overlap !== 0) {
         return overlap;
     }
-    const leftPos = left.highlightKind === "inline-memo"
-        ? (left.anchorOffset ?? left.start)
-        : left.start;
-    const rightPos = right.highlightKind === "inline-memo"
-        ? (right.anchorOffset ?? right.start)
-        : right.start;
+    const leftPos = left.highlightKind === "inline-memo" ?
+        (left.anchorOffset ?? left.start) :
+        left.start;
+    const rightPos = right.highlightKind === "inline-memo" ?
+        (right.anchorOffset ?? right.start) :
+        right.start;
     if (leftPos !== rightPos) {
         return leftPos - rightPos;
     }
@@ -1157,9 +1870,9 @@ function bodyBeforeOverlappingMemo(left: SearchMatch, right: SearchMatch): numbe
     if (left.blockId !== right.blockId) {
         return 0;
     }
-    const memo = left.highlightKind === "inline-memo"
-        ? left
-        : (right.highlightKind === "inline-memo" ? right : null);
+    const memo = left.highlightKind === "inline-memo" ?
+        left :
+        (right.highlightKind === "inline-memo" ? right : null);
     const text = memo === left ? right : left;
     if (!memo || text.highlightKind === "inline-memo" || text.highlightKind === "inline-math") {
         return 0;
@@ -1193,10 +1906,14 @@ function structuralNavSeq(
     const nextRow = new Map<string, number>();
     const nextCol = new Map<string, number>();
     const tableRank = new Map<string, number>();
-    const tablePlaces = new Map<string, Array<{key: string; row: number; column: number; index: number}>>();
+    const tablePlaces = new Map<string, Array<{key: string; row: number; column: number; index: number;}>>();
     const byIndex = new Set<string>(indexRankedTables);
     units.forEach((unit, index) => {
         const key = `${unit.blockId}\u0000${unit.unitId ?? ""}`;
+        if (isRendererUnitId(unit.unitId)) {
+            // 同一图表的标签各自从 0 起算偏移；用单位顺序确保冷数据导航仍按 SVG DOM 顺序。
+            seq.set(key, index);
+        }
         if (unit.blockType === "NodeTable") {
             tableRank.set(key, index);
             const place = unit.tableSlot ?? tableCellPlace(unit.unitId);
@@ -1263,15 +1980,15 @@ function structuralNavSeq(
             return undefined;
         }
         const at = unit.tableSlot ? unit.tableSlot.offset : start;
-        const slot = unit.highlightKind === "inline-memo"
-            ? 2
-            : (unit.tableSlot ? 0 : 1);
+        const slot = unit.highlightKind === "inline-memo" ?
+            2 :
+            (unit.tableSlot ? 0 : 1);
         const inner = at * TABLE_CELL_SLOT + slot;
         return rank * TABLE_CELL_SEQ_SPAN + Math.min(inner, TABLE_CELL_SEQ_SPAN - 1);
     };
 }
 
-function tableCellPlace(unitId: string | undefined): {row: number; column: number} | null {
+function tableCellPlace(unitId: string | undefined): {row: number; column: number;} | null {
     const position = tableCellPosition(unitId);
     if (!position) {
         return null;
@@ -1280,7 +1997,7 @@ function tableCellPlace(unitId: string | undefined): {row: number; column: numbe
     return {row: Number(position.slice(0, colon)), column: Number(position.slice(colon + 1))};
 }
 
-function avMatchPosition(unitId: string | undefined): {row: string; col: string} | null {
+function avMatchPosition(unitId: string | undefined): {row: string; col: string;} | null {
     if (!unitId) {
         return null;
     }
@@ -1310,8 +2027,8 @@ function avMatchPosition(unitId: string | undefined): {row: string; col: string}
 }
 
 function sameStructuralBlock(left: SearchMatch, right: SearchMatch): boolean {
-    return (left.blockType === "NodeTable" || left.blockType === "NodeAttributeView")
-        && left.blockType === right.blockType;
+    return (left.blockType === "NodeTable" || left.blockType === "NodeAttributeView") &&
+        left.blockType === right.blockType;
 }
 
 function avViewTypeOf(edit: Element, blockId: string, cache: Map<string, string>): string {
@@ -1321,12 +2038,25 @@ function avViewTypeOf(edit: Element, blockId: string, cache: Map<string, string>
     }
     const block = edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"]`);
     const direct = block?.getAttribute("data-av-type") || "";
-    const focused = direct
-        ? ""
-        : block?.querySelector(".av__views .item--focus")?.getAttribute("data-av-type") || "";
+    const focused = direct ?
+        "" :
+        block?.querySelector(".av__views .item--focus")?.getAttribute("data-av-type") || "";
     const viewType = direct || focused;
     cache.set(blockId, viewType);
     return viewType;
+}
+
+function avViewIdOf(edit: Element, blockId: string, cache: Map<string, string>): string {
+    const cached = cache.get(blockId);
+    if (cached !== undefined) {
+        return cached;
+    }
+    const block = edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"]`);
+    const selected = block?.getAttribute("custom-sy-av-view")?.trim() ||
+        block?.querySelector<HTMLElement>(".av__views .item--focus")?.dataset.id?.trim() ||
+        "";
+    cache.set(blockId, selected);
+    return selected;
 }
 
 function rowLabelSkip(sets: Map<string, Set<string>>, blockId: string): Set<string> {
@@ -1339,7 +2069,7 @@ function rowLabelSkip(sets: Map<string, Set<string>>, blockId: string): Set<stri
 }
 
 function avToCached(
-    unit: SearchableUnit & {snippet?: string},
+    unit: SearchableUnit & {snippet?: string;},
     orderIndex: Map<string, number>,
 ): CachedUnit {
     return {
@@ -1358,9 +2088,9 @@ function dedupeMathUnits(units: CachedUnit[]): CachedUnit[] {
     const seen = new Set<string>();
     const kept: CachedUnit[] = [];
     for (const unit of units) {
-        const isMath = unit.blockType === "NodeMathBlock"
-            || unit.highlightKind === "inline-math"
-            || Boolean(unit.unitId?.startsWith("inline-math:"));
+        const isMath = unit.blockType === "NodeMathBlock" ||
+            unit.highlightKind === "inline-math" ||
+            Boolean(unit.unitId?.startsWith("inline-math:"));
         if (!isMath) {
             kept.push(unit);
             continue;

@@ -1,8 +1,13 @@
-import type {MatchHit, MatchOptions, MatchTextUnitsOptions, SearchableUnit} from "./types";
 import {
     normalizeRestrictInlineTypes,
     type RestrictInlineType,
 } from "./restrict-inline";
+import type {
+    MatchHit,
+    MatchOptions,
+    MatchTextUnitsOptions,
+    SearchableUnit,
+} from "./types";
 
 /** 内核 / 前端约定的搜索请求 */
 export interface MatchRequest {
@@ -16,6 +21,9 @@ export interface MatchRequest {
     caseSensitive?: boolean;
     wholeWord?: boolean;
     regex?: boolean;
+    regexUnicode?: boolean;
+    regexMultiline?: boolean;
+    regexDotAll?: boolean;
 }
 
 /** 内核 match RPC 响应 */
@@ -64,7 +72,7 @@ export interface PluginPrefs {
     includeTabs: boolean;
     /**
      * 是否匹配思维导图块（NodeMindmap，以及带 custom-sy-list-mindmap 的列表）及其内部；默认 true。
-     * 不含代码块子类型 mindmap，那一项仍由 includeMermaid 控制。
+     * 不含代码块子类型 mindmap，那一项仍随普通代码块开关。
      */
     includeMindmap: boolean;
     /**
@@ -96,18 +104,20 @@ export interface PluginPrefs {
     includeMathBlock: boolean;
     /** 是否匹配嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
     includeEmbedBlock: boolean;
-    /** 是否匹配代码块（不含 Mermaid，由 includeMermaid 单独控制）；默认 true */
+    /** 是否匹配普通代码块；默认 true。不含 Mermaid、flowchart。 */
     includeCodeBlock: boolean;
-    /** 是否匹配 Mermaid 图；默认 true */
+    /** 是否匹配 Mermaid 图；默认 true。不受代码块开关影响。 */
     includeMermaid: boolean;
+    /** 是否匹配 flowchart 图；默认 true。不受代码块开关影响。 */
+    includeFlowchart: boolean;
     /**
      * 是否匹配 HTML 块（NodeHTMLBlock）Shadow 内渲染可见文字；默认 true。
      * 匹配渲染结果而非 data-content 源码；不可替换。
      */
     includeHtmlBlock: boolean;
     /**
-     * 是否匹配非标题 CSS 折叠块内隐藏内容；默认 false。
-     * 不含折叠标题（子块已不在 DOM）。
+     * 是否匹配折叠块内隐藏内容；默认 true。
+     * 包含非标题 CSS 折叠和折叠标题的未加载后代。
      */
     includeFoldedBlocks: boolean;
     /**
@@ -126,6 +136,12 @@ export interface PluginPrefs {
      * 跨次打开搜索条保持；发布服务/全局只读下不写 petal（与其它 prefs 相同）。
      */
     useRegex: boolean;
+    /** 正则 Unicode (u) 语义；默认 false，保持既有 UTF-16 行为。 */
+    regexUnicode: boolean;
+    /** 正则多行锚点 (m)；默认 false。 */
+    regexMultiline: boolean;
+    /** 正则点号匹配换行 (s)；默认 false。 */
+    regexDotAll: boolean;
 }
 
 /** 跨窗口搜索状态同步（内核 broadcast → 前端 bind） */
@@ -169,11 +185,15 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeEmbedBlock: true,
     includeCodeBlock: true,
     includeMermaid: true,
+    includeFlowchart: true,
     includeHtmlBlock: true,
     includeFoldedBlocks: true,
     includeInlineMemo: false,
     restrictInlineTypes: [],
     useRegex: false,
+    regexUnicode: false,
+    regexMultiline: false,
+    regexDotAll: false,
 };
 
 export const PREFS_STORAGE_PATH = "prefs.json";
@@ -211,6 +231,7 @@ export function coercePluginPrefs(
         includeEmbedBlock: base.includeEmbedBlock !== false,
         includeCodeBlock: base.includeCodeBlock !== false,
         includeMermaid: base.includeMermaid !== false,
+        includeFlowchart: base.includeFlowchart !== false,
         includeHtmlBlock: base.includeHtmlBlock !== false,
         includeFoldedBlocks: base.includeFoldedBlocks === true,
         includeInlineMemo,
@@ -218,6 +239,9 @@ export function coercePluginPrefs(
             includeInlineMemo,
         }),
         useRegex: base.useRegex === true,
+        regexUnicode: base.regexUnicode === true,
+        regexMultiline: base.regexMultiline === true,
+        regexDotAll: base.regexDotAll === true,
     };
 }
 
@@ -232,90 +256,102 @@ export function mergePrefs(
         dialogLeft: patch.dialogLeft !== undefined ? patch.dialogLeft : base.dialogLeft,
         dialogTop: patch.dialogTop !== undefined ? patch.dialogTop : base.dialogTop,
         lastQuery: patch.lastQuery !== undefined ? patch.lastQuery : base.lastQuery,
-        includeDocTitle: patch.includeDocTitle !== undefined
-            ? patch.includeDocTitle
-            : base.includeDocTitle,
-        includeImageTitle: patch.includeImageTitle !== undefined
-            ? patch.includeImageTitle
-            : base.includeImageTitle,
-        includeAttributeView: patch.includeAttributeView !== undefined
-            ? patch.includeAttributeView
-            : base.includeAttributeView,
-        includeTable: patch.includeTable !== undefined
-            ? patch.includeTable
-            : base.includeTable,
-        includeBlockquote: patch.includeBlockquote !== undefined
-            ? patch.includeBlockquote
-            : base.includeBlockquote,
-        includeCallout: patch.includeCallout !== undefined
-            ? patch.includeCallout
-            : base.includeCallout,
-        includeSuperBlock: patch.includeSuperBlock !== undefined
-            ? patch.includeSuperBlock
-            : base.includeSuperBlock,
-        includeTabs: patch.includeTabs !== undefined
-            ? patch.includeTabs
-            : base.includeTabs,
-        includeMindmap: patch.includeMindmap !== undefined
-            ? patch.includeMindmap
-            : base.includeMindmap,
-        includeListUnordered: patch.includeListUnordered !== undefined
-            ? patch.includeListUnordered
-            : base.includeListUnordered,
-        includeListOrdered: patch.includeListOrdered !== undefined
-            ? patch.includeListOrdered
-            : base.includeListOrdered,
-        includeListTask: patch.includeListTask !== undefined
-            ? patch.includeListTask
-            : base.includeListTask,
-        includeParagraph: patch.includeParagraph !== undefined
-            ? patch.includeParagraph
-            : base.includeParagraph,
-        includeHeadingH1: patch.includeHeadingH1 !== undefined
-            ? patch.includeHeadingH1
-            : base.includeHeadingH1,
-        includeHeadingH2: patch.includeHeadingH2 !== undefined
-            ? patch.includeHeadingH2
-            : base.includeHeadingH2,
-        includeHeadingH3: patch.includeHeadingH3 !== undefined
-            ? patch.includeHeadingH3
-            : base.includeHeadingH3,
-        includeHeadingH4: patch.includeHeadingH4 !== undefined
-            ? patch.includeHeadingH4
-            : base.includeHeadingH4,
-        includeHeadingH5: patch.includeHeadingH5 !== undefined
-            ? patch.includeHeadingH5
-            : base.includeHeadingH5,
-        includeHeadingH6: patch.includeHeadingH6 !== undefined
-            ? patch.includeHeadingH6
-            : base.includeHeadingH6,
-        includeMathBlock: patch.includeMathBlock !== undefined
-            ? patch.includeMathBlock
-            : base.includeMathBlock,
-        includeEmbedBlock: patch.includeEmbedBlock !== undefined
-            ? patch.includeEmbedBlock
-            : base.includeEmbedBlock,
-        includeCodeBlock: patch.includeCodeBlock !== undefined
-            ? patch.includeCodeBlock
-            : base.includeCodeBlock,
-        includeMermaid: patch.includeMermaid !== undefined
-            ? patch.includeMermaid
-            : base.includeMermaid,
-        includeHtmlBlock: patch.includeHtmlBlock !== undefined
-            ? patch.includeHtmlBlock
-            : base.includeHtmlBlock,
-        includeFoldedBlocks: patch.includeFoldedBlocks !== undefined
-            ? patch.includeFoldedBlocks
-            : base.includeFoldedBlocks,
-        includeInlineMemo: patch.includeInlineMemo !== undefined
-            ? patch.includeInlineMemo
-            : base.includeInlineMemo,
-        restrictInlineTypes: patch.restrictInlineTypes !== undefined
-            ? patch.restrictInlineTypes
-            : base.restrictInlineTypes,
-        useRegex: patch.useRegex !== undefined
-            ? patch.useRegex
-            : base.useRegex,
+        includeDocTitle: patch.includeDocTitle !== undefined ?
+            patch.includeDocTitle :
+            base.includeDocTitle,
+        includeImageTitle: patch.includeImageTitle !== undefined ?
+            patch.includeImageTitle :
+            base.includeImageTitle,
+        includeAttributeView: patch.includeAttributeView !== undefined ?
+            patch.includeAttributeView :
+            base.includeAttributeView,
+        includeTable: patch.includeTable !== undefined ?
+            patch.includeTable :
+            base.includeTable,
+        includeBlockquote: patch.includeBlockquote !== undefined ?
+            patch.includeBlockquote :
+            base.includeBlockquote,
+        includeCallout: patch.includeCallout !== undefined ?
+            patch.includeCallout :
+            base.includeCallout,
+        includeSuperBlock: patch.includeSuperBlock !== undefined ?
+            patch.includeSuperBlock :
+            base.includeSuperBlock,
+        includeTabs: patch.includeTabs !== undefined ?
+            patch.includeTabs :
+            base.includeTabs,
+        includeMindmap: patch.includeMindmap !== undefined ?
+            patch.includeMindmap :
+            base.includeMindmap,
+        includeListUnordered: patch.includeListUnordered !== undefined ?
+            patch.includeListUnordered :
+            base.includeListUnordered,
+        includeListOrdered: patch.includeListOrdered !== undefined ?
+            patch.includeListOrdered :
+            base.includeListOrdered,
+        includeListTask: patch.includeListTask !== undefined ?
+            patch.includeListTask :
+            base.includeListTask,
+        includeParagraph: patch.includeParagraph !== undefined ?
+            patch.includeParagraph :
+            base.includeParagraph,
+        includeHeadingH1: patch.includeHeadingH1 !== undefined ?
+            patch.includeHeadingH1 :
+            base.includeHeadingH1,
+        includeHeadingH2: patch.includeHeadingH2 !== undefined ?
+            patch.includeHeadingH2 :
+            base.includeHeadingH2,
+        includeHeadingH3: patch.includeHeadingH3 !== undefined ?
+            patch.includeHeadingH3 :
+            base.includeHeadingH3,
+        includeHeadingH4: patch.includeHeadingH4 !== undefined ?
+            patch.includeHeadingH4 :
+            base.includeHeadingH4,
+        includeHeadingH5: patch.includeHeadingH5 !== undefined ?
+            patch.includeHeadingH5 :
+            base.includeHeadingH5,
+        includeHeadingH6: patch.includeHeadingH6 !== undefined ?
+            patch.includeHeadingH6 :
+            base.includeHeadingH6,
+        includeMathBlock: patch.includeMathBlock !== undefined ?
+            patch.includeMathBlock :
+            base.includeMathBlock,
+        includeEmbedBlock: patch.includeEmbedBlock !== undefined ?
+            patch.includeEmbedBlock :
+            base.includeEmbedBlock,
+        includeCodeBlock: patch.includeCodeBlock !== undefined ?
+            patch.includeCodeBlock :
+            base.includeCodeBlock,
+        includeMermaid: patch.includeMermaid !== undefined ?
+            patch.includeMermaid :
+            base.includeMermaid,
+        includeFlowchart: patch.includeFlowchart !== undefined ?
+            patch.includeFlowchart :
+            base.includeFlowchart,
+        includeHtmlBlock: patch.includeHtmlBlock !== undefined ?
+            patch.includeHtmlBlock :
+            base.includeHtmlBlock,
+        includeFoldedBlocks: patch.includeFoldedBlocks !== undefined ?
+            patch.includeFoldedBlocks :
+            base.includeFoldedBlocks,
+        includeInlineMemo: patch.includeInlineMemo !== undefined ?
+            patch.includeInlineMemo :
+            base.includeInlineMemo,
+        restrictInlineTypes: patch.restrictInlineTypes !== undefined ?
+            patch.restrictInlineTypes :
+            base.restrictInlineTypes,
+        useRegex: patch.useRegex !== undefined ?
+            patch.useRegex :
+            base.useRegex,
+        regexUnicode: patch.regexUnicode !== undefined ?
+            patch.regexUnicode :
+            base.regexUnicode,
+        regexMultiline: patch.regexMultiline !== undefined ?
+            patch.regexMultiline :
+            base.regexMultiline,
+        regexDotAll: patch.regexDotAll !== undefined ?
+            patch.regexDotAll :
+            base.regexDotAll,
     });
 }
 
@@ -330,13 +366,16 @@ export function normalizeMatchRequest(args: any[]): MatchRequest {
             caseSensitive: boolOrUndef(nested.caseSensitive ?? obj.caseSensitive),
             wholeWord: boolOrUndef(nested.wholeWord ?? obj.wholeWord),
             regex: boolOrUndef(nested.regex ?? obj.regex),
+            regexUnicode: boolOrUndef(nested.regexUnicode ?? obj.regexUnicode),
+            regexMultiline: boolOrUndef(nested.regexMultiline ?? obj.regexMultiline),
+            regexDotAll: boolOrUndef(nested.regexDotAll ?? obj.regexDotAll),
         };
     }
 
     const third = args[2];
-    const fromThird = typeof third === "boolean"
-        ? {dedupeOverlaps: third}
-        : (isPlainObject(third) ? third as MatchTextUnitsOptions & MatchOptions : {});
+    const fromThird = typeof third === "boolean" ?
+        {dedupeOverlaps: third} :
+        (isPlainObject(third) ? third as MatchTextUnitsOptions & MatchOptions : {});
 
     return {
         query: String(args[0] ?? ""),
@@ -345,6 +384,9 @@ export function normalizeMatchRequest(args: any[]): MatchRequest {
         caseSensitive: boolOrUndef(fromThird.caseSensitive),
         wholeWord: boolOrUndef(fromThird.wholeWord),
         regex: boolOrUndef(fromThird.regex),
+        regexUnicode: boolOrUndef(fromThird.regexUnicode),
+        regexMultiline: boolOrUndef(fromThird.regexMultiline),
+        regexDotAll: boolOrUndef(fromThird.regexDotAll),
     };
 }
 
@@ -354,6 +396,9 @@ export function matchOptionsFromRequest(request: MatchRequest): MatchTextUnitsOp
         caseSensitive: request.caseSensitive,
         wholeWord: request.wholeWord,
         regex: request.regex,
+        regexUnicode: request.regexUnicode,
+        regexMultiline: request.regexMultiline,
+        regexDotAll: request.regexDotAll,
     };
 }
 
@@ -368,9 +413,9 @@ export function normalizePrefsPatch(args: any[]): Partial<PluginPrefs> {
 }
 
 export function normalizeSearchStateEvent(args: any[]): SearchStateEvent | null {
-    const raw = args.length >= 1 && isPlainObject(args[0])
-        ? args[0]
-        : null;
+    const raw = args.length >= 1 && isPlainObject(args[0]) ?
+        args[0] :
+        null;
     if (!raw) {
         return null;
     }

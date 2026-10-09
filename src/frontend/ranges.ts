@@ -7,11 +7,69 @@ interface TextPoint {
   offset: number
 }
 
+/** 同一轮采集的多个命中共享 Text 节点累积偏移；DOM 重建会产生新的数组键。 */
+const textNodeEndsCache = new WeakMap<Text[], number[]>()
+
+function textNodeEnds(textNodes: Text[]): number[] {
+  const cached = textNodeEndsCache.get(textNodes)
+  if (cached) {
+    return cached
+  }
+  const ends: number[] = []
+  let cursor = 0
+  for (const textNode of textNodes) {
+    cursor += (textNode.nodeValue ?? "").length
+    ends.push(cursor)
+  }
+  textNodeEndsCache.set(textNodes, ends)
+  return ends
+}
+
+function upperBound(values: number[], target: number): number {
+  let low = 0
+  let high = values.length
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2)
+    if (values[middle] <= target) {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  return low
+}
+
+function lowerBound(values: number[], target: number): number {
+  let low = 0
+  let high = values.length
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2)
+    if (values[middle] < target) {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  return low
+}
+
 export function locateRangeInSingleTextNode(
   block: SearchableBlock,
   start: number,
   end: number,
 ): { node: Text, startOffset: number, endOffset: number } | null {
+  if (end > start) {
+    const startPoint = locateTextPoint(block.textNodes, start, "start")
+    const endPoint = locateTextPoint(block.textNodes, end, "end")
+    if (startPoint && endPoint && startPoint.node === endPoint.node) {
+      return {
+        node: startPoint.node,
+        startOffset: startPoint.offset,
+        endOffset: endPoint.offset,
+      }
+    }
+    return null
+  }
   let cursor = 0
   for (const textNode of block.textNodes) {
     const text = textNode.nodeValue ?? ''
@@ -142,42 +200,23 @@ export function locateTextPoint(
   if (!textNodes.length) {
     return null
   }
-
-  let cursor = 0
-  for (let index = 0; index < textNodes.length; index++) {
-    const textNode = textNodes[index]
-    const text = textNode.nodeValue ?? ""
-    const nextCursor = cursor + text.length
-    const isLast = index === textNodes.length - 1
-
-    if (edge === "start") {
-      // [cursor, nextCursor)；仅末节点包含全文末尾 nextCursor
-      if (
-        targetOffset >= cursor
-        && (targetOffset < nextCursor || (targetOffset === nextCursor && isLast))
-      ) {
-        return {
-          node: textNode,
-          offset: targetOffset - cursor,
-        }
-      }
-    } else if (targetOffset === 0 && index === 0) {
-      return {
-        node: textNode,
-        offset: 0,
-      }
-    } else if (targetOffset > cursor && targetOffset <= nextCursor) {
-      // (cursor, nextCursor]；边界偏向上一节点末尾
-      return {
-        node: textNode,
-        offset: targetOffset - cursor,
-      }
-    }
-
-    cursor = nextCursor
+  const ends = textNodeEnds(textNodes)
+  const total = ends[ends.length - 1]
+  if (targetOffset < 0 || targetOffset > total) {
+    return null
   }
-
-  return null
+  // [cursor, nextCursor)；仅末节点包含全文末尾。end 保持落在前一个节点的边界语义。
+  const index = edge === "start" ?
+    (targetOffset === total ? textNodes.length - 1 : upperBound(ends, targetOffset)) :
+    (targetOffset === 0 ? 0 : lowerBound(ends, targetOffset))
+  if (index < 0 || index >= textNodes.length) {
+    return null
+  }
+  const cursor = index === 0 ? 0 : ends[index - 1]
+  return {
+    node: textNodes[index],
+    offset: targetOffset - cursor,
+  }
 }
 
 /**

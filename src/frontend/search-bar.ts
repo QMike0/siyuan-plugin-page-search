@@ -1,12 +1,23 @@
+import type {
+    IMenu,
+    Plugin,
+} from "siyuan";
+import {
+    confirm,
+    Menu,
+    showMessage,
+} from "siyuan";
 import {
     ATTRIBUTE_VIEW_TYPE,
     INLINE_MATH_TYPE,
     INLINE_MEMO_TYPE,
     RESTRICT_INLINE_TYPE_ALLOWLIST,
     canRestrictInlineMemo,
+    effectiveSearchQuery,
     formatSearchCountLabel,
     hasRestrictInlineType,
     isRestrictInlineActive,
+    isRendererUnitFor,
     normalizeRestrictInlineTypes,
     toggleRestrictInlineType,
     logicalRowOffset,
@@ -16,33 +27,86 @@ import {
     tableCellPosition,
     type RestrictInlineType,
 } from "../shared";
-import type {IMenu, Plugin} from "siyuan";
-import {confirm, Menu, showMessage} from "siyuan";
-import {rpcSetPrefs} from "./kernel-client";
+import {
+    AV_REFRESH_DEBOUNCE_MS,
+    isAttrViewRelevantToEdit,
+    isAttrViewWsTransaction,
+    watchAttributeViewDom,
+} from "./av-watch";
 import {
     collectSearchableBlocks,
     collectMindmapPreviewUnits,
-    HTML_BLOCK_UNIT_ID,
-    MERMAID_UNIT_ID,
     resolveDocRoot,
     TABLE_TYPE,
     type CollectSearchableBlocksOptions,
 } from "./blocks";
+import {
+    blockIsInEditor,
+    openBlockInEditor,
+} from "./corpus/locate";
+import {
+    fillLiveRanges,
+    rebindChangedRanges,
+    type RebindTarget,
+} from "./corpus/project";
+import {
+    cancelBackgroundCorpusJobs,
+    editorRootId,
+    invalidateDocumentSearchCaches,
+    invalidateDocumentStructureCaches,
+    releaseBackgroundCorpusRoot,
+    retainBackgroundCorpusRoot,
+    subscribeIndexSettled,
+} from "./corpus/search";
+import {
+    DocumentSearchIndexMemory,
+    type DocumentSearchIndexSnapshot,
+} from "./document-search-index";
 import {parentElementCrossingShadow} from "./dom-parent";
-import {calculateSearchMatches, type SearchPipelineResult} from "./pipeline";
-import {createRangeFromBlockOffsets} from "./ranges";
-import {fillLiveRanges, rebindChangedRanges, type RebindTarget} from "./corpus/project";
-import {MAX_TOUCHED_BLOCKS, watchEditorDom, type EditorDomChange} from "./editor-dom-watch";
-import {blockIsInEditor, openBlockInEditor} from "./corpus/locate";
-import {revealHiddenTabs, mirrorTabsTitleRange} from "./tabs-reveal";
+import type {
+    SearchableBlock,
+    SearchMatch,
+} from "./dom-types";
+import {
+    MAX_TOUCHED_BLOCKS,
+    watchEditorDom,
+    type EditorDomChange,
+} from "./editor-dom-watch";
+import {isEditorReplaceModeBlocked} from "./editor-mode";
+import {
+    clearNonHeadingFoldLocally,
+    collectNonHeadingFoldedAncestorIds,
+    consumeUnfoldedOuterHeadingId,
+    isUnderNonHeadingCssFold,
+    listBlocksUnfoldedAfterHeading,
+    unfoldNonHeadingFoldedBlocks,
+    waitForLayout,
+} from "./fold";
+import {rpcSetPrefs} from "./kernel-client";
+import {resolveInitialMatchIndex} from "./match-anchor";
+import {
+    applyMemoUnderlineVisual,
+    clearMemoUnderlineVisual,
+    pulseMemoFocusUnderline,
+} from "./memo-underline-visual";
 import {panMindmapIntoView} from "./mindmap-pan";
-import {cancelBackgroundCorpusJobs, editorRootId, invalidateDocumentSearchCaches, subscribeIndexSettled} from "./corpus/search";
+import {SearchPanelFrame} from "./panel-frame";
+import {resolveSettingsMenuZIndex} from "./panel-layer";
+import {
+    calculateSearchMatches,
+    type SearchPipelineResult,
+} from "./pipeline";
 import {
     isMatchWritable,
     replaceAllMatchesInEditor,
     replaceCurrentMatchInEditor,
 } from "./protyle-write";
-import {isEditorReplaceModeBlocked} from "./editor-mode";
+import {createRangeFromBlockOffsets} from "./ranges";
+import {RegexTextMatcher} from "./regex-matcher";
+import {
+    searchHistory,
+    stableSearchHistoryDocId,
+} from "./search-history";
 import {
     cloneSelectionScope,
     getSelectionScope,
@@ -54,15 +118,6 @@ import {
     type SelectionScope,
     type TableCellTextSelection,
 } from "./selection";
-import {SearchPanelFrame} from "./panel-frame";
-import {resolveSettingsMenuZIndex} from "./panel-layer";
-import {
-    AV_REFRESH_DEBOUNCE_MS,
-    isAttrViewRelevantToEdit,
-    isAttrViewWsTransaction,
-    watchAttributeViewDom,
-} from "./av-watch";
-import {resolveInitialMatchIndex} from "./match-anchor";
 import {
     applySelectionScopeVisual,
     captureSelectionScopeWithKind,
@@ -73,20 +128,9 @@ import {
     type TableCellVisualRef,
 } from "./selection-scope-visual";
 import {
-    applyMemoUnderlineVisual,
-    clearMemoUnderlineVisual,
-    pulseMemoFocusUnderline,
-} from "./memo-underline-visual";
-import type {SearchableBlock, SearchMatch} from "./dom-types";
-import {
-    clearNonHeadingFoldLocally,
-    collectNonHeadingFoldedAncestorIds,
-    consumeUnfoldedOuterHeadingId,
-    isUnderNonHeadingCssFold,
-    listBlocksUnfoldedAfterHeading,
-    unfoldNonHeadingFoldedBlocks,
-    waitForLayout,
-} from "./fold";
+    revealHiddenTabs,
+    mirrorTabsTitleRange,
+} from "./tabs-reveal";
 
 /** 限制查找菜单：类型 → 图标（对齐思源 hint/工具栏符号 id） */
 const RESTRICT_INLINE_ICONS: Record<RestrictInlineType, string> = {
@@ -109,6 +153,11 @@ const RESTRICT_INLINE_ICONS: Record<RestrictInlineType, string> = {
 const DONE_TYPING_MS = 400;
 /** 补 Range 时按块采集的上限，超过就整篇采集一次。 */
 const MAX_SCOPED_REPAIR_BLOCKS = 64;
+/**
+ * 跳到尚未装载的块时，思源会先插入块壳，再在后续渲染帧填入正文 / 公式 / 嵌入内容。
+ * 只等待当前用户选中的一条命中，超时后仍回退到原来的整篇搜索与 DOM 观察修复流程。
+ */
+const LOCATED_MATCH_BIND_TIMEOUT_MS = 1500;
 
 /**
  * Range 还连在文档上、没有缩成空点。思源换掉节点时，旧 Range 会缩到父节点上。
@@ -133,13 +182,20 @@ function rangeStillPainted(match: SearchMatch): boolean {
         return false;
     }
     const host = range.startContainer;
-    return host.nodeType === Node.ELEMENT_NODE
-        && (host as Element).matches(`[data-type~="${INLINE_MEMO_TYPE}"]`);
+    return host.nodeType === Node.ELEMENT_NODE &&
+        (host as Element).matches(`[data-type~="${INLINE_MEMO_TYPE}"]`);
 }
 
 /**
+ * 与 highlight-search 的 search-results / search-focus 分开。
+ * CSS 自定义高亮是整页一份注册表，同名 set/delete 会盖掉另一个插件。
+ */
+const PAGE_SEARCH_RESULTS_HIGHLIGHT = "page-search-results";
+const PAGE_SEARCH_FOCUS_HIGHLIGHT = "page-search-focus";
+
+/**
  * 命中很多时不能把全部 Range 一次传给构造函数，参数个数超过引擎上限会整轮高亮失败。
- * 先建空的 Highlight，再逐个 add。
+ * 先建空的 Highlight，再逐个 add。没有 add 的旧实现只保留前 4096 条着色，结果列表仍是全部命中。
  */
 function newHighlight(ranges: readonly Range[]): any | null {
     const HighlightCtor = (window as any).Highlight;
@@ -148,16 +204,21 @@ function newHighlight(ranges: readonly Range[]): any | null {
     }
     try {
         const highlight = new HighlightCtor();
-        if (typeof highlight.add === "function") {
-            for (let index = 0; index < ranges.length; index += 1) {
-                highlight.add(ranges[index]);
-            }
-            return highlight;
+        if (typeof highlight.add !== "function") {
+            throw new Error("Highlight.add unavailable");
         }
+        for (let index = 0; index < ranges.length; index += 1) {
+            highlight.add(ranges[index]);
+        }
+        return highlight;
     } catch {
         // 空构造不可用时退回分批传入
+        try {
+            return new HighlightCtor(...ranges.slice(0, 4096));
+        } catch {
+            return null;
+        }
     }
-    return new HighlightCtor(...ranges.slice(0, 4096));
 }
 
 /** 结果列表：固定行高，只渲染视口附近的行。 */
@@ -190,6 +251,13 @@ export interface SearchBarI18n {
     searchMethodKeyword: string;
     /** 查找方法：正则表达式 */
     searchMethodRegex: string;
+    /** 正则 flags 子菜单标题 */
+    regexOptions: string;
+    regexUnicode: string;
+    regexMultiline: string;
+    regexDotAll: string;
+    /** 正则匹配边界说明，避免把零长度/跨单元行为误解为漏召回。 */
+    regexBoundaryHint: string;
     preserveCase: string;
     /** 正则开启时 Aa* 的禁用说明 */
     preserveCaseDisabledByRegex: string;
@@ -216,6 +284,7 @@ export interface SearchBarI18n {
     replaceDocTitleEmpty: string;
     replaceAllConfirm: string;
     replaceAllConfirmTitle: string;
+    replaceAllIncomplete: string;
     replaceCurrentDone: string;
     replaceAllResult: string;
     replaceProtyleMissing: string;
@@ -261,7 +330,9 @@ export interface SearchBarI18n {
     settingsIncludeMathBlock: string;
     settingsIncludeEmbedBlock: string;
     settingsIncludeCodeBlock: string;
+    settingsIncludePlainCodeBlock: string;
     settingsIncludeMermaid: string;
+    settingsIncludeFlowchart: string;
     settingsIncludeHtmlBlock: string;
     settingsIncludeHtmlBlockHint: string;
     settingsIncludeFoldedBlocks: string;
@@ -332,6 +403,8 @@ export interface SearchBarHost {
     syncIncludeCodeBlock?(value: boolean, source?: SearchBar): void;
     /** 将 Mermaid 匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeMermaid?(value: boolean, source?: SearchBar): void;
+    /** 将 flowchart 匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeFlowchart?(value: boolean, source?: SearchBar): void;
     /** 将 HTML 块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeHtmlBlock?(value: boolean, source?: SearchBar): void;
     /** 将折叠块内容匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -342,9 +415,17 @@ export interface SearchBarHost {
     syncRestrictInlineTypes?(value: RestrictInlineType[], source?: SearchBar): void;
     /** 将查找方法（关键字/正则）同步到其它已打开的搜索面板（不写 prefs） */
     syncUseRegex?(value: boolean, source?: SearchBar): void;
+    /** 将正则 flags 同步到其它已打开的搜索面板（不写 prefs） */
+    syncRegexOptions?(value: RegexOptions, source?: SearchBar): void;
 }
 
 type MatchOptionKey = "caseSensitive" | "wholeWord" | "preserveCase" | "selectionOnly";
+
+type RegexOptions = {
+    regexUnicode: boolean;
+    regexMultiline: boolean;
+    regexDotAll: boolean;
+};
 
 function avScopeRefKey(ref: AvScopeVisualRef): string {
     return `${ref.kind}\0${ref.avBlockId}\0${ref.groupId}\0${ref.rowId}\0${ref.colId ?? ""}`;
@@ -366,8 +447,14 @@ export class SearchBar {
     private resultIndex = 0;
     private resultCount = 0;
     private resultMatches: SearchMatch[] = [];
+    private searchCoverageIncomplete = false;
+    /** 已提交结果之外，特殊块/数据库仍在后台补全。 */
+    private backgroundIndexing = false;
+    /** 当前数字属于上一轮/快照，尚未得到最新查询的计算结果。 */
+    private awaitingSearchResult = false;
     private degradedNotified = false;
     private unrenderedNotified = false;
+    private truncatedNotified = false;
     private indexSettledTimer: number | null = null;
     private unsubscribeIndexSettled: (() => void) | null = null;
     private locatePending = false;
@@ -375,12 +462,44 @@ export class SearchBar {
     private tableRevealSerial = 0;
     private staleRefreshPending = false;
     private typingTimer: number | undefined;
+    /** switch-protyle 后等待可见编辑器稳定的帧任务。 */
+    private documentSwitchRaf = 0;
     private searchGeneration = 0;
+    /** 只用于可中断的正则和后台匹配；generation 仍保护其它异步步骤。 */
+    private searchAbortController: AbortController | null = null;
+    /** 最近一次仍能从编辑器解析出的文档 ID，供 DOM 已卸载后的销毁清理使用。 */
+    private lastRootId = "";
+    /** 页签切换时按文档保留“第 x 项”；匹配内容仍每次从当前 Protyle 重建。 */
+    private readonly documentSearchIndices: DocumentSearchIndexMemory;
+    /**
+     * 页签切换后的短暂显示快照。真实匹配仍为零，因而不能用于跳转、结果面板或替换；
+     * 待当前文档匹配完成后由真实结果取代，避免已访问文档反复闪为 0/0。
+     */
+    private pendingDocumentCountDisplay: DocumentSearchIndexSnapshot | null = null;
+    /** 方向键正在翻的历史下标；-1 表示没有在翻。 */
+    private historyCursor = -1;
+    private historyDraft = "";
+    private historyView: string[] = [];
+    /**
+     * 当前文档上已经随一次查找记过、或从上一篇带过来而不该记的词。
+     * 与这次实际搜索的词相同时不再写盘。
+     */
+    private historyLatchDocId = "";
+    private historyLatchText = "";
+    /** 查找框正在用输入法组字。组字期间的搜索不进历史。 */
+    private findComposing = false;
+    /** 本查找框持有的后台补全根，根切换或销毁时释放。 */
+    private backgroundCorpusRootId = "";
 
     private caseSensitive = false;
     private wholeWord = false;
     private regex = false;
+    /** 三个 flags 默认均关闭，以保持原有 g/gi 正则行为。 */
+    private regexUnicode = false;
+    private regexMultiline = false;
+    private regexDotAll = false;
     private preserveCase = false;
+    private readonly regexMatcher = new RegexTextMatcher();
     /** 选区内查找；打开预填关键词不会自动打开 */
     private selectionOnly = false;
     /** 是否匹配文档标题；全局 prefs，默认 true */
@@ -424,9 +543,10 @@ export class SearchBar {
     private includeCodeBlock = true;
     /** 是否匹配 Mermaid；全局 prefs，默认 true */
     private includeMermaid = true;
+    private includeFlowchart = true;
     /** 是否匹配 HTML 块渲染可见文字；全局 prefs，默认 true */
     private includeHtmlBlock = true;
-    /** 是否匹配非标题折叠块内隐藏内容；全局 prefs，默认 false */
+    /** 是否匹配折叠块内隐藏内容；全局 prefs，默认 true */
     private includeFoldedBlocks = true;
     /** 是否匹配行内备注；全局 prefs，默认 false */
     private includeInlineMemo = false;
@@ -453,7 +573,7 @@ export class SearchBar {
             this.pendingTableCellText = null;
             return;
         }
-        const button = target.closest("[data-option=\"selectionOnly\"]");
+        const button = target.closest('[data-option="selectionOnly"]');
         if (!button || !this.root.contains(button)) {
             this.pendingTableCells = null;
             this.pendingTableCellText = null;
@@ -485,6 +605,8 @@ export class SearchBar {
     /** 嵌入块一次渲染出太多子块，补 Range 盖不住，等停下来重搜一次。 */
     private embedRefreshPending = false;
     private domRefreshTimer: number | undefined;
+    /** fold 属性变更专用刷新：不等 savedoc，也不复用输入的 400ms 防抖。 */
+    private foldRefreshTimer: number | undefined;
     /** 跳转滚动期间抑制 AV DOM 观察触发的重搜，避免把索引打回 1 */
     private avWatchPausedUntil = 0;
     /** 折叠展开或装载块期间，禁止把当前序号清成 0 */
@@ -543,6 +665,8 @@ export class SearchBar {
          * 选区带入时一般不选；会话恢复 / 空框打开时全选便于覆盖输入。
          */
         selectSearchOnOpen?: boolean;
+        /** 打开时的预填词是选区，应记入当前文档历史。会话恢复不传。 */
+        recordInitialQuery?: boolean;
         /** 打开时是否展开替换行（Ctrl+H） */
         replaceVisible?: boolean;
         /** 是否匹配文档标题（来自全局 prefs） */
@@ -583,8 +707,10 @@ export class SearchBar {
         includeEmbedBlock?: boolean;
         /** 是否匹配代码块（来自全局 prefs） */
         includeCodeBlock?: boolean;
-        /** 是否匹配 Mermaid（来自全局 prefs） */
+        /** 是否匹配 Mermaid（来自全局 prefs）。不受代码块开关影响。 */
         includeMermaid?: boolean;
+        /** 是否匹配 flowchart（来自全局 prefs）。不受代码块开关影响。 */
+        includeFlowchart?: boolean;
         /** 是否匹配 HTML 块渲染可见文字（来自全局 prefs） */
         includeHtmlBlock?: boolean;
         /** 是否匹配折叠块内容（来自全局 prefs） */
@@ -595,8 +721,15 @@ export class SearchBar {
         restrictInlineTypes?: RestrictInlineType[];
         /** 查找方法是否为正则（来自全局 prefs；默认关键字） */
         useRegex?: boolean;
+        /** 正则 flags（来自全局 prefs；均默认关闭） */
+        regexUnicode?: boolean;
+        regexMultiline?: boolean;
+        regexDotAll?: boolean;
     }) {
         this.edit = options.edit;
+        this.lastRootId = editorRootId(this.edit);
+        this.documentSearchIndices = new DocumentSearchIndexMemory(this.lastRootId);
+        this.syncBackgroundCorpusRoot();
         this.unsubscribeIndexSettled = subscribeIndexSettled((rootId) => {
             this.scheduleIndexRefresh(rootId);
         });
@@ -605,6 +738,9 @@ export class SearchBar {
         this.i18n = options.i18n;
         this.replaceVisible = Boolean(options.replaceVisible);
         this.regex = options.useRegex === true;
+        this.regexUnicode = options.regexUnicode === true;
+        this.regexMultiline = options.regexMultiline === true;
+        this.regexDotAll = options.regexDotAll === true;
         this.includeDocTitle = options.includeDocTitle !== false;
         this.includeImageTitle = options.includeImageTitle !== false;
         this.includeAttributeView = options.includeAttributeView !== false;
@@ -628,6 +764,7 @@ export class SearchBar {
         this.includeEmbedBlock = options.includeEmbedBlock !== false;
         this.includeCodeBlock = options.includeCodeBlock !== false;
         this.includeMermaid = options.includeMermaid !== false;
+        this.includeFlowchart = options.includeFlowchart !== false;
         this.includeHtmlBlock = options.includeHtmlBlock !== false;
         this.includeFoldedBlocks = options.includeFoldedBlocks !== false;
         this.includeInlineMemo = options.includeInlineMemo === true;
@@ -651,12 +788,14 @@ export class SearchBar {
         this.replaceAllBtn = this.root.querySelector('[data-action="replace-all"]');
         this.searchMethodBtn = this.root.querySelector('[data-action="search-method"]');
 
-        for (const key of [
-            "caseSensitive",
-            "wholeWord",
-            "preserveCase",
-            "selectionOnly",
-        ] as MatchOptionKey[]) {
+        for (
+            const key of [
+                "caseSensitive",
+                "wholeWord",
+                "preserveCase",
+                "selectionOnly",
+            ] as MatchOptionKey[]
+        ) {
             const el = this.root.querySelector(`[data-option="${key}"]`) as HTMLElement | null;
             if (el) {
                 this.optionButtons.set(key, el);
@@ -695,6 +834,9 @@ export class SearchBar {
             onSettled: (change) => {
                 this.noteAddedBlocks(change);
                 this.repairHighlightRanges();
+                if (change.foldChanged) {
+                    this.scheduleFoldRefresh();
+                }
             },
         });
         this.plugin.onSearchComponentMounted(this.eventBusHandle);
@@ -727,6 +869,12 @@ export class SearchBar {
                 void this.highlightHitResult("", true);
             }
         }
+        if (options.recordInitialQuery && options.presetText) {
+            this.commitSearchHistory(options.presetText);
+        }
+        if (!this.historyLatchDocId) {
+            this.baselineSearchHistory();
+        }
     }
 
     /** 当前查找框文案（关闭会话恢复用） */
@@ -739,13 +887,248 @@ export class SearchBar {
         return this.replaceInput?.value ?? this.replaceText;
     }
 
+    private rememberCurrentRootId(): string {
+        const rootId = editorRootId(this.edit);
+        if (rootId) {
+            this.lastRootId = rootId;
+        }
+        return rootId;
+    }
+
+    private syncBackgroundCorpusRoot(): string {
+        const rootId = this.rememberCurrentRootId();
+        this.activateDocumentSearchState(rootId);
+        if (rootId === this.backgroundCorpusRootId) {
+            return rootId;
+        }
+        const previousRootId = this.backgroundCorpusRootId;
+        if (this.backgroundCorpusRootId) {
+            releaseBackgroundCorpusRoot(this.backgroundCorpusRootId);
+        }
+        this.backgroundCorpusRootId = rootId;
+        if (previousRootId && rootId) {
+            this.onSearchDocumentChanged(rootId);
+        }
+        if (rootId) {
+            retainBackgroundCorpusRoot(rootId);
+        }
+        return rootId;
+    }
+
+    /**
+     * 页签共用一个 SearchBar，因此必须在切换瞬间隔离索引和异步结果。
+     * 清空的是旧文档的 DOM 命中，不是已保存的数值索引；新文档完成匹配后再恢复该数值。
+     */
+    private activateDocumentSearchState(rootId: string): boolean {
+        if (
+            !this.documentSearchIndices.activate(
+                rootId,
+                this.resultIndex,
+                this.resultCount,
+                this.pendingDocumentCountDisplay === null,
+            )
+        ) {
+            return false;
+        }
+        this.searchGeneration += 1;
+        this.searchAbortController?.abort();
+        this.searchAbortController = null;
+        this.tableRevealSerial += 1;
+        this.resultMatches = [];
+        this.resultCount = 0;
+        this.resultIndex = 0;
+        this.pendingDocumentCountDisplay = this.documentSearchIndices.pendingSnapshot(rootId);
+        this.searchCoverageIncomplete = Boolean(effectiveSearchQuery(this.searchText));
+        this.backgroundIndexing = false;
+        this.awaitingSearchResult = Boolean(effectiveSearchQuery(this.searchText));
+        this.clearHighlight();
+        this.updateCountLabel(false, false);
+        this.syncIndexingIndicator();
+        this.syncReplaceButtons();
+        return true;
+    }
+
+    /**
+     * 思源的 switch-protyle 事件可能早于可见 Protyle/光标更新，也可能在连续切换后延迟到达。
+     * 因此只把当前编辑器重新解析出的 rootID 当作切换依据；连续两帧相同
+     * 才提交，覆盖宿主更新 DOM 稍晚、旧 Protyle 尚未隐藏的情形。
+     */
+    private settleDocumentSwitch(): void {
+        if (this.documentSwitchRaf) {
+            window.cancelAnimationFrame(this.documentSwitchRaf);
+        }
+        let previousRootId = "";
+        let stableFrames = 0;
+        let frames = 0;
+        const settle = () => {
+            this.documentSwitchRaf = 0;
+            const rootId = this.rememberCurrentRootId();
+            frames += 1;
+            stableFrames = rootId && rootId === previousRootId ? stableFrames + 1 : 1;
+            previousRootId = rootId;
+            if (rootId && (stableFrames >= 2 || frames >= 4)) {
+                this.activateDocumentSearchState(rootId);
+                return;
+            }
+            if (frames < 4) {
+                this.documentSwitchRaf = window.requestAnimationFrame(settle);
+            }
+        };
+        this.documentSwitchRaf = window.requestAnimationFrame(settle);
+    }
+
+    /** 新关键词或匹配语义不应带入此前各文档的序号。 */
+    private clearDocumentSearchIndices(): void {
+        this.documentSearchIndices.clear();
+        this.pendingDocumentCountDisplay = null;
+    }
+
+    /** 页签稳定前不借用上一页的 rootId，避免历史串到其它文档。 */
+    private stableHistoryDocumentId(): string {
+        return stableSearchHistoryDocId(
+            this.rememberCurrentRootId(),
+            this.documentSearchIndices.activeRoot,
+        );
+    }
+
+    private setSearchText(text: string): void {
+        if (text !== this.searchText) {
+            this.clearDocumentSearchIndices();
+            // 输入防抖期也属于“结果即将变化”：现有数字来自上一轮，提前闪烁避免误解为已稳定。
+            this.awaitingSearchResult = Boolean(effectiveSearchQuery(text)) ||
+                isRestrictInlineActive(this.restrictInlineTypes);
+            this.syncIndexingIndicator();
+        }
+        this.searchText = text;
+    }
+
+    /** 打开时把当前输入框当作基线，会话恢复的词不会因此写入历史。 */
+    private baselineSearchHistory() {
+        this.historyLatchDocId = this.stableHistoryDocumentId();
+        this.historyLatchText = this.input?.value ?? this.searchText;
+    }
+
+    /**
+     * 切到另一篇时退出方向键翻阅。
+     * 输入框里的词是上一篇带过来的，只在这篇里接着搜，不记进新文档。
+     */
+    private onSearchDocumentChanged(rootId: string) {
+        this.exitHistoryNavigation();
+        this.historyLatchDocId = rootId;
+        this.historyLatchText = this.input?.value ?? this.searchText;
+    }
+
+    private exitHistoryNavigation() {
+        this.historyCursor = -1;
+        this.historyView = [];
+        this.historyDraft = "";
+    }
+
+    /**
+     * 查找框停手后再搜。组字未结束时到点也不搜拼音。
+     * 上屏后仍等同一个间隔，不在 compositionend 上立刻搜。
+     */
+    private scheduleFindFromInput() {
+        clearTimeout(this.typingTimer);
+        this.typingTimer = window.setTimeout(() => {
+            this.typingTimer = undefined;
+            if (this.findComposing) {
+                return;
+            }
+            const text = this.searchText;
+            void this.highlightHitResult(text, true);
+            this.commitSearchHistory(text);
+        }, DONE_TYPING_MS);
+    }
+
+    /** 用户换过的查找词。与基线相同则不写盘。 */
+    private commitSearchHistory(text: string) {
+        const docId = this.stableHistoryDocumentId();
+        if (!docId || (docId === this.historyLatchDocId && text === this.historyLatchText)) {
+            return;
+        }
+        searchHistory.push(docId, text);
+        this.historyLatchDocId = docId;
+        this.historyLatchText = text;
+    }
+
+    private applyHistoryText(text: string) {
+        clearTimeout(this.typingTimer);
+        this.typingTimer = undefined;
+        this.setSearchText(text);
+        this.input.value = text;
+        void this.highlightHitResult(text, true);
+        this.input.focus();
+        this.input.select();
+    }
+
+    /**
+     * ↑ 更早，↓ 更新。翻过最新一条时回到开始翻之前的输入。
+     * 没有可翻的历史时返回 false，方向键仍留给输入框。
+     */
+    private navigateSearchHistory(direction: -1 | 1): boolean {
+        const docId = this.stableHistoryDocumentId();
+        if (!docId) {
+            return false;
+        }
+        if (this.historyCursor === -1) {
+            if (direction > 0) {
+                return false;
+            }
+            this.historyView = searchHistory.getForDoc(docId);
+            if (this.historyView.length === 0) {
+                return false;
+            }
+            this.historyDraft = this.input.value;
+            this.historyCursor = this.historyView.length - 1;
+            if (this.historyView[this.historyCursor] === this.historyDraft) {
+                if (this.historyCursor === 0) {
+                    this.exitHistoryNavigation();
+                    return false;
+                }
+                this.historyCursor -= 1;
+            }
+        } else {
+            const next = this.historyCursor + direction;
+            if (next < 0) {
+                return true;
+            }
+            if (next >= this.historyView.length) {
+                const draft = this.historyDraft;
+                this.exitHistoryNavigation();
+                this.applyHistoryText(draft);
+                return true;
+            }
+            this.historyCursor = next;
+        }
+        this.applyHistoryText(this.historyView[this.historyCursor]);
+        return true;
+    }
+
     destroy() {
         // 关掉面板时作废还在等大表分段挂出的跳转，避免关闭后仍滚动正文。
         this.tableRevealSerial += 1;
-        cancelBackgroundCorpusJobs();
+        this.searchGeneration += 1;
+        this.searchAbortController?.abort();
+        this.searchAbortController = null;
+        this.regexMatcher.dispose();
+        if (this.backgroundCorpusRootId) {
+            releaseBackgroundCorpusRoot(this.backgroundCorpusRootId);
+            this.backgroundCorpusRootId = "";
+        } else {
+            const rootId = this.rememberCurrentRootId() || this.lastRootId;
+            if (rootId) {
+                cancelBackgroundCorpusJobs(rootId);
+            }
+        }
         clearTimeout(this.typingTimer);
+        if (this.documentSwitchRaf) {
+            window.cancelAnimationFrame(this.documentSwitchRaf);
+            this.documentSwitchRaf = 0;
+        }
         clearTimeout(this.avRefreshTimer);
         clearTimeout(this.domRefreshTimer);
+        clearTimeout(this.foldRefreshTimer);
         this.stopEditorDomWatch?.();
         this.stopEditorDomWatch = null;
         if (this.indexSettledTimer != null) {
@@ -832,10 +1215,14 @@ export class SearchBar {
         }
     }
 
-    applyPresetAndSearch(text: string, options?: {focusFind?: boolean}) {
-        this.searchText = text;
+    applyPresetAndSearch(text: string, options?: {focusFind?: boolean;}) {
+        this.exitHistoryNavigation();
+        clearTimeout(this.typingTimer);
+        this.typingTimer = undefined;
+        this.setSearchText(text);
         this.input.value = text;
         void this.highlightHitResult(text, true);
+        this.commitSearchHistory(text);
         if (options?.focusFind !== false) {
             this.input.focus();
             this.input.select();
@@ -848,7 +1235,11 @@ export class SearchBar {
         this.resultMatches = [];
         this.resultCount = 0;
         this.resultIndex = 0;
+        this.pendingDocumentCountDisplay = null;
+        this.backgroundIndexing = false;
+        this.awaitingSearchResult = false;
         this.updateCountLabel();
+        this.syncIndexingIndicator();
         this.syncReplaceButtons();
     }
 
@@ -869,25 +1260,39 @@ export class SearchBar {
         const rph = escapeAttr(this.i18n.replacePlaceholder);
         return `
 <div class="search-dialog">
-  ${mobile ? "" : `<div class="search-resize-handle" aria-hidden="true"></div>`}
+  ${mobile ? "" : '<div class="search-resize-handle" aria-hidden="true"></div>'}
   <div class="search-dialog__rows">
     <div class="search-row search-row--find">
-      <div data-action="toggle-replace" class="search-replace-toggle search-no-drag" title="${escapeAttr(this.i18n.replaceToggle)}" aria-label="${escapeAttr(this.i18n.replaceToggle)}" aria-expanded="false">${replaceToggleIcon()}</div>
+      <div data-action="toggle-replace" class="search-replace-toggle search-no-drag" title="${
+            escapeAttr(this.i18n.replaceToggle)
+        }" aria-label="${escapeAttr(this.i18n.replaceToggle)}" aria-expanded="false">${replaceToggleIcon()}</div>
       <div class="search-field">
         <input type="text" class="b3-text-field search-input-find" spellcheck="false" placeholder="${ph}" />
         <div class="search-field__toggles" role="group" aria-label="${escapeAttr(this.i18n.searchPlaceholder)}">
-          <div class="search-option" data-option="caseSensitive" title="${escapeAttr(this.i18n.matchCase)}" aria-label="${escapeAttr(this.i18n.matchCase)}" role="button" tabindex="-1">Aa</div>
-          <div class="search-option" data-option="wholeWord" title="${escapeAttr(this.i18n.wholeWord)}" aria-label="${escapeAttr(this.i18n.wholeWord)}" role="button" tabindex="-1">${wholeWordIcon()}</div>
-          <div class="search-option search-method-trigger" data-action="search-method" data-method="keyword" title="${escapeAttr(this.i18n.searchMethodKeyword)}" aria-label="${escapeAttr(this.i18n.searchMethodKeyword)}" aria-haspopup="menu" aria-expanded="false" role="button" tabindex="-1">${iconUse("#iconExact")}</div>
+          <div class="search-option" data-option="caseSensitive" title="${
+            escapeAttr(this.i18n.matchCase)
+        }" aria-label="${escapeAttr(this.i18n.matchCase)}" role="button" tabindex="-1">Aa</div>
+          <div class="search-option" data-option="wholeWord" title="${escapeAttr(this.i18n.wholeWord)}" aria-label="${
+            escapeAttr(this.i18n.wholeWord)
+        }" role="button" tabindex="-1">${wholeWordIcon()}</div>
+          <div class="search-option search-method-trigger" data-action="search-method" data-method="keyword" title="${
+            escapeAttr(this.i18n.searchMethodKeyword)
+        }" aria-label="${
+            escapeAttr(this.i18n.searchMethodKeyword)
+        }" aria-haspopup="menu" aria-expanded="false" role="button" tabindex="-1">${iconUse("#iconExact")}</div>
         </div>
       </div>
       <div class="search-row__trailing">
-        <div class="search-count search-no-drag ariaLabel" data-action="results" data-position="north" role="button" tabindex="-1" aria-expanded="false" aria-label="${escapeAttr(this.i18n.resultsPanelToggle ?? "搜索结果列表")}">0/0</div>
+        <div class="search-count search-no-drag ariaLabel" data-action="results" data-position="north" role="button" tabindex="-1" aria-expanded="false" aria-label="${
+            escapeAttr(this.i18n.resultsPanelToggle ?? "搜索结果列表")
+        }">0/0</div>
         <span class="search-index-status" aria-live="polite"></span>
         <div class="search-tools">
           <div data-action="prev" title="${escapeAttr(this.i18n.searchPrev)}">${iconUse("#iconUp")}</div>
           <div data-action="next" title="${escapeAttr(this.i18n.searchNext)}">${iconUse("#iconDown")}</div>
-          <div class="search-option" data-option="selectionOnly" title="${escapeAttr(this.i18n.selectionOnly)}" aria-label="${escapeAttr(this.i18n.selectionOnly)}" role="button" tabindex="-1">${selectionOnlyIcon()}</div>
+          <div class="search-option" data-option="selectionOnly" title="${
+            escapeAttr(this.i18n.selectionOnly)
+        }" aria-label="${escapeAttr(this.i18n.selectionOnly)}" role="button" tabindex="-1">${selectionOnlyIcon()}</div>
           <div data-action="close" title="${escapeAttr(this.i18n.searchClose)}">${iconUse("#iconClose")}</div>
         </div>
       </div>
@@ -897,18 +1302,28 @@ export class SearchBar {
       <div class="search-field">
         <input type="text" class="b3-text-field search-input-replace" spellcheck="false" placeholder="${rph}" />
         <div class="search-field__toggles">
-          <span class="search-replace-help search-no-drag ariaLabel" data-position="north" aria-label="${escapeAttr(this.i18n.replaceUnsupportedHelp)}" role="img">${circleQuestionIcon()}</span>
-          <div class="search-option" data-option="preserveCase" title="${escapeAttr(this.i18n.preserveCase)}" aria-label="${escapeAttr(this.i18n.preserveCase)}" role="button" tabindex="-1">Aa*</div>
+          <span class="search-replace-help search-no-drag ariaLabel" data-position="north" aria-label="${
+            escapeAttr(this.i18n.replaceUnsupportedHelp)
+        }" role="img">${circleQuestionIcon()}</span>
+          <div class="search-option" data-option="preserveCase" title="${
+            escapeAttr(this.i18n.preserveCase)
+        }" aria-label="${escapeAttr(this.i18n.preserveCase)}" role="button" tabindex="-1">Aa*</div>
         </div>
       </div>
       <div class="search-row__trailing search-row__trailing--replace">
         <div class="search-tools search-tools--replace">
-          <div data-action="replace" title="${escapeAttr(this.i18n.replaceAction)}" aria-label="${escapeAttr(this.i18n.replaceAction)}">${replaceOneIcon()}</div>
-          <div data-action="replace-all" title="${escapeAttr(this.i18n.replaceAllAction)}" aria-label="${escapeAttr(this.i18n.replaceAllAction)}">${replaceAllIcon()}</div>
+          <div data-action="replace" title="${escapeAttr(this.i18n.replaceAction)}" aria-label="${
+            escapeAttr(this.i18n.replaceAction)
+        }">${replaceOneIcon()}</div>
+          <div data-action="replace-all" title="${escapeAttr(this.i18n.replaceAllAction)}" aria-label="${
+            escapeAttr(this.i18n.replaceAllAction)
+        }">${replaceAllIcon()}</div>
         </div>
         <span class="search-trailing-flex" aria-hidden="true"></span>
         <div class="search-tools search-tools--settings">
-          <div data-action="settings" title="${escapeAttr(this.i18n.settingsTitle)}" aria-label="${escapeAttr(this.i18n.settingsTitle)}" role="button" tabindex="-1">${settingsGearIcon()}</div>
+          <div data-action="settings" title="${escapeAttr(this.i18n.settingsTitle)}" aria-label="${
+            escapeAttr(this.i18n.settingsTitle)
+        }" role="button" tabindex="-1">${settingsGearIcon()}</div>
         </div>
       </div>
     </div>
@@ -920,13 +1335,20 @@ export class SearchBar {
     }
 
     private bindUi() {
+        this.input.addEventListener("compositionstart", () => {
+            this.findComposing = true;
+        });
+        this.input.addEventListener("compositionend", () => {
+            this.findComposing = false;
+            this.setSearchText(this.input.value);
+            // 有的输入法上屏后不再发 input。这里用同一次停手间隔补上，
+            // 紧跟着的 input 会清掉这个定时器，不会搜两次。
+            this.scheduleFindFromInput();
+        });
         this.input.addEventListener("input", () => {
-            this.searchText = this.input.value;
-            clearTimeout(this.typingTimer);
-            this.typingTimer = window.setTimeout(() => {
-                this.typingTimer = undefined;
-                void this.highlightHitResult(this.searchText, true);
-            }, DONE_TYPING_MS);
+            this.exitHistoryNavigation();
+            this.setSearchText(this.input.value);
+            this.scheduleFindFromInput();
         });
 
         this.replaceInput.addEventListener("input", () => {
@@ -981,9 +1403,9 @@ export class SearchBar {
             event.preventDefault();
         });
         this.resultsListEl?.addEventListener("click", (event) => {
-            const target = event.target instanceof Element
-                ? event.target.closest<HTMLElement>(".search-results-panel__item")
-                : null;
+            const target = event.target instanceof Element ?
+                event.target.closest<HTMLElement>(".search-results-panel__item") :
+                null;
             if (!target) {
                 return;
             }
@@ -1033,6 +1455,19 @@ export class SearchBar {
             return;
         }
         // 仅在查找输入框聚焦时生效（本监听只绑在查找框上）
+        if (
+            !event.isComposing &&
+            !event.shiftKey &&
+            !event.ctrlKey &&
+            !event.altKey &&
+            !event.metaKey &&
+            (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+            this.navigateSearchHistory(event.key === "ArrowUp" ? -1 : 1)
+        ) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }
         if (event.key === "Enter" && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
             event.preventDefault();
             this.clickLast();
@@ -1156,10 +1591,10 @@ export class SearchBar {
     }
 
     private hasRememberedScopeVisual(): boolean {
-        return this.rememberedSelectionScope.size > 0
-            || this.rememberedVisualBlockIds.length > 0
-            || this.rememberedTableCellRefs.length > 0
-            || this.rememberedAvScopeRefs.length > 0;
+        return this.rememberedSelectionScope.size > 0 ||
+            this.rememberedVisualBlockIds.length > 0 ||
+            this.rememberedTableCellRefs.length > 0 ||
+            this.rememberedAvScopeRefs.length > 0;
     }
 
     private avScopeRefsSame(next: readonly AvScopeVisualRef[]): boolean {
@@ -1183,34 +1618,41 @@ export class SearchBar {
         tableCells?: readonly HTMLTableCellElement[],
         tableCellText?: TableCellTextSelection | null,
     ) {
-        const {scope, kind, visualBlockIds, tableCellRefs, avScopeRefs} = captureSelectionScopeWithKind(this.edit, {
-            includeDocTitle: this.includeDocTitle,
-            includeImageTitle: this.includeImageTitle,
-            includeAttributeView: this.includeAttributeView,
-            includeTable: this.includeTable,
-            includeBlockquote: this.includeBlockquote,
-            includeCallout: this.includeCallout,
-            includeSuperBlock: this.includeSuperBlock,
-            includeTabs: this.includeTabs,
-            includeMindmap: this.includeMindmap,
-            includeListUnordered: this.includeListUnordered,
-            includeListOrdered: this.includeListOrdered,
-            includeListTask: this.includeListTask,
-            includeParagraph: this.includeParagraph,
-            includeHeadingH1: this.includeHeadingH1,
-            includeHeadingH2: this.includeHeadingH2,
-            includeHeadingH3: this.includeHeadingH3,
-            includeHeadingH4: this.includeHeadingH4,
-            includeHeadingH5: this.includeHeadingH5,
-            includeHeadingH6: this.includeHeadingH6,
-            includeMathBlock: this.includeMathBlock,
-            includeEmbedBlock: this.includeEmbedBlock,
-            includeCodeBlock: this.includeCodeBlock,
-            includeMermaid: this.includeMermaid,
-            includeHtmlBlock: this.includeHtmlBlock,
-            includeInlineMemo: this.includeInlineMemo,
-            restrictInlineTypes: this.restrictInlineTypes,
-        }, tableCells, true, tableCellText);
+        const {scope, kind, visualBlockIds, tableCellRefs, avScopeRefs} = captureSelectionScopeWithKind(
+            this.edit,
+            {
+                includeDocTitle: this.includeDocTitle,
+                includeImageTitle: this.includeImageTitle,
+                includeAttributeView: this.includeAttributeView,
+                includeTable: this.includeTable,
+                includeBlockquote: this.includeBlockquote,
+                includeCallout: this.includeCallout,
+                includeSuperBlock: this.includeSuperBlock,
+                includeTabs: this.includeTabs,
+                includeMindmap: this.includeMindmap,
+                includeListUnordered: this.includeListUnordered,
+                includeListOrdered: this.includeListOrdered,
+                includeListTask: this.includeListTask,
+                includeParagraph: this.includeParagraph,
+                includeHeadingH1: this.includeHeadingH1,
+                includeHeadingH2: this.includeHeadingH2,
+                includeHeadingH3: this.includeHeadingH3,
+                includeHeadingH4: this.includeHeadingH4,
+                includeHeadingH5: this.includeHeadingH5,
+                includeHeadingH6: this.includeHeadingH6,
+                includeMathBlock: this.includeMathBlock,
+                includeEmbedBlock: this.includeEmbedBlock,
+                includeCodeBlock: this.includeCodeBlock,
+                includeMermaid: this.includeMermaid,
+                includeFlowchart: this.includeFlowchart,
+                includeHtmlBlock: this.includeHtmlBlock,
+                includeInlineMemo: this.includeInlineMemo,
+                restrictInlineTypes: this.restrictInlineTypes,
+            },
+            tableCells,
+            true,
+            tableCellText,
+        );
         this.rememberedSelectionScope = cloneSelectionScope(scope);
         this.selectionScopeVisualKind = kind;
         this.rememberedVisualBlockIds = visualBlockIds;
@@ -1246,18 +1688,20 @@ export class SearchBar {
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
+            includeFlowchart: this.includeFlowchart,
             includeHtmlBlock: this.includeHtmlBlock,
+            includeFoldedBlocks: this.includeFoldedBlocks,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
         });
-        const pendingCells = this.pendingTableCells && this.pendingTableCells.length > 0
-            ? this.pendingTableCells
-            : undefined;
+        const pendingCells = this.pendingTableCells && this.pendingTableCells.length > 0 ?
+            this.pendingTableCells :
+            undefined;
         const pendingCellText = this.pendingTableCellText;
         // 已经是整块选区时，不因随后点中的数据库格子把范围收成那一格。
-        const followCellSelection = Boolean(pendingCells)
-            || this.selectionScopeVisualKind === "table-cells"
-            || this.rememberedAvScopeRefs.length > 0;
+        const followCellSelection = Boolean(pendingCells) ||
+            this.selectionScopeVisualKind === "table-cells" ||
+            this.rememberedAvScopeRefs.length > 0;
         const live = getSelectionScope(
             this.edit,
             blocks,
@@ -1268,44 +1712,51 @@ export class SearchBar {
         if (live.size > 0) {
             // 仍有现场选区时同步提示（用户改选了范围）；光标挪走后 live 为空则保持冻结提示。
             // 表格浮层在按下按钮时就被清掉，所以这里把刚快照的格子再并进去。
-            const captured = captureSelectionScopeWithKind(this.edit, {
-                includeDocTitle: this.includeDocTitle,
-                includeImageTitle: this.includeImageTitle,
-                includeAttributeView: this.includeAttributeView,
-                includeTable: this.includeTable,
-                includeBlockquote: this.includeBlockquote,
-                includeCallout: this.includeCallout,
-                includeSuperBlock: this.includeSuperBlock,
-                includeTabs: this.includeTabs,
-                includeMindmap: this.includeMindmap,
-                includeListUnordered: this.includeListUnordered,
-                includeListOrdered: this.includeListOrdered,
-                includeListTask: this.includeListTask,
-                includeParagraph: this.includeParagraph,
-                includeHeadingH1: this.includeHeadingH1,
-                includeHeadingH2: this.includeHeadingH2,
-                includeHeadingH3: this.includeHeadingH3,
-                includeHeadingH4: this.includeHeadingH4,
-                includeHeadingH5: this.includeHeadingH5,
-                includeHeadingH6: this.includeHeadingH6,
-                includeMathBlock: this.includeMathBlock,
-                includeEmbedBlock: this.includeEmbedBlock,
-                includeCodeBlock: this.includeCodeBlock,
-                includeMermaid: this.includeMermaid,
-                includeHtmlBlock: this.includeHtmlBlock,
-                includeInlineMemo: this.includeInlineMemo,
-                restrictInlineTypes: this.restrictInlineTypes,
-            }, pendingCells, followCellSelection, pendingCellText);
+            const captured = captureSelectionScopeWithKind(
+                this.edit,
+                {
+                    includeDocTitle: this.includeDocTitle,
+                    includeImageTitle: this.includeImageTitle,
+                    includeAttributeView: this.includeAttributeView,
+                    includeTable: this.includeTable,
+                    includeBlockquote: this.includeBlockquote,
+                    includeCallout: this.includeCallout,
+                    includeSuperBlock: this.includeSuperBlock,
+                    includeTabs: this.includeTabs,
+                    includeMindmap: this.includeMindmap,
+                    includeListUnordered: this.includeListUnordered,
+                    includeListOrdered: this.includeListOrdered,
+                    includeListTask: this.includeListTask,
+                    includeParagraph: this.includeParagraph,
+                    includeHeadingH1: this.includeHeadingH1,
+                    includeHeadingH2: this.includeHeadingH2,
+                    includeHeadingH3: this.includeHeadingH3,
+                    includeHeadingH4: this.includeHeadingH4,
+                    includeHeadingH5: this.includeHeadingH5,
+                    includeHeadingH6: this.includeHeadingH6,
+                    includeMathBlock: this.includeMathBlock,
+                    includeEmbedBlock: this.includeEmbedBlock,
+                    includeCodeBlock: this.includeCodeBlock,
+                    includeMermaid: this.includeMermaid,
+                    includeFlowchart: this.includeFlowchart,
+                    includeHtmlBlock: this.includeHtmlBlock,
+                    includeInlineMemo: this.includeInlineMemo,
+                    restrictInlineTypes: this.restrictInlineTypes,
+                },
+                pendingCells,
+                followCellSelection,
+                pendingCellText,
+            );
             let scope = captured.scope;
             let tableRefs = captured.tableCellRefs;
             // 数据库选区没变时，补回同时冻结的表格格子，避免打字把表格丢掉。
             // 数据库又选了别的格子时，只跟新的数据库选区，不再并上一次的表格。
             if (
-                captured.kind === "table-cells"
-                && !pendingCells
-                && this.rememberedTableCellRefs.length > 0
-                && this.rememberedAvScopeRefs.length > 0
-                && this.avScopeRefsSame(captured.avScopeRefs)
+                captured.kind === "table-cells" &&
+                !pendingCells &&
+                this.rememberedTableCellRefs.length > 0 &&
+                this.rememberedAvScopeRefs.length > 0 &&
+                this.avScopeRefsSame(captured.avScopeRefs)
             ) {
                 const keptCells = elementsForTableCellRefs(this.edit, this.rememberedTableCellRefs);
                 if (keptCells.length > 0) {
@@ -1407,11 +1858,11 @@ export class SearchBar {
         visualViewport?.addEventListener("resize", scheduleRedraw);
         visualViewport?.addEventListener("scroll", scheduleRedraw);
 
-        const resizeObserver = typeof ResizeObserver === "function"
-            ? new ResizeObserver(() => {
+        const resizeObserver = typeof ResizeObserver === "function" ?
+            new ResizeObserver(() => {
                 scheduleRedraw();
-            })
-            : null;
+            }) :
+            null;
         this.edit.querySelectorAll<HTMLElement>(
             ".protyle-content, .protyle-wysiwyg, .protyle-preview",
         ).forEach((el) => {
@@ -1453,16 +1904,16 @@ export class SearchBar {
         if (!button) {
             return;
         }
-        const label = this.regex
-            ? this.i18n.searchMethodRegex
-            : this.i18n.searchMethodKeyword;
+        const label = this.regex ?
+            this.i18n.searchMethodRegex :
+            this.i18n.searchMethodKeyword;
         button.dataset.method = this.regex ? "regex" : "keyword";
         button.setAttribute("title", label);
         button.setAttribute("aria-label", label);
         button.setAttribute("aria-expanded", this.methodMenu ? "true" : "false");
-        button.innerHTML = this.regex
-            ? iconUse("#iconRegex")
-            : iconUse("#iconExact");
+        button.innerHTML = this.regex ?
+            iconUse("#iconRegex") :
+            iconUse("#iconExact");
     }
 
     /** 正则开启时灰显 Aa*（捕获组替换与保留大小写互斥） */
@@ -1474,9 +1925,9 @@ export class SearchBar {
         const disabled = this.regex;
         button.classList.toggle("is-disabled", disabled);
         button.setAttribute("aria-disabled", disabled ? "true" : "false");
-        const tip = disabled
-            ? (this.i18n.preserveCaseDisabledByRegex || this.i18n.preserveCase)
-            : this.i18n.preserveCase;
+        const tip = disabled ?
+            (this.i18n.preserveCaseDisabledByRegex || this.i18n.preserveCase) :
+            this.i18n.preserveCase;
         button.setAttribute("title", tip);
         button.setAttribute("aria-label", tip);
     }
@@ -1491,12 +1942,13 @@ export class SearchBar {
         const enumerateMode = this.isRestrictEnumerateMode();
         const modeBlocked = isEditorReplaceModeBlocked(this.edit);
         const current = this.getCurrentMatch();
-        const canReplaceCurrent = !enumerateMode
-            && !modeBlocked
-            && Boolean(current && isMatchWritable(this.edit, current));
-        const hasWritable = !enumerateMode
-            && !modeBlocked
-            && this.resultMatches.some((match) => isMatchWritable(this.edit, match));
+        const canReplaceCurrent = !enumerateMode &&
+            !modeBlocked &&
+            Boolean(current && isMatchWritable(this.edit, current));
+        const hasWritable = !enumerateMode &&
+            !modeBlocked &&
+            !this.searchCoverageIncomplete &&
+            this.resultMatches.some((match) => isMatchWritable(this.edit, match));
         this.replaceBtn?.classList.toggle("is-disabled", !canReplaceCurrent);
         this.replaceAllBtn?.classList.toggle("is-disabled", !hasWritable);
         this.replaceBtn?.setAttribute("aria-disabled", canReplaceCurrent ? "false" : "true");
@@ -1535,11 +1987,37 @@ export class SearchBar {
         return this.resultMatches[this.resultIndex - 1] ?? null;
     }
 
-    private updateCountLabel(scrollPanelToActive = false) {
-        this.countEl.textContent = formatSearchCountLabel(this.resultIndex, this.resultCount);
+    private updateCountLabel(scrollPanelToActive = false, rememberDocumentIndex = true) {
+        // pendingDocumentCountDisplay 只是此前完整匹配的显示快照；当前真实结果仍是
+        // 临时 0/0。任何重绘都不能借此把已保存的文档状态写坏。
+        if (rememberDocumentIndex && this.pendingDocumentCountDisplay === null) {
+            this.documentSearchIndices.remember(this.resultIndex, this.resultCount);
+        }
+        const display = this.pendingDocumentCountDisplay;
+        this.countEl.textContent = formatSearchCountLabel(
+            display?.index ?? this.resultIndex,
+            display?.count ?? this.resultCount,
+        );
         if (this.resultsPanelOpen) {
             this.renderResultsPanel(scrollPanelToActive);
         }
+    }
+
+    /**
+     * 数字闪烁只表示“当前搜索仍会产出新结果”。
+     * 已知失败、降级或分页截断会阻止替换，但不会永久显示为索引中。
+     */
+    private syncIndexingIndicator() {
+        if (!this.countEl || !this.indexStatusEl) {
+            return;
+        }
+        const indexing = this.searchesInFlight > 0 ||
+            this.backgroundIndexing ||
+            this.awaitingSearchResult;
+        this.countEl.classList.toggle("is-indexing", indexing);
+        this.indexStatusEl.textContent = indexing ?
+            (this.i18n.searchIndexingBadge ?? "索引中") :
+            "";
     }
 
     private toggleResultsPanel() {
@@ -1604,9 +2082,9 @@ export class SearchBar {
         const mark = match?.listMark;
         let body = this.escapeResultsText(plain);
         if (mark && mark.start >= 0 && mark.end <= plain.length && mark.start < mark.end) {
-            body = this.escapeResultsText(plain.slice(0, mark.start))
-                + `<mark>${this.escapeResultsText(plain.slice(mark.start, mark.end))}</mark>`
-                + this.escapeResultsText(plain.slice(mark.end));
+            body = this.escapeResultsText(plain.slice(0, mark.start)) +
+                `<mark>${this.escapeResultsText(plain.slice(mark.start, mark.end))}</mark>` +
+                this.escapeResultsText(plain.slice(mark.end));
         }
         return `<div class="search-results-panel__item${active}" role="option" data-index="${index}" title="${title}">${body}</div>`;
     }
@@ -1655,9 +2133,9 @@ export class SearchBar {
             items.push(this.formatResultsItemHtml(index));
         }
         this.resultsScrollLock = true;
-        list.innerHTML = `<div class="search-results-panel__spacer" style="height:${topSpacerHeight}px"></div>`
-            + items.join("")
-            + `<div class="search-results-panel__spacer" style="height:${bottomSpacerHeight}px"></div>`;
+        list.innerHTML = `<div class="search-results-panel__spacer" style="height:${topSpacerHeight}px"></div>` +
+            items.join("") +
+            `<div class="search-results-panel__spacer" style="height:${bottomSpacerHeight}px"></div>`;
         list.scrollTop = scrollTop;
         this.resultsScrollLock = false;
     }
@@ -1688,36 +2166,76 @@ export class SearchBar {
         this.renderResultsWindow(scrollTop);
     }
 
-    private async calculateSearchResults(value: string, change: boolean): Promise<SearchMatch[]> {
-        const keyword = value.trim();
+    private async calculateSearchResults(
+        value: string,
+        change: boolean,
+        retainDisplayedResults = false,
+    ): Promise<SearchMatch[]> {
+        const rootId = this.syncBackgroundCorpusRoot();
+        this.searchAbortController?.abort();
+        const abortController = new AbortController();
+        this.searchAbortController = abortController;
+        // 即使新查询为空，也必须作废旧的异步结果，避免它回来覆盖清空后的状态。
+        const generation = ++this.searchGeneration;
+        if (change) {
+            this.clearDocumentSearchIndices();
+        }
+        const keyword = effectiveSearchQuery(value);
         if (!keyword && !isRestrictInlineActive(this.restrictInlineTypes)) {
             this.clearHighlight();
             this.resultMatches = [];
             this.resultCount = 0;
             this.resultIndex = 0;
+            this.pendingDocumentCountDisplay = null;
+            this.searchCoverageIncomplete = false;
+            this.backgroundIndexing = false;
+            this.awaitingSearchResult = false;
             this.updateCountLabel();
+            this.syncIndexingIndicator();
             this.syncReplaceButtons();
+            if (this.searchAbortController === abortController) {
+                this.searchAbortController = null;
+            }
             return [];
         }
 
-        if (change) {
+        if (change && !retainDisplayedResults) {
             this.resultIndex = 0;
             this.resultCount = 0;
+            // 输入已变更而新结果尚未到达时，旧命中绝不能继续参与“全部替换”。
+            this.searchCoverageIncomplete = true;
             this.updateCountLabel();
+            this.syncReplaceButtons();
+        } else if (change) {
+            // Memo 的完整召回需要查其属性宿主，冷缓存时可能需请求未加载块。
+            // 保留上一轮数字和高亮避免可见的 0/0 闪烁；覆盖范围未确认前仍禁止替换。
+            this.searchCoverageIncomplete = true;
+            this.syncReplaceButtons();
         }
 
-        const generation = ++this.searchGeneration;
         this.searchEpoch = this.domEpoch;
         this.searchesInFlight += 1;
+        this.syncIndexingIndicator();
         let result: SearchPipelineResult;
         try {
-            result = await this.runSearchPipeline(value);
+            result = await this.runSearchPipeline(value, abortController.signal);
         } finally {
             this.searchesInFlight -= 1;
+            if (this.searchAbortController === abortController) {
+                this.searchAbortController = null;
+            }
+            this.syncIndexingIndicator();
         }
-        const {matches, error, degraded, partial, unrendered} = result;
-        if (generation !== this.searchGeneration) {
-            return this.resultMatches;
+        const {matches, error, degraded, partial, unrendered, truncated} = result;
+        if (
+            result.cancelled ||
+            generation !== this.searchGeneration ||
+            rootId !== this.documentSearchIndices.activeRoot ||
+            this.rememberCurrentRootId() !== rootId
+        ) {
+            // 调用方若是高亮流程，不得拿另一篇文档的旧 Range 再次上屏。
+            this.syncIndexingIndicator();
+            return [];
         }
 
         if (error) {
@@ -1725,17 +2243,30 @@ export class SearchBar {
             this.resultMatches = [];
             this.resultCount = 0;
             this.resultIndex = 0;
+            this.pendingDocumentCountDisplay = null;
+            this.searchCoverageIncomplete = false;
+            this.backgroundIndexing = false;
+            this.awaitingSearchResult = false;
             this.updateCountLabel();
+            this.syncIndexingIndicator();
             this.syncReplaceButtons();
             showMessage(this.i18n.invalidRegex.replace("{error}", error), 4000, "error");
             return [];
         }
 
-        const previous = change ? undefined : this.resultMatches[this.resultIndex - 1];
+        const restoredSnapshot = change ? null : this.documentSearchIndices.consumePending(rootId);
+        const previous = change || restoredSnapshot !== null ? undefined : this.resultMatches[this.resultIndex - 1];
         this.resultMatches = matches;
         this.resultCount = matches.length;
-        this.noteSearchCoverage(degraded, partial, unrendered);
-        if (change && matches.length > 0) {
+        this.pendingDocumentCountDisplay = null;
+        this.awaitingSearchResult = false;
+        this.searchCoverageIncomplete = Boolean(
+            degraded || partial || (unrendered ?? 0) > 0 || (truncated ?? 0) > 0,
+        );
+        this.noteSearchCoverage(degraded, partial, unrendered, truncated);
+        if (restoredSnapshot !== null) {
+            this.resultIndex = Math.min(restoredSnapshot.index, matches.length);
+        } else if (change && matches.length > 0) {
             // 仅 change=true 时按光标/选区锚定；失败回退第 1 项。替换后走 keepIndex，不走这里。
             this.resultIndex = resolveInitialMatchIndex(matches, {
                 anchorRange: this.getSearchAnchorRange(),
@@ -1743,14 +2274,26 @@ export class SearchBar {
             });
         } else if (previous) {
             const kept = matches.findIndex((match) => {
-                return match.blockId === previous.blockId
-                    && match.unitId === previous.unitId
-                    && match.start === previous.start;
+                return match.blockId === previous.blockId &&
+                    match.unitId === previous.unitId &&
+                    match.start === previous.start;
             });
             if (kept >= 0) {
                 this.resultIndex = kept + 1;
-            } else if (this.resultIndex > matches.length) {
-                this.resultIndex = matches.length;
+            } else {
+                // 同一块在当前命中之前插入/删除文字时，偏移会整体移动。
+                // 仅在同一单元中同样文字唯一时才重锚；重复词不猜测，仍保留旧序号，
+                // 避免把用户从第一个 “foo” 跳到另一个 “foo”。
+                const sameText = matches.filter((match) => {
+                    return match.blockId === previous.blockId &&
+                        match.unitId === previous.unitId &&
+                        match.matchedText === previous.matchedText;
+                });
+                if (sameText.length === 1) {
+                    this.resultIndex = matches.indexOf(sameText[0]) + 1;
+                } else if (this.resultIndex > matches.length) {
+                    this.resultIndex = matches.length;
+                }
             }
         } else if (this.resultIndex > matches.length) {
             this.resultIndex = matches.length;
@@ -1760,11 +2303,16 @@ export class SearchBar {
         return matches;
     }
 
-    private runSearchPipeline(value: string): Promise<SearchPipelineResult> {
+    private runSearchPipeline(value: string, signal: AbortSignal): Promise<SearchPipelineResult> {
         return calculateSearchMatches(this.plugin, this.edit, value, {
             caseSensitive: this.caseSensitive,
             wholeWord: this.wholeWord,
             regex: this.regex,
+            regexUnicode: this.regexUnicode,
+            regexMultiline: this.regexMultiline,
+            regexDotAll: this.regexDotAll,
+            regexMatcher: this.regexMatcher,
+            signal,
             selectionOnly: this.selectionOnly,
             selectionScope: this.resolveScopeForSearch(),
             includeDocTitle: this.includeDocTitle,
@@ -1790,6 +2338,7 @@ export class SearchBar {
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
+            includeFlowchart: this.includeFlowchart,
             includeHtmlBlock: this.includeHtmlBlock,
             includeFoldedBlocks: this.includeFoldedBlocks,
             includeInlineMemo: this.includeInlineMemo,
@@ -1797,26 +2346,33 @@ export class SearchBar {
         });
     }
 
-    private noteSearchCoverage(degraded?: boolean, partial?: boolean, unrendered?: number) {
+    private noteSearchCoverage(degraded?: boolean, partial?: boolean, unrendered?: number, truncated?: number) {
         if (degraded && !this.degradedNotified) {
             this.degradedNotified = true;
             showMessage(
-                this.i18n.searchDegradedLoadedOnly
-                    ?? "当前环境不能读取未加载内容，结果只包含已加载区域",
+                this.i18n.searchDegradedLoadedOnly ??
+                    "当前环境不能读取未加载内容，结果只包含已加载区域",
                 5000,
                 "info",
             );
         }
-        const indexing = Boolean(partial);
-        this.countEl.classList.toggle("is-indexing", indexing);
-        this.indexStatusEl.textContent = indexing
-            ? (this.i18n.searchIndexingBadge ?? "索引中")
-            : "";
-        if (unrendered && unrendered > 0 && !this.unrenderedNotified) {
+        this.backgroundIndexing = partial === true;
+        this.syncIndexingIndicator();
+        const failedCount = Math.max(0, (unrendered ?? 0) - (truncated ?? 0));
+        if (failedCount > 0 && !this.unrenderedNotified) {
             this.unrenderedNotified = true;
             showMessage(
-                (this.i18n.searchUnrendered ?? "有 {count} 个块渲染失败，未计入")
-                    .replace("{count}", String(unrendered)),
+                (this.i18n.searchUnrendered ?? "有 {count} 个块未完成解析，未计入")
+                    .replace("{count}", String(failedCount)),
+                5000,
+                "info",
+            );
+        }
+        if (truncated && truncated > 0 && !this.truncatedNotified) {
+            this.truncatedNotified = true;
+            showMessage(
+                (this.i18n.searchTruncated ?? "有 {count} 个数据库达到分页上限，结果未完整计入")
+                    .replace("{count}", String(truncated)),
                 5000,
                 "info",
             );
@@ -1825,7 +2381,7 @@ export class SearchBar {
 
     /** 后台索引结束时合并成一次刷新，避免补图期间反复全量搜索。 */
     private scheduleIndexRefresh(rootId: string) {
-        if (!this.searchText.trim() || editorRootId(this.edit) !== rootId) {
+        if (!effectiveSearchQuery(this.searchText) || this.rememberCurrentRootId() !== rootId) {
             return;
         }
         if (this.indexSettledTimer != null) {
@@ -1837,14 +2393,18 @@ export class SearchBar {
         }, 80);
     }
 
-    async highlightHitResult(value: string, change: boolean) {
+    async highlightHitResult(value: string, change: boolean, retainDisplayedResults = false) {
         const epoch = this.domEpoch;
-        const matches = await this.calculateSearchResults(value, change);
-        const trimmed = value.trim();
+        const matches = await this.calculateSearchResults(value, change, retainDisplayedResults);
+        // 已被后续输入或页签切换作废的搜索不能清理/重画后来搜索的高亮。
+        if (matches !== this.resultMatches) {
+            return;
+        }
+        const keyword = effectiveSearchQuery(value);
 
         // 空查询且未限制：清空高亮（旧行为）。限制激活的空查询走下方枚举高亮。
         // 保持原有高亮归属。清空时改归属的话，别的窗口之后只更新计数、不再重画。
-        if (!trimmed && !shouldEnumerateRestrictInline(value, this.restrictInlineTypes)) {
+        if (!keyword && !shouldEnumerateRestrictInline(value, this.restrictInlineTypes)) {
             this.clearHighlight();
             return;
         }
@@ -1873,7 +2433,7 @@ export class SearchBar {
         if (textRanges.length) {
             const highlight = newHighlight(textRanges);
             if (highlight) {
-                (CSS as any).highlights.set("search-results", highlight);
+                (CSS as any).highlights.set(PAGE_SEARCH_RESULTS_HIGHLIGHT, highlight);
             } else {
                 console.warn("[page-search] CSS Custom Highlight API unavailable");
             }
@@ -1898,9 +2458,10 @@ export class SearchBar {
     private clearHighlight() {
         const highlights = (CSS as any).highlights;
         if (highlights) {
-            highlights.delete("search-results");
-            highlights.delete("search-focus");
-            // 旧版曾用独立 math/memo Highlight 名；清理以免残留底色
+            highlights.delete(PAGE_SEARCH_RESULTS_HIGHLIGHT);
+            highlights.delete(PAGE_SEARCH_FOCUS_HIGHLIGHT);
+            // 旧版曾用独立 math/memo Highlight 名；清理以免残留底色。
+            // 不删除 search-results / search-focus，那是 highlight-search 的键。
             highlights.delete("search-math-results");
             highlights.delete("search-math-focus");
             highlights.delete("search-memo-results");
@@ -1924,9 +2485,9 @@ export class SearchBar {
             return;
         }
         const focusMatch = this.getCurrentMatch();
-        const focusRange = focusMatch?.highlightKind === "inline-memo"
-            ? (focusMatch.range ?? null)
-            : null;
+        const focusRange = focusMatch?.highlightKind === "inline-memo" ?
+            (focusMatch.range ?? null) :
+            null;
         try {
             applyMemoUnderlineVisual(this.edit, memoRanges, focusRange);
         } catch (error) {
@@ -1958,9 +2519,9 @@ export class SearchBar {
                     }
                 }
                 const focusMatch = this.getCurrentMatch();
-                const focusRange = focusMatch?.highlightKind === "inline-memo"
-                    ? (focusMatch.range ?? null)
-                    : null;
+                const focusRange = focusMatch?.highlightKind === "inline-memo" ?
+                    (focusMatch.range ?? null) :
+                    null;
                 try {
                     applyMemoUnderlineVisual(this.edit, memoRanges, focusRange);
                 } catch (error) {
@@ -1975,11 +2536,11 @@ export class SearchBar {
         visualViewport?.addEventListener("resize", scheduleRedraw);
         visualViewport?.addEventListener("scroll", scheduleRedraw);
 
-        const resizeObserver = typeof ResizeObserver === "function"
-            ? new ResizeObserver(() => {
+        const resizeObserver = typeof ResizeObserver === "function" ?
+            new ResizeObserver(() => {
                 scheduleRedraw();
-            })
-            : null;
+            }) :
+            null;
         this.edit.querySelectorAll<HTMLElement>(
             ".protyle-content, .protyle-wysiwyg, .protyle-preview",
         ).forEach((el) => {
@@ -2007,14 +2568,18 @@ export class SearchBar {
     private onEventBus(event: CustomEvent) {
         // 数据库事务：列改名 / 切视图 / 单元格等 → avRender 重建 DOM，需重搜
         if (
-            isAttrViewWsTransaction(event.detail)
-            && isAttrViewRelevantToEdit(this.edit, event.detail)
+            isAttrViewWsTransaction(event.detail) &&
+            isAttrViewRelevantToEdit(this.edit, event.detail)
         ) {
             this.scheduleAttrViewResearch();
             return;
         }
 
         if (["savedoc", "rename"].includes(event.detail?.cmd)) {
+            const rootId = this.rememberCurrentRootId();
+            if (rootId) {
+                invalidateDocumentStructureCaches(rootId);
+            }
             clearTimeout(this.typingTimer);
             this.typingTimer = window.setTimeout(() => {
                 this.typingTimer = undefined;
@@ -2048,17 +2613,23 @@ export class SearchBar {
                 return;
             }
 
+            if (event.type === "switch-protyle") {
+                // 事件和可见 Protyle 的更新并不同步。不能直接使用事件携带的 rootID：
+                // 连续切换时，旧页签的延迟事件会把当前的 0 临时状态保存回另一篇文档。
+                // 这里只作废在途结果；防抖结束后 calculateSearchResults 会从可见编辑器读取
+                // 已稳定的 rootID，再提交真正的文档切换。
+                this.searchGeneration += 1;
+                this.searchAbortController?.abort();
+                this.searchAbortController = null;
+                this.tableRevealSerial += 1;
+                this.settleDocumentSwitch();
+            }
+
             clearTimeout(this.typingTimer);
             this.typingTimer = window.setTimeout(() => {
                 this.typingTimer = undefined;
-                const preserveIndex = event.type === "loaded-protyle-dynamic"
-                    || this.locatePending
-                    || Date.now() < this.indexResetPausedUntil;
-                if (!preserveIndex) {
-                    this.resultIndex = 0;
-                    this.updateCountLabel();
-                }
-                // 文档重载后 DOM 几何变化，按冻结 scope 重画选区提示
+                // 文档重载后 DOM 几何变化，按冻结 scope 重画选区提示。
+                // 不在重搜前把序号清成 0：calculateSearchResults 要靠当前项的块和偏移对回原命中。
                 if (this.selectionOnly) {
                     this.syncSelectionScopeVisual();
                 }
@@ -2083,7 +2654,7 @@ export class SearchBar {
         if (!this.includeAttributeView) {
             return;
         }
-        if (!this.searchText.trim()) {
+        if (!effectiveSearchQuery(this.searchText)) {
             return;
         }
         if (Date.now() < this.avWatchPausedUntil) {
@@ -2094,18 +2665,12 @@ export class SearchBar {
             if (Date.now() < this.avWatchPausedUntil) {
                 return;
             }
-            const keepIndex = this.resultIndex;
             if (this.plugin.isLastHighlightComponent(this.root)) {
                 void this.highlightHitResult(this.searchText, false).then(() => {
-                    if (this.resultCount === 0) {
+                    if (this.resultCount === 0 || this.resultIndex < 1) {
                         return;
                     }
-                    // 尽量停留在原序号；越界则夹到末项
-                    this.resultIndex = Math.min(
-                        Math.max(keepIndex, 1),
-                        this.resultCount,
-                    );
-                    this.updateCountLabel();
+                    // 重搜已按块和偏移对回原命中，这里只补橙色，不再改序号。
                     this.scrollIntoRanges(this.resultIndex - 1, false);
                 });
             } else {
@@ -2213,7 +2778,7 @@ export class SearchBar {
     private locateLogicalTableRow(
         table: HTMLElement,
         logicalRow: number,
-    ): {row: HTMLElement; placeholder: boolean} | null {
+    ): {row: HTMLElement; placeholder: boolean;} | null {
         if (!table.isConnected) {
             return null;
         }
@@ -2259,9 +2824,9 @@ export class SearchBar {
 
     /** 只补这一条，并且偏移处的文字必须还是命中文字。对不上就保持没有 Range。 */
     private bindShownTableMatch(index: number, match: SearchMatch, table: HTMLElement): boolean {
-        const host = table.isConnected
-            ? table
-            : this.edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(match.blockId)}"]`);
+        const host = table.isConnected ?
+            table :
+            this.edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(match.blockId)}"]`);
         if (!host?.isConnected) {
             return false;
         }
@@ -2308,16 +2873,16 @@ export class SearchBar {
             });
             return;
         }
-        const shown = existing
-            && existing.clientHeight > 0
-            && !isUnderNonHeadingCssFold(existing);
+        const shown = existing &&
+            existing.clientHeight > 0 &&
+            !isUnderNonHeadingCssFold(existing);
         if (shown && !match.range && this.tryBindUnfoldedMatch(index + 1)) {
             void this.scrollIntoRangesAsync(index, scroll, false, false, false).then(() => {
                 window.requestAnimationFrame(() => this.applyResultHighlights());
             });
             return;
         }
-        const renderedMindmap = existing?.closest<HTMLElement>("[data-mindmap-view-rendered=\"true\"]");
+        const renderedMindmap = existing?.closest<HTMLElement>('[data-mindmap-view-rendered="true"]');
         if (!shown && renderedMindmap) {
             renderedMindmap.querySelector<HTMLElement>(":scope > .mindmap-view")
                 ?.scrollIntoView({block: "center", inline: "nearest"});
@@ -2347,6 +2912,16 @@ export class SearchBar {
             const release = () => {
                 this.locatePending = false;
                 this.pauseIndexReset(800);
+                // 大量块同时插入时观察器会以 null 表示“整篇变动”。本次只需要补当前
+                // 跳转目标，避免一次点击结果触发整篇 Range 重建。
+                if (this.pendingAddedBlocks === null) {
+                    this.pendingAddedBlocks = new Set([match.blockId]);
+                } else {
+                    this.pendingAddedBlocks.add(match.blockId);
+                }
+                // 定位期间的渲染突变不能丢掉。目标块若在超时后才填入正文，
+                // 这里立即走既有的按块补 Range 流程；之后的突变仍由观察器处理。
+                this.repairHighlightRanges();
             };
             finish.then(release, release);
         }, this.edit);
@@ -2357,10 +2932,11 @@ export class SearchBar {
      * 先给当前命中补高亮并滚动；标题下其余命中下一帧再补，对不上才整篇重搜。
      */
     private async finishLocatedMatch(keepIndex: number, scroll: boolean) {
-        const index = this.resultIndex >= 1 && this.resultIndex <= this.resultMatches.length
-            ? this.resultIndex
-            : keepIndex;
-        if (index >= 1 && this.tryBindUnfoldedMatch(index)) {
+        const index = this.resultIndex >= 1 && this.resultIndex <= this.resultMatches.length ?
+            this.resultIndex :
+            keepIndex;
+        const target = index >= 1 ? this.resultMatches[index - 1] : undefined;
+        if (target && await this.waitForLocatedMatchRange(index, target.id)) {
             if (this.resultIndex < 1) {
                 this.resultIndex = Math.min(index, this.resultMatches.length);
                 this.updateCountLabel();
@@ -2396,6 +2972,40 @@ export class SearchBar {
         )?.scrollIntoView({block: "center", inline: "nearest"});
     }
 
+    /**
+     * openTab / unfold 的完成回调只表示目标块已可定位；思源随后仍可能异步写入块内文本。
+     * 等待期间只尝试当前命中，不重搜全文，也不会改动当前序号。
+     */
+    private async waitForLocatedMatchRange(index: number, matchId: string): Promise<boolean> {
+        const generation = this.searchGeneration;
+        const started = Date.now();
+        while (Date.now() - started < LOCATED_MATCH_BIND_TIMEOUT_MS) {
+            if (
+                generation !== this.searchGeneration ||
+                this.replaceBusy ||
+                !this.plugin.isLastHighlightComponent(this.root)
+            ) {
+                return false;
+            }
+            const current = this.resultMatches[index - 1];
+            if (!current || current.id !== matchId) {
+                return false;
+            }
+            if (this.tryBindUnfoldedMatch(index, true)) {
+                // 已有的结果 Highlight 是可变集合；只追加刚装载的这一条，避免在命中很多时
+                // 为首次跳转重建全部 Range。定位结束后的局部修复仍会补齐同一块的其它命中。
+                if (!this.appendResultHighlight(this.resultMatches[index - 1])) {
+                    this.applyResultHighlights();
+                }
+                return true;
+            }
+            await new Promise<void>((resolve) => {
+                window.requestAnimationFrame(() => resolve());
+            });
+        }
+        return false;
+    }
+
     /** 画布副本没有 data-node-id。按源块 id 把 Range 绑到当前可见节点上。 */
     private bindMindmapPreview(index: number): boolean {
         const match = this.resultMatches[index];
@@ -2410,8 +3020,11 @@ export class SearchBar {
         return Boolean(this.resultMatches[index]?.range);
     }
 
-    /** 当前这条已经在编辑器里时，只采集这一块并补上 Range，不重搜全文 */
-    private tryBindUnfoldedMatch(index: number): boolean {
+    /**
+     * 当前这条已经在编辑器里时，只采集这一块并补上 Range，不重搜全文。
+     * onlyCurrent 只用于未装载区域首次定位：先让目标命中尽快着色，随后由局部修复补齐同块其余命中。
+     */
+    private tryBindUnfoldedMatch(index: number, onlyCurrent = false): boolean {
         const match = this.resultMatches[index - 1];
         if (!match || match.blockId === "__doc-title__") {
             return false;
@@ -2430,7 +3043,14 @@ export class SearchBar {
             includeDocTitle: false,
             scopeRoots: [owner],
         });
-        this.resultMatches = fillLiveRanges(this.resultMatches, live, this.includeFoldedBlocks);
+        if (onlyCurrent) {
+            const rebound = fillLiveRanges([match], live, this.includeFoldedBlocks)[0];
+            if (rebound !== match) {
+                this.resultMatches[index - 1] = rebound;
+            }
+        } else {
+            this.resultMatches = fillLiveRanges(this.resultMatches, live, this.includeFoldedBlocks);
+        }
         let current = this.resultMatches[index - 1];
         if (!current?.range && this.bindMindmapPreview(index - 1)) {
             current = this.resultMatches[index - 1];
@@ -2494,7 +3114,9 @@ export class SearchBar {
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
             includeMermaid: this.includeMermaid,
+            includeFlowchart: this.includeFlowchart,
             includeHtmlBlock: this.includeHtmlBlock,
+            includeFoldedBlocks: this.includeFoldedBlocks,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
         };
@@ -2503,7 +3125,7 @@ export class SearchBar {
     /** 用当前命中上的 Range 重画高亮，不清除还没补上的命中 */
     private applyResultHighlights() {
         const HighlightCtor = (window as any).Highlight as {
-            new (...ranges: Range[]): Highlight;
+            new(...ranges: Range[]): Highlight;
         };
         if (typeof HighlightCtor !== "function" || !(CSS as any).highlights) {
             this.syncMemoUnderlineVisual();
@@ -2533,9 +3155,9 @@ export class SearchBar {
                 this.syncMemoUnderlineVisual();
                 return;
             }
-            (CSS as any).highlights.set("search-results", highlight);
+            (CSS as any).highlights.set(PAGE_SEARCH_RESULTS_HIGHLIGHT, highlight);
         } else {
-            (CSS as any).highlights.delete("search-results");
+            (CSS as any).highlights.delete(PAGE_SEARCH_RESULTS_HIGHLIGHT);
         }
         const current = this.getCurrentMatch();
         if (current?.range && current.highlightKind !== "inline-memo") {
@@ -2545,6 +3167,31 @@ export class SearchBar {
         }
         this.syncMemoUnderlineVisual();
         this.plugin.updateLastHighlightComponent(this.root);
+    }
+
+    /**
+     * CSS Highlight 是 Set-like 对象。目标块刚挂载时直接 add 新 Range，避免遍历全部命中并重建集合。
+     * 不支持可变 Highlight 的运行时回退到 applyResultHighlights，保持旧兼容路径。
+     */
+    private appendResultHighlight(match: SearchMatch): boolean {
+        if (!match.range || match.highlightKind === "inline-memo") {
+            return false;
+        }
+        const highlights = (CSS as any).highlights;
+        const resultHighlight = highlights?.get?.(PAGE_SEARCH_RESULTS_HIGHLIGHT);
+        if (!resultHighlight || typeof resultHighlight.add !== "function") {
+            return false;
+        }
+        try {
+            resultHighlight.add(match.range);
+            const mirror = mirrorTabsTitleRange(match.range);
+            if (mirror) {
+                resultHighlight.add(mirror);
+            }
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     private noteAddedBlocks(change: EditorDomChange) {
@@ -2583,7 +3230,12 @@ export class SearchBar {
      * 没有 Range 的命中，只在所在块插入了节点时核对：大表虚拟滚动挂出新行、嵌入块渲染完成等。
      */
     private repairHighlightRanges() {
-        if (this.replaceBusy || this.locatePending || !this.plugin.isLastHighlightComponent(this.root)) {
+        // 定位时思源会在块壳出现后继续异步插入正文。保留这些块 id，等定位结束后
+        // 立刻重用本函数补 Range；清空会导致首次跳转只能等下一次导航才有高亮。
+        if (this.locatePending) {
+            return;
+        }
+        if (this.replaceBusy || !this.plugin.isLastHighlightComponent(this.root)) {
             this.pendingAddedBlocks = new Set();
             this.embedRefreshPending = false;
             return;
@@ -2659,13 +3311,13 @@ export class SearchBar {
                     shown.add(id);
                 });
             }
-            live = roots.length
-                ? collectSearchableBlocks(this.edit, {
+            live = roots.length ?
+                collectSearchableBlocks(this.edit, {
                     ...this.searchCollectOptions(),
                     includeDocTitle: false,
                     scopeRoots: roots,
-                })
-                : [];
+                }) :
+                [];
         }
         for (const [match, target] of targets) {
             target.blockShown = shown.has(match.blockId);
@@ -2693,7 +3345,7 @@ export class SearchBar {
         if (!embedRefresh) {
             return false;
         }
-        if (!this.searchText.trim() && !this.isRestrictEnumerateMode()) {
+        if (!effectiveSearchQuery(this.searchText) && !this.isRestrictEnumerateMode()) {
             return false;
         }
         if (this.typingTimer != null) {
@@ -2735,6 +3387,32 @@ export class SearchBar {
         }, DONE_TYPING_MS);
     }
 
+    /**
+     * 非标题折叠只改 DOM 属性，标题折叠还会异步装卸后代；二者都可能不触发 savedoc。
+     * 关闭折叠内容时立即重算，但保留当前计数直到新结果提交，避免短暂显示 0/0。
+     */
+    private scheduleFoldRefresh() {
+        if (
+            this.includeFoldedBlocks ||
+            (!effectiveSearchQuery(this.searchText) && !this.isRestrictEnumerateMode())
+        ) {
+            return;
+        }
+        window.clearTimeout(this.foldRefreshTimer);
+        this.foldRefreshTimer = window.setTimeout(() => {
+            if (this.replaceBusy || this.locatePending || !this.plugin.isLastHighlightComponent(this.root)) {
+                return;
+            }
+            this.searchCoverageIncomplete = true;
+            this.syncReplaceButtons();
+            void this.highlightHitResult(this.searchText, false).then(() => {
+                if (this.resultIndex >= 1) {
+                    this.scrollIntoRanges(this.resultIndex - 1, false);
+                }
+            });
+        }, 0);
+    }
+
     private scrollIntoRanges(index: number, scroll: boolean = true, pulseMemoFocus = false) {
         void this.scrollIntoRangesAsync(index, scroll, pulseMemoFocus);
     }
@@ -2745,7 +3423,7 @@ export class SearchBar {
      */
     private rangeStillInMatchBlock(range: Range, match: SearchMatch): boolean {
         const blockId = match.blockId;
-        let node: Node | null = null;
+        let node: Node;
         try {
             node = range.startContainer;
             if (!node?.isConnected) {
@@ -2761,9 +3439,9 @@ export class SearchBar {
             return false;
         }
         const selector = `[data-node-id="${CSS.escape(blockId)}"]`;
-        let element: Element | null = node.nodeType === Node.ELEMENT_NODE
-            ? node as Element
-            : node.parentElement;
+        let element: Element | null = node.nodeType === Node.ELEMENT_NODE ?
+            node as Element :
+            node.parentElement;
         while (element) {
             if (element.getAttribute("data-mindmap-source-id") === blockId || element.matches(selector)) {
                 return true;
@@ -2802,7 +3480,7 @@ export class SearchBar {
     /** 当前命中立刻标成橙色。标题展开路径在滚动之前调用。 */
     private applyFocusHighlight(range: Range) {
         const HighlightCtor = (window as any).Highlight as {
-            new (...ranges: Range[]): Highlight;
+            new(...ranges: Range[]): Highlight;
         };
         if (typeof HighlightCtor !== "function" || !(CSS as any).highlights) {
             return;
@@ -2817,19 +3495,19 @@ export class SearchBar {
             return;
         }
         const highlights = (CSS as any).highlights;
-        highlights.delete("search-focus");
+        highlights.delete(PAGE_SEARCH_FOCUS_HIGHLIGHT);
         highlights.delete("search-math-focus");
-        highlights.set("search-focus", highlight);
+        highlights.set(PAGE_SEARCH_FOCUS_HIGHLIGHT, highlight);
         this.plugin.updateLastHighlightComponent(this.root);
     }
 
-    /** 当前项是备注虚线时，去掉正文上的橙色，让它回到 search-results 的黄色。 */
+    /** 当前项是备注虚线时，去掉正文上的橙色，让它回到页内查找的黄色。 */
     private clearSearchFocus() {
         const highlights = (CSS as any).highlights;
         if (!highlights) {
             return;
         }
-        highlights.delete("search-focus");
+        highlights.delete(PAGE_SEARCH_FOCUS_HIGHLIGHT);
         highlights.delete("search-math-focus");
     }
 
@@ -2862,10 +3540,10 @@ export class SearchBar {
             // 块还在画面上，只是块内 DOM 被重建，格内文字也可能改过，旧偏移不能再用来补 Range。
             // 大表只是把这一行收进占位行，文字没变。直接挂出分段，不整篇重搜。
             if (
-                scroll
-                && refreshStale
-                && this.matchBlockShown(match)
-                && !this.tableMatchRowVirtualizedAway(match)
+                scroll &&
+                refreshStale &&
+                this.matchBlockShown(match) &&
+                !this.tableMatchRowVirtualizedAway(match)
             ) {
                 await this.refreshStaleMatch(pulseMemoFocus);
                 return;
@@ -2885,15 +3563,15 @@ export class SearchBar {
         let backgroundFoldIds: string[] = [];
         if (scroll && this.includeFoldedBlocks) {
             const ancestor = range.commonAncestorContainer;
-            const fromNode = ancestor.nodeType === Node.TEXT_NODE
-                ? ancestor.parentElement
-                : ancestor as Element | null;
+            const fromNode = ancestor.nodeType === Node.TEXT_NODE ?
+                ancestor.parentElement :
+                ancestor as Element | null;
             const foldIds = collectNonHeadingFoldedAncestorIds(fromNode);
             if (foldIds.length && immediate) {
                 clearNonHeadingFoldLocally(foldIds);
-                const host = range.startContainer.nodeType === Node.ELEMENT_NODE
-                    ? range.startContainer as HTMLElement
-                    : range.startContainer.parentElement;
+                const host = range.startContainer.nodeType === Node.ELEMENT_NODE ?
+                    range.startContainer as HTMLElement :
+                    range.startContainer.parentElement;
                 if (host) {
                     void host.offsetHeight;
                 }
@@ -2907,9 +3585,9 @@ export class SearchBar {
 
         if (scroll) {
             const commonAncestor = range.commonAncestorContainer;
-            const ancestorElement = commonAncestor.nodeType === Node.TEXT_NODE
-                ? commonAncestor.parentElement
-                : commonAncestor as Element;
+            const ancestorElement = commonAncestor.nodeType === Node.TEXT_NODE ?
+                commonAncestor.parentElement :
+                commonAncestor as Element;
 
             if (ancestorElement?.closest(".mindmap-view")) {
                 panMindmapIntoView(range);
@@ -2940,9 +3618,9 @@ export class SearchBar {
         this.syncMemoUnderlineVisual();
         // 异步展开折叠后索引可能已变；仅当仍停在本次目标命中时才脉冲
         if (
-            pulseMemoFocus
-            && match.highlightKind === "inline-memo"
-            && this.getCurrentMatch()?.id === match.id
+            pulseMemoFocus &&
+            match.highlightKind === "inline-memo" &&
+            this.getCurrentMatch()?.id === match.id
         ) {
             pulseMemoFocusUnderline(this.edit);
         }
@@ -3067,8 +3745,8 @@ export class SearchBar {
         }
 
         const wysiwyg = this.edit.querySelector<HTMLElement>(
-            ':scope > .protyle:not(.fn__none) .protyle-wysiwyg[contenteditable="true"], '
-            + '.protyle:not(.fn__none) .protyle-wysiwyg[contenteditable="true"]',
+            ':scope > .protyle:not(.fn__none) .protyle-wysiwyg[contenteditable="true"], ' +
+                '.protyle:not(.fn__none) .protyle-wysiwyg[contenteditable="true"]',
         ) ?? this.edit.querySelector<HTMLElement>('[contenteditable="true"]');
         wysiwyg?.focus({preventScroll: true});
     }
@@ -3086,9 +3764,9 @@ export class SearchBar {
 
     private isRangeInEditor(range: Range): boolean {
         const node = range.commonAncestorContainer;
-        const el = node.nodeType === Node.ELEMENT_NODE
-            ? node as Element
-            : node.parentElement;
+        const el = node.nodeType === Node.ELEMENT_NODE ?
+            node as Element :
+            node.parentElement;
         if (!el || this.root.contains(el)) {
             return false;
         }
@@ -3101,9 +3779,9 @@ export class SearchBar {
             if (!node.isConnected) {
                 return false;
             }
-            const el = node.nodeType === Node.ELEMENT_NODE
-                ? node as Element
-                : node.parentElement;
+            const el = node.nodeType === Node.ELEMENT_NODE ?
+                node as Element :
+                node.parentElement;
             return Boolean(el && this.edit.contains(el) && !this.root.contains(el));
         } catch {
             return false;
@@ -3112,9 +3790,9 @@ export class SearchBar {
 
     private findFocusableNear(range: Range): HTMLElement | null {
         const node = range.startContainer;
-        const el = node.nodeType === Node.ELEMENT_NODE
-            ? node as Element
-            : node.parentElement;
+        const el = node.nodeType === Node.ELEMENT_NODE ?
+            node as Element :
+            node.parentElement;
         if (!el) {
             return null;
         }
@@ -3130,10 +3808,10 @@ export class SearchBar {
         if (match.blockType === ATTRIBUTE_VIEW_TYPE) {
             return this.i18n.replaceAttributeViewUnsupported;
         }
-        if (match.unitId === MERMAID_UNIT_ID) {
+        if (isRendererUnitFor(match.unitId, "mermaid") || match.unitId === "mermaid-source") {
             return this.i18n.replaceMermaidUnsupported;
         }
-        if (match.unitId === HTML_BLOCK_UNIT_ID) {
+        if (isRendererUnitFor(match.unitId, "html") || match.unitId === "html-block-rendered") {
             return this.i18n.replaceHtmlBlockUnsupported;
         }
         if (match.replaceLock === "table-rich") {
@@ -3150,6 +3828,10 @@ export class SearchBar {
      */
     private async clickReplace() {
         if (this.replaceBusy || this.resultCount === 0 || this.isRestrictEnumerateMode()) {
+            return;
+        }
+        if (this.searchCoverageIncomplete) {
+            showMessage(this.i18n.replaceAllIncomplete, 4000, "info");
             return;
         }
         if (isEditorReplaceModeBlocked(this.edit)) {
@@ -3207,6 +3889,10 @@ export class SearchBar {
                     regex: this.regex,
                     searchQuery: this.searchText,
                     caseSensitive: this.caseSensitive,
+                    regexUnicode: this.regexUnicode,
+                    regexMultiline: this.regexMultiline,
+                    regexDotAll: this.regexDotAll,
+                    regexMatcher: this.regexMatcher,
                 },
             );
             if (result.error === "readonly-or-preview") {
@@ -3232,9 +3918,9 @@ export class SearchBar {
                 return;
             }
             if (
-                result.error === "title-context-missing"
-                || result.error === "title-rename-failed"
-                || result.error === "title-missing"
+                result.error === "title-context-missing" ||
+                result.error === "title-rename-failed" ||
+                result.error === "title-missing"
             ) {
                 showMessage(this.formatDocTitleReplaceError(result.detail), 4000, "error");
                 return;
@@ -3268,6 +3954,7 @@ export class SearchBar {
             showMessage(this.i18n.replaceModeUnsupported, 3000, "info");
             return;
         }
+        const searchGeneration = this.searchGeneration;
         const confirmText = this.i18n.replaceAllConfirm.replace(
             "{count}",
             String(this.resultCount),
@@ -3277,6 +3964,19 @@ export class SearchBar {
             confirmText,
         );
         if (!confirmed) {
+            return;
+        }
+        if (
+            this.searchCoverageIncomplete ||
+            searchGeneration !== this.searchGeneration ||
+            this.resultCount === 0 ||
+            this.isRestrictEnumerateMode()
+        ) {
+            showMessage(this.i18n.replaceAllIncomplete, 4000, "info");
+            return;
+        }
+        if (isEditorReplaceModeBlocked(this.edit)) {
+            showMessage(this.i18n.replaceModeUnsupported, 3000, "info");
             return;
         }
 
@@ -3291,6 +3991,10 @@ export class SearchBar {
                     regex: this.regex,
                     searchQuery: this.searchText,
                     caseSensitive: this.caseSensitive,
+                    regexUnicode: this.regexUnicode,
+                    regexMultiline: this.regexMultiline,
+                    regexDotAll: this.regexDotAll,
+                    regexMatcher: this.regexMatcher,
                 },
             );
             if (result.error === "readonly-or-preview") {
@@ -3301,23 +4005,27 @@ export class SearchBar {
                 showMessage(this.i18n.replaceProtyleMissing, 4000, "error");
                 return;
             }
+            if (result.error === "regex-expand-failed") {
+                showMessage(this.i18n.replaceRegexExpandFailed, 3000, "info");
+                return;
+            }
             if (result.replacedCount === 0 && result.error === "table-pending-edit") {
                 showMessage(this.i18n.replaceTablePendingEdit, 4000, "info");
                 return;
             }
             if (
-                result.replacedCount === 0
-                && result.error === "title-invalid"
+                result.replacedCount === 0 &&
+                result.error === "title-invalid"
             ) {
                 showMessage(this.i18n.replaceDocTitleEmpty, 3000, "info");
                 return;
             }
             if (
-                result.replacedCount === 0
-                && (
-                    result.error === "title-rename-failed"
-                    || result.error === "title-missing"
-                    || result.error === "title-context-missing"
+                result.replacedCount === 0 &&
+                (
+                    result.error === "title-rename-failed" ||
+                    result.error === "title-missing" ||
+                    result.error === "title-context-missing"
                 )
             ) {
                 showMessage(this.formatDocTitleReplaceError(result.detail), 4000, "error");
@@ -3351,7 +4059,7 @@ export class SearchBar {
 
     /**
      * 思源原生 Menu + b3-switch：搜索范围设置（全局持久化）。
-     * 一级：是否搜索 ▸ / 折叠块内容 / 限制搜索 ▸
+     * 一级：是否搜索 ▸ / 限制搜索 ▸ / 折叠块内容
      * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/plugin/Menu.ts
      */
     private openSettingsMenu(anchor: HTMLElement) {
@@ -3470,15 +4178,7 @@ export class SearchBar {
                         void this.setIncludeMathBlock(checked);
                     },
                 }),
-                this.buildMatchSwitchMenuItem({
-                    id: "page-search-include-code-block",
-                    icon: "iconCode",
-                    label: this.i18n.settingsIncludeCodeBlock,
-                    checked: this.includeCodeBlock,
-                    onChange: (checked) => {
-                        void this.setIncludeCodeBlock(checked);
-                    },
-                }),
+                this.buildCodeBlockMenuItem(),
                 this.buildMatchSwitchMenuItem({
                     id: "page-search-include-table",
                     icon: "iconTable",
@@ -3561,18 +4261,19 @@ export class SearchBar {
                         void this.setIncludeHtmlBlock(checked);
                     },
                 }),
-                this.buildMatchSwitchMenuItem({
-                    id: "page-search-include-mermaid",
-                    icon: "iconCode",
-                    label: this.i18n.settingsIncludeMermaid,
-                    checked: this.includeMermaid,
-                    onChange: (checked) => {
-                        void this.setIncludeMermaid(checked);
-                    },
-                }),
             ],
             bind: (element) => {
                 this.attachMenuHelpTip(element, this.i18n.settingsIncludeScopeHint);
+            },
+        });
+        menu.addItem({
+            id: "page-search-restrict-inline",
+            icon: "iconList",
+            label: this.i18n.settingsRestrictInline,
+            type: "submenu",
+            submenu: this.buildRestrictInlineSubmenuItems(),
+            bind: (element) => {
+                this.attachMenuHelpTip(element, this.i18n.settingsRestrictInlineHint);
             },
         });
         menu.addItem(this.buildMatchSwitchMenuItem({
@@ -3585,16 +4286,6 @@ export class SearchBar {
                 void this.setIncludeFoldedBlocks(checked);
             },
         }));
-        menu.addItem({
-            id: "page-search-restrict-inline",
-            icon: "iconList",
-            label: this.i18n.settingsRestrictInline,
-            type: "submenu",
-            submenu: this.buildRestrictInlineSubmenuItems(),
-            bind: (element) => {
-                this.attachMenuHelpTip(element, this.i18n.settingsRestrictInlineHint);
-            },
-        });
         const rect = anchor.getBoundingClientRect();
         menu.open({
             x: rect.left,
@@ -3644,6 +4335,46 @@ export class SearchBar {
                 void this.setSearchMethod(true);
             },
         });
+        menu.addSeparator();
+        menu.addItem({
+            id: "page-search-method-regex-options",
+            type: "submenu",
+            label: this.i18n.regexOptions,
+            disabled: !this.regex,
+            submenu: [
+                {
+                    id: "page-search-regex-unicode",
+                    label: this.i18n.regexUnicode,
+                    checked: this.regexUnicode,
+                    click: () => {
+                        void this.setRegexOption("regexUnicode", !this.regexUnicode);
+                    },
+                },
+                {
+                    id: "page-search-regex-multiline",
+                    label: this.i18n.regexMultiline,
+                    checked: this.regexMultiline,
+                    click: () => {
+                        void this.setRegexOption("regexMultiline", !this.regexMultiline);
+                    },
+                },
+                {
+                    id: "page-search-regex-dotall",
+                    label: this.i18n.regexDotAll,
+                    checked: this.regexDotAll,
+                    click: () => {
+                        void this.setRegexOption("regexDotAll", !this.regexDotAll);
+                    },
+                },
+                {
+                    type: "separator",
+                },
+                {
+                    type: "readonly",
+                    label: this.i18n.regexBoundaryHint,
+                },
+            ],
+        });
         const rect = anchor.getBoundingClientRect();
         menu.open({
             x: rect.left,
@@ -3686,6 +4417,26 @@ export class SearchBar {
         this.syncOptionButtons();
         await rpcSetPrefs(this.plugin, {useRegex});
         this.plugin.syncUseRegex?.(useRegex, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private regexOptions(): RegexOptions {
+        return {
+            regexUnicode: this.regexUnicode,
+            regexMultiline: this.regexMultiline,
+            regexDotAll: this.regexDotAll,
+        };
+    }
+
+    /** 切换一个 flags；即使菜单已关闭，也先写入当前值再启动新搜索。 */
+    private async setRegexOption(key: keyof RegexOptions, value: boolean) {
+        if (this[key] === value) {
+            return;
+        }
+        this[key] = value;
+        const options = this.regexOptions();
+        await rpcSetPrefs(this.plugin, options);
+        this.plugin.syncRegexOptions?.(options, this);
         void this.highlightHitResult(this.searchText, true);
     }
 
@@ -3775,9 +4526,9 @@ export class SearchBar {
 
     private attachMenuHelpTip(element: HTMLElement, helpTip: string) {
         const labelEl = element.querySelector(".b3-menu__label");
-        const helpHtml = `<svg class="b3-menu__icon page-search-menu-help ariaLabel" data-position="north"`
-            + ` aria-label="${escapeAttr(helpTip)}">`
-            + `<use xlink:href="#iconHelp"></use></svg>`;
+        const helpHtml = '<svg class="b3-menu__icon page-search-menu-help ariaLabel" data-position="north"' +
+            ` aria-label="${escapeAttr(helpTip)}">` +
+            '<use xlink:href="#iconHelp"></use></svg>';
         if (labelEl) {
             labelEl.insertAdjacentHTML("afterend", helpHtml);
         } else {
@@ -3787,6 +4538,64 @@ export class SearchBar {
             event.preventDefault();
             event.stopPropagation();
         });
+    }
+
+    /** 代码块只是分组。普通代码块、Mermaid、flowchart 各自开关。 */
+    private buildCodeBlockMenuItem(): IMenu {
+        return {
+            id: "page-search-include-code-block",
+            icon: "iconCode",
+            label: this.i18n.settingsIncludeCodeBlock,
+            type: "submenu",
+            submenu: [
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-plain-code-block",
+                    icon: "iconCode",
+                    label: this.i18n.settingsIncludePlainCodeBlock,
+                    checked: this.includeCodeBlock,
+                    onChange: (checked) => {
+                        void this.setIncludeCodeBlock(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-mermaid",
+                    icon: "iconCode",
+                    label: this.i18n.settingsIncludeMermaid,
+                    checked: this.includeMermaid,
+                    onChange: (checked) => {
+                        void this.setIncludeMermaid(checked);
+                    },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-flowchart",
+                    icon: "iconGraph",
+                    label: this.i18n.settingsIncludeFlowchart,
+                    checked: this.includeFlowchart,
+                    onChange: (checked) => {
+                        void this.setIncludeFlowchart(checked);
+                    },
+                }),
+            ],
+        };
+    }
+
+    private syncCodeFamilyMenu() {
+        if (!this.getOpenSettingsMenuElement()) {
+            return;
+        }
+        this.setOpenMenuSwitch("page-search-include-plain-code-block", this.includeCodeBlock);
+        this.setOpenMenuSwitch("page-search-include-mermaid", this.includeMermaid);
+        this.setOpenMenuSwitch("page-search-include-flowchart", this.includeFlowchart);
+    }
+
+    private setOpenMenuSwitch(id: string, checked: boolean) {
+        const input = document.querySelector<HTMLInputElement>(
+            `[data-id="${id}"] .b3-switch`,
+        );
+        if (!input || input.disabled) {
+            return;
+        }
+        input.checked = checked;
     }
 
     private buildMatchSwitchMenuItem(options: {
@@ -3812,10 +4621,10 @@ export class SearchBar {
                 }
                 element.insertAdjacentHTML(
                     "beforeend",
-                    `<span class="fn__flex-1"></span>`
-                    + `<input class="b3-switch fn__flex-center" type="checkbox"`
-                    + `${checked ? " checked" : ""}`
-                    + `${disabled ? " disabled" : ""}>`,
+                    '<span class="fn__flex-1"></span>' +
+                        '<input class="b3-switch fn__flex-center" type="checkbox"' +
+                        `${checked ? " checked" : ""}` +
+                        `${disabled ? " disabled" : ""}>`,
                 );
                 const input = element.querySelector(".b3-switch") as HTMLInputElement | null;
                 if (!input) {
@@ -4067,6 +4876,7 @@ export class SearchBar {
         this.includeCodeBlock = value;
         await rpcSetPrefs(this.plugin, {includeCodeBlock: value});
         this.plugin.syncIncludeCodeBlock?.(value, this);
+        this.syncCodeFamilyMenu();
         void this.highlightHitResult(this.searchText, true);
     }
 
@@ -4077,6 +4887,18 @@ export class SearchBar {
         this.includeMermaid = value;
         await rpcSetPrefs(this.plugin, {includeMermaid: value});
         this.plugin.syncIncludeMermaid?.(value, this);
+        this.syncCodeFamilyMenu();
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeFlowchart(value: boolean) {
+        if (this.includeFlowchart === value) {
+            return;
+        }
+        this.includeFlowchart = value;
+        await rpcSetPrefs(this.plugin, {includeFlowchart: value});
+        this.plugin.syncIncludeFlowchart?.(value, this);
+        this.syncCodeFamilyMenu();
         void this.highlightHitResult(this.searchText, true);
     }
 
@@ -4095,9 +4917,13 @@ export class SearchBar {
             return;
         }
         this.includeFoldedBlocks = value;
+        // calculateSearchResults 无论 change 值都会中止在途请求。这里保留已有计数，
+        // 仅暂时禁止替换，避免切换范围时先显示 0/0 再等待完整语料重算。
+        this.searchCoverageIncomplete = true;
+        this.syncReplaceButtons();
+        void this.highlightHitResult(this.searchText, false);
         await rpcSetPrefs(this.plugin, {includeFoldedBlocks: value});
         this.plugin.syncIncludeFoldedBlocks?.(value, this);
-        void this.highlightHitResult(this.searchText, true);
     }
 
     private async setIncludeInlineMemo(value: boolean) {
@@ -4125,15 +4951,15 @@ export class SearchBar {
             {includeInlineMemo: this.includeInlineMemo},
         );
         if (
-            next.length === this.restrictInlineTypes.length
-            && next.every((token, i) => token === this.restrictInlineTypes[i])
+            next.length === this.restrictInlineTypes.length &&
+            next.every((token, i) => token === this.restrictInlineTypes[i])
         ) {
             return;
         }
         this.restrictInlineTypes = next;
         // 限制查找仅会话内生效，不写入 prefs
         this.plugin.syncRestrictInlineTypes?.(next, this);
-        void this.highlightHitResult(this.searchText, true);
+        void this.highlightHitResult(this.searchText, true, type === INLINE_MEMO_TYPE);
     }
 
     /**
@@ -4285,6 +5111,14 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    applyIncludeFlowchart(value: boolean) {
+        if (this.includeFlowchart === value) {
+            return;
+        }
+        this.includeFlowchart = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     applyIncludeHtmlBlock(value: boolean) {
         if (this.includeHtmlBlock === value) {
             return;
@@ -4298,7 +5132,9 @@ export class SearchBar {
             return;
         }
         this.includeFoldedBlocks = value;
-        void this.highlightHitResult(this.searchText, true);
+        this.searchCoverageIncomplete = true;
+        this.syncReplaceButtons();
+        void this.highlightHitResult(this.searchText, false);
     }
 
     applyIncludeInlineMemo(value: boolean) {
@@ -4318,8 +5154,8 @@ export class SearchBar {
             includeInlineMemo: this.includeInlineMemo,
         });
         if (
-            next.length === this.restrictInlineTypes.length
-            && next.every((token, i) => token === this.restrictInlineTypes[i])
+            next.length === this.restrictInlineTypes.length &&
+            next.every((token, i) => token === this.restrictInlineTypes[i])
         ) {
             return;
         }
@@ -4337,6 +5173,27 @@ export class SearchBar {
         this.regex = value;
         this.closeSearchMethodMenu();
         this.syncOptionButtons();
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    /** 其它面板同步过来的正则 flags（不再写存储）。 */
+    applyRegexOptions(value: RegexOptions) {
+        const next = {
+            regexUnicode: value.regexUnicode === true,
+            regexMultiline: value.regexMultiline === true,
+            regexDotAll: value.regexDotAll === true,
+        };
+        if (
+            this.regexUnicode === next.regexUnicode &&
+            this.regexMultiline === next.regexMultiline &&
+            this.regexDotAll === next.regexDotAll
+        ) {
+            return;
+        }
+        this.regexUnicode = next.regexUnicode;
+        this.regexMultiline = next.regexMultiline;
+        this.regexDotAll = next.regexDotAll;
+        this.closeSearchMethodMenu();
         void this.highlightHitResult(this.searchText, true);
     }
 }
@@ -4367,7 +5224,7 @@ function isMenuItemDisabled(element: HTMLElement): boolean {
 
 /** 展开/折叠替换行：chevron */
 function replaceToggleIcon(): string {
-    return `<span class="search-chevron" aria-hidden="true"></span>`;
+    return '<span class="search-chevron" aria-hidden="true"></span>';
 }
 
 function selectionOnlyIcon(): string {
@@ -4451,8 +5308,8 @@ function shouldPulseMemoFocusOnNavigate(
     }
     if (prev.range && next.range) {
         try {
-            return prev.range.compareBoundaryPoints(Range.START_TO_START, next.range) === 0
-                && prev.range.compareBoundaryPoints(Range.END_TO_END, next.range) === 0;
+            return prev.range.compareBoundaryPoints(Range.START_TO_START, next.range) === 0 &&
+                prev.range.compareBoundaryPoints(Range.END_TO_END, next.range) === 0;
         } catch {
             return false;
         }
@@ -4468,10 +5325,10 @@ function findScrollContainers(element: Element): HTMLElement[] {
         const htmlElement = current as HTMLElement;
         const overflowY = window.getComputedStyle(htmlElement).overflowY;
         const overflowX = window.getComputedStyle(htmlElement).overflowX;
-        const canScrollY = (overflowY === "auto" || overflowY === "scroll")
-            && htmlElement.scrollHeight > htmlElement.clientHeight;
-        const canScrollX = (overflowX === "auto" || overflowX === "scroll")
-            && htmlElement.scrollWidth > htmlElement.clientWidth;
+        const canScrollY = (overflowY === "auto" || overflowY === "scroll") &&
+            htmlElement.scrollHeight > htmlElement.clientHeight;
+        const canScrollX = (overflowX === "auto" || overflowX === "scroll") &&
+            htmlElement.scrollWidth > htmlElement.clientWidth;
         if (canScrollY || canScrollX) {
             containers.push(htmlElement);
         }
@@ -4488,10 +5345,10 @@ function scrollContainerToRange(range: Range, container: HTMLElement) {
     const rangeCenterX = (rangeRect.left + rangeRect.right) / 2;
     const overflowY = containerStyle.overflowY;
     const overflowX = containerStyle.overflowX;
-    const canScrollY = (overflowY === "auto" || overflowY === "scroll")
-        && container.scrollHeight > container.clientHeight;
-    const canScrollX = (overflowX === "auto" || overflowX === "scroll")
-        && container.scrollWidth > container.clientWidth;
+    const canScrollY = (overflowY === "auto" || overflowY === "scroll") &&
+        container.scrollHeight > container.clientHeight;
+    const canScrollX = (overflowX === "auto" || overflowX === "scroll") &&
+        container.scrollWidth > container.clientWidth;
 
     if (canScrollY) {
         const rangeCenterY = (rangeRect.top + rangeRect.bottom) / 2;

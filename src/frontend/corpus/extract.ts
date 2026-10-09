@@ -1,9 +1,18 @@
-import {fetchSyncPost} from "siyuan";
 import {collectSearchableBlocks} from "../blocks";
-import type {SearchableBlock} from "../dom-types";
 import type {CollectSearchableBlocksOptions} from "../blocks";
-import {DIAGRAM_SUBTYPE_SET, createOffscreenHost, offscreenWysiwyg, renderOffscreenBlocks, type OffscreenRenderMode} from "./offscreen";
-import {freezeBlock, type CachedUnit} from "./units";
+import type {SearchableBlock} from "../dom-types";
+import {rendererAdapterKind} from "../renderer-adapters";
+import {postJson} from "./api";
+import {
+    createOffscreenHost,
+    offscreenWysiwyg,
+    renderOffscreenBlocks,
+    type OffscreenRenderMode,
+} from "./offscreen";
+import {
+    freezeBlock,
+    type CachedUnit,
+} from "./units";
 
 const DOM_BATCH_SIZE = 64;
 const DOM_BATCH_CONCURRENCY = 4;
@@ -20,62 +29,33 @@ async function fetchBlockDoms(
     ids: string[],
     notebookId: string,
     withEmbed: boolean,
+    shouldContinue: () => boolean,
+    signal?: AbortSignal,
 ): Promise<Record<string, string> | null> {
     const body: Record<string, unknown> = {ids};
     if (notebookId) {
         body.notebook = notebookId;
     }
-    const paths = withEmbed
-        ? ["/api/block/getBlockDOMsWithEmbed", "/api/block/getBlockDOMs"]
-        : ["/api/block/getBlockDOMs"];
+    const paths = withEmbed ?
+        ["/api/block/getBlockDOMsWithEmbed", "/api/block/getBlockDOMs"] :
+        ["/api/block/getBlockDOMs"];
     for (const path of paths) {
+        if (!shouldContinue()) {
+            return null;
+        }
         try {
-            const response = await fetchSyncPost(path, body);
-            if (response?.code === 0 && response.data && typeof response.data === "object") {
-                return response.data as Record<string, string>;
+            const response = await postJson<Record<string, string>>(path, body, signal);
+            if (!shouldContinue()) {
+                return null;
+            }
+            if (response && typeof response === "object") {
+                return response;
             }
         } catch {
             // 下一种接口
         }
     }
     return null;
-}
-
-function diagramTextUnit(element: HTMLElement, blockId: string, blockIndex: number): SearchableBlock | null {
-    const nodes: Text[] = [];
-    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
-        acceptNode(node) {
-            if (!(node instanceof Text) || !node.nodeValue?.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim()) {
-                return NodeFilter.FILTER_REJECT;
-            }
-            const parent = node.parentElement;
-            if (!parent || parent.closest(".protyle-attr, .protyle-icons, style, script")) {
-                return NodeFilter.FILTER_REJECT;
-            }
-            if (!parent.closest("svg, foreignObject")) {
-                return NodeFilter.FILTER_REJECT;
-            }
-            return NodeFilter.FILTER_ACCEPT;
-        },
-    });
-    let current = walker.nextNode();
-    while (current) {
-        nodes.push(current as Text);
-        current = walker.nextNode();
-    }
-    const text = nodes.map((node) => node.nodeValue ?? "").join("");
-    if (!text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim()) {
-        return null;
-    }
-    return {
-        blockId,
-        blockType: "NodeCodeBlock",
-        blockIndex,
-        element,
-        text,
-        textNodes: nodes,
-        unitId: "diagram-rendered",
-    };
 }
 
 function keepOwnedUnits(blocks: SearchableBlock[], ownerId: string, embed: boolean): SearchableBlock[] {
@@ -96,20 +76,15 @@ function keepOwnedUnits(blocks: SearchableBlock[], ownerId: string, embed: boole
     });
 }
 
-function rewriteSpecialUnits(blocks: SearchableBlock[], unrendered: Set<string>, ownerId: string): SearchableBlock[] {
-    const element = blocks.find((block) => block.blockId === ownerId)?.element
-        ?? document.querySelector<HTMLElement>(`[data-page-search-offscreen] [data-node-id="${CSS.escape(ownerId)}"]`);
-    const subtype = element?.getAttribute("data-subtype") ?? "";
-    const type = element?.getAttribute("data-type") ?? "";
-    if (DIAGRAM_SUBTYPE_SET.has(subtype) && subtype !== "mermaid") {
-        const rendered = element ? diagramTextUnit(element, ownerId, 0) : null;
-        if (!rendered) {
-            unrendered.add(ownerId);
-            return blocks.filter((block) => block.blockId !== ownerId);
-        }
-        return blocks.filter((block) => block.blockId !== ownerId).concat(rendered);
-    }
-    if (subtype === "mermaid" || type === "NodeHTMLBlock" || type === "NodeMathBlock") {
+function markUnrenderedSpecial(
+    blocks: SearchableBlock[],
+    unrendered: Set<string>,
+    ownerId: string,
+    root: ParentNode,
+): SearchableBlock[] {
+    const element = blocks.find((block) => block.blockId === ownerId)?.element ??
+        root.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(ownerId)}"]`);
+    if (element && rendererAdapterKind(element)) {
         const owned = blocks.filter((block) => block.blockId === ownerId);
         const meaningful = owned.some((block) => block.text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim());
         if (!meaningful) {
@@ -130,6 +105,8 @@ export async function extractUnitsFromDoms(
     options: CollectSearchableBlocksOptions,
     embedIds: ReadonlySet<string>,
     mode: OffscreenRenderMode = "light",
+    shouldContinue: () => boolean = () => true,
+    signal?: AbortSignal,
 ): Promise<ExtractedUnits> {
     const blocks: SearchableBlock[] = [];
     const unrenderedIds: string[] = [];
@@ -153,7 +130,10 @@ export async function extractUnitsFromDoms(
             }
         }
         if (mode !== "none") {
-            await renderOffscreenBlocks(wysiwyg, mode);
+            await renderOffscreenBlocks(wysiwyg, mode, shouldContinue);
+        }
+        if (!shouldContinue()) {
+            return {blocks, unrenderedIds, dispose: () => host.remove()};
         }
         const collected = collectSearchableBlocks(host, {
             ...options,
@@ -163,7 +143,7 @@ export async function extractUnitsFromDoms(
         const unrendered = new Set<string>();
         for (const id of ids) {
             const owned = keepOwnedUnits(collected, id, embedIds.has(id));
-            const rewritten = rewriteSpecialUnits(owned, unrendered, id);
+            const rewritten = markUnrenderedSpecial(owned, unrendered, id, wysiwyg);
             for (const block of rewritten) {
                 if (!block.text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim()) {
                     continue;
@@ -185,7 +165,9 @@ export async function fetchAndExtractUnits(
     options: CollectSearchableBlocksOptions,
     embedIds: ReadonlySet<string>,
     mode: OffscreenRenderMode = "light",
-): Promise<{units: CachedUnit[]; unrenderedIds: string[]} | null> {
+    shouldContinue: () => boolean = () => true,
+    signal?: AbortSignal,
+): Promise<{units: CachedUnit[]; unrenderedIds: string[];} | null> {
     const units: CachedUnit[] = [];
     const unrenderedIds: string[] = [];
     const embedList = ids.filter((id) => embedIds.has(id));
@@ -195,25 +177,63 @@ export async function fetchAndExtractUnits(
         const batchSize = mode === "diagram" ? 1 : DOM_BATCH_SIZE;
         const concurrency = mode === "diagram" ? 2 : DOM_BATCH_CONCURRENCY;
         for (let i = 0; i < list.length; i += batchSize * concurrency) {
+            if (!shouldContinue()) {
+                return false;
+            }
             const wave = list.slice(i, i + batchSize * concurrency);
             const batches: string[][] = [];
             for (let j = 0; j < wave.length; j += batchSize) {
                 batches.push(wave.slice(j, j + batchSize));
             }
             const results = await Promise.all(batches.map(async (batch) => {
-                const doms = await fetchBlockDoms(batch, notebookId, withEmbed);
-                if (!doms) {
+                if (!shouldContinue()) {
                     return null;
                 }
-                return extractUnitsFromDoms(batch, doms, options, embedIds, mode);
+                try {
+                    const doms = await fetchBlockDoms(batch, notebookId, withEmbed, shouldContinue, signal);
+                    if (!doms) {
+                        return null;
+                    }
+                    const extracted = await extractUnitsFromDoms(
+                        batch,
+                        doms,
+                        options,
+                        embedIds,
+                        mode,
+                        shouldContinue,
+                    );
+                    if (shouldContinue()) {
+                        return extracted;
+                    }
+                    // 取消可能恰好落在离屏提取完成之后。此时结果不会进入 wave 的
+                    // 统一释放分支，必须在这里归还宿主，避免遗留在 document.body。
+                    extracted.dispose();
+                    return null;
+                } catch {
+                    return null;
+                }
             }));
+            if (!shouldContinue()) {
+                for (const result of results) {
+                    result?.dispose();
+                }
+                return false;
+            }
+            let complete = true;
             for (const result of results) {
                 if (!result) {
-                    return false;
+                    complete = false;
+                    continue;
                 }
-                units.push(...result.blocks.map((block) => freezeBlock(block)));
-                unrenderedIds.push(...result.unrenderedIds);
-                result.dispose();
+                try {
+                    units.push(...result.blocks.map((block) => freezeBlock(block)));
+                    unrenderedIds.push(...result.unrenderedIds);
+                } finally {
+                    result.dispose();
+                }
+            }
+            if (!complete) {
+                return false;
             }
         }
         return true;

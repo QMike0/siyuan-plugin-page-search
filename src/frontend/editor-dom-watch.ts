@@ -8,7 +8,7 @@
  * - 代码高亮、公式渲染、块引用锚文本回填、嵌入块渲染、大表虚拟滚动，不产生事务
  *
  * 只看 `.protyle-wysiwyg` 里面的变化。高亮层、选区竖线、搜索面板都挂在外面。
- * 不看属性变化，块选中、悬停等 class 抖动不会触发。
+ * 属性只观察 fold；块选中、悬停等 class 抖动不会触发。
  */
 
 export interface EditorDomChange {
@@ -16,6 +16,8 @@ export interface EditorDomChange {
     addedInBlocks: ReadonlySet<string> | null;
     /** 块数溢出发生在嵌入块内部。嵌入渲染不发 savedoc，需要单独重搜。 */
     embedOverflow: boolean;
+    /** 折叠属性改变；它不一定伴随保存或块节点增删。 */
+    foldChanged: boolean;
 }
 
 export interface EditorDomWatchHandlers {
@@ -38,11 +40,13 @@ export function watchEditorDom(
     let pendingSince = 0;
     let touched: Set<string> | null = new Set();
     let embedOverflow = false;
+    let foldChanged = false;
 
     const flush = () => {
-        const change: EditorDomChange = {addedInBlocks: touched, embedOverflow};
+        const change: EditorDomChange = {addedInBlocks: touched, embedOverflow, foldChanged};
         touched = new Set();
         embedOverflow = false;
+        foldChanged = false;
         pendingSince = 0;
         handlers.onSettled(change);
     };
@@ -50,13 +54,21 @@ export function watchEditorDom(
     const observer = new MutationObserver((records) => {
         let relevant = false;
         for (const record of records) {
-            const target = record.target.nodeType === Node.ELEMENT_NODE
-                ? record.target as Element
-                : record.target.parentElement;
+            const target = record.target.nodeType === Node.ELEMENT_NODE ?
+                record.target as Element :
+                record.target.parentElement;
             if (!target || !target.closest(".protyle-wysiwyg")) {
                 continue;
             }
             relevant = true;
+            if (record.type === "attributes") {
+                // 思源切换非标题折叠时只改 fold 属性；标题折叠通常还会卸载后代。
+                // 这两种变化都不能依赖 savedoc，否则关闭“折叠块内容”时计数会停留旧值。
+                if (record.attributeName === "fold") {
+                    foldChanged = true;
+                }
+                continue;
+            }
             if (record.type !== "childList" || record.addedNodes.length === 0) {
                 continue;
             }
@@ -89,6 +101,8 @@ export function watchEditorDom(
         childList: true,
         subtree: true,
         characterData: true,
+        attributes: true,
+        attributeFilter: ["fold"],
     });
 
     return () => {

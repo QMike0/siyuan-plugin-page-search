@@ -3,6 +3,9 @@ import {escSql, querySql} from "./corpus/api";
 import {peekDocMeta} from "./corpus/meta";
 import {peekDocOrder} from "./corpus/order";
 import {parentElementCrossingShadow} from "./dom-parent";
+import {isUnderNonHeadingCssFold} from "./fold-dom";
+
+export {isUnderNonHeadingCssFold} from "./fold-dom";
 
 /**
  * 思源非标题折叠：块保留在 DOM，仅 CSS 隐藏（list / callout / bq / sb 等）。
@@ -53,11 +56,6 @@ export function listBlocksUnfoldedAfterHeading(heading: HTMLElement): HTMLElemen
     return roots;
 }
 
-/** 是否落在「非标题」且 fold="1" 的祖先下（CSS 折叠容器） */
-export function isUnderNonHeadingCssFold(element: Element | null): boolean {
-    return Boolean(findNearestNonHeadingFoldedAncestor(element));
-}
-
 /**
  * 自内向外收集需展开的非标题折叠祖先 id（数组末项为最外层）。
  * 跳转时从外到内展开更稳。
@@ -79,20 +77,6 @@ export function collectNonHeadingFoldedAncestorIds(element: Element | null): str
         current = parentElementCrossingShadow(current);
     }
     return ids.reverse();
-}
-
-function findNearestNonHeadingFoldedAncestor(element: Element | null): HTMLElement | null {
-    let current = element instanceof Element ? element : null;
-    while (current) {
-        if (
-            current.getAttribute("fold") === "1"
-            && current.getAttribute("data-type") !== HEADING_TYPE
-        ) {
-            return current as HTMLElement;
-        }
-        current = parentElementCrossingShadow(current);
-    }
-    return null;
 }
 
 function isSelfFoldedIal(ial: string): boolean {

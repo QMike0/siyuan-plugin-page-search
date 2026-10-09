@@ -516,19 +516,19 @@ body.page-search-resizing * {
     cursor: ew-resize !important;
 }
 
-::highlight(search-results) {
+::highlight(page-search-results) {
     background-color: rgb(235 235 5);
     color: rgb(0, 0, 0);
 }
 
-::highlight(search-focus) {
+::highlight(page-search-focus) {
     background-color: rgb(255, 150, 50);
     color: rgb(0, 0, 0);
 }
 
 /**
  * 行内备注命中虚线下划线：挂在 .protyle-content，不进内容块。
- * 颜色对齐 search-results / search-focus；位置下沉以区别思源 u / inline-memo 的 border-bottom。
+ * 颜色对齐页内查找的黄/橙高亮；位置下沉以区别思源 u / inline-memo 的 border-bottom。
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/assets/scss/component/_typography.scss
  */
 .protyle-content.page-search-memo-underline-host {

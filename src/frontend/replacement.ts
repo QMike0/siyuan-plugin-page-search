@@ -1,11 +1,16 @@
-import type {SearchableBlock} from "./dom-types";
-import type {SearchMatch} from "./dom-types";
 import {
+    effectiveSearchQuery,
     expandRegexReplacement,
     plainTextFromInlineMemoContent,
     sanitizeInlineMemoContentForWrite,
 } from "../shared";
+import type {
+    RegexReplacementExpansion,
+    RegexReplacementUnitRequest,
+} from "../shared";
 import {isInlineMemoSearchUnit} from "./blocks";
+import type {SearchableBlock} from "./dom-types";
+import type {SearchMatch} from "./dom-types";
 import {preserveReplacementCase} from "./preserve-case";
 import {
     isRangePlainTextOnly,
@@ -14,6 +19,7 @@ import {
 } from "./ranges";
 
 export interface ReplacementSpec {
+    matchId?: string;
     start: number;
     end: number;
     matchedText: string;
@@ -27,9 +33,14 @@ export interface ApplyReplacementOptions {
      * 开启时忽略 preserveCase，避免改写捕获组结果。
      */
     regex?: boolean;
-    /** 与查找相同的正则源（会 trim，与 match 引擎一致） */
+    /** 与查找相同的正则源（普通查询会 trim，纯空白查询保留原值） */
     searchQuery?: string;
     caseSensitive?: boolean;
+    regexUnicode?: boolean;
+    regexMultiline?: boolean;
+    regexDotAll?: boolean;
+    /** Worker 已准备的正则展开结果；有值时绝不在主线程重新执行 RegExp。 */
+    regexPlan?: RegexReplacementPlan;
 }
 
 export interface ApplyReplacementOutcome {
@@ -40,6 +51,136 @@ export interface ApplyReplacementOutcome {
     regexExpandFailedCount: number;
 }
 
+export interface RegexReplacementPlan {
+    expansions: ReadonlyMap<string, RegexReplacementExpansion>;
+}
+
+/**
+ * 把当前可写单元整理为 Worker 可克隆的纯文本请求。未找到单元的命中仍由原写回流程计为跳过。
+ * 备注按宿主在块内的偏移对上，避免只重采当前块时全文序号错位。
+ */
+export interface ReplacementUnitMatch {
+    blockId: string;
+    unitId?: string;
+    anchorOffset?: number;
+    highlightKind?: SearchMatch["highlightKind"];
+}
+
+export function createReplacementUnitLookup(unitsByKey: Map<string, SearchableBlock>) {
+    let memoByAnchor: Map<string, SearchableBlock> | null = null;
+    const anchors = () => {
+        if (memoByAnchor) {
+            return memoByAnchor;
+        }
+        const index = new Map<string, SearchableBlock>();
+        memoByAnchor = index;
+        for (const unit of unitsByKey.values()) {
+            if (!isInlineMemoSearchUnit(unit) || unit.anchorOffset === undefined) {
+                continue;
+            }
+            const key = `${unit.blockId}\0${unit.anchorOffset}`;
+            if (!index.has(key)) {
+                index.set(key, unit);
+            }
+        }
+        return index;
+    };
+    return (match: ReplacementUnitMatch): SearchableBlock | undefined => {
+        const direct = unitsByKey.get(unitKeyFor(match.blockId, match.unitId));
+        const memoMatch = match.highlightKind === "inline-memo" ||
+            Boolean(match.unitId?.startsWith("inline-memo:")) ||
+            Boolean(match.unitId?.startsWith("table-memo:"));
+        if (!memoMatch || match.anchorOffset === undefined) {
+            return direct;
+        }
+        if (
+            direct &&
+            direct.blockId === match.blockId &&
+            isInlineMemoSearchUnit(direct) &&
+            direct.anchorOffset === match.anchorOffset
+        ) {
+            return direct;
+        }
+        return anchors().get(`${match.blockId}\0${match.anchorOffset}`);
+    };
+}
+
+export function collectRegexReplacementRequests(
+    unitsByKey: Map<string, SearchableBlock>,
+    matches: Array<Pick<SearchMatch, "id" | "blockId" | "unitId" | "start" | "end" | "matchedText"> & ReplacementUnitMatch>,
+): RegexReplacementUnitRequest[] {
+    const lookup = createReplacementUnitLookup(unitsByKey);
+    const grouped = new Map<string, {
+        unit: SearchableBlock;
+        replacements: RegexReplacementUnitRequest["replacements"];
+    }>();
+    for (const match of matches) {
+        const unit = lookup(match);
+        if (!unit) {
+            continue;
+        }
+        const key = unitKeyFor(unit.blockId, unit.unitId);
+        const group = grouped.get(key) ?? {unit, replacements: []};
+        group.replacements.push({
+            id: match.id,
+            start: match.start,
+            end: match.end,
+            matchedText: match.matchedText,
+        });
+        grouped.set(key, group);
+    }
+    return Array.from(grouped, ([id, group]) => ({
+        id,
+        haystack: replacementHaystack(group.unit),
+        replacements: group.replacements,
+    }));
+}
+
+export function createRegexReplacementPlan(
+    expansions: RegexReplacementExpansion[],
+): RegexReplacementPlan {
+    return {expansions: new Map(expansions.map((item) => [item.id, item]))};
+}
+
+function unitKeyFor(blockId: string, unitId?: string): string {
+    return `${blockId}::${unitId ?? ""}`;
+}
+
+function groupReplacementSpecs(
+    unitsByKey: Map<string, SearchableBlock>,
+    matches: Array<Pick<SearchMatch, "id" | "start" | "end" | "matchedText"> & ReplacementUnitMatch>,
+): {byUnit: Map<SearchableBlock, ReplacementSpec[]>; skippedCount: number;} {
+    const lookup = createReplacementUnitLookup(unitsByKey);
+    const byUnit = new Map<SearchableBlock, ReplacementSpec[]>();
+    let skippedCount = 0;
+    for (const match of matches) {
+        const unit = lookup(match);
+        if (!unit) {
+            skippedCount += 1;
+            continue;
+        }
+        const list = byUnit.get(unit) ?? [];
+        list.push({
+            matchId: match.id,
+            start: match.start,
+            end: match.end,
+            matchedText: match.matchedText,
+            unitId: unit.unitId,
+        });
+        byUnit.set(unit, list);
+    }
+    return {byUnit, skippedCount};
+}
+
+function replacementHaystack(unit: SearchableBlock): string {
+    if (isInlineMemoSearchUnit(unit)) {
+        return plainTextFromInlineMemoContent(
+            unit.element.getAttribute("data-inline-memo-content") ?? "",
+        );
+    }
+    return unit.textNodes.map((node) => node.nodeValue ?? "").join("");
+}
+
 function resolveReplacementText(
     haystack: string,
     spec: ReplacementSpec,
@@ -47,7 +188,11 @@ function resolveReplacementText(
     options: ApplyReplacementOptions,
 ): string | null {
     if (options.regex) {
-        const patternSource = (options.searchQuery ?? "").trim();
+        if (options.regexPlan) {
+            const planned = spec.matchId ? options.regexPlan.expansions.get(spec.matchId) : undefined;
+            return planned?.haystack === haystack ? planned.replacement : null;
+        }
+        const patternSource = effectiveSearchQuery(options.searchQuery ?? "");
         if (!patternSource) {
             return null;
         }
@@ -57,6 +202,9 @@ function resolveReplacementText(
             end: spec.end,
             patternSource,
             caseSensitive: options.caseSensitive === true,
+            regexUnicode: options.regexUnicode === true,
+            regexMultiline: options.regexMultiline === true,
+            regexDotAll: options.regexDotAll === true,
             template: replacementText,
         });
     }
@@ -75,7 +223,7 @@ export function applyReplacementsToString(
     replacements: ReplacementSpec[],
     replacementText: string,
     options: ApplyReplacementOptions = {},
-): ApplyReplacementOutcome & {text: string} {
+): ApplyReplacementOutcome & {text: string;} {
     if (!replacements.length) {
         return {
             text: haystack,
@@ -93,10 +241,10 @@ export function applyReplacementsToString(
 
     for (const replacement of sorted) {
         if (
-            replacement.start < 0
-            || replacement.end > haystack.length
-            || replacement.start > replacement.end
-            || haystack.slice(replacement.start, replacement.end) !== replacement.matchedText
+            replacement.start < 0 ||
+            replacement.end > haystack.length ||
+            replacement.start > replacement.end ||
+            haystack.slice(replacement.start, replacement.end) !== replacement.matchedText
         ) {
             skippedCount += 1;
             continue;
@@ -166,15 +314,44 @@ export function applyReplacementsToInlineMemoElement(
         };
     }
 
-    host.setAttribute(
-        "data-inline-memo-content",
-        sanitizeInlineMemoContentForWrite(outcome.text),
-    );
+    writeInlineMemoContent(host, outcome.text);
     return {
         appliedCount: outcome.appliedCount,
         skippedCount: outcome.skippedCount,
         regexExpandFailedCount: outcome.regexExpandFailedCount,
     };
+}
+
+/**
+ * 在已定位的 textNodes 上从后往前替换（同一单元内）。
+ * 优先单 Text 节点；若命中跨多个纯 Text 拆分节点（编辑中未合并），用 Range 删除后插入。
+ */
+/**
+ * 与思源备注浮层关闭时一致：空内容卸掉标记，其余只写回属性。
+ * 宿主里的可见字不动。
+ */
+function writeInlineMemoContent(host: HTMLElement, text: string): void {
+    const written = text ? sanitizeInlineMemoContentForWrite(text) : "";
+    if (written) {
+        host.setAttribute("data-inline-memo-content", written);
+        return;
+    }
+    const types = (host.getAttribute("data-type") ?? "")
+        .split(/\s+/)
+        .filter((token) => token && token !== "inline-memo");
+    if (types.length === 0) {
+        const parent = host.parentNode;
+        if (!parent) {
+            return;
+        }
+        while (host.firstChild) {
+            parent.insertBefore(host.firstChild, host);
+        }
+        host.remove();
+        return;
+    }
+    host.setAttribute("data-type", types.join(" "));
+    host.removeAttribute("data-inline-memo-content");
 }
 
 /**
@@ -374,48 +551,31 @@ export function applyMatchesToSubmitClone(
     liveSubmit: HTMLElement,
     cloneSubmit: HTMLElement,
     unitsByKey: Map<string, SearchableBlock>,
-    matches: Array<Pick<SearchMatch, "start" | "end" | "matchedText" | "unitId" | "blockId">>,
+    matches: Array<Pick<SearchMatch, "id" | "start" | "end" | "matchedText" | "unitId" | "blockId"> & ReplacementUnitMatch>,
     replacementText: string,
     options: ApplyReplacementOptions = {},
 ): ApplyReplacementOutcome {
-    const byUnit = new Map<string, ReplacementSpec[]>();
-    for (const match of matches) {
-        const key = `${match.blockId}::${match.unitId ?? ""}`;
-        const list = byUnit.get(key) ?? [];
-        list.push({
-            start: match.start,
-            end: match.end,
-            matchedText: match.matchedText,
-            unitId: match.unitId,
-        });
-        byUnit.set(key, list);
-    }
-
+    const grouped = groupReplacementSpecs(unitsByKey, matches);
     let appliedCount = 0;
-    let skippedCount = 0;
+    let skippedCount = grouped.skippedCount;
     let regexExpandFailedCount = 0;
-    for (const [key, specs] of byUnit) {
-        const unit = unitsByKey.get(key);
-        if (!unit) {
-            skippedCount += specs.length;
-            continue;
-        }
+    for (const [unit, specs] of grouped.byUnit) {
         if (liveSubmit !== unit.element && !liveSubmit.contains(unit.element)) {
             skippedCount += specs.length;
             continue;
         }
 
-        const unitPath = liveSubmit === unit.element
-            ? []
-            : getNodePath(liveSubmit, unit.element);
+        const unitPath = liveSubmit === unit.element ?
+            [] :
+            getNodePath(liveSubmit, unit.element);
         if (unitPath === null) {
             skippedCount += specs.length;
             continue;
         }
 
-        const cloneUnitNode = unitPath.length === 0
-            ? cloneSubmit
-            : followNodePath(cloneSubmit, unitPath);
+        const cloneUnitNode = unitPath.length === 0 ?
+            cloneSubmit :
+            followNodePath(cloneSubmit, unitPath);
         if (!(cloneUnitNode instanceof HTMLElement)) {
             skippedCount += specs.length;
             continue;
@@ -459,32 +619,15 @@ export function applyMatchesToSubmitClone(
  */
 export function applyMatchesToLiveUnits(
     unitsByKey: Map<string, SearchableBlock>,
-    matches: Array<Pick<SearchMatch, "start" | "end" | "matchedText" | "unitId" | "blockId">>,
+    matches: Array<Pick<SearchMatch, "id" | "start" | "end" | "matchedText" | "unitId" | "blockId"> & ReplacementUnitMatch>,
     replacementText: string,
     options: ApplyReplacementOptions = {},
 ): ApplyReplacementOutcome {
-    const byUnit = new Map<string, ReplacementSpec[]>();
-    for (const match of matches) {
-        const key = `${match.blockId}::${match.unitId ?? ""}`;
-        const list = byUnit.get(key) ?? [];
-        list.push({
-            start: match.start,
-            end: match.end,
-            matchedText: match.matchedText,
-            unitId: match.unitId,
-        });
-        byUnit.set(key, list);
-    }
-
+    const grouped = groupReplacementSpecs(unitsByKey, matches);
     let appliedCount = 0;
-    let skippedCount = 0;
+    let skippedCount = grouped.skippedCount;
     let regexExpandFailedCount = 0;
-    for (const [key, specs] of byUnit) {
-        const unit = unitsByKey.get(key);
-        if (!unit) {
-            skippedCount += specs.length;
-            continue;
-        }
+    for (const [unit, specs] of grouped.byUnit) {
         if (isInlineMemoSearchUnit(unit)) {
             const outcome = applyReplacementsToInlineMemoElement(
                 unit.element,

@@ -1,27 +1,40 @@
-import {getFrontend, IKernelPluginState, Plugin} from "siyuan";
+import {
+    fetchPost,
+    getFrontend,
+    IKernelPluginState,
+    Plugin,
+} from "siyuan";
 import "./index.scss";
+import {isEditorReplaceModeBlocked} from "./frontend/editor-mode";
 import {
     createClientId,
     isKernelRunning,
     rpcGetPrefs,
     rpcSetPrefs,
 } from "./frontend/kernel-client";
-import {SearchBar, type SearchBarHost, type SearchBarI18n, type HeadingIncludeLevel} from "./frontend/search-bar";
-import {isEditorReplaceModeBlocked} from "./frontend/editor-mode";
-import {scrubSelectionScopePollution, clearAllSelectionScopeSessionOverlays} from "./frontend/selection-scope-visual";
-import {PREFS_STORAGE_PATH, type RestrictInlineType} from "./shared";
-
-export {
-    findOffsetMatchesInText,
-    generateSearchVariants,
-    matchTextUnits,
+import {
+    SearchBar,
+    type SearchBarHost,
+    type SearchBarI18n,
+    type HeadingIncludeLevel,
+} from "./frontend/search-bar";
+import {
+    scrubSelectionScopePollution,
+    clearAllSelectionScopeSessionOverlays,
+} from "./frontend/selection-scope-visual";
+import {
+    bindSearchHistoryIo,
+    SEARCH_HISTORY_STORAGE_KEY,
+    searchHistory,
+} from "./frontend/search-history";
+import {
+    PREFS_STORAGE_PATH,
+    type RestrictInlineType,
 } from "./shared";
-export type {MatchHit, SearchableUnit, SearchStateEvent} from "./shared";
-export {
-    isKernelRunning,
-    rpcGetPrefs,
-    rpcSetPrefs,
-} from "./frontend/kernel-client";
+
+export { isKernelRunning, rpcGetPrefs, rpcSetPrefs } from "./frontend/kernel-client";
+export { findOffsetMatchesInText, generateSearchVariants, matchTextUnits } from "./shared";
+export type { MatchHit, SearchableUnit, SearchStateEvent } from "./shared";
 
 export const CLASS_NAME = "highlight-search-result";
 
@@ -69,6 +82,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     onload() {
         this.isMobile = isMobileFrontend();
         this.kernelReady = isKernelRunning(this);
+        this.bindSearchHistory();
+        searchHistory.load();
 
         // 描边属性写在 g 上，避免被思源全局 svg { fill } 覆盖
         this.addIcons(`<symbol id="iconPageSearch" viewBox="0 0 48 48">
@@ -154,11 +169,47 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         } catch (error) {
             console.warn("[page-search] uninstall removeData prefs.json failed", error);
         }
+        searchHistory.removePersisted();
         console.log(this.i18n.pluginUninstall);
     }
 
+    /**
+     * 查找历史走思源 localStorage，不写 prefs。
+     * setLocalStorageVal 不回推给本窗口，内存列表在 push 时已经更新。
+     */
+    private bindSearchHistory() {
+        bindSearchHistoryIo({
+            read: (apply) => {
+                fetchPost(
+                    "/api/storage/getLocalStorageVal",
+                    {key: SEARCH_HISTORY_STORAGE_KEY},
+                    (response) => apply(response?.data),
+                );
+            },
+            write: (entries) => {
+                fetchPost("/api/storage/setLocalStorageVal", {
+                    app: this.app?.appId ?? "",
+                    key: SEARCH_HISTORY_STORAGE_KEY,
+                    val: entries,
+                });
+            },
+            remove: () => {
+                fetchPost("/api/storage/removeLocalStorageVal", {
+                    app: this.app?.appId ?? "",
+                    key: SEARCH_HISTORY_STORAGE_KEY,
+                });
+            },
+        });
+        this.eventBus.on("ws-main", this.onSearchHistoryBroadcast);
+    }
+
+    private readonly onSearchHistoryBroadcast = (event: CustomEvent) => {
+        searchHistory.acceptBroadcast(event.detail);
+    };
+
     /** 卸下快捷键、搜索条、事件与选区视觉残留（不碰持久化配置） */
     private teardownRuntime() {
+        this.eventBus.off("ws-main", this.onSearchHistoryBroadcast);
         window.removeEventListener("keydown", this.onWindowKeydownCapture, true);
         this.closeSearchDialog();
         this.stopCleanupTimer();
@@ -184,11 +235,11 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         }
 
         if (
-            event.key === "Escape"
-            && !event.ctrlKey
-            && !event.metaKey
-            && !event.altKey
-            && !event.shiftKey
+            event.key === "Escape" &&
+            !event.ctrlKey &&
+            !event.metaKey &&
+            !event.altKey &&
+            !event.shiftKey
         ) {
             if (this.tryCloseSearchOnEscape(event.target)) {
                 event.preventDefault();
@@ -255,12 +306,12 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             }
         }
 
-        const toClose = candidates.length > 0
-            ? candidates
-            : Array.from(this.searchBars.keys()).filter((root) => (
+        const toClose = candidates.length > 0 ?
+            candidates :
+            Array.from(this.searchBars.keys()).filter((root) => (
                 root.isConnected && (
-                    this.searchBars.size === 1
-                    || Boolean(root.closest(".layout__wnd--active"))
+                    this.searchBars.size === 1 ||
+                    Boolean(root.closest(".layout__wnd--active"))
                 )
             ));
 
@@ -277,7 +328,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     private getSearchI18n(): SearchBarI18n {
         const t = this.i18n as Record<string, string>;
         return {
-            searchPlaceholder: t.searchPlaceholder || "Search",
+            searchPlaceholder: t.searchPlaceholder || "Search (↑↓ view history)",
             replacePlaceholder: t.replacePlaceholder || "Replace with",
             searchPrev: t.searchPrev || "Previous (Shift+Enter)",
             searchNext: t.searchNext || "Next (Enter)",
@@ -287,65 +338,73 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             wholeWord: t.wholeWord || "Whole word",
             searchMethodKeyword: t.searchMethodKeyword || "Keyword",
             searchMethodRegex: t.searchMethodRegex || "Regular expression",
+            regexOptions: t.regexOptions || "Regular expression options",
+            regexUnicode: t.regexUnicode || "Unicode (u)",
+            regexMultiline: t.regexMultiline || "Multiline anchors (m)",
+            regexDotAll: t.regexDotAll || "Dot matches newline (s)",
+            regexBoundaryHint: t.regexBoundaryHint ||
+                "Zero-length matches are skipped; matches do not cross text units",
             preserveCase: t.preserveCase || "Preserve case",
-            preserveCaseDisabledByRegex: t.preserveCaseDisabledByRegex
-                || "Unavailable with regex (replace uses $1 templates)",
-            replaceUnsupportedHelp: t.replaceUnsupportedHelp
-                || "Replacement is unavailable in read-only mode, export preview, and the publish service; math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced; replacing the document title cannot be undone with Ctrl+Z. When the search mode is Regular expression, the replace box can use $1, $&, and similar syntax",
+            preserveCaseDisabledByRegex: t.preserveCaseDisabledByRegex ||
+                "Unavailable with regex (replace uses $1 templates)",
+            replaceUnsupportedHelp: t.replaceUnsupportedHelp ||
+                "Replacement is unavailable in read-only mode, export preview, and the publish service; math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced; replacing the document title cannot be undone with Ctrl+Z. When the search mode is Regular expression, the replace box can use $1, $&, and similar syntax",
             replaceAction: t.replaceAction || "Replace (Enter)",
             replaceAllAction: t.replaceAllAction || "Replace all (Ctrl+Alt+Enter)",
             replaceToggle: t.replaceToggle || "Expand or collapse replace row",
-            replaceCurrentUnsupported: t.replaceCurrentUnsupported
-                || "This match cannot be replaced directly",
-            replaceRegexExpandFailed: t.replaceRegexExpandFailed
-                || "Regex replace expansion failed; skipped",
-            replaceAttributeViewUnsupported: t.replaceAttributeViewUnsupported
-                || "Database results cannot be replaced",
-            replaceMermaidUnsupported: t.replaceMermaidUnsupported
-                || "Mermaid diagrams support search and highlight only, not replace",
-            replaceHtmlBlockUnsupported: t.replaceHtmlBlockUnsupported
-                || "HTML blocks support search and highlight of rendered text only; replacement is not supported",
-            replaceTableRichUnsupported: t.replaceTableRichUnsupported
-                || "Rich-text table cells support search and highlight only; replacement is not supported",
-            replaceTableCellEditingUnsupported: t.replaceTableCellEditingUnsupported
-                || "This cell is being edited. Click outside the cell to finish editing, then replace",
-            replaceTablePendingEdit: t.replaceTablePendingEdit
-                || "This table still has an edit that has not been saved. Click outside the cell, then replace",
-            replaceModeUnsupported: t.replaceModeUnsupported
-                || "Replacement is unavailable in publish, export preview, or read-only mode",
-            replaceDocTitleFailed: t.replaceDocTitleFailed
-                || "Failed to rename the document title",
-            replaceDocTitleEmpty: t.replaceDocTitleEmpty
-                || "Document title is invalid; skipped",
+            replaceCurrentUnsupported: t.replaceCurrentUnsupported ||
+                "This match cannot be replaced directly",
+            replaceRegexExpandFailed: t.replaceRegexExpandFailed ||
+                "Regex replace expansion failed; skipped",
+            replaceAttributeViewUnsupported: t.replaceAttributeViewUnsupported ||
+                "Database results cannot be replaced",
+            replaceMermaidUnsupported: t.replaceMermaidUnsupported ||
+                "Mermaid diagrams support search and highlight only, not replace",
+            replaceHtmlBlockUnsupported: t.replaceHtmlBlockUnsupported ||
+                "HTML blocks support search and highlight of rendered text only; replacement is not supported",
+            replaceTableRichUnsupported: t.replaceTableRichUnsupported ||
+                "Rich-text table cells support search and highlight only; replacement is not supported",
+            replaceTableCellEditingUnsupported: t.replaceTableCellEditingUnsupported ||
+                "This cell is being edited. Click outside the cell to finish editing, then replace",
+            replaceTablePendingEdit: t.replaceTablePendingEdit ||
+                "This table still has an edit that has not been saved. Click outside the cell, then replace",
+            replaceModeUnsupported: t.replaceModeUnsupported ||
+                "Replacement is unavailable in publish, export preview, or read-only mode",
+            replaceDocTitleFailed: t.replaceDocTitleFailed ||
+                "Failed to rename the document title",
+            replaceDocTitleEmpty: t.replaceDocTitleEmpty ||
+                "Document title is invalid; skipped",
             replaceAllConfirm: t.replaceAllConfirm || "Replace {count} matches?",
             replaceAllConfirmTitle: t.replaceAllConfirmTitle || "Replace all",
+            replaceAllIncomplete: t.replaceAllIncomplete ||
+                "Search results are incomplete. Wait for indexing before replacing all.",
             replaceCurrentDone: t.replaceCurrentDone || "Current match replaced",
-            replaceAllResult: t.replaceAllResult
-                || "Replacement complete: {replacedCount} replaced, {skippedCount} skipped",
-            replaceProtyleMissing: t.replaceProtyleMissing
-                || "Cannot find Protyle editor; replace aborted to keep undo available",
-            selectionOnlyNoScope: t.selectionOnlyNoScope
-                || "Selection-only mode is on, but there is no usable selection",
-            searchDegradedLoadedOnly: t.searchDegradedLoadedOnly
-                || "This environment cannot query unloaded content. Results include only what is already loaded.",
+            replaceAllResult: t.replaceAllResult ||
+                "Replacement complete: {replacedCount} replaced, {skippedCount} skipped",
+            replaceProtyleMissing: t.replaceProtyleMissing ||
+                "Cannot find Protyle editor; replace aborted to keep undo available",
+            selectionOnlyNoScope: t.selectionOnlyNoScope ||
+                "Selection-only mode is on, but there is no usable selection",
+            searchDegradedLoadedOnly: t.searchDegradedLoadedOnly ||
+                "This environment cannot query unloaded content. Results include only what is already loaded.",
             searchIndexingBadge: t.searchIndexingBadge || "Indexing",
-            searchUnrendered: t.searchUnrendered
-                || "{count} blocks failed to render and were not counted",
+            searchUnrendered: t.searchUnrendered ||
+                "{count} blocks failed to render and were not counted",
             resultsPanelToggle: t.resultsPanelToggle || "Search results",
             resultsPanelEmpty: t.resultsPanelEmpty || "No results",
             settingsTitle: t.settingsTitle || "Search scope",
             settingsRestrictInline: t.settingsRestrictInline || "Limit search",
-            settingsRestrictInlineHint: t.settingsRestrictInlineHint
-                || "When enabled, search only within the selected inline elements (multi-select). With an empty search box, preview all matching inline elements of the selected types. Limit-search choices reset when the search UI closes",
+            settingsRestrictInlineHint: t.settingsRestrictInlineHint ||
+                "When enabled, search only within the selected inline elements (multi-select). With an empty search box, preview all matching inline elements of the selected types. Limit-search choices reset when the search UI closes",
             settingsIncludeScope: t.settingsIncludeScope || "Include in search",
-            settingsIncludeScopeHint: t.settingsIncludeScopeHint
-                || "Controls which block-level types (and inline memos) may be searched",
+            settingsIncludeScopeHint: t.settingsIncludeScopeHint ||
+                "Controls which block-level types (and inline memos) may be searched",
             settingsIncludeDocTitle: t.settingsIncludeDocTitle || "Document title",
-            settingsIncludeDocTitleHint: t.settingsIncludeDocTitleHint
-                || "Replacing the document title cannot be undone with Ctrl+Z",
+            settingsIncludeDocTitleHint: t.settingsIncludeDocTitleHint ||
+                "Replacing the document title cannot be undone with Ctrl+Z",
             settingsIncludeImageTitle: t.settingsIncludeImageTitle || "Image title",
-            settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database",
-            settingsIncludeTable: t.settingsIncludeTable || "Table",
+            settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database block",
+            settingsIncludeTable: t.settingsIncludeTable || "Table block",
             settingsIncludeBlockquote: t.settingsIncludeBlockquote || "Blockquote",
             settingsIncludeCallout: t.settingsIncludeCallout || "Callout",
             settingsIncludeSuperBlock: t.settingsIncludeSuperBlock || "Super block",
@@ -366,16 +425,18 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeMathBlock: t.settingsIncludeMathBlock || "Math block",
             settingsIncludeEmbedBlock: t.settingsIncludeEmbedBlock || "Embed block",
             settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
-            settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid diagram",
-            settingsIncludeHtmlBlock: t.settingsIncludeHtmlBlock || "HTML",
-            settingsIncludeHtmlBlockHint: t.settingsIncludeHtmlBlockHint
-                || "Match visible rendered text inside HTML blocks, not the HTML source",
+            settingsIncludePlainCodeBlock: t.settingsIncludePlainCodeBlock || "Plain code blocks",
+            settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
+            settingsIncludeFlowchart: t.settingsIncludeFlowchart || "flowchart",
+            settingsIncludeHtmlBlock: t.settingsIncludeHtmlBlock || "HTML block",
+            settingsIncludeHtmlBlockHint: t.settingsIncludeHtmlBlockHint ||
+                "Match visible rendered text inside HTML blocks, not the HTML source",
             settingsIncludeFoldedBlocks: t.settingsIncludeFoldedBlocks || "Folded block content",
-            settingsIncludeFoldedBlocksHint: t.settingsIncludeFoldedBlocksHint
-                || "Controls whether to search hidden content inside folded blocks (excluding folded headings)",
+            settingsIncludeFoldedBlocksHint: t.settingsIncludeFoldedBlocksHint ||
+                "Controls whether to search hidden content inside folded blocks",
             settingsIncludeInlineMemo: t.settingsIncludeInlineMemo || "Inline memos",
-            settingsIncludeInlineMemoHint: t.settingsIncludeInlineMemoHint
-                || "Matches show a yellow/orange dashed underline under the corresponding text; replacement is supported and can be undone with Ctrl+Z",
+            settingsIncludeInlineMemoHint: t.settingsIncludeInlineMemoHint ||
+                "Matches show a yellow/orange dashed underline under the corresponding text; replacement is supported and can be undone with Ctrl+Z",
             settingsRestrictBlockRef: t.settingsRestrictBlockRef || "Block ref",
             settingsRestrictLink: t.settingsRestrictLink || "Link",
             settingsRestrictStrong: t.settingsRestrictStrong || "Bold",
@@ -389,13 +450,13 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsRestrictKbd: t.settingsRestrictKbd || "Keyboard",
             settingsRestrictTag: t.settingsRestrictTag || "Tag",
             settingsRestrictInlineMath: t.settingsRestrictInlineMath || "Inline math",
-            settingsRestrictInlineMathHint: t.settingsRestrictInlineMathHint
-                || "Match visible rendered formula text rather than LaTeX source",
+            settingsRestrictInlineMathHint: t.settingsRestrictInlineMathHint ||
+                "Match visible rendered formula text rather than LaTeX source",
             settingsRestrictInlineMemo: t.settingsRestrictInlineMemo || "Inline memo",
-            settingsRestrictInlineMemoHint: t.settingsRestrictInlineMemoHint
-                || "Turn on Include in search → Inline memos first",
-            settingsRestrictInlineMemoOnHint: t.settingsRestrictInlineMemoOnHint
-                || "Turn on Include in search → Inline memos first",
+            settingsRestrictInlineMemoHint: t.settingsRestrictInlineMemoHint ||
+                "Turn on Include in search → Inline memos first",
+            settingsRestrictInlineMemoOnHint: t.settingsRestrictInlineMemoOnHint ||
+                "Turn on Include in search → Inline memos first",
             invalidRegex: t.invalidRegex || "Invalid regex: {error}",
         };
     }
@@ -580,6 +641,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         });
     }
 
+    /** 将 flowchart 匹配开关同步到其它已打开面板 */
+    syncIncludeFlowchart(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeFlowchart(value);
+        });
+    }
+
     /** 将 HTML 块匹配开关同步到其它已打开面板 */
     syncIncludeHtmlBlock(value: boolean, source?: SearchBar) {
         this.searchBars.forEach((bar) => {
@@ -627,6 +698,20 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyUseRegex(value);
+        });
+    }
+
+    /** 将正则 flags 同步到其它已打开面板 */
+    syncRegexOptions(value: {
+        regexUnicode: boolean;
+        regexMultiline: boolean;
+        regexDotAll: boolean;
+    }, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyRegexOptions(value);
         });
     }
 
@@ -813,9 +898,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         this.cleanupInvalidComponents();
 
         const mobile = this.isMobile;
-        let edits: NodeListOf<Element> | Element[] = mobile
-            ? document.querySelectorAll("#editor")
-            : document.querySelectorAll(".layout__wnd--active > .layout-tab-container");
+        let edits: NodeListOf<Element> | Element[] = mobile ?
+            document.querySelectorAll("#editor") :
+            document.querySelectorAll(".layout__wnd--active > .layout-tab-container");
 
         if (edits.length === 0) {
             const protyle = document.activeElement?.closest(".protyle");
@@ -835,9 +920,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         const selectSearchOnOpen = !selectedText;
 
         edits.forEach((edit) => {
-            const existingElement = mobile
-                ? document.querySelector(`.${CLASS_NAME}`)
-                : edit.querySelector(`.${CLASS_NAME}`);
+            const existingElement = mobile ?
+                document.querySelector(`.${CLASS_NAME}`) :
+                edit.querySelector(`.${CLASS_NAME}`);
 
             if (!existingElement) {
                 // (1) 关闭态：Ctrl+F 折叠替换；Ctrl+H 展开替换；焦点均在查找框
@@ -858,6 +943,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     presetText: initialQuery || undefined,
                     presetReplaceText: initialReplace || undefined,
                     selectSearchOnOpen,
+                    // 选区预填是一次新查找；会话里带回的词只恢复输入框，不记入历史。
+                    recordInitialQuery: Boolean(selectedText),
                     replaceVisible: replaceVisibleOnCreate,
                     includeDocTitle: prefs.includeDocTitle !== false,
                     includeImageTitle: prefs.includeImageTitle !== false,
@@ -882,19 +969,23 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeEmbedBlock: prefs.includeEmbedBlock !== false,
                     includeCodeBlock: prefs.includeCodeBlock !== false,
                     includeMermaid: prefs.includeMermaid !== false,
+                    includeFlowchart: prefs.includeFlowchart !== false,
                     includeHtmlBlock: prefs.includeHtmlBlock !== false,
                     includeFoldedBlocks: prefs.includeFoldedBlocks === true,
                     includeInlineMemo: prefs.includeInlineMemo === true,
                     useRegex: prefs.useRegex === true,
+                    regexUnicode: prefs.regexUnicode === true,
+                    regexMultiline: prefs.regexMultiline === true,
+                    regexDotAll: prefs.regexDotAll === true,
                     // 限制查找仅会话内有效，打开时始终不限制
                     restrictInlineTypes: [],
                 });
                 this.searchBars.set(element, bar);
 
                 if (
-                    !isFromTopBar
-                    && typeof prefs.dialogLeft === "number"
-                    && typeof prefs.dialogTop === "number"
+                    !isFromTopBar &&
+                    typeof prefs.dialogLeft === "number" &&
+                    typeof prefs.dialogTop === "number"
                 ) {
                     bar.applySavedPosition(prefs.dialogLeft, prefs.dialogTop);
                 }
@@ -934,21 +1025,21 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
 
 /** 当前快捷键应对准的编辑宿主（焦点处 protyle / 活动窗口） */
 function resolveHotkeyHostElement(target: Element | null): Element | null {
-    const fromTarget = target?.closest(".protyle")
-        ?? target?.closest(".layout-tab-container");
+    const fromTarget = target?.closest(".protyle") ??
+        target?.closest(".layout-tab-container");
     if (fromTarget) {
         return fromTarget;
     }
-    return document.querySelector(".layout__wnd--active > .layout-tab-container")
-        ?? document.querySelector(".layout__wnd--active .protyle:not(.fn__none)")
-        ?? document.querySelector("#editor .protyle:not(.fn__none)");
+    return document.querySelector(".layout__wnd--active > .layout-tab-container") ??
+        document.querySelector(".layout__wnd--active .protyle:not(.fn__none)") ??
+        document.querySelector("#editor .protyle:not(.fn__none)");
 }
 
 /** 设置页等非文档输入区，避免抢 Ctrl+F/H */
 function isForeignTextInput(el: Element): boolean {
     const tag = el.tagName;
-    const isField = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT"
-        || (el as HTMLElement).isContentEditable;
+    const isField = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" ||
+        (el as HTMLElement).isContentEditable;
     if (!isField) {
         return false;
     }

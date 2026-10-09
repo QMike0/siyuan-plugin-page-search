@@ -2,11 +2,21 @@ import {
     INLINE_MATH_TYPE,
     INLINE_MEMO_TYPE,
     RESTRICT_INLINE_TYPE_ALLOWLIST,
+    isRendererUnitId,
     parseDataTypeTokens,
     type RestrictInlineType,
 } from "../../shared";
-import {isInlineMathSearchUnit, isInlineMemoSearchUnit, tableCellReplaceLock} from "../blocks";
-import type {SearchableBlock, SearchMatch, TableReplaceLock, TableSlot} from "../dom-types";
+import {
+    isInlineMathSearchUnit,
+    isInlineMemoSearchUnit,
+    tableCellReplaceLock,
+} from "../blocks";
+import type {
+    SearchableBlock,
+    SearchMatch,
+    TableReplaceLock,
+    TableSlot,
+} from "../dom-types";
 
 const HOST_TYPES = new Set<string>(
     RESTRICT_INLINE_TYPE_ALLOWLIST.filter((token) => token !== INLINE_MATH_TYPE && token !== INLINE_MEMO_TYPE),
@@ -22,7 +32,7 @@ export interface CachedUnit {
     segmentLengths?: number[];
     highlightKind: NonNullable<SearchMatch["highlightKind"]>;
     /** 行内类型宿主在单元文本中的覆盖区间。限制查找不再依赖已卸载的节点。 */
-    restrictSpans: Array<{type: string; start: number; end: number}>;
+    restrictSpans: Array<{type: string; start: number; end: number;}>;
     /** 行内备注宿主在所属块文本中的起始偏移。 */
     anchorOffset?: number;
     /** 行内备注宿主在所属块文本中的结束偏移。 */
@@ -36,14 +46,15 @@ export interface CachedUnit {
 }
 
 function nonReplaceable(block: SearchableBlock): boolean {
-    return block.blockType === "NodeMathBlock"
-        || block.blockType === "NodeHTMLBlock"
-        || block.blockType === "NodeAttributeView"
-        || block.unitId === "mermaid-source"
-        || block.unitId === "html-block-rendered"
-        || block.unitId === "diagram-rendered"
-        || Boolean(block.unitId?.startsWith("inline-math:"))
-        || Boolean(block.unitId?.startsWith("embed:"));
+    return block.blockType === "NodeMathBlock" ||
+        block.blockType === "NodeHTMLBlock" ||
+        block.blockType === "NodeAttributeView" ||
+        isRendererUnitId(block.unitId) ||
+        block.unitId === "mermaid-source" ||
+        block.unitId === "html-block-rendered" ||
+        block.unitId === "diagram-rendered" ||
+        Boolean(block.unitId?.startsWith("inline-math:")) ||
+        Boolean(block.unitId?.startsWith("embed:"));
 }
 
 function collectRestrictSpans(block: SearchableBlock): CachedUnit["restrictSpans"] {
@@ -88,9 +99,13 @@ export function freezeBlock(
     blockIndex = block.blockIndex,
     includeRestrict = true,
 ): CachedUnit {
-    const lengths = nonReplaceable(block)
-        ? undefined
-        : block.textNodes.map((node) => node.nodeValue?.length ?? 0);
+    const blocked = nonReplaceable(block);
+    // 备注正文在属性里，没有 Text 节点。整段属性是一个可替换片段。
+    const lengths = blocked ?
+        undefined :
+        (isInlineMemoSearchUnit(block) ?
+            (block.text.length > 0 ? [block.text.length] : undefined) :
+            block.textNodes.map((node) => node.nodeValue?.length ?? 0));
     const replaceLock = block.blockType === "NodeTable" ? tableCellReplaceLock(block.element) : undefined;
     let highlightKind: CachedUnit["highlightKind"] = "text";
     if (isInlineMemoSearchUnit(block)) {
@@ -124,7 +139,9 @@ export function restrictSpanCovers(
     if (!types?.length) {
         return true;
     }
-    return types.some((type) => spans.some((span) => {
-        return span.type === type && span.start <= start && end <= span.end;
-    }));
+    return types.some((type) =>
+        spans.some((span) => {
+            return span.type === type && span.start <= start && end <= span.end;
+        })
+    );
 }

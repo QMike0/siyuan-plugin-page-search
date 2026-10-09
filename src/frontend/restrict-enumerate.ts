@@ -106,6 +106,7 @@ export function enumerateRestrictInlineMatches(
     const includeEmbedBlock = options.includeEmbedBlock !== false;
     const includeCodeBlock = options.includeCodeBlock !== false;
     const includeMermaid = options.includeMermaid !== false;
+    const includeFlowchart = options.includeFlowchart !== false;
     const includeHtmlBlock = options.includeHtmlBlock !== false;
     const allowFoldedHidden = options.includeFoldedBlocks === true;
     const selectionOnly = options.selectionOnly === true;
@@ -135,7 +136,9 @@ export function enumerateRestrictInlineMatches(
         includeEmbedBlock,
         includeCodeBlock,
         includeMermaid,
+        includeFlowchart,
         includeHtmlBlock,
+        includeFoldedBlocks: allowFoldedHidden,
         includeInlineMemo,
         restrictInlineTypes: [],
     });
@@ -197,6 +200,7 @@ export function enumerateRestrictInlineMatches(
                     includeEmbedBlock,
                     includeCodeBlock,
                     includeMermaid,
+                    includeFlowchart,
                     includeHtmlBlock,
                 })) {
                     continue;
@@ -433,6 +437,7 @@ function shouldSkipHostByIncludeGates(
         includeEmbedBlock: boolean;
         includeCodeBlock: boolean;
         includeMermaid: boolean;
+        includeFlowchart: boolean;
         includeHtmlBlock: boolean;
     },
 ): boolean {
@@ -521,16 +526,23 @@ function shouldSkipHostByIncludeGates(
         return true;
     }
     if (blockType === CODE_BLOCK_TYPE) {
-        const isMermaid = owner.getAttribute("data-subtype") === MERMAID_SUBTYPE;
-        if (isMermaid && !options.includeMermaid) {
+        const subtype = owner.getAttribute("data-subtype");
+        if (subtype === MERMAID_SUBTYPE && !options.includeMermaid) {
             return true;
         }
-        if (!isMermaid && !options.includeCodeBlock) {
+        if (subtype === "flowchart" && !options.includeFlowchart) {
+            return true;
+        }
+        if (subtype !== MERMAID_SUBTYPE && subtype !== "flowchart" && !options.includeCodeBlock) {
             return true;
         }
     }
     if (host.closest(`[data-type="${CODE_BLOCK_TYPE}"][data-subtype="${MERMAID_SUBTYPE}"]`)
         && !options.includeMermaid) {
+        return true;
+    }
+    if (host.closest('[data-type="NodeCodeBlock"][data-subtype="flowchart"]')
+        && !options.includeFlowchart) {
         return true;
     }
     return false;
