@@ -1,7 +1,9 @@
 import {
     generateSearchVariants,
+    searchNormalizeFoldIsSuperset,
     ZERO_WIDTH_GLOBAL_RE,
 } from "../../shared";
+import {isDiagramCodeLanguage} from "../../shared/code-block-language";
 import type {RegexPrefilterAtom} from "../../shared/regex-literals";
 import {
     escSql,
@@ -89,13 +91,24 @@ async function queryScopedCandidates(rootId: string, scope: string, signal?: Abo
     return rows.map((row) => row.id).filter((id) => typeof id === "string" && id);
 }
 
-/** 分页查出全部候选；规范化查询失败会扩大到同范围全部块，两次都失败才返回 null。 */
+/**
+ * 分页查出全部候选。
+ * 规范化查询失败，或 JS/Go 大小写无法证明是超集时，扩大到同范围全部块。
+ * 两次查询都失败才返回 null。
+ */
 export async function fetchContentCandidateIds(
     rootId: string,
     needle: string,
     caseSensitive: boolean,
     signal?: AbortSignal,
 ): Promise<string[] | null> {
+    if (!caseSensitive && !searchNormalizeFoldIsSuperset(needle)) {
+        return queryScopedCandidates(
+            rootId,
+            `AND type NOT IN (${CONTAINER_SQL}) `,
+            signal,
+        );
+    }
     const predicate = literalCandidatePredicate("content", needle, caseSensitive);
     return queryLiteralCandidates(
         rootId,
@@ -204,6 +217,13 @@ export async function fetchImageTitleCandidateIds(
     caseSensitive: boolean,
     signal?: AbortSignal,
 ): Promise<string[] | null> {
+    if (!caseSensitive && !searchNormalizeFoldIsSuperset(needle)) {
+        return queryScopedCandidates(
+            rootId,
+            "AND instr(markdown, 'protyle-action__title') > 0 ",
+            signal,
+        );
+    }
     return queryLiteralCandidates(
         rootId,
         "AND instr(markdown, 'protyle-action__title') > 0 ",
@@ -257,32 +277,14 @@ export function isSpecialRenderType(type: string, subtype: string): boolean {
     if (type === "html" || type === "m") {
         return true;
     }
-    if (
-        type === "c" && (
-            subtype === "mermaid" ||
-            subtype === "flowchart" ||
-            subtype === "graphviz" ||
-            subtype === "plantuml" ||
-            subtype === "chart" ||
-            subtype === "mindmap" ||
-            subtype === "abc"
-        )
-    ) {
+    if (type === "c" && isDiagramCodeLanguage(subtype)) {
         return true;
     }
     return false;
 }
 
 export function isDiagramBlock(type: string, subtype: string): boolean {
-    return type === "c" && (
-        subtype === "mermaid" ||
-        subtype === "flowchart" ||
-        subtype === "graphviz" ||
-        subtype === "plantuml" ||
-        subtype === "chart" ||
-        subtype === "mindmap" ||
-        subtype === "abc"
-    );
+    return type === "c" && isDiagramCodeLanguage(subtype);
 }
 
 export function isEmbedType(type: string): boolean {

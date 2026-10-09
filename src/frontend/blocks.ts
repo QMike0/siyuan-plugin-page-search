@@ -14,12 +14,17 @@ import type {
     TableReplaceLock,
     TableSlot,
 } from "./dom-types";
+import {isUnderNonHeadingCssFold} from "./fold-dom";
 import {
     collectRendererSearchUnits,
     rendererAdapterKind,
     type RendererAdapterKind,
 } from "./renderer-adapters";
-import {isUnderNonHeadingCssFold} from "./fold-dom";
+import {splitTextNodesAtBarriers} from "./text-runs";
+import {
+    beginTextCollection,
+    omitAuthorCssHiddenText,
+} from "./visibility";
 
 const ZERO_WIDTH_RE = /[\u200B-\u200D\u2060\uFEFF]/;
 const PREVIEW_BLOCK_ID = "__preview__";
@@ -76,12 +81,13 @@ function rendererEnabled(
  * MathML / annotation 与 .katex-html 字形重复，也不能计入。
  * 页签导航 .tabs-header 是标题块的克隆，正文仍在 .tab-item-info 里，再计一次会重复。
  * 思维导图画布 .mindmap-view 是源块的副本，源块仍单独计数，不能再把副本算进导图块。
+ * 有序列表项的 .protyle-action 是运行时编号，不属于正文搜索源。
  * @see https://github.com/siyuan-note/siyuan/blob/v3.8.7-alpha.5/app/src/protyle/render/listMindmap/view.ts
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
  * @see https://github.com/KaTeX/KaTeX/blob/v0.16.9/src/buildTree.js
  */
 const TEXT_NODE_EXCLUDED_CLOSEST =
-    '.protyle-attr, svg, style, script, .katex, .katex-html, .katex-display, .katex-mathml, math, annotation, span[data-type~="inline-math"], .tabs-header, .mindmap-view';
+    '.protyle-attr, svg, style, script, .katex, .katex-html, .katex-display, .katex-mathml, math, annotation, span[data-type~="inline-math"], .tabs-header, .mindmap-view, [data-type="NodeListItem"] > .protyle-action';
 /** 图片标题可见字（官方 imgTitle / `.protyle-action__title`） */
 const IMAGE_TITLE_TEXT_CLOSEST = ".img .protyle-action__title";
 /** 行内备注 unitId 前缀；text 来自 data-inline-memo-content */
@@ -90,7 +96,6 @@ const INLINE_MEMO_UNIT_PREFIX = "inline-memo:";
 const INLINE_MEMO_BLOCK_TYPE = "inline-memo";
 /** 行内公式 unitId 前缀；text 来自 KaTeX 渲染可见文字 */
 const INLINE_MATH_UNIT_PREFIX = "inline-math:";
-
 /** 与 mathOrdinal 使用同一段可见文字，补高亮时才能和全文采集对上。 */
 export function inlineMathIdentityText(text: string): string {
     return text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");
@@ -324,6 +329,7 @@ export function collectSearchableBlocks(
     // 这是被替换、选区可视化等低层路径共用的采集器。省略选项时保留它们
     // 原有的“完整 DOM”语义；搜索管线始终显式传入用户开关。
     const includeFoldedBlocks = options.includeFoldedBlocks !== false;
+    beginTextCollection(includeFoldedBlocks);
     const includeInlineMemo = options.includeInlineMemo === true;
     // 限制未传 / 空数组：保持旧行为；非空才 normalize（含备注门闩）
     const rawRestrict = options.restrictInlineTypes;
@@ -359,6 +365,7 @@ export function collectSearchableBlocks(
         includeHeadingH4,
         includeHeadingH5,
         includeHeadingH6,
+        includeMathBlock,
         includeEmbedBlock,
         includeCodeBlock,
         includeMermaid,
@@ -593,19 +600,12 @@ export function collectSearchableBlocks(
         }
 
         const textNodes = collectTextNodes(element, element, includeImageTitle);
-        const text = textNodes.map((node) => node.nodeValue ?? "").join("");
-        if (!text) {
-            return;
-        }
-
-        blocks.push({
+        blocks.push(...unitsFromTextNodes({
             blockId,
             blockType,
             blockIndex,
             element,
-            text,
-            textNodes,
-        });
+        }, textNodes));
     });
 
     const attributeRoots = scoped ? scopeRoots : (docRoot ? [docRoot] : []);
@@ -664,6 +664,7 @@ interface IncludeGates {
     includeHeadingH4: boolean;
     includeHeadingH5: boolean;
     includeHeadingH6: boolean;
+    includeMathBlock: boolean;
     includeEmbedBlock: boolean;
     includeCodeBlock: boolean;
     includeMermaid: boolean;
@@ -969,19 +970,13 @@ function collectImageTitleSearchUnits(
     });
     titles.forEach((titleElement, index) => {
         const textNodes = collectDescendantTextNodes(titleElement, true);
-        const text = textNodes.map((node) => node.nodeValue ?? "").join("");
-        if (!text) {
-            return;
-        }
-        units.push({
+        units.push(...unitsFromTextNodes({
             blockId,
             blockType: PARAGRAPH_TYPE,
             blockIndex,
             element: titleElement,
-            text,
-            textNodes,
             unitId: `image-title:${index}`,
-        });
+        }, textNodes));
     });
     return units;
 }
@@ -1003,36 +998,28 @@ function collectCalloutSearchUnits(
     const titleElement = calloutBlock.querySelector<HTMLElement>(".callout-title");
     if (titleElement) {
         const titleNodes = collectDescendantTextNodes(titleElement, includeImageTitle);
-        const titleText = titleNodes.map((node) => node.nodeValue ?? "").join("");
-        if (titleText) {
-            units.push({
-                blockId,
-                blockType: CALLOUT_TYPE,
-                blockIndex,
-                element: titleElement,
-                text: titleText,
-                textNodes: titleNodes,
-                unitId: "callout-title",
-            });
-        }
+        units.push(...unitsFromTextNodes({
+            blockId,
+            blockType: CALLOUT_TYPE,
+            blockIndex,
+            element: titleElement,
+            unitId: "callout-title",
+        }, titleNodes));
     }
 
     // Callout 容器上可能还有标题区以外、且不属于子块的少量文本（一般为空）
     const ownedNodes = collectTextNodes(calloutBlock, calloutBlock, includeImageTitle).filter((node) => {
         return !titleElement || !titleElement.contains(node);
     });
-    const ownedText = ownedNodes.map((node) => node.nodeValue ?? "").join("");
-    if (ownedText.trim()) {
-        units.push({
+    units.push(
+        ...unitsFromTextNodes({
             blockId,
             blockType: CALLOUT_TYPE,
             blockIndex,
             element: calloutBlock,
-            text: ownedText,
-            textNodes: ownedNodes,
             unitId: "callout-owned",
-        });
-    }
+        }, ownedNodes).filter((unit) => unit.text.trim()),
+    );
 
     return units;
 }
@@ -1202,20 +1189,18 @@ function pushTableCellUnit(
         return;
     }
     const textNodes = collectDescendantTextNodes(tableCellTextRoot(cell), includeImageTitle, headingGates);
-    const text = textNodes.map((node) => node.nodeValue ?? "").join("");
-    if (!text) {
-        return;
-    }
-    seenUnitKeys.add(unitId);
-    units.push({
+    const produced = unitsFromTextNodes({
         blockId,
         blockType: TABLE_TYPE,
         blockIndex,
         element: cell,
-        text,
-        textNodes,
         unitId,
-    });
+    }, textNodes);
+    if (produced.length === 0) {
+        return;
+    }
+    seenUnitKeys.add(unitId);
+    units.push(...produced);
 }
 
 /** 行的直接子节点里，算作单元格的元素。嵌套表的格子不在 children 里。 */
@@ -1830,6 +1815,45 @@ function collectMindmapOwnTextNodes(preview: HTMLElement): Text[] {
         },
     });
     return collectWalkerTextNodes(walker);
+}
+
+function joinTextNodes(nodes: readonly Text[]): string {
+    return nodes.map((node) => node.nodeValue ?? "").join("");
+}
+
+/**
+ * 没有阻隔时保持原来的单个 unit。切开后用 `#run-N` 区分，避免改掉表格行列号。
+ */
+function unitsFromTextNodes(
+    base: Omit<SearchableBlock, "text" | "textNodes">,
+    textNodes: readonly Text[],
+): SearchableBlock[] {
+    const visible = omitAuthorCssHiddenText(textNodes);
+    const runs = splitTextNodesAtBarriers(visible).filter((run) => joinTextNodes(run).length > 0);
+    if (runs.length === 0) {
+        return [];
+    }
+    if (runs.length === 1) {
+        return [{
+            ...base,
+            text: joinTextNodes(runs[0]),
+            textNodes: runs[0],
+        }];
+    }
+    const units: SearchableBlock[] = [];
+    runs.forEach((run, index) => {
+        const text = joinTextNodes(run);
+        if (!text) {
+            return;
+        }
+        units.push({
+            ...base,
+            text,
+            textNodes: run,
+            unitId: base.unitId ? `${base.unitId}#run-${index}` : `run-${index}`,
+        });
+    });
+    return units;
 }
 
 /**

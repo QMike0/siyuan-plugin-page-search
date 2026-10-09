@@ -1,5 +1,10 @@
 import type {BlockAncestorIncludeFlags} from "../../shared";
 import {
+    codeBlockLanguagesNeeded as codeBlockLanguagesNeededFor,
+    effectiveCodeBlockLanguage,
+    isCodeBlockLanguageEnabled,
+} from "../../shared/code-block-language";
+import {
     escSql,
     querySqlAll,
 } from "./api";
@@ -39,6 +44,11 @@ export interface BlockMeta {
      * 未解析到时保持 undefined，已解析的普通代码块是空字符串。
      */
     codeLanguage?: string;
+    /**
+     * 围栏语言仅来自当前已挂载的编辑器 DOM。它可能尚未保存，不能按数据库 hash
+     * 复用到下一轮元数据；卸载后应重新从 blocks.markdown 读取。
+     */
+    codeLanguageFromLive?: boolean;
     ial: string;
     hash: string;
     updated: string;
@@ -47,10 +57,17 @@ export interface BlockMeta {
 export interface DocMeta {
     byId: Map<string, BlockMeta>;
     /** 含容器在内的父子关系，供聚焦时收窄范围。 */
-    links: Map<string, {parentId: string; type: string; subtype: string; ial: string;}>;
+    links: Map<string, {
+        parentId: string;
+        type: string;
+        subtype: string;
+        ial: string;
+        /** 容器块不进 byId，但运行时文字缓存仍需用内容版本校验。 */
+        hash: string;
+    }>;
     /** 块数量加最新 updated。变化后再拉 getDocBlocksOrders。 */
     signature: string;
-    /** 本轮是否已经解析过代码块围栏语言。默认三个开关一致时不查。 */
+    /** 本轮是否已经解析过代码块围栏语言。图表分流、开关和缓存共用它。 */
     codeLanguagesLoaded?: boolean;
     /**
      * getDocBlocksOrders 失败时的阅读序。
@@ -61,6 +78,20 @@ export interface DocMeta {
 
 const metaCache = new Map<string, {at: number; meta: DocMeta;}>();
 const META_TTL_MS = 1500;
+/** 长会话切换大量文档时，结构信息不能无限留下。当前文档刚写入，淘汰的是更早的文档。 */
+const META_CACHE_LIMIT = 16;
+
+function rememberMeta(rootId: string, entry: {at: number; meta: DocMeta;}): void {
+    metaCache.delete(rootId);
+    metaCache.set(rootId, entry);
+    while (metaCache.size > META_CACHE_LIMIT) {
+        const oldest = metaCache.keys().next().value as string | undefined;
+        if (!oldest) {
+            break;
+        }
+        metaCache.delete(oldest);
+    }
+}
 
 /** 只读缓存，不因过期再查库。跳转用它猜折叠标题，猜错会退回接口。 */
 export function peekDocMeta(rootId: string): DocMeta | null {
@@ -81,6 +112,7 @@ export async function loadDocMeta(rootId: string, signal?: AbortSignal): Promise
     }
     const cached = metaCache.get(rootId);
     if (cached && Date.now() - cached.at < META_TTL_MS) {
+        rememberMeta(rootId, cached);
         return cached.meta;
     }
     const root = escSql(rootId);
@@ -102,8 +134,15 @@ export async function loadDocMeta(rootId: string, signal?: AbortSignal): Promise
     }
 
     const byId = new Map<string, BlockMeta>();
-    const parentById = new Map<string, {parentId: string; type: string; subtype: string; ial: string;}>();
+    const parentById = new Map<string, {
+        parentId: string;
+        type: string;
+        subtype: string;
+        ial: string;
+        hash: string;
+    }>();
     let maxUpdated = "";
+    let codeLanguagesComplete = true;
     for (const row of rows) {
         if (!row.id) {
             continue;
@@ -122,11 +161,27 @@ export async function loadDocMeta(rootId: string, signal?: AbortSignal): Promise
             hash: String(row.hash ?? ""),
             updated,
         };
+        // 元数据 1.5 秒过期后仍可复用未改代码块的围栏语言，避免连续输入反复扫描整篇文档。
+        // hash 为空时不猜；围栏或内容变更后 hash 变化，下一次会重新读取 markdown。
+        const previous = cached?.meta.byId.get(meta.id);
+        if (
+            type === "c" &&
+            meta.hash &&
+            previous?.hash === meta.hash &&
+            previous.codeLanguage !== undefined &&
+            !previous.codeLanguageFromLive
+        ) {
+            meta.codeLanguage = previous.codeLanguage;
+        }
+        if (type === "c" && meta.codeLanguage === undefined) {
+            codeLanguagesComplete = false;
+        }
         parentById.set(row.id, {
             parentId: meta.parentId,
             type: meta.type,
             subtype: meta.subtype,
             ial: meta.ial,
+            hash: meta.hash,
         });
         if (!isContainerType(type)) {
             byId.set(row.id, meta);
@@ -146,7 +201,11 @@ export async function loadDocMeta(rootId: string, signal?: AbortSignal): Promise
             })),
         ),
     };
-    metaCache.set(rootId, {at: Date.now(), meta});
+    if (codeLanguagesComplete) {
+        meta.codeLanguagesLoaded = true;
+    }
+    const cachedAt = Date.now();
+    rememberMeta(rootId, {at: cachedAt, meta});
     return meta;
 }
 
@@ -201,14 +260,8 @@ export function isContainerType(type: string): boolean {
         type === "mindmap" || type === "mindmap_item";
 }
 
-/**
- * 三个代码块开关不一致时才需要语言。都开或都关时，语言不影响候选。
- */
 export function codeBlockLanguagesNeeded(options: BlockIncludeFlags): boolean {
-    const plain = options.includeCodeBlock !== false;
-    const mermaid = options.includeMermaid !== false;
-    const flowchart = options.includeFlowchart !== false;
-    return plain !== mermaid || plain !== flowchart || mermaid !== flowchart;
+    return codeBlockLanguagesNeededFor(options);
 }
 
 /**
@@ -251,6 +304,7 @@ export async function ensureCodeBlockLanguages(
         const item = row.id ? meta.byId.get(row.id) : undefined;
         if (item && item.codeLanguage === undefined) {
             item.codeLanguage = codeFenceLanguage(String(row.fence ?? ""));
+            item.codeLanguageFromLive = false;
         }
     }
     meta.codeLanguagesLoaded = true;
@@ -264,6 +318,14 @@ export async function ensureCodeBlockLanguages(
 export function codeFenceLanguage(markdownHead: string): string {
     const line = markdownHead.replace(/^[\s\uFEFF]+/, "").split(/\r?\n/, 1)[0] ?? "";
     return /^(?:`{3,}|~{3,})([^\s`~]*)/.exec(line)?.[1] ?? "";
+}
+
+/**
+ * 代码块分类唯一使用的有效语言：已挂载块的 data-subtype 优先，其次是围栏语言，
+ * 最后才兼容未来内核可能写入的 blocks.subtype。
+ */
+export function effectiveCodeLanguage(meta: Pick<BlockMeta, "type" | "subtype" | "codeLanguage">): string {
+    return effectiveCodeBlockLanguage(meta.type, meta.subtype, meta.codeLanguage);
 }
 
 const CODE_BLOCK_DOM_TYPE = "NodeCodeBlock";
@@ -284,11 +346,13 @@ export function noteLiveCodeLanguage(meta: BlockMeta, element: HTMLElement): boo
         return false;
     }
     const language = host.getAttribute("data-subtype") ?? "";
-    if (meta.codeLanguage === language) {
+    const changed = meta.codeLanguage !== language;
+    if (!changed && meta.codeLanguageFromLive) {
         return false;
     }
     meta.codeLanguage = language;
-    return true;
+    meta.codeLanguageFromLive = true;
+    return changed;
 }
 
 /** 用户关掉的块类型不进入候选。标题级别、列表子类型按 subtype 判断。 */
@@ -329,15 +393,8 @@ export function isBlockTypeEnabled(meta: BlockMeta, options: BlockIncludeFlags):
         return options.includeMindmap !== false;
     }
     if (type === "c") {
-        // codeLanguage 优先：subtype 对代码块没有语言。undefined 才回退 subtype。
-        const language = meta.codeLanguage ?? subtype;
-        if (language === "mermaid") {
-            return options.includeMermaid !== false;
-        }
-        if (language === "flowchart") {
-            return options.includeFlowchart !== false;
-        }
-        return options.includeCodeBlock !== false;
+        const language = effectiveCodeLanguage(meta);
+        return isCodeBlockLanguageEnabled(language, options);
     }
     if ((type === "tabs" || type === "tab") && options.includeTabs === false) {
         return false;

@@ -1,25 +1,23 @@
+import {
+    DIAGRAM_CODE_LANGUAGES,
+    DIAGRAM_CODE_LANGUAGE_SET,
+} from "../shared/code-block-language";
 import {ZERO_WIDTH_GLOBAL_RE} from "../shared/constants";
 import {rendererUnitId} from "../shared/renderer-units";
 import type {SearchableBlock} from "./dom-types";
+import {splitTextNodesAtBarriers} from "./text-runs";
+import {omitAuthorCssHiddenText} from "./visibility";
 
 const CODE_BLOCK_TYPE = "NodeCodeBlock";
 const MATH_BLOCK_TYPE = "NodeMathBlock";
 const HTML_BLOCK_TYPE = "NodeHTMLBlock";
 
-export const DIAGRAM_SUBTYPES = [
-    "mermaid",
-    "flowchart",
-    "graphviz",
-    "plantuml",
-    "chart",
-    "mindmap",
-    "abc",
-] as const;
+export const DIAGRAM_SUBTYPES = DIAGRAM_CODE_LANGUAGES;
 
 export type DiagramSubtype = (typeof DIAGRAM_SUBTYPES)[number];
 export type RendererAdapterKind = DiagramSubtype | "math" | "html";
 
-export const DIAGRAM_SUBTYPE_SET = new Set<string>(DIAGRAM_SUBTYPES);
+export const DIAGRAM_SUBTYPE_SET = DIAGRAM_CODE_LANGUAGE_SET;
 
 interface RendererContext {
     blockId: string;
@@ -45,7 +43,8 @@ export function rendererAdapterKind(element: HTMLElement): RendererAdapterKind |
 
 /**
  * live DOM 与离屏 DOM 共用的 renderer 采集入口。
- * 返回 [] 表示 renderer 尚未产生可搜索 Text；不会用 data-content 源码冒充可见字。
+ * Mermaid / flowchart 没有 renderer 文本时会返回一个明确标记的源码兜底单元；
+ * 其他 renderer 仍返回 []，不会把源码误当成公式或 HTML 的可见字。
  */
 export function collectRendererSearchUnits(
     element: HTMLElement,
@@ -95,7 +94,12 @@ function collectHtmlUnits(element: HTMLElement, context: RendererContext): Searc
             "style, script, textarea, noscript, title, head, template, noembed, noframes, canvas, desc, [hidden]",
         );
     });
-    return singleRenderedUnit(element, context, "html", textNodes);
+    const runs = splitTextNodesAtBarriers(omitAuthorCssHiddenText(textNodes));
+    const units: SearchableBlock[] = [];
+    for (const run of runs) {
+        units.push(...singleRenderedUnit(element, context, "html", run, units.length));
+    }
+    return units;
 }
 
 function collectDiagramUnits(
@@ -120,9 +124,15 @@ function collectDiagramUnits(
 
     const units: SearchableBlock[] = [];
     for (const boundary of boundaries) {
-        const textNodes = collectTextNodes(boundary, (parent) => {
-            return !parent.closest(".protyle-attr, .protyle-icons, style, script, textarea, noscript");
-        });
+        const textNodes = omitAuthorCssHiddenText(collectTextNodes(boundary, (parent) => {
+            const ariaHidden = parent.closest('[aria-hidden="true"]');
+            if (ariaHidden && !parent.closest("svg")) {
+                return false;
+            }
+            return !parent.closest(
+                ".protyle-attr, .protyle-icons, style, script, textarea, noscript, title, desc, template, [hidden]",
+            );
+        }));
         const text = textNodes.map((node) => node.nodeValue ?? "").join("");
         if (!meaningful(text)) {
             continue;
@@ -135,6 +145,23 @@ function collectDiagramUnits(
             unitId: rendererUnitId("rendered-text", kind, units.length),
         });
     }
+    if (units.length === 0 && (kind === "mermaid" || kind === "flowchart")) {
+        // Mermaid / flowchart 的源码通常包含节点标签；当思源 renderer 尚未挂载
+        // SVG（例如首次打开的折叠块）时，保留一份不可定位的源码单元，避免整块
+        // 被误报为“未完成解析”。有 SVG 时仍只使用真正的可见文字，避免重复命中。
+        const source = diagramSourceText(element);
+        if (meaningful(source)) {
+            units.push({
+                ...context,
+                element,
+                text: source,
+                textNodes: [],
+                // 源码只是召回兜底，不能按普通正文定位或替换；沿用统一
+                // renderer 单元标识也能让缓存、跳转和替换门闩保持一致。
+                unitId: rendererUnitId("source-fallback", kind),
+            });
+        }
+    }
     return units;
 }
 
@@ -143,6 +170,7 @@ function singleRenderedUnit(
     context: RendererContext,
     kind: "math" | "html",
     textNodes: Text[],
+    index = 0,
 ): SearchableBlock[] {
     const text = textNodes.map((node) => node.nodeValue ?? "").join("");
     if (!meaningful(text)) {
@@ -153,7 +181,7 @@ function singleRenderedUnit(
         element,
         text,
         textNodes,
-        unitId: rendererUnitId("rendered-text", kind),
+        unitId: rendererUnitId("rendered-text", kind, index),
     }];
 }
 
@@ -187,4 +215,23 @@ function collectTextNodes(
 
 function meaningful(text: string): boolean {
     return Boolean(text.replace(ZERO_WIDTH_GLOBAL_RE, "").trim());
+}
+
+/** 返回图表块里的源码文本，用于 renderer 尚未完成时的召回候选判断。 */
+export function diagramSourceText(element: HTMLElement): string {
+    const raw = element.getAttribute("data-content");
+    if (!raw) {
+        return "";
+    }
+    const lute = (window as Window & {Lute?: {UnEscapeHTMLStr?: (value: string) => string;};}).Lute;
+    if (typeof lute?.UnEscapeHTMLStr === "function") {
+        try {
+            return lute.UnEscapeHTMLStr(raw);
+        } catch {
+            // DOM decoding below is sufficient for ordinary entities.
+        }
+    }
+    const textarea = document.createElement("textarea");
+    textarea.innerHTML = raw;
+    return textarea.value;
 }

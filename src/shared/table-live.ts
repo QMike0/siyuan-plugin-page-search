@@ -95,6 +95,16 @@ export function tableHostOmitsRows(element: HTMLElement): boolean {
     return false;
 }
 
+/** 虚拟表合并用的格子键。同一格被 br、公式或图片切开时，用 `#run-N` 区分，避免后一段被前一段盖掉。 */
+export function tableOverlayKey(unitId: string | undefined): string {
+    const position = tableCellPosition(unitId);
+    if (!position) {
+        return "";
+    }
+    const run = /#run-(\d+)$/.exec(unitId ?? "");
+    return run ? `${position}#${run[1]}` : position;
+}
+
 /** `table-cell:行:列` 或 `table-cell:行:列:单元格id` 里的逻辑位置。对不上时返回空串。 */
 export function tableCellPosition(unitId: string | undefined): string {
     if (!unitId || unitId.indexOf(TABLE_CELL_PREFIX) !== 0) {
@@ -319,11 +329,12 @@ export function mergeVirtualTableUnits<T extends {
             next.push(unit);
             continue;
         }
-        const mark = unit.blockId + "\0" + position;
+        const overlayKey = tableOverlayKey(unit.unitId);
+        const mark = unit.blockId + "\0" + overlayKey;
         if (handled.has(mark)) {
             continue;
         }
-        const live = state.liveByKey.get(position);
+        const live = state.liveByKey.get(overlayKey);
         if (live && unit === live) {
             continue;
         }

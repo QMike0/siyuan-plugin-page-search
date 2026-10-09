@@ -52,7 +52,7 @@ import {
 import {
     cancelBackgroundCorpusJobs,
     editorRootId,
-    invalidateDocumentSearchCaches,
+    invalidateAttributeViewSearch,
     invalidateDocumentStructureCaches,
     releaseBackgroundCorpusRoot,
     retainBackgroundCorpusRoot,
@@ -158,6 +158,12 @@ const MAX_SCOPED_REPAIR_BLOCKS = 64;
  * 只等待当前用户选中的一条命中，超时后仍回退到原来的整篇搜索与 DOM 观察修复流程。
  */
 const LOCATED_MATCH_BIND_TIMEOUT_MS = 1500;
+/**
+ * 思源把目标块壳、正文、渲染器结果分批写入时，MutationObserver 会立即触发定向补绑。
+ * 这条低频兜底只覆盖 shadow DOM / 第三方渲染器等没有可观察 DOM 突变的情况；避免像旧逻辑那样
+ * 每帧重复解析整个目标块。
+ */
+const LOCATED_MATCH_BIND_FALLBACK_RETRY_MS = 120;
 
 /**
  * Range 还连在文档上、没有缩成空点。思源换掉节点时，旧 Range 会缩到父节点上。
@@ -300,6 +306,8 @@ export interface SearchBarI18n {
     replaceDocTitleUnsupported?: string;
     /** 渲染失败未计入的块数 */
     searchUnrendered?: string;
+    /** 数据库分页截断未计入的结果数 */
+    searchTruncated?: string;
     settingsTitle: string;
     settingsRestrictInline: string;
     settingsRestrictInlineHint: string;
@@ -833,6 +841,10 @@ export class SearchBar {
             },
             onSettled: (change) => {
                 this.noteAddedBlocks(change);
+                if (change.foldChanged && this.includeFoldedBlocks) {
+                    this.noteFoldContentStable(change);
+                    return;
+                }
                 this.repairHighlightRanges();
                 if (change.foldChanged) {
                     this.scheduleFoldRefresh();
@@ -1945,6 +1957,7 @@ export class SearchBar {
         const canReplaceCurrent = !enumerateMode &&
             !modeBlocked &&
             Boolean(current && isMatchWritable(this.edit, current));
+        // 覆盖未完成只禁止全部替换。单处替换只看当前这条是否可写。
         const hasWritable = !enumerateMode &&
             !modeBlocked &&
             !this.searchCoverageIncomplete &&
@@ -2651,6 +2664,9 @@ export class SearchBar {
      * 使用 change=false 保留当前跳转索引；跳转滚动期间不响应，避免误重置到第一项。
      */
     private scheduleAttrViewResearch() {
+        // 变更一到就丢掉引用缓存。跳转暂停或搜索框为空时不会重搜，
+        // 但下一次手动搜索也不能继续用旧单元格。
+        invalidateAttributeViewSearch(this.rememberCurrentRootId());
         if (!this.includeAttributeView) {
             return;
         }
@@ -2974,12 +2990,13 @@ export class SearchBar {
 
     /**
      * openTab / unfold 的完成回调只表示目标块已可定位；思源随后仍可能异步写入块内文本。
-     * 等待期间只尝试当前命中，不重搜全文，也不会改动当前序号。
+     * 目标块每次真正发生 DOM 变动时立刻尝试当前命中。旧逻辑每帧都重新解析目标块，
+     * 在大块、嵌套容器或渲染器逐步挂载时会抢占主线程，反而拖慢思源把文本插进来。
+     * 低频轮询只保留给观察不到的 shadow DOM / 外部渲染器路径。
      */
     private async waitForLocatedMatchRange(index: number, matchId: string): Promise<boolean> {
         const generation = this.searchGeneration;
-        const started = Date.now();
-        while (Date.now() - started < LOCATED_MATCH_BIND_TIMEOUT_MS) {
+        const canBindCurrent = (): boolean => {
             if (
                 generation !== this.searchGeneration ||
                 this.replaceBusy ||
@@ -2991,19 +3008,121 @@ export class SearchBar {
             if (!current || current.id !== matchId) {
                 return false;
             }
-            if (this.tryBindUnfoldedMatch(index, true)) {
-                // 已有的结果 Highlight 是可变集合；只追加刚装载的这一条，避免在命中很多时
-                // 为首次跳转重建全部 Range。定位结束后的局部修复仍会补齐同一块的其它命中。
-                if (!this.appendResultHighlight(this.resultMatches[index - 1])) {
-                    this.applyResultHighlights();
-                }
-                return true;
+            return true;
+        };
+        const tryBind = (): boolean => {
+            if (!canBindCurrent() || !this.tryBindUnfoldedMatch(index, true)) {
+                return false;
             }
-            await new Promise<void>((resolve) => {
-                window.requestAnimationFrame(() => resolve());
-            });
+            // 已有的结果 Highlight 是可变集合；只追加刚装载的这一条，避免在命中很多时
+            // 为首次跳转重建全部 Range。定位结束后的局部修复仍会补齐同一块的其它命中。
+            if (!this.appendResultHighlight(this.resultMatches[index - 1])) {
+                this.applyResultHighlights();
+            }
+            return true;
+        };
+
+        if (!canBindCurrent()) {
+            return false;
         }
-        return false;
+        if (tryBind()) {
+            return true;
+        }
+
+        const blockId = this.resultMatches[index - 1]?.blockId;
+        if (!blockId || blockId === "__doc-title__") {
+            return false;
+        }
+        const selector = `[data-node-id="${CSS.escape(blockId)}"]`;
+        return await new Promise<boolean>((resolve) => {
+            let settled = false;
+            let fallbackTimer: number | undefined;
+            let timeoutTimer: number | undefined;
+            let owner: HTMLElement | null = null;
+
+            const finish = (bound: boolean) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                observer.disconnect();
+                window.clearTimeout(fallbackTimer);
+                window.clearTimeout(timeoutTimer);
+                resolve(bound);
+            };
+            const currentOwner = (): HTMLElement | null => {
+                if (!owner || !owner.isConnected) {
+                    owner = this.edit.querySelector<HTMLElement>(selector);
+                }
+                return owner;
+            };
+            const mutationTouchesTarget = (records: MutationRecord[]): boolean => {
+                const targetOwner = currentOwner();
+                for (const record of records) {
+                    if (
+                        targetOwner && (
+                            targetOwner.contains(record.target) ||
+                            (record.target instanceof Element && record.target.contains(targetOwner))
+                        )
+                    ) {
+                        return true;
+                    }
+                    for (let nodeIndex = 0; nodeIndex < record.addedNodes.length; nodeIndex += 1) {
+                        const node = record.addedNodes[nodeIndex];
+                        if (
+                            targetOwner && (
+                                targetOwner.contains(node) ||
+                                (node instanceof Element && node.contains(targetOwner))
+                            )
+                        ) {
+                            return true;
+                        }
+                        if (
+                            !targetOwner && node instanceof Element && (
+                                node.matches(selector) || Boolean(node.querySelector(selector))
+                            )
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            };
+            const attempt = () => {
+                if (settled) {
+                    return;
+                }
+                if (!canBindCurrent()) {
+                    finish(false);
+                    return;
+                }
+                if (tryBind()) {
+                    finish(true);
+                }
+            };
+            const scheduleFallback = () => {
+                attempt();
+                if (!settled) {
+                    fallbackTimer = window.setTimeout(scheduleFallback, LOCATED_MATCH_BIND_FALLBACK_RETRY_MS);
+                }
+            };
+            const observer = new MutationObserver((records) => {
+                if (mutationTouchesTarget(records)) {
+                    // MutationObserver 在本批 DOM 写入完成后运行；这里直接建 Range，避免再等一帧。
+                    attempt();
+                }
+            });
+
+            observer.observe(this.edit, {
+                childList: true,
+                subtree: true,
+                characterData: true,
+                attributes: true,
+                attributeFilter: ["class", "style", "fold", "data-render", "data-subtype", "data-content"],
+            });
+            fallbackTimer = window.setTimeout(scheduleFallback, LOCATED_MATCH_BIND_FALLBACK_RETRY_MS);
+            timeoutTimer = window.setTimeout(() => finish(false), LOCATED_MATCH_BIND_TIMEOUT_MS);
+        });
     }
 
     /** 画布副本没有 data-node-id。按源块 id 把 Range 绑到当前可见节点上。 */
@@ -3210,6 +3329,45 @@ export class SearchBar {
         if (pending.size > MAX_TOUCHED_BLOCKS) {
             this.pendingAddedBlocks = null;
         }
+    }
+
+    /**
+     * 开启“搜索折叠块内容”时，fold 只会改变 DOM 挂载与可见性，局部 Range 不必重建全文索引。
+     * 收起标题没有新增节点：直接释放已断开的 Range，避免按所有命中重扫整篇文档；
+     * 展开时保留既有的按新增块补 Range 路径，公式/图表完成渲染后会继续触发同一条路径。
+     */
+    private noteFoldContentStable(change: EditorDomChange) {
+        if (change.addedInBlocks === null || change.addedInBlocks.size > 0) {
+            this.repairHighlightRanges();
+            return;
+        }
+        this.dropDetachedFoldRanges();
+    }
+
+    private dropDetachedFoldRanges() {
+        if (
+            this.locatePending ||
+            this.replaceBusy ||
+            this.searchesInFlight > 0 ||
+            !this.plugin.isLastHighlightComponent(this.root) ||
+            !this.resultMatches.length
+        ) {
+            return;
+        }
+        let changed = false;
+        const next = this.resultMatches.map((match) => {
+            if (!match.range || rangeStillPainted(match)) {
+                return match;
+            }
+            changed = true;
+            return {...match, range: undefined};
+        });
+        if (!changed) {
+            return;
+        }
+        this.resultMatches = next;
+        this.applyResultHighlights();
+        this.syncReplaceButtons();
     }
 
     /**
@@ -3825,13 +3983,11 @@ export class SearchBar {
 
     /**
      * 替换当前：不可替则提示并跳到下一项；可替走 Protyle transaction。
+     * 图表无可见字、索引未完成或结果被截断时，全部替换仍要完整快照。
+     * 单处只验证这一条：只读、不可写和偏移处文字已经对不上的，写回会拒绝。
      */
     private async clickReplace() {
         if (this.replaceBusy || this.resultCount === 0 || this.isRestrictEnumerateMode()) {
-            return;
-        }
-        if (this.searchCoverageIncomplete) {
-            showMessage(this.i18n.replaceAllIncomplete, 4000, "info");
             return;
         }
         if (isEditorReplaceModeBlocked(this.edit)) {
@@ -3940,7 +4096,6 @@ export class SearchBar {
                 this.scrollIntoRanges(this.resultIndex - 1, false);
             }
             showMessage(this.i18n.replaceCurrentDone, 2000, "info");
-            invalidateDocumentSearchCaches();
         } finally {
             this.replaceBusy = false;
         }
@@ -4041,7 +4196,6 @@ export class SearchBar {
                 4000,
                 "info",
             );
-            invalidateDocumentSearchCaches();
         } finally {
             this.replaceBusy = false;
         }

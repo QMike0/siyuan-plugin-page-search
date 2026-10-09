@@ -1,6 +1,15 @@
 export { avApiUnitInView, avApiUnitShown, collectAvDomCoverage } from "./av-live";
 export { collectHeadingFoldedIds, isBlockTreeEnabled, isSelfFoldedIal } from "./block-tree";
 export type { BlockAncestorIncludeFlags, BlockTreeLink, MountedHeadingFoldState } from "./block-tree";
+export {
+    codeBlockLanguagesNeeded,
+    DIAGRAM_CODE_LANGUAGE_SET,
+    DIAGRAM_CODE_LANGUAGES,
+    effectiveCodeBlockLanguage,
+    isCodeBlockLanguageEnabled,
+    isDiagramCodeLanguage,
+} from "./code-block-language";
+export type { CodeBlockLanguageFlags } from "./code-block-language";
 export { effectiveSearchQuery, formatSearchCountLabel, ZERO_WIDTH_GLOBAL_RE, ZERO_WIDTH_RE } from "./constants";
 export { DOC_TITLE_MAX_LENGTH, isValidDocTitle, sanitizeDocTitle } from "./doc-title";
 export { plainTextFromInlineMemoContent, sanitizeInlineMemoContentForWrite } from "./inline-memo-content";
@@ -19,7 +28,12 @@ export {
     rangesOverlap,
     regexSearchFlags,
 } from "./match-text";
-export { extractRegexLiteralGroups, regexPrefilterStoresPlainCache } from "./regex-literals";
+export {
+    extractRegexLiteralGroups,
+    regexPrefilterStoresPlainCache,
+    searchNormalizeFoldIsSuperset,
+} from "./regex-literals";
+export type { RegexPrefilterOptions } from "./regex-literals";
 export { expandRegexReplacement, expandRegexReplacementUnits, expandReplacementTemplate } from "./regex-replace";
 export type {
     ExpandRegexReplacementOptions,
@@ -76,6 +90,7 @@ export {
     TABLE_VIRTUAL_ROWS_ATTR,
     tableCellNodeId,
     tableCellPosition,
+    tableOverlayKey,
     tableHostOmitsRows,
 } from "./table-live";
 export type { LogicalTableLayout, LogicalTableRow } from "./table-live";

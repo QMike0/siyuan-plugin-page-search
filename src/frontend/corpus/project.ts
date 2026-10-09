@@ -45,12 +45,36 @@ export function projectRanges(
         restrictInlineTypes: options.restrictInlineTypes,
     });
     const byKey = new Map<string, SearchableBlock>();
+    const mathByKey = new Map<string, SearchableBlock[]>();
     for (const block of live) {
         byKey.set(unitKey(block.blockId, block.unitId), block);
+        if (isInlineMathSearchUnit(block) && block.mathOrdinal !== undefined) {
+            const key = `${block.blockId}\0${block.mathOrdinal}\0${inlineMathIdentityText(block.text)}`;
+            const candidates = mathByKey.get(key);
+            if (candidates) {
+                candidates.push(block);
+            } else {
+                mathByKey.set(key, [block]);
+            }
+        }
     }
 
     return matches.map((match) => {
-        const block = byKey.get(unitKey(match.blockId, match.unitId));
+        let block: SearchableBlock | undefined;
+        // 行级公式的 unitId 是全文采集序号；局部补绑（例如标题展开后）会从 0
+        // 重新编号。优先使用所属块内序号和可见文字，避免碰巧相同的 unitId 指向另一条公式。
+        if (
+            match.highlightKind === "inline-math" &&
+            match.mathOrdinal !== undefined &&
+            match.mathUnitText !== undefined
+        ) {
+            block = mathByKey.get(
+                `${match.blockId}\0${match.mathOrdinal}\0${match.mathUnitText}`,
+            )?.[0];
+        }
+        if (!block) {
+            block = byKey.get(unitKey(match.blockId, match.unitId));
+        }
         if (!block) {
             return {...match, range: undefined};
         }
@@ -74,12 +98,34 @@ export function fillLiveRanges(
         return matches;
     }
     const byKey = new Map<string, SearchableBlock>();
+    const mathByKey = new Map<string, SearchableBlock[]>();
     for (const block of liveBlocks) {
         byKey.set(unitKey(block.blockId, block.unitId), block);
+        if (isInlineMathSearchUnit(block) && block.mathOrdinal !== undefined) {
+            const key = `${block.blockId}\0${block.mathOrdinal}\0${inlineMathIdentityText(block.text)}`;
+            const candidates = mathByKey.get(key);
+            if (candidates) {
+                candidates.push(block);
+            } else {
+                mathByKey.set(key, [block]);
+            }
+        }
     }
     let changed = false;
     const next = matches.map((match) => {
-        const block = byKey.get(unitKey(match.blockId, match.unitId));
+        let block: SearchableBlock | undefined;
+        if (
+            match.highlightKind === "inline-math" &&
+            match.mathOrdinal !== undefined &&
+            match.mathUnitText !== undefined
+        ) {
+            block = mathByKey.get(
+                `${match.blockId}\0${match.mathOrdinal}\0${match.mathUnitText}`,
+            )?.[0];
+        }
+        if (!block) {
+            block = byKey.get(unitKey(match.blockId, match.unitId));
+        }
         if (!block) {
             return match;
         }

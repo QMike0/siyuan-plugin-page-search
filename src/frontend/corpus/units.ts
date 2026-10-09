@@ -57,38 +57,88 @@ function nonReplaceable(block: SearchableBlock): boolean {
         Boolean(block.unitId?.startsWith("embed:"));
 }
 
+function hostTokensOf(element: Element): string[] {
+    const tokens = parseDataTypeTokens(element.getAttribute("data-type"));
+    const hosts: string[] = [];
+    for (const token of tokens) {
+        if (HOST_TYPES.has(token)) {
+            hosts.push(token);
+        }
+    }
+    return hosts;
+}
+
+/**
+ * 每个文本节点只沿祖先走一趟。
+ * 思源行内格式是 span[data-type]，不含 data-node-id；走到块根或带 data-node-id 的节点为止。
+ * 区间仍覆盖该元素下、本单元文本里的全部节点，和原先 contains 扫出来的首尾偏移一致。
+ */
 function collectRestrictSpans(block: SearchableBlock): CachedUnit["restrictSpans"] {
     const nodes = block.textNodes;
+    if (nodes.length === 0) {
+        return [];
+    }
+    const bounds = new Map<Element, {start: number; end: number; reached: boolean;}>();
+    const tokensOf = new Map<Element, string[]>();
+    const reachedOrder: Element[] = [];
     let cursor = 0;
-    const ranges = nodes.map((node) => {
+    for (const node of nodes) {
         const start = cursor;
         const length = node.nodeValue?.length ?? 0;
-        cursor += length;
-        return {node, start, end: cursor};
-    });
-    const spans: CachedUnit["restrictSpans"] = [];
-    const seen = new Set<string>();
-    for (const item of ranges) {
-        let element = item.node.parentElement;
-        while (element && element !== block.element && !element.hasAttribute("data-node-id")) {
-            for (const token of parseDataTypeTokens(element.getAttribute("data-type"))) {
-                if (!HOST_TYPES.has(token)) {
-                    continue;
+        const end = start + length;
+        cursor = end;
+        let element = node.parentElement;
+        let blocked = false;
+        while (element && element !== block.element) {
+            if (!blocked && element.hasAttribute("data-node-id")) {
+                blocked = true;
+            }
+            let tokens = tokensOf.get(element);
+            if (!tokens) {
+                tokens = hostTokensOf(element);
+                tokensOf.set(element, tokens);
+            }
+            if (tokens.length > 0) {
+                const bound = bounds.get(element);
+                if (!bound) {
+                    bounds.set(element, {start, end, reached: !blocked});
+                    if (!blocked) {
+                        reachedOrder.push(element);
+                    }
+                } else {
+                    if (start < bound.start) {
+                        bound.start = start;
+                    }
+                    if (end > bound.end) {
+                        bound.end = end;
+                    }
+                    if (!blocked && !bound.reached) {
+                        bound.reached = true;
+                        reachedOrder.push(element);
+                    }
                 }
-                const inside = ranges.filter((range) => element!.contains(range.node));
-                if (!inside.length) {
-                    continue;
-                }
-                const start = inside[0].start;
-                const end = inside[inside.length - 1].end;
-                const key = `${token}:${start}:${end}`;
-                if (seen.has(key)) {
-                    continue;
-                }
-                seen.add(key);
-                spans.push({type: token, start, end});
+            }
+            if (element.hasAttribute("data-node-id")) {
+                blocked = true;
             }
             element = element.parentElement;
+        }
+    }
+    const spans: CachedUnit["restrictSpans"] = [];
+    const seen = new Set<string>();
+    for (const element of reachedOrder) {
+        const bound = bounds.get(element);
+        const tokens = tokensOf.get(element);
+        if (!bound?.reached || !tokens?.length) {
+            continue;
+        }
+        for (const token of tokens) {
+            const key = `${token}:${bound.start}:${bound.end}`;
+            if (seen.has(key)) {
+                continue;
+            }
+            seen.add(key);
+            spans.push({type: token, start: bound.start, end: bound.end});
         }
     }
     return spans;

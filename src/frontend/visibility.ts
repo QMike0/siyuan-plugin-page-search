@@ -1,5 +1,80 @@
 import {parentElementCrossingShadow} from "./dom-parent";
-import {isUnderNonHeadingCssFold} from "./fold";
+import {isUnderNonHeadingCssFold} from "./fold-dom";
+
+const cssHideBoundaryCache = new Map<Element, boolean>();
+let collectAllowsFoldedHidden = true;
+
+/** 每次采集开始时清掉。样式会变，不能把上一次搜索的 display 留到下一次。 */
+export function beginTextCollection(allowFoldedHidden: boolean): void {
+    cssHideBoundaryCache.clear();
+    collectAllowsFoldedHidden = allowFoldedHidden;
+}
+
+/**
+ * 这个元素自己是作者写的隐藏边界，而不是被 display:none 祖先牵连。
+ * 思源用 .fn__none 收起页签等界面，离屏宿主和 fold="1" 也不是正文里的隐藏字。
+ */
+export function isCssHideBoundary(element: Element): boolean {
+    if (!(element instanceof HTMLElement)) {
+        return false;
+    }
+    const cached = cssHideBoundaryCache.get(element);
+    if (cached !== undefined) {
+        return cached;
+    }
+    let hidden = false;
+    const inlineHidden = element.hasAttribute("hidden") ||
+        element.style.display === "none" ||
+        element.style.visibility === "hidden";
+    if (inlineHidden) {
+        hidden = true;
+    } else if (
+        !element.classList.contains("fn__none") &&
+        !element.classList.contains("katex-html") &&
+        !element.hasAttribute("data-page-search-offscreen") &&
+        element.getAttribute("fold") !== "1"
+    ) {
+        if (typeof getComputedStyle !== "function") {
+            cssHideBoundaryCache.set(element, false);
+            return false;
+        }
+        const own = getComputedStyle(element);
+        const parent = parentElementCrossingShadow(element);
+        const parentStyle = parent instanceof HTMLElement ? getComputedStyle(parent) : null;
+        if (own.visibility === "hidden" && parentStyle?.visibility !== "hidden") {
+            hidden = true;
+        } else if (own.display === "none" && parentStyle?.display !== "none") {
+            hidden = true;
+        }
+    }
+    cssHideBoundaryCache.set(element, hidden);
+    return hidden;
+}
+
+/** 文本落在作者 CSS 隐藏里。打开折叠块时，折叠树内的字仍保留。 */
+export function isAuthorCssHiddenText(node: Text, allowFoldedHidden: boolean): boolean {
+    if (allowFoldedHidden && isUnderNonHeadingCssFold(node.parentElement)) {
+        return false;
+    }
+    let current = node.parentElement;
+    while (current && current !== document.body) {
+        if (current.hasAttribute("data-page-search-offscreen")) {
+            break;
+        }
+        if (isCssHideBoundary(current)) {
+            return true;
+        }
+        current = parentElementCrossingShadow(current);
+    }
+    return false;
+}
+
+export function omitAuthorCssHiddenText(nodes: readonly Text[]): Text[] {
+    if (nodes.length === 0) {
+        return [];
+    }
+    return nodes.filter((node) => !isAuthorCssHiddenText(node, collectAllowsFoldedHidden));
+}
 
 export interface ElementVisibilityOptions {
     /**
@@ -136,6 +211,10 @@ function isStrictlyVisible(htmlElement: HTMLElement): boolean {
         } as Parameters<HTMLElement["checkVisibility"]>[0]);
     }
 
+    if (typeof getComputedStyle !== "function") {
+        return true;
+    }
+
     const style = window.getComputedStyle(htmlElement);
     if (style.display === "none" || style.visibility === "hidden") {
         return false;
@@ -155,6 +234,9 @@ function isLooseUiElementVisible(element: HTMLElement): boolean {
             return false;
         }
 
+        if (typeof getComputedStyle !== "function") {
+            return true;
+        }
         const style = window.getComputedStyle(current);
         if (style.display === "none" || style.visibility === "hidden") {
             return false;

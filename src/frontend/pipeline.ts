@@ -121,11 +121,14 @@ export interface SearchPipelineResult {
     matches: SearchMatch[];
     /** 非法正则等；空表示成功 */
     error: string;
-    /** 内核查询 API 不可用，结果只覆盖已加载 DOM */
+    /**
+     * 覆盖不完整：文档接口不可用、数据库列表或代码块语言查询失败。
+     * 已打开区域里的命中仍在；未加载部分不能当成已经查完。
+     */
     degraded?: boolean;
-    /** 渲染块或正则文本库仍在后台补齐 */
+    /** 图表、数据库等仍在后台补齐，当前计数还不是终稿 */
     partial?: boolean;
-    /** 图表 / HTML / 公式渲染失败、未计入命中的块数 */
+    /** 图表 / HTML / 公式没有可用文本，这些块未计入命中 */
     unrendered?: number;
     /** 属性视图达到安全分页上限，结果未写入缓存且当前覆盖不完整 */
     truncated?: number;
@@ -412,7 +415,7 @@ async function calculateLoadedDomMatches(
         await options.regexMatcher.match(units, value, matchOptions, options.signal) :
         matchTextUnitsDetailed(units, value, matchOptions);
 
-    if (matched.cancelled) {
+    if ("cancelled" in matched && matched.cancelled) {
         return {matches: [], error: "", cancelled: true};
     }
 
