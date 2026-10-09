@@ -1,7 +1,12 @@
-import {ZERO_WIDTH_GLOBAL_RE, ZERO_WIDTH_RE} from "./constants";
+import {
+    effectiveSearchQuery,
+    ZERO_WIDTH_GLOBAL_RE,
+    ZERO_WIDTH_RE,
+} from "./constants";
+import {isRendererUnitId} from "./renderer-units";
 import {ATTRIBUTE_VIEW_TYPE} from "./replaceable";
 
-/** 与 frontend/blocks MERMAID_UNIT_ID / HTML_BLOCK_UNIT_ID 对齐 */
+/** 旧缓存/旧 RPC 单元兼容；新单元统一使用 renderer: 前缀。 */
 const MERMAID_UNIT_ID = "mermaid-source";
 const HTML_BLOCK_UNIT_ID = "html-block-rendered";
 import type {
@@ -51,7 +56,10 @@ export function generateSearchVariants(
         }
     }
 
-    return [...new Set(variants)];
+    // 仅内部标记组成的变体在 indexOf("") 循环中无法前进，也没有用户可见意义。
+    return [...new Set(variants)].filter((variant) => {
+        return variant.length > 0 && variant.replace(ZERO_WIDTH_GLOBAL_RE, "").length > 0;
+    });
 }
 
 /**
@@ -85,10 +93,18 @@ export function isHitReplaceableByUnit(
     if (unit.blockType === ATTRIBUTE_VIEW_TYPE) {
         return false;
     }
-    if (unit.unitId === MERMAID_UNIT_ID || unit.unitId === HTML_BLOCK_UNIT_ID) {
+    if (
+        isRendererUnitId(unit.unitId) ||
+        unit.unitId === MERMAID_UNIT_ID ||
+        unit.unitId === HTML_BLOCK_UNIT_ID
+    ) {
         return false;
     }
-    return isOffsetReplaceable(unit.segmentLengths, start, end);
+    if (!isOffsetReplaceable(unit.segmentLengths, start, end)) {
+        return false;
+    }
+    // 跨内部标记的替换会删除该字符。搜索可保持透明，写回必须等 DOM 身份能证明它是思源标记。
+    return !ZERO_WIDTH_RE.test(unit.text.slice(start, end));
 }
 
 export function rangesOverlap(
@@ -100,13 +116,33 @@ export function rangesOverlap(
     return aStart < bEnd && aEnd > bStart;
 }
 
-function usesAdvancedOptions(options: MatchOptions): boolean {
-    return Boolean(options.caseSensitive || options.wholeWord || options.regex);
+function usesRegex(options: MatchOptions): boolean {
+    return options.regex === true;
 }
 
-/**
- * 无高级选项时的默认路径：小写 + 变体 indexOf（含去空白变体）。
- */
+interface LiteralVariant {
+    value: string;
+    folded: string;
+}
+
+interface LiteralSearchPlan {
+    variants: LiteralVariant[];
+    caseSensitive: boolean;
+}
+
+function createLiteralSearchPlan(keyword: string, caseSensitive: boolean): LiteralSearchPlan {
+    return {
+        caseSensitive,
+        variants: generateSearchVariants(keyword, true).map((value) => {
+            const folded = value.toLowerCase();
+            return {
+                value,
+                folded,
+            };
+        }),
+    };
+}
+
 /**
  * 判断这段文字有没有可能命中。允许多放进一些格子，不能漏掉真正会命中的文字。
  * 正则只编译一次，避免每个单元格各建一份。
@@ -115,14 +151,14 @@ export function createTextMatchProbe(
     keyword: string,
     options: MatchOptions,
 ): (text: string) => boolean {
-    const trimmed = keyword.trim();
-    if (!trimmed) {
+    const query = effectiveSearchQuery(keyword);
+    if (!query) {
         return () => false;
     }
-    if (usesAdvancedOptions(options)) {
+    if (usesRegex(options)) {
         let pattern: RegExp;
         try {
-            pattern = createSearchPattern(trimmed, options);
+            pattern = createSearchPattern(query, options);
         } catch {
             return () => false;
         }
@@ -134,40 +170,12 @@ export function createTextMatchProbe(
             return pattern.test(text);
         };
     }
-    const needle = trimmed.toLowerCase();
-    const variants = generateSearchVariants(needle, true);
-    return (text: string) => {
-        if (!text) {
-            return false;
-        }
-        const haystack = text.toLowerCase();
-        let plainHay = "";
-        let plainReady = false;
-        for (let index = 0; index < variants.length; index += 1) {
-            const variant = variants[index];
-            if (!variant) {
-                continue;
-            }
-            if (haystack.indexOf(variant) >= 0) {
-                return true;
-            }
-            const plainNeedle = variant.replace(ZERO_WIDTH_GLOBAL_RE, "");
-            if (!plainNeedle) {
-                continue;
-            }
-            if (plainNeedle === variant && !ZERO_WIDTH_RE.test(haystack)) {
-                continue;
-            }
-            if (!plainReady) {
-                plainHay = haystack.replace(ZERO_WIDTH_GLOBAL_RE, "");
-                plainReady = true;
-            }
-            if (plainHay.indexOf(plainNeedle) >= 0) {
-                return true;
-            }
-        }
-        return false;
-    };
+    const plan = createLiteralSearchPlan(query, options.caseSensitive === true);
+    if (plan.variants.length === 0) {
+        return () => false;
+    }
+    // Probe 只负责构造候选超集，wholeWord 留给最终匹配判断。
+    return (text: string) => findLiteralMatches(text, plan, false, true).length > 0;
 }
 
 export function findOffsetMatchesInText(
@@ -175,75 +183,213 @@ export function findOffsetMatchesInText(
     keyword: string,
     options: MatchOptions = {},
 ): TextOffsetMatch[] {
-    if (usesAdvancedOptions(options)) {
-        return findOffsetMatchesAdvanced(blockText, keyword, options);
+    const query = effectiveSearchQuery(keyword);
+    if (!query) {
+        return [];
     }
-    return findOffsetMatchesLegacy(blockText, keyword);
+    if (usesRegex(options)) {
+        return findOffsetMatchesAdvanced(blockText, query, options);
+    }
+    return findOffsetMatchesLegacy(blockText, query, options);
 }
 
-function findOffsetMatchesLegacy(blockText: string, keyword: string): TextOffsetMatch[] {
-    const searchVariants = generateSearchVariants(keyword, true);
+function findOffsetMatchesLegacy(
+    blockText: string,
+    keyword: string,
+    options: MatchOptions = {},
+): TextOffsetMatch[] {
+    const plan = createLiteralSearchPlan(keyword, options.caseSensitive === true);
+    return findLiteralMatches(blockText, plan, options.wholeWord === true, false);
+}
+
+function findLiteralMatches(
+    blockText: string,
+    plan: LiteralSearchPlan,
+    wholeWord: boolean,
+    stopAfterFirst: boolean,
+): TextOffsetMatch[] {
     const allMatches: TextOffsetMatch[] = [];
+    if (!blockText || plan.variants.length === 0) {
+        return allMatches;
+    }
+    const normalizeMarkers = ZERO_WIDTH_RE.test(blockText) ||
+        plan.variants.some((variant) => ZERO_WIDTH_RE.test(variant.value));
+    // 普通文本不需要 span 去重，避免给高频词的每个命中分配字符串 key。
+    const visibleSpans = normalizeMarkers ? new Set<string>() : null;
 
-    for (const searchStr of searchVariants) {
-        let startIndex = 0;
-        while ((startIndex = blockText.indexOf(searchStr, startIndex)) !== -1) {
-            const endIndex = startIndex + searchStr.length;
-            allMatches.push({startIndex, endIndex, searchStr});
-            startIndex = endIndex;
+    const addDirect = (startIndex: number, endIndex: number, searchStr: string): boolean => {
+        if (!isWholeWordMatch(blockText, startIndex, endIndex, wholeWord)) {
+            return false;
         }
-
-        const normalizedDocText = blockText.replace(ZERO_WIDTH_GLOBAL_RE, "");
-        const normalizedSearchStr = searchStr.replace(ZERO_WIDTH_GLOBAL_RE, "");
-
-        // 思源在行级标签 / 行级代码 / 键盘两侧各放一个零宽空格。
-        // 原文已经命中过的词，去掉零宽后再映射回来会多记一次。
-        // 零宽夹在词中间、原文对不上的，仍然保留。
-        // @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/util/inlineElementMarker.ts
-        if (normalizedSearchStr !== searchStr || normalizedDocText !== blockText) {
-            startIndex = 0;
-            while ((startIndex = normalizedDocText.indexOf(normalizedSearchStr, startIndex)) !== -1) {
-                const endIndex = startIndex + normalizedSearchStr.length;
-                const originalStartIndex = findOriginalPosition(blockText, normalizedDocText, startIndex);
-                const originalEndIndex = findOriginalPosition(blockText, normalizedDocText, endIndex);
-                if (
-                    originalStartIndex !== -1
-                    && originalEndIndex !== -1
-                    && !sameVisibleSpan(blockText, allMatches, originalStartIndex, originalEndIndex)
-                ) {
-                    allMatches.push({
-                        startIndex: originalStartIndex,
-                        endIndex: originalEndIndex,
-                        searchStr,
-                    });
-                }
-                startIndex = endIndex;
+        if (visibleSpans) {
+            const spanKey = visibleSpanKey(blockText, startIndex, endIndex);
+            if (visibleSpans.has(spanKey)) {
+                return false;
             }
+            visibleSpans.add(spanKey);
+        }
+        allMatches.push({startIndex, endIndex, searchStr});
+        return stopAfterFirst;
+    };
+    const directView = createSearchView(blockText, plan.caseSensitive);
+
+    for (const variant of plan.variants) {
+        const needle = plan.caseSensitive ? variant.value : variant.folded;
+        if (forEachLiteralOccurrence(directView, needle, variant.value, addDirect)) {
+            return allMatches;
+        }
+    }
+
+    if (!normalizeMarkers) {
+        return sortOffsetMatches(allMatches);
+    }
+
+    const normalized = stripInternalMarkers(blockText);
+    const normalizedView = createSearchView(normalized.text, plan.caseSensitive);
+    for (const variant of plan.variants) {
+        const normalizedSearchStr = variant.value.replace(ZERO_WIDTH_GLOBAL_RE, "");
+        if (!normalizedSearchStr) {
+            continue;
+        }
+        const normalizedNeedle = plan.caseSensitive ? normalizedSearchStr : normalizedSearchStr.toLowerCase();
+        const stopped = forEachLiteralOccurrence(
+            normalizedView,
+            normalizedNeedle,
+            normalizedSearchStr,
+            (normalizedStart, normalizedEnd) => {
+                const originalStart = originalStartAt(normalized.positions, normalizedStart);
+                const originalEnd = originalEndAt(normalized.positions, normalizedEnd);
+                if (originalStart < 0 || originalEnd <= originalStart) {
+                    return false;
+                }
+                if (!isWholeWordMatch(blockText, originalStart, originalEnd, wholeWord)) {
+                    return false;
+                }
+                const spanKey = visibleSpanKey(blockText, originalStart, originalEnd);
+                if ((visibleSpans as Set<string>).has(spanKey)) {
+                    return false;
+                }
+                (visibleSpans as Set<string>).add(spanKey);
+                allMatches.push({
+                    startIndex: originalStart,
+                    endIndex: originalEnd,
+                    searchStr: variant.value,
+                });
+                return stopAfterFirst;
+            },
+        );
+        if (stopped) {
+            return allMatches;
         }
     }
 
     return sortOffsetMatches(allMatches);
 }
 
-/** 去掉两端零宽后是否和已有命中是同一段可见文字。 */
-function sameVisibleSpan(
-    text: string,
-    matches: readonly TextOffsetMatch[],
-    start: number,
-    end: number,
+interface SearchView {
+    text: string;
+    /** 折叠改变长度时，将折叠后每个 code unit 映回原文范围。 */
+    starts?: number[];
+    ends?: number[];
+    /** 极少数无法建立长度映射的运行时回退。 */
+    rawFallback?: string;
+}
+
+function createSearchView(text: string, caseSensitive: boolean): SearchView {
+    if (caseSensitive) {
+        return {text};
+    }
+    const folded = text.toLowerCase();
+    if (folded.length === text.length) {
+        return {text: folded};
+    }
+    const starts: number[] = [];
+    const ends: number[] = [];
+    for (let index = 0; index < text.length;) {
+        const codePoint = text.codePointAt(index) as number;
+        const raw = String.fromCodePoint(codePoint);
+        const width = raw.length;
+        const foldedPiece = raw.toLowerCase();
+        for (let offset = 0; offset < foldedPiece.length; offset += 1) {
+            starts.push(index);
+            ends.push(index + width);
+        }
+        index += width;
+    }
+    // 默认 Unicode lower 的上下文规则可能改字符值，但通常不改变上述分段总长度。
+    // 若将来 JS 引擎出现例外，用原文 RegExp 保留正确坐标。
+    if (starts.length !== folded.length) {
+        return {text: folded, rawFallback: text};
+    }
+    return {text: folded, starts, ends};
+}
+
+/** callback 返回 true 时提前停止。 */
+function forEachLiteralOccurrence(
+    view: SearchView,
+    needle: string,
+    searchStr: string,
+    callback: (start: number, end: number, searchStr: string) => boolean,
 ): boolean {
-    const visibleStart = skipZeroWidthForward(text, start);
-    const visibleEnd = skipZeroWidthBackward(text, end);
-    for (let index = 0; index < matches.length; index += 1) {
-        const match = matches[index];
-        if (
-            skipZeroWidthForward(text, match.startIndex) === visibleStart
-            && skipZeroWidthBackward(text, match.endIndex) === visibleEnd
-        ) {
+    if (!needle || !view.text) {
+        return false;
+    }
+    if (view.rawFallback !== undefined) {
+        const pattern = new RegExp(escapeForRegex(searchStr), "gi");
+        let match = pattern.exec(view.rawFallback);
+        while (match) {
+            if (match[0].length > 0 && callback(match.index, match.index + match[0].length, searchStr)) {
+                return true;
+            }
+            if (match[0].length === 0) {
+                pattern.lastIndex += 1;
+            }
+            match = pattern.exec(view.rawFallback);
+        }
+        return false;
+    }
+    let start = 0;
+    while ((start = view.text.indexOf(needle, start)) !== -1) {
+        const foldedEnd = start + needle.length;
+        const originalStart = view.starts?.[start] ?? start;
+        const originalEnd = view.ends?.[foldedEnd - 1] ?? foldedEnd;
+        if (callback(originalStart, originalEnd, searchStr)) {
             return true;
         }
+        start = foldedEnd;
     }
     return false;
+}
+
+function stripInternalMarkers(text: string): {text: string; positions: number[];} {
+    let normalized = "";
+    const positions: number[] = [];
+    for (let index = 0; index < text.length; index += 1) {
+        if (ZERO_WIDTH_RE.test(text.charAt(index))) {
+            continue;
+        }
+        normalized += text.charAt(index);
+        positions.push(index);
+    }
+    return {text: normalized, positions};
+}
+
+function originalStartAt(positions: readonly number[], normalizedIndex: number): number {
+    return normalizedIndex >= 0 && normalizedIndex < positions.length ? positions[normalizedIndex] : -1;
+}
+
+function originalEndAt(positions: readonly number[], normalizedIndex: number): number {
+    if (normalizedIndex <= 0 || normalizedIndex > positions.length) {
+        return -1;
+    }
+    return positions[normalizedIndex - 1] + 1;
+}
+
+/** 去掉两端内部标记后，用原文坐标形成稳定去重键。 */
+function visibleSpanKey(text: string, start: number, end: number): string {
+    const visibleStart = skipZeroWidthForward(text, start);
+    const visibleEnd = skipZeroWidthBackward(text, end);
+    return `${visibleStart}:${visibleEnd}`;
 }
 
 function skipZeroWidthForward(text: string, index: number): number {
@@ -266,6 +412,18 @@ function findOffsetMatchesAdvanced(
     options: MatchOptions,
 ): TextOffsetMatch[] {
     const pattern = createSearchPattern(keyword, options);
+    return findOffsetMatchesWithPattern(blockText, pattern, options);
+}
+
+/**
+ * RegExp 带有 lastIndex 状态，但同一查询的 pattern 可以在每个单元开始时重置后安全复用。
+ * 这让整轮搜索只编译一次正则，同时保留原有的 g/u/m/s 和零长度命中语义。
+ */
+function findOffsetMatchesWithPattern(
+    blockText: string,
+    pattern: RegExp,
+    options: MatchOptions,
+): TextOffsetMatch[] {
     const allMatches: TextOffsetMatch[] = [];
     pattern.lastIndex = 0;
     let match = pattern.exec(blockText);
@@ -288,8 +446,31 @@ function findOffsetMatchesAdvanced(
 
 export function createSearchPattern(query: string, options: MatchOptions): RegExp {
     const source = options.regex ? query : escapeForRegex(query);
-    const flags = options.caseSensitive ? "g" : "gi";
+    const flags = regexSearchFlags(options);
     return new RegExp(source, flags);
+}
+
+/**
+ * 正则查找与替换捕获组展开共用的 flags。
+ * 仅在正则模式接受 u/m/s，避免普通关键词搜索因 UI 残留选项改变历史行为。
+ */
+export function regexSearchFlags(options: MatchOptions, global = true): string {
+    let flags = global ? "g" : "";
+    if (!options.caseSensitive) {
+        flags += "i";
+    }
+    if (options.regex) {
+        if (options.regexUnicode) {
+            flags += "u";
+        }
+        if (options.regexMultiline) {
+            flags += "m";
+        }
+        if (options.regexDotAll) {
+            flags += "s";
+        }
+    }
+    return flags;
 }
 
 export function escapeForRegex(value: string): string {
@@ -316,10 +497,18 @@ export function isWholeWordMatch(
     if (start < 0 || end > text.length || start >= end) {
         return false;
     }
-    if (start > 0 && isWordChar(text.charAt(start - 1))) {
+    let visibleStart = start;
+    while (visibleStart > 0 && ZERO_WIDTH_RE.test(text.charAt(visibleStart - 1))) {
+        visibleStart -= 1;
+    }
+    if (visibleStart > 0 && isWordChar(text.charAt(visibleStart - 1))) {
         return false;
     }
-    if (end < text.length && isWordChar(text.charAt(end))) {
+    let visibleEnd = end;
+    while (visibleEnd < text.length && ZERO_WIDTH_RE.test(text.charAt(visibleEnd))) {
+        visibleEnd += 1;
+    }
+    if (visibleEnd < text.length && isWordChar(text.charAt(visibleEnd))) {
         return false;
     }
     return true;
@@ -337,7 +526,7 @@ function sortOffsetMatches(allMatches: TextOffsetMatch[]): TextOffsetMatch[] {
 
 /**
  * 对多个纯文本单元执行匹配，返回 MatchHit[]（无 DOM Range）。
- * 默认行为与历史一致；开启 caseSensitive/wholeWord/regex 时走 RegExp 路径。
+ * 默认行为与历史一致；大小写和全字只控制各自维度，正则单独走 RegExp 路径。
  */
 export function matchTextUnits(
     units: SearchableUnit[],
@@ -352,18 +541,22 @@ export function matchTextUnitsDetailed(
     query: string,
     options: MatchTextUnitsOptions = {},
 ): MatchTextUnitsResult {
-    const trimmed = query.trim();
-    if (!trimmed || !units.length) {
+    const effectiveQuery = effectiveSearchQuery(query);
+    if (!effectiveQuery || !units.length) {
         return {hits: [], error: ""};
     }
 
-    const advanced = usesAdvancedOptions(options);
-    let keywordForLegacy = "";
-    if (!advanced) {
-        keywordForLegacy = trimmed.toLowerCase();
+    const regex = usesRegex(options);
+    let literalPlan: LiteralSearchPlan | null = null;
+    let regexPattern: RegExp | null = null;
+    if (!regex) {
+        literalPlan = createLiteralSearchPlan(effectiveQuery, options.caseSensitive === true);
+        if (literalPlan.variants.length === 0) {
+            return {hits: [], error: ""};
+        }
     } else {
         try {
-            createSearchPattern(trimmed, options);
+            regexPattern = createSearchPattern(effectiveQuery, options);
         } catch (error) {
             return {
                 hits: [],
@@ -376,23 +569,20 @@ export function matchTextUnitsDetailed(
     const result: MatchHit[] = [];
 
     for (const unit of units) {
-        const haystack = advanced ? unit.text : unit.text.toLowerCase();
-        const needle = advanced ? trimmed : keywordForLegacy;
-        const offsetMatches = findOffsetMatchesInText(haystack, needle, options);
-        const acceptedRanges: Array<{start: number; end: number}> = [];
+        const offsetMatches = regex ?
+            findOffsetMatchesWithPattern(unit.text, regexPattern as RegExp, options) :
+            findLiteralMatches(unit.text, literalPlan as LiteralSearchPlan, options.wholeWord === true, false);
+        // offsetMatches 已按 start/end 排序。被接受的区间两两不重叠，
+        // 所以只需同最近区间的终点比较，不需要对每个命中重复扫描整个数组。
+        let acceptedEnd = -1;
 
         for (const match of offsetMatches) {
-            if (
-                dedupeOverlaps
-                && acceptedRanges.some((range) =>
-                    rangesOverlap(match.startIndex, match.endIndex, range.start, range.end)
-                )
-            ) {
+            if (dedupeOverlaps && match.startIndex < acceptedEnd) {
                 continue;
             }
 
             if (dedupeOverlaps) {
-                acceptedRanges.push({start: match.startIndex, end: match.endIndex});
+                acceptedEnd = match.endIndex;
             }
 
             result.push(offsetMatchToHit(unit, match));
@@ -415,41 +605,4 @@ export function offsetMatchToHit(unit: SearchableUnit, match: TextOffsetMatch): 
         matchedText: unit.text.slice(match.startIndex, match.endIndex),
         replaceable: isHitReplaceableByUnit(unit, match.startIndex, match.endIndex),
     };
-}
-
-function findOriginalPosition(
-    originalText: string,
-    normalizedText: string,
-    normalizedIndex: number,
-): number {
-    let originalIndex = 0;
-    let normalizedIndexCount = 0;
-
-    while (originalIndex < originalText.length && normalizedIndexCount < normalizedIndex) {
-        if (!ZERO_WIDTH_RE.test(originalText[originalIndex])) {
-            normalizedIndexCount++;
-        }
-        originalIndex++;
-    }
-
-    if (normalizedIndexCount === normalizedIndex && originalIndex <= originalText.length) {
-        const remainingOriginal = originalText.slice(originalIndex).replace(ZERO_WIDTH_GLOBAL_RE, "");
-        const remainingNormalized = normalizedText.slice(normalizedIndex);
-
-        if (
-            remainingOriginal.startsWith(
-                remainingNormalized.substring(
-                    0,
-                    Math.min(remainingOriginal.length, remainingNormalized.length),
-                ),
-            )
-        ) {
-            while (originalIndex < originalText.length && ZERO_WIDTH_RE.test(originalText[originalIndex])) {
-                originalIndex++;
-            }
-            return originalIndex;
-        }
-    }
-
-    return -1;
 }

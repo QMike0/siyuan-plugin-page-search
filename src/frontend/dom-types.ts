@@ -33,6 +33,13 @@ export interface TableSlot {
     offset: number;
 }
 
+/**
+ * 表格命中为什么不能替换。
+ * table-rich：内容在 data-sy-table-cell-rich 里，改画面文字会被思源按源码重画掉。
+ * table-cell-editor：格子编辑器还开着，写回会等到编辑结束才提交，中途整表刷新会丢掉。
+ */
+export type TableReplaceLock = "table-rich" | "table-cell-editor";
+
 /** 带 Range 的搜索命中（高亮 / 导航） */
 export interface SearchMatch {
     id: string;
@@ -46,6 +53,8 @@ export interface SearchMatch {
     end: number;
     matchedText: string;
     replaceable: boolean;
+    /** 表格格子不能替换的原因。有值时 replaceable 为 false。 */
+    replaceLock?: TableReplaceLock;
     /** 行内备注：宿主在块文本中的位置。缺省时用 start。 */
     anchorOffset?: number;
     /** 行内备注宿主在块文本中的结束位置，不含终点。和 anchorOffset 一起判断正文是否落在这段宿主里。 */

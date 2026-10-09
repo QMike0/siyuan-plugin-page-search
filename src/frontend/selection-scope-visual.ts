@@ -1066,6 +1066,7 @@ export function captureSelectionScopeWithKind(
         includeEmbedBlock?: boolean;
         includeCodeBlock?: boolean;
         includeMermaid?: boolean;
+        includeFlowchart?: boolean;
         includeHtmlBlock?: boolean;
         includeInlineMemo?: boolean;
         restrictInlineTypes?: RestrictInlineType[];
@@ -1104,6 +1105,7 @@ export function captureSelectionScopeWithKind(
         includeEmbedBlock: options?.includeEmbedBlock !== false,
         includeCodeBlock: options?.includeCodeBlock !== false,
         includeMermaid: options?.includeMermaid !== false,
+        includeFlowchart: options?.includeFlowchart !== false,
         includeHtmlBlock: options?.includeHtmlBlock !== false,
         includeInlineMemo: options?.includeInlineMemo === true,
         restrictInlineTypes: options?.restrictInlineTypes,

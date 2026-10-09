@@ -1,6 +1,12 @@
 /**
  * Shared 冒烟：匹配核 + 限制查找门闩 + 选区纯函数 + preserve-case + RPC 规范化
  */
+import {DocumentSearchIndexMemory} from "../src/frontend/document-search-index";
+import {preserveReplacementCase} from "../src/frontend/preserve-case";
+import {
+    SearchHistoryStore,
+    stableSearchHistoryDocId,
+} from "../src/frontend/search-history";
 import {
     ATTRIBUTE_VIEW_TYPE,
     DEFAULT_PREFS,
@@ -8,23 +14,32 @@ import {
     canRestrictInlineMemo,
     coercePluginPrefs,
     expandRegexReplacement,
+    expandRegexReplacementUnits,
     extractRegexLiteralGroups,
     regexPrefilterStoresPlainCache,
     avApiUnitInView,
     avApiUnitShown,
     collectAvDomCoverage,
+    collectHeadingFoldedIds,
     countVirtualTableRows,
+    logicalRowOffset,
+    logicalTableRows,
     createTextMatchProbe,
     findOffsetMatchesInText,
     mergeVirtualTableUnits,
     tableCellNodeId,
     tableCellPosition,
+    effectiveSearchQuery,
     formatSearchCountLabel,
     generateSearchVariants,
     hasRestrictInlineType,
     isHitReplaceableByUnit,
+    isBlockTreeEnabled,
+    isSelfFoldedIal,
     isOffsetReplaceable,
     isRestrictInlineActive,
+    isRendererUnitFor,
+    isRendererUnitId,
     isValidDocTitle,
     matchPassesRestrictInline,
     matchTextUnits,
@@ -37,6 +52,8 @@ import {
     parseDataTypeTokens,
     plainTextFromInlineMemoContent,
     rangeRestrictTokens,
+    rendererUnitId,
+    rendererUnitSource,
     sanitizeDocTitle,
     sanitizeInlineMemoContentForWrite,
     shouldCollectBodyTextForRestrict,
@@ -46,7 +63,6 @@ import {
     toggleRestrictInlineType,
 } from "../src/shared";
 import type {RegexPrefilterAtom} from "../src/shared/regex-literals";
-import {preserveReplacementCase} from "../src/frontend/preserve-case";
 
 function assert(condition: boolean, message: string) {
     if (!condition) {
@@ -54,11 +70,142 @@ function assert(condition: boolean, message: string) {
     }
 }
 
+const documentSearchIndices = new DocumentSearchIndexMemory("A");
+documentSearchIndices.remember(10, 31);
+assert(documentSearchIndices.activate("B", 10, 31), "switching documents records the previous index");
+assert(documentSearchIndices.consumePending("B")?.index === 0, "a document without saved state starts at index zero");
+documentSearchIndices.remember(22, 40);
+assert(documentSearchIndices.activate("A", 22, 40), "switching back records B's index");
+const restoredA = documentSearchIndices.consumePending("A");
+assert(restoredA?.index === 10 && restoredA.count === 31, "switching back restores A's index and count snapshot");
+assert(documentSearchIndices.activate("C", 10, 31), "switching to a no-match document records A's index");
+assert(documentSearchIndices.consumePending("C")?.index === 0, "a no-match document keeps index zero");
+documentSearchIndices.remember(0, 0);
+assert(documentSearchIndices.activate("A", 0, 0), "switching back from a no-match document is tracked");
+assert(
+    documentSearchIndices.pendingSnapshot("A")?.index === 10,
+    "the restored label uses A's cached index while matching",
+);
+assert(documentSearchIndices.consumePending("A")?.index === 10, "a no-match document never overwrites A's saved index");
+const unresolvedDocumentSearchIndices = new DocumentSearchIndexMemory("A");
+unresolvedDocumentSearchIndices.remember(10, 31);
+assert(unresolvedDocumentSearchIndices.activate("B", 10, 31), "A may be left before B is matched");
+assert(unresolvedDocumentSearchIndices.activate("A", 0, 0), "returning to A restores its pending snapshot");
+assert(
+    unresolvedDocumentSearchIndices.activate("C", 0, 0, false),
+    "an unresolved document may be left without committing its temporary zero",
+);
+assert(
+    unresolvedDocumentSearchIndices.activate("A", 0, 0),
+    "the later switch back to A is tracked",
+);
+assert(
+    unresolvedDocumentSearchIndices.pendingSnapshot("A")?.index === 10,
+    "a temporary zero never overwrites A while its saved result is still being restored",
+);
+const noMatchChainIndices = new DocumentSearchIndexMemory("A");
+noMatchChainIndices.remember(10, 31);
+let currentIndex = 10;
+let currentCount = 31;
+for (const rootId of ["C", "D", "E"]) {
+    assert(
+        noMatchChainIndices.activate(rootId, currentIndex, currentCount),
+        `switches to no-match document ${rootId}`,
+    );
+    assert(noMatchChainIndices.consumePending(rootId)?.index === 0, `${rootId} has no saved index`);
+    noMatchChainIndices.remember(0, 0);
+    currentIndex = 0;
+    currentCount = 0;
+}
+assert(noMatchChainIndices.activate("A", 0, 0), "switching back after consecutive no-match documents is tracked");
+assert(
+    noMatchChainIndices.pendingSnapshot("A")?.index === 10,
+    "C/D/E zero-match snapshots never replace A's selected index",
+);
+documentSearchIndices.clear();
+assert(documentSearchIndices.activate("B", 10, 31), "a changed query may switch documents after clearing state");
+assert(documentSearchIndices.consumePending("B")?.index === 0, "a changed query clears saved document indices");
+
 const variants = generateSearchVariants("  foo\u200B  ");
 assert(variants.includes("  foo\u200B  "), "keeps original");
 assert(variants.includes("foo\u200B"), "trims");
-assert(variants.some((v) => !/[\u200B-\u200D\uFEFF]/.test(v)), "has no-zw variant");
+assert(variants.some((v) => !/[\u200B-\u200D\u2060\uFEFF]/.test(v)), "has no-zw variant");
+assert(generateSearchVariants("\u200B").length === 0, "marker-only query has no variants");
+assert(generateSearchVariants("\u2060").length === 0, "word-joiner-only query has no variants");
+assert(findOffsetMatchesInText("abc", "\u200B").length === 0, "marker-only query returns immediately");
+assert(
+    findOffsetMatchesInText("foo", "  foo  ").length === 1,
+    "offset helper trims an ordinary padded query like the main pipeline",
+);
+assert(
+    findOffsetMatchesInText("foo", "  foo  ", {regex: true}).length === 1,
+    "regex offset helper uses the effective query",
+);
+assert(
+    findOffsetMatchesInText("a  b", "  ").length === 1,
+    "offset helper preserves a pure-whitespace query",
+);
+assert(
+    findOffsetMatchesInText("abc", "\u200B", {regex: true}).length === 0,
+    "marker-only regex query returns before compilation",
+);
 
+assert(effectiveSearchQuery("") === "", "empty query stays empty");
+assert(effectiveSearchQuery("\u200B\u2060") === "", "marker-only query is empty");
+assert(effectiveSearchQuery("  foo  ") === "foo", "ordinary query still trims its edges");
+assert(effectiveSearchQuery("  ") === "  ", "space-only query keeps the exact run");
+assert(effectiveSearchQuery("\t") === "\t", "tab-only query stays searchable");
+assert(effectiveSearchQuery("\u2002\u2003") === "\u2002\u2003", "en/em spaces stay searchable");
+assert(effectiveSearchQuery("\u3000") === "\u3000", "full-width space stays searchable");
+assert(
+    generateSearchVariants("  ").length === 1 && generateSearchVariants("  ")[0] === "  ",
+    "space-only variants contain no empty needle",
+);
+
+const renderedMermaidUnit = rendererUnitId("rendered-text", "mermaid", 2);
+assert(renderedMermaidUnit === "renderer:rendered-text:mermaid:2", "renderer unit identity is deterministic");
+assert(rendererUnitSource(renderedMermaidUnit) === "rendered-text", "renderer source is explicit");
+assert(isRendererUnitId(renderedMermaidUnit), "renderer unit is recognized");
+assert(isRendererUnitFor(renderedMermaidUnit, "mermaid"), "renderer kind is recognized");
+assert(!isRendererUnitFor(renderedMermaidUnit, "html"), "renderer kinds stay distinct");
+assert(
+    !isHitReplaceableByUnit(
+        {
+            blockId: "diagram",
+            blockType: "NodeCodeBlock",
+            blockIndex: 0,
+            text: "label",
+            unitId: renderedMermaidUnit,
+            segmentLengths: [5],
+        },
+        0,
+        5,
+    ),
+    "rendered units remain non-replaceable",
+);
+
+const whitespaceUnits = [{
+    blockId: "whitespace",
+    blockType: "p",
+    blockIndex: 0,
+    text: "a  b\tc\u3000d foo ",
+    segmentLengths: [13],
+}];
+const doubleSpaceHits = matchTextUnits(whitespaceUnits, "  ");
+assert(
+    doubleSpaceHits.length === 1 &&
+        doubleSpaceHits[0].start === 1 &&
+        doubleSpaceHits[0].end === 3,
+    "space-only query matches the exact whitespace run",
+);
+assert(matchTextUnits(whitespaceUnits, "\t").length === 1, "tab-only query matches literally");
+assert(matchTextUnits(whitespaceUnits, "\u3000").length === 1, "full-width space matches literally");
+assert(matchTextUnits(whitespaceUnits, " foo ").length === 1, "normal padded query keeps trim behavior");
+assert(matchTextUnits(whitespaceUnits, "\u200B").length === 0, "marker-only query never enters matching");
+assert(
+    matchTextUnits(whitespaceUnits, " ", {regex: true}).length === 4,
+    "regex mode also accepts a literal whitespace query",
+);
 const tightVariants = generateSearchVariants("a b", false);
 assert(tightVariants.includes("a b"), "tight keeps spaced");
 assert(!tightVariants.includes("ab"), "tight skips no-whitespace variant");
@@ -78,6 +225,83 @@ assert(
     matches.some((m) => m.startIndex === 0 && m.endIndex === zwText.length),
     "maps to original span",
 );
+const wordJoinerText = "hello\u2060world";
+const wordJoinerMatches = findOffsetMatchesInText(wordJoinerText, "helloworld");
+assert(
+    wordJoinerMatches.length === 1 &&
+        wordJoinerMatches[0].startIndex === 0 &&
+        wordJoinerMatches[0].endIndex === wordJoinerText.length,
+    "v3.8.6 word joiner maps back to the original span",
+);
+const markerSpanningHit = matchTextUnits([{
+    blockId: "marker-write",
+    blockType: "p",
+    blockIndex: 0,
+    text: "a\u2060b",
+    segmentLengths: [3],
+}], "ab");
+assert(markerSpanningHit.length === 1, "word joiner remains searchable");
+assert(markerSpanningHit[0].replaceable === false, "a marker-spanning hit cannot delete the marker");
+const markerPrefixHit = matchTextUnits([{
+    blockId: "marker-prefix",
+    blockType: "p",
+    blockIndex: 0,
+    text: "\u2060foo",
+    segmentLengths: [4],
+}], "foo");
+assert(markerPrefixHit.length === 1 && markerPrefixHit[0].replaceable, "visible text after a marker stays replaceable");
+
+const ancestorLinks = new Map([
+    ["quote", {parentId: "root", type: "b", subtype: "", ial: ""}],
+    ["list", {parentId: "quote", type: "l", subtype: "t", ial: ""}],
+    ["item", {parentId: "list", type: "i", subtype: "t", ial: ""}],
+    ["leaf", {parentId: "item", type: "p", subtype: "", ial: ""}],
+]);
+assert(
+    !isBlockTreeEnabled("leaf", ancestorLinks, {includeBlockquote: false}),
+    "cold leaf follows disabled blockquote ancestor",
+);
+assert(
+    !isBlockTreeEnabled("leaf", ancestorLinks, {includeListTask: false}),
+    "cold leaf follows disabled task-list ancestor",
+);
+assert(
+    isBlockTreeEnabled("leaf", ancestorLinks, {includeBlockquote: true, includeListTask: true}),
+    "cold leaf stays enabled when all ancestors are enabled",
+);
+assert(isSelfFoldedIal('{: fold="1"}'), "self fold is recognized");
+assert(!isSelfFoldedIal('{: fold="1" heading-fold="1"}'), "legacy heading-fold is not a self fold");
+const headingLinks = new Map([
+    ["h1", {parentId: "root", type: "h", subtype: "h1", ial: '{: fold="1"}'}],
+    ["p1", {parentId: "root", type: "p", subtype: "", ial: ""}],
+    ["h2", {parentId: "root", type: "h", subtype: "h2", ial: '{: fold="1"}'}],
+    ["container", {parentId: "root", type: "b", subtype: "", ial: ""}],
+    ["nested", {parentId: "container", type: "p", subtype: "", ial: ""}],
+    ["next-h1", {parentId: "root", type: "h", subtype: "h1", ial: ""}],
+    ["visible", {parentId: "root", type: "p", subtype: "", ial: ""}],
+]);
+const headingHidden = collectHeadingFoldedIds(
+    ["h1", "p1", "h2", "container", "nested", "next-h1", "visible"],
+    headingLinks,
+);
+assert(headingHidden.has("p1") && headingHidden.has("h2"), "folded heading hides deeper following siblings");
+assert(headingHidden.has("container") && headingHidden.has("nested"), "hidden containers propagate to descendants");
+assert(
+    !headingHidden.has("h1") && !headingHidden.has("next-h1"),
+    "fold headings stay visible and peer heading ends the range",
+);
+assert(!headingHidden.has("visible"), "content after the next peer heading stays visible");
+const mountedHeadingState = {
+    mountedIds: new Set(["h1", "h2"]),
+    foldedIds: new Set(["h2"]),
+};
+const headingHiddenFromDom = collectHeadingFoldedIds(
+    ["h1", "p1", "h2", "container", "nested", "next-h1", "visible"],
+    headingLinks,
+    mountedHeadingState,
+);
+assert(!headingHiddenFromDom.has("p1"), "mounted unfolded heading overrides stale IAL");
+assert(headingHiddenFromDom.has("container"), "mounted folded heading hides its descendants");
 
 const units = [
     {
@@ -144,6 +368,30 @@ assert(insensitive.length === 3, `default case-insensitive: expected 3, got ${in
 const sensitive = matchTextUnits(caseUnits, "foo", {caseSensitive: true});
 assert(sensitive.length === 1 && sensitive[0].matchedText === "foo", "caseSensitive finds exact foo");
 
+const orthogonalUnits = [{
+    blockId: "orthogonal",
+    blockType: "p",
+    blockIndex: 0,
+    text: "a b ab a\u200Bb",
+    segmentLengths: [12],
+}];
+const sensitiveLoose = matchTextUnits(orthogonalUnits, "a b", {caseSensitive: true});
+assert(sensitiveLoose.length === 3, `caseSensitive keeps loose variants, got ${sensitiveLoose.length}`);
+const wholeLoose = matchTextUnits(orthogonalUnits, "a b", {wholeWord: true});
+assert(wholeLoose.length === 3, `wholeWord keeps loose variants, got ${wholeLoose.length}`);
+
+const unicodeOffset = matchTextUnits(
+    [{blockId: "unicode", blockType: "p", blockIndex: 0, text: "İx", segmentLengths: [2]}],
+    "x",
+);
+assert(
+    unicodeOffset.length === 1 &&
+        unicodeOffset[0].start === 1 &&
+        unicodeOffset[0].end === 2 &&
+        unicodeOffset[0].matchedText === "x",
+    "case folding keeps original UTF-16 offsets",
+);
+
 const wordUnits = [{
     blockId: "w1",
     blockType: "p",
@@ -185,14 +433,33 @@ const underscoreWhole = matchTextUnits(
     "foo",
     {wholeWord: true},
 );
-assert(underscoreWhole.length === 1 && underscoreWhole[0].start === 8, `wholeWord underscore stays inside the word, got ${underscoreWhole.length}`);
+assert(
+    underscoreWhole.length === 1 && underscoreWhole[0].start === 8,
+    `wholeWord underscore stays inside the word, got ${underscoreWhole.length}`,
+);
 
 const zeroWidthWhole = matchTextUnits(
     [{blockId: "w6", blockType: "p", blockIndex: 0, text: "\u200bcat", segmentLengths: [4]}],
     "cat",
     {wholeWord: true},
 );
-assert(zeroWidthWhole.length === 1 && zeroWidthWhole[0].start === 1, `wholeWord ignores adjacent zero-width, got ${zeroWidthWhole.length}`);
+assert(
+    zeroWidthWhole.length === 1 && zeroWidthWhole[0].start === 1,
+    `wholeWord ignores adjacent zero-width, got ${zeroWidthWhole.length}`,
+);
+
+const internalMarkerWhole = matchTextUnits(
+    [{blockId: "w7", blockType: "p", blockIndex: 0, text: "foo\u2060bar", segmentLengths: [7]}],
+    "foo",
+    {wholeWord: true},
+);
+assert(internalMarkerWhole.length === 0, "an internal marker inside a word is not a whole-word boundary");
+const markerBeforeSeparatorWhole = matchTextUnits(
+    [{blockId: "w8", blockType: "p", blockIndex: 0, text: "foo\u2060 bar", segmentLengths: [8]}],
+    "foo",
+    {wholeWord: true},
+);
+assert(markerBeforeSeparatorWhole.length === 1, "a visible separator after an internal marker remains a word boundary");
 
 const regexHits = matchTextUnits(
     [{blockId: "r1", blockType: "p", blockIndex: 0, text: "a1 b22 c3", segmentLengths: [9]}],
@@ -200,6 +467,67 @@ const regexHits = matchTextUnits(
     {regex: true},
 );
 assert(regexHits.length === 3, `regex \\d+: expected 3, got ${regexHits.length}`);
+
+const regexUnicodeHits = matchTextUnits(
+    [{blockId: "ru", blockType: "p", blockIndex: 0, text: "中文 123", segmentLengths: [6]}],
+    "\\p{L}+",
+    {regex: true, regexUnicode: true, caseSensitive: true},
+);
+assert(
+    regexUnicodeHits.length === 1 && regexUnicodeHits[0].matchedText === "中文",
+    "Unicode regex flag enables property escapes",
+);
+const regexMultilineHits = matchTextUnits(
+    [{blockId: "rm", blockType: "p", blockIndex: 0, text: "a\nb", segmentLengths: [3]}],
+    "^b",
+    {regex: true, regexMultiline: true, caseSensitive: true},
+);
+assert(
+    regexMultilineHits.length === 1 && regexMultilineHits[0].start === 2,
+    "multiline regex flag changes anchors only when selected",
+);
+assert(
+    matchTextUnits([{blockId: "rm0", blockType: "p", blockIndex: 0, text: "a\nb", segmentLengths: [3]}], "^b", {
+        regex: true,
+        caseSensitive: true,
+    }).length === 0,
+    "multiline stays disabled by default",
+);
+const regexDotAllHits = matchTextUnits(
+    [{blockId: "rs", blockType: "p", blockIndex: 0, text: "a\nb", segmentLengths: [3]}],
+    "a.b",
+    {regex: true, regexDotAll: true, caseSensitive: true},
+);
+assert(regexDotAllHits.length === 1 && regexDotAllHits[0].matchedText === "a\nb", "dotAll matches newline");
+assert(
+    matchTextUnits([{blockId: "rs0", blockType: "p", blockIndex: 0, text: "a\nb", segmentLengths: [3]}], "a.b", {
+        regex: true,
+        caseSensitive: true,
+    }).length === 0,
+    "dotAll stays disabled by default",
+);
+const unicodeDotHits = matchTextUnits(
+    [{blockId: "emoji", blockType: "p", blockIndex: 0, text: "😀", segmentLengths: [2]}],
+    ".",
+    {regex: true, regexUnicode: true, caseSensitive: true},
+);
+assert(
+    unicodeDotHits.length === 1 && unicodeDotHits[0].start === 0 && unicodeDotHits[0].end === 2,
+    "Unicode dot keeps a surrogate pair as one match while retaining DOM UTF-16 offsets",
+);
+const reusedRegexHits = matchTextUnitsDetailed(
+    [
+        {blockId: "reuse-a", blockType: "p", blockIndex: 0, text: "a", segmentLengths: [1]},
+        {blockId: "reuse-b", blockType: "p", blockIndex: 1, text: "a", segmentLengths: [1]},
+    ],
+    "a",
+    {regex: true, caseSensitive: true},
+);
+assert(
+    reusedRegexHits.error === "" && reusedRegexHits.hits.length === 2 &&
+        reusedRegexHits.hits[1].blockId === "reuse-b",
+    "a reused regex resets lastIndex for every searchable unit",
+);
 
 const badRegex = matchTextUnitsDetailed(
     [{blockId: "r2", blockType: "p", blockIndex: 0, text: "x", segmentLengths: [1]}],
@@ -347,7 +675,10 @@ assert(DEFAULT_PREFS.includeListUnordered === true, "includeListUnordered defaul
 assert(DEFAULT_PREFS.includeListOrdered === true, "includeListOrdered defaults on");
 assert(DEFAULT_PREFS.includeListTask === true, "includeListTask defaults on");
 assert(coercePluginPrefs({}).includeListUnordered === true, "coerce includeListUnordered default on");
-assert(coercePluginPrefs({includeListUnordered: false}).includeListUnordered === false, "coerce includeListUnordered off");
+assert(
+    coercePluginPrefs({includeListUnordered: false}).includeListUnordered === false,
+    "coerce includeListUnordered off",
+);
 assert(
     mergePrefs(DEFAULT_PREFS, {
         includeListUnordered: false,
@@ -391,6 +722,18 @@ assert(coercePluginPrefs({useRegex: true}).useRegex === true, "coerce useRegex o
 assert(
     mergePrefs(DEFAULT_PREFS, {useRegex: true}).useRegex === true,
     "merge prefs useRegex",
+);
+assert(
+    !DEFAULT_PREFS.regexUnicode && !DEFAULT_PREFS.regexMultiline && !DEFAULT_PREFS.regexDotAll,
+    "regex flags default off to preserve legacy regex behavior",
+);
+assert(
+    coercePluginPrefs({regexUnicode: true, regexMultiline: true, regexDotAll: true}).regexDotAll,
+    "coerce regex flags",
+);
+assert(
+    mergePrefs(DEFAULT_PREFS, {regexUnicode: true}).regexUnicode,
+    "merge regex Unicode flag",
 );
 
 const named = normalizeMatchRequest([{
@@ -438,8 +781,8 @@ const withMemo = normalizeRestrictInlineTypes(
 assert(withMemo.join(",") === "mark,inline-memo", "normalize allowlist order");
 
 assert(
-    normalizeRestrictInlineTypes(["a", "block-ref", "code"], {includeInlineMemo: true}).join(",")
-        === "block-ref,a,code",
+    normalizeRestrictInlineTypes(["a", "block-ref", "code"], {includeInlineMemo: true}).join(",") ===
+        "block-ref,a,code",
     "block-ref sorts before link and code",
 );
 
@@ -612,7 +955,8 @@ assert(
 assert(!shouldEnumerateRestrictInline("", []), "empty query without restrict → no enumerate");
 assert(!shouldEnumerateRestrictInline("", undefined), "undefined restrict → no enumerate");
 assert(shouldEnumerateRestrictInline("", ["strong"]), "empty + restrict → enumerate");
-assert(shouldEnumerateRestrictInline("  ", ["mark"]), "whitespace-only query → enumerate");
+assert(!shouldEnumerateRestrictInline("  ", ["mark"]), "whitespace-only query → keyword mode");
+assert(shouldEnumerateRestrictInline("\u200B", ["mark"]), "marker-only query → enumerate");
 assert(!shouldEnumerateRestrictInline("foo", ["strong"]), "keyword + restrict → keyword mode");
 assert(formatSearchCountLabel(1, 10) === "1/10", "count label");
 assert(formatSearchCountLabel(3, 1000) === "3/1000", "count above 999 shows full total");
@@ -653,9 +997,9 @@ const merged = mergeTextOffsetRanges([
     {start: 10, end: 12},
 ]);
 assert(
-    merged.length === 2
-    && merged[0].start === 0 && merged[0].end === 8
-    && merged[1].start === 10 && merged[1].end === 12,
+    merged.length === 2 &&
+        merged[0].start === 0 && merged[0].end === 8 &&
+        merged[1].start === 10 && merged[1].end === 12,
     "merge overlapping offset ranges",
 );
 
@@ -688,6 +1032,18 @@ assert(
 );
 assert(
     expandRegexReplacement({
+        haystack: "😀x",
+        start: 0,
+        end: 2,
+        patternSource: "(.)",
+        caseSensitive: true,
+        regexUnicode: true,
+        template: "[$1]",
+    }) === "[😀]",
+    "regex replacement uses the same Unicode flag as search",
+);
+assert(
+    expandRegexReplacement({
         haystack: "x一y",
         start: 0,
         end: 3,
@@ -708,6 +1064,37 @@ assert(
 );
 assert(
     expandRegexReplacement({
+        haystack: "left foo right",
+        start: 5,
+        end: 8,
+        patternSource: "foo",
+        template: "$`|$&|$'",
+    }) === "left |foo| right",
+    "regex replacement keeps original-context $` and $' at a nonzero offset",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "foo\nbar",
+        start: 0,
+        end: 7,
+        patternSource: "foo",
+        regexMultiline: true,
+        template: "changed",
+    }) === null,
+    "regex replacement rejects a multiline partial-slice fallback",
+);
+assert(
+    expandRegexReplacement({
+        haystack: "xfoo",
+        start: 1,
+        end: 4,
+        patternSource: "(?<!.)foo",
+        template: "changed",
+    }) === null,
+    "regex replacement never evaluates lookaround against an isolated slice",
+);
+assert(
+    expandRegexReplacement({
         haystack: "abc",
         start: 0,
         end: 3,
@@ -715,6 +1102,26 @@ assert(
         template: "$1",
     }) === null,
     "regex expand failure returns null (skip, do not write literal $1)",
+);
+const workerExpansions = expandRegexReplacementUnits(
+    [{
+        id: "unit",
+        haystack: "one-1 two-2",
+        replacements: [
+            {id: "first", start: 0, end: 5, matchedText: "one-1"},
+            {id: "second", start: 6, end: 11, matchedText: "two-2"},
+        ],
+    }],
+    "(?<word>[a-z]+)-(?<number>\\d+)",
+    "$<number>:$<word>",
+    {},
+);
+assert(
+    workerExpansions.length === 2 &&
+        workerExpansions[0].replacement === "1:one" &&
+        workerExpansions[1].replacement === "2:two" &&
+        workerExpansions.every((item) => item.haystack === "one-1 two-2"),
+    "worker regex expansion preserves captures and haystack snapshots",
 );
 assert(
     expandRegexReplacement({
@@ -803,9 +1210,40 @@ assert(countVirtualTableRows("<tr><td>&lt;tr</td></tr>") === 1, "escaped tr in a
 assert(countVirtualTableRows("") === 0, "empty placeholder has no rows");
 assert(countVirtualTableRows("<TR><td></td></TR>") === 1, "uppercase row tag still counts");
 
+const tableRow = (virtualHtml: string | null) => ({
+    getAttribute(name: string) {
+        return name === "data-sy-table-virtual-rows" ? virtualHtml : null;
+    },
+});
+const logicalRows = logicalTableRows([
+    tableRow(null),
+    tableRow("<tr><td>a</td></tr><tr><td>b</td></tr>"),
+    tableRow(null),
+]);
+assert(logicalRows.stable, "placeholder with two rows stays countable");
+assert(logicalRows.rows.length === 3, "logical layout keeps every dom row");
+assert(logicalRows.rows[0].logical === 0 && logicalRows.rows[0].omitted === 0, "first mounted row is logical 0");
+assert(
+    logicalRows.rows[1].logical === 1 && logicalRows.rows[1].omitted === 2,
+    "placeholder covers the next two logical rows",
+);
+assert(
+    logicalRows.rows[2].logical === 3 && logicalRows.rows[2].omitted === 0,
+    "row after a placeholder keeps the full-table index",
+);
+assert(logicalRowOffset(logicalRows.rows, 2) === 1, "a hidden row maps onto its placeholder");
+assert(logicalRowOffset(logicalRows.rows, 3) === 2, "a mounted row maps onto itself");
+assert(logicalRowOffset(logicalRows.rows, 4) === -1, "a row past the table is not invented");
+const brokenRows = logicalTableRows([tableRow(null), tableRow("")]);
+assert(!brokenRows.stable && brokenRows.rows.length === 1, "an unreadable placeholder stops the count");
+assert(brokenRows.rows[0].logical === 0, "rows before the bad placeholder keep their index");
+
 const looseProbe = createTextMatchProbe("ab", {});
 assert(looseProbe("a\u200bb"), "probe sees a match across a zero-width char");
 assert(!looseProbe("zz"), "probe rejects a miss");
+const whitespaceProbe = createTextMatchProbe("  ", {});
+assert(whitespaceProbe("a  b"), "probe keeps a pure-whitespace candidate");
+assert(!whitespaceProbe("a b"), "probe preserves the exact whitespace run");
 const spacedProbe = createTextMatchProbe("foo bar", {});
 assert(spacedProbe("foobar"), "probe keeps the no-whitespace variant");
 assert(spacedProbe("foo bar"), "probe keeps the original keyword");
@@ -865,7 +1303,66 @@ const unstableTable = mergeVirtualTableUnits(
         unstable: false,
     }]]),
 );
-assert(unstableTable.units.map((unit) => unit.text).indexOf("改") < 0, "a cell without a row and column keeps the kernel text");
+assert(
+    unstableTable.units.map((unit) => unit.text).indexOf("改") < 0,
+    "a cell without a row and column keeps the kernel text",
+);
 assert(unstableTable.staleKeys.size === 0, "kernel-only table does not mark cells stale");
 
-console.log("smoke:shared OK (match + restrict + selection + preserve-case + regex-replace + doc-title + inline-memo)");
+const memoTable = mergeVirtualTableUnits(
+    [
+        tableCell("table-cell:0:0", "旧"),
+        {blockId: "t", blockType: "NodeTable", unitId: "table-memo:0:0:1", text: "备注"},
+        {blockId: "t", blockType: "NodeTable", unitId: "inline-math:0", text: "公式"},
+    ],
+    new Map([["t", {
+        shownKeys: new Set(["0:0"]),
+        liveByKey: new Map([["0:0", tableCell("table-cell:0:0", "新")]]),
+        unstable: false,
+    }]]),
+);
+assert(
+    memoTable.units.map((unit) => unit.text).indexOf("新") >= 0,
+    "a memo in the table still uses the live cell text",
+);
+assert(memoTable.units.map((unit) => unit.text).indexOf("备注") >= 0, "table memo stays searchable");
+assert(
+    memoTable.staleKeys.has("t\u0000table-cell:0:0"),
+    "edited cell stays non-replaceable when the table also has a memo",
+);
+
+const historyWrites: unknown[] = [];
+assert(stableSearchHistoryDocId("doc-a", "doc-a") === "doc-a", "stable document id accepts the active document");
+assert(stableSearchHistoryDocId("", "doc-a") === "", "missing visible document never falls back to a stale id");
+assert(
+    stableSearchHistoryDocId("doc-b", "doc-a") === "",
+    "a switching document never uses the previous document history",
+);
+const history = new SearchHistoryStore({
+    read: () => undefined,
+    write: (entries) => {
+        historyWrites.push(entries.map((entry) => `${entry.docId}:${entry.text}`));
+    },
+    remove: () => undefined,
+});
+history.push("doc-a", "苹果");
+history.push("doc-b", "香蕉");
+history.push("doc-a", "橘子");
+history.push("doc-a", "苹果");
+assert(history.getForDoc("doc-a").join(",") === "橘子,苹果", "document history keeps its own newest term");
+assert(history.getForDoc("doc-b").join(",") === "香蕉", "another document does not see those terms");
+history.push("doc-a", "苹果");
+assert(historyWrites.length === 4, "repeating the newest term of a document does not write again");
+history.push("doc-a", "");
+history.push("doc-a", "\u200B");
+assert(history.getForDoc("doc-a").length === 2, "empty and marker-only queries stay out of history");
+for (let index = 0; index < 120; index += 1) {
+    history.push("doc-c", `词${index}`);
+}
+assert(history.getForDoc("doc-a").length === 0, "global cap drops the oldest documents first");
+assert(history.getForDoc("doc-c").length === 100, "history keeps the newest 100 terms");
+assert(history.getForDoc("doc-c")[99] === "词119", "the newest term stays at the end");
+
+console.log(
+    "smoke:shared OK (match + restrict + selection + preserve-case + regex-replace + doc-title + inline-memo + search-history)",
+);

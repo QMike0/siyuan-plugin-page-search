@@ -1,33 +1,22 @@
+import {DIAGRAM_SUBTYPES} from "../renderer-adapters";
+
 const OFFSCREEN_WIDTH_PX = 800;
 
-const DIAGRAM_SUBTYPES = [
-    "mermaid",
-    "flowchart",
-    "graphviz",
-    "plantuml",
-    "chart",
-    "mindmap",
-    "abc",
-] as const;
-
-export const DIAGRAM_SUBTYPE_SET = new Set<string>(DIAGRAM_SUBTYPES);
-
-const RENDER_METHODS = [
-    "mathRender",
-    "highlightRender",
-    "mermaidRender",
-    "flowchartRender",
-    "chartRender",
-    "graphvizRender",
-    "abcRender",
-    "mindmapRender",
-    "plantumlRender",
-    "htmlRender",
-] as const;
+type RenderMethod =
+    | "mathRender"
+    | "highlightRender"
+    | "mermaidRender"
+    | "flowchartRender"
+    | "chartRender"
+    | "graphvizRender"
+    | "abcRender"
+    | "mindmapRender"
+    | "plantumlRender"
+    | "htmlRender";
 
 export type OffscreenRenderMode = "none" | "light" | "diagram";
 
-type ProtyleRenderer = Partial<Record<(typeof RENDER_METHODS)[number], (el: Element) => void>>;
+type ProtyleRenderer = Partial<Record<RenderMethod, (el: Element) => void>>;
 
 const LIGHT_METHODS = ["mathRender", "htmlRender"] as const;
 const DIAGRAM_METHODS = [
@@ -42,7 +31,7 @@ const DIAGRAM_METHODS = [
 ] as const;
 
 export function getProtyleRenderer(): ProtyleRenderer | null {
-    const win = window as Window & {Protyle?: ProtyleRenderer};
+    const win = window as Window & {Protyle?: ProtyleRenderer;};
     return win.Protyle ?? null;
 }
 
@@ -108,24 +97,39 @@ function widenDiagrams(root: ParentNode): void {
     });
 }
 
+function hasDiagramOutput(node: Element): boolean {
+    return Array.from(node.querySelectorAll("svg, canvas, img, .ft__error")).some((output) => {
+        // renderer 会先插入带 SVG 图标的 .protyle-icons；它不是图表输出，不能据此提前结束等待。
+        return !output.closest(".protyle-icons, .protyle-attr");
+    });
+}
+
 export async function waitForRender(
     root: ParentNode,
     timeoutMs: number,
-    wait: {math?: boolean; html?: boolean; diagram?: boolean},
+    wait: {math?: boolean; html?: boolean; diagram?: boolean;},
+    shouldContinue: () => boolean = () => true,
 ): Promise<void> {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
-        const pendingMath = wait.math
-            && root.querySelector('[data-subtype="math"]:not([data-render="true"])');
+        if (!shouldContinue()) {
+            return;
+        }
+        const pendingMath = wait.math &&
+            root.querySelector('[data-subtype="math"]:not([data-render="true"])');
         const pendingDiagram = wait.diagram && DIAGRAM_SUBTYPES.some((subtype) => {
             return Array.from(root.querySelectorAll(`[data-subtype="${subtype}"]`)).some((node) => {
-                return !node.querySelector("svg, .ft__error");
+                // PlantUML 是 img，Chart 常为 canvas；它们没有可投影的 Text，但也不能
+                // 因等待 SVG 每块白耗完整超时。空源码的 ZWSP 壳同样已经完成。
+                const content = node.getAttribute("data-content") ?? "";
+                return Boolean(content) && !hasDiagramOutput(node);
             });
         });
-        const pendingHtml = wait.html && Array.from(root.querySelectorAll("protyle-html, [data-type='NodeHTMLBlock'] protyle-html")).some((node) => {
-            const host = node as HTMLElement & {shadowRoot?: ShadowRoot | null};
-            return !host.shadowRoot || !host.shadowRoot.textContent?.trim();
-        });
+        const pendingHtml = wait.html &&
+            Array.from(root.querySelectorAll("protyle-html, [data-type='NodeHTMLBlock'] protyle-html")).some((node) => {
+                const host = node as HTMLElement & {shadowRoot?: ShadowRoot | null;};
+                return !host.shadowRoot || !host.shadowRoot.textContent?.trim();
+            });
         if (!pendingMath && !pendingDiagram && !pendingHtml) {
             return;
         }
@@ -137,8 +141,9 @@ export async function waitForRender(
 export async function renderOffscreenBlocks(
     wysiwyg: HTMLElement,
     mode: OffscreenRenderMode = "light",
+    shouldContinue: () => boolean = () => true,
 ): Promise<void> {
-    if (mode === "none") {
+    if (mode === "none" || !shouldContinue()) {
         return;
     }
     if (mode === "diagram") {
@@ -156,6 +161,6 @@ export async function renderOffscreenBlocks(
             math: hasMath,
             html: mode === "light" && hasHtml,
             diagram: hasDiagram,
-        });
+        }, shouldContinue);
     }
 }

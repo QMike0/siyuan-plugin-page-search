@@ -45,10 +45,16 @@ export interface MatchHit {
 export interface MatchOptions {
     /** 区分大小写；默认 false（与历史行为一致：强制小写子串） */
     caseSensitive?: boolean;
-    /** 全字匹配（ASCII 词边界）；默认 false */
+    /** 按 VS Code 风格分隔符判断全字边界；默认 false */
     wholeWord?: boolean;
     /** 正则搜索（仅搜索，不做正则替换）；默认 false */
     regex?: boolean;
+    /** 正则 Unicode（u）模式；默认 false，保持历史 UTF-16 语义 */
+    regexUnicode?: boolean;
+    /** 正则多行锚点（m）模式；默认 false */
+    regexMultiline?: boolean;
+    /** 正则点匹配换行（s）模式；默认 false */
+    regexDotAll?: boolean;
 }
 
 export interface MatchTextUnitsOptions extends MatchOptions {

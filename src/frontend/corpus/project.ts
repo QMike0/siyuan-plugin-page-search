@@ -38,7 +38,9 @@ export function projectRanges(
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeMermaid: options.includeMermaid !== false,
+        includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeFoldedBlocks: options.includeFoldedBlocks === true,
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,
     });
@@ -130,7 +132,11 @@ export function rebindChangedRanges(
                 block,
             );
         }
-        if (isInlineMemoSearchUnit(block) && block.anchorOffset !== undefined) {
+        if (
+            isInlineMemoSearchUnit(block)
+            && block.anchorOffset !== undefined
+            && !block.unitId?.startsWith("table-memo:")
+        ) {
             pushLiveUnit(memoByKey, `${block.blockId}\0${block.anchorOffset}`, block);
         }
     }
@@ -222,6 +228,9 @@ function rankedLiveUnits(
         && match.mathUnitText !== undefined
     ) {
         list = mathByKey.get(`${match.blockId}\0${match.mathOrdinal}\0${match.mathUnitText}`);
+    } else if (match.highlightKind === "inline-memo" && match.unitId?.startsWith("table-memo:")) {
+        // 表格备注的 unitId 是逻辑行列加格内偏移，不随全文序号变化。
+        list = byKey.get(unitKey(match.blockId, match.unitId));
     } else if (match.highlightKind === "inline-memo" && match.anchorOffset !== undefined) {
         list = memoByKey.get(`${match.blockId}\0${match.anchorOffset}`);
     } else {

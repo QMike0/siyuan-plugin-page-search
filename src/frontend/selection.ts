@@ -444,7 +444,7 @@ function stripZwsp(value: string): string {
 }
 
 function isZwsp(code: number): boolean {
-    return code === 0x200B || code === 0x200C || code === 0x200D || code === 0xFEFF;
+    return code === 0x200B || code === 0x200C || code === 0x200D || code === 0x2060 || code === 0xFEFF;
 }
 
 /**

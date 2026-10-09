@@ -58,6 +58,9 @@ module.exports = (env, argv) => {
         devtool: production ? false : "eval-source-map",
         output: {
             filename: "[name].js",
+            // 生产入口在 dist/index.js，而 webpack 的 Worker publicPath 指向插件根目录。
+            // 因而 Worker 同样写入 dist，才能被 ZipPlugin 一并装入发布包。
+            chunkFilename: production ? "dist/[name].js" : "[name].js",
             path: path.resolve(__dirname),
             libraryTarget: "commonjs2",
             library: {
@@ -89,6 +92,11 @@ module.exports = (env, argv) => {
                             loader: "esbuild-loader",
                             options: {
                                 target: "es6",
+                                // 交给 webpack 5 识别 new Worker(new URL(..., import.meta.url))，
+                                // 不能由 esbuild 按 ES6 降级成空对象，否则 Worker 资源不会产出。
+                                supported: {
+                                    "import-meta": true,
+                                },
                             },
                         },
                     ],

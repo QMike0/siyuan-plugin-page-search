@@ -1,3 +1,5 @@
+import {effectiveSearchQuery} from "./constants";
+
 /**
  * 限制查找（行内类型）与「是否查找」的边界契约。
  *
@@ -11,7 +13,7 @@
  *    - 门闩：`includeInlineMemo === false` 时限制项不可开；normalize 时踢掉 `inline-memo`。
  * 6. 行内公式：匹配 KaTeX 渲染可见文本（`.katex-html`），排除含源码的 `.katex-mathml`；
  *    不搜 `data-content` LaTeX（避免 “d” 命中 `\delta`）。全文与「限制·公式」均走渲染文本。
- * 7. 空查询 + 限制激活 → 枚举所选类型的整段行内宿主（元素去重、嵌套父子分别计）；
+ * 7. 无有效查询 + 限制激活 → 枚举所选类型的整段行内宿主（元素去重、嵌套父子分别计）；
  *    不可替换。限制关 + 空查询 → 仍为 0。
  *
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/assets/scss/component/_typography.scss
@@ -58,14 +60,15 @@ export function isRestrictInlineActive(
 }
 
 /**
- * 空查询 + 限制激活 → 走行内宿主枚举（非关键词匹配）。
+ * 无有效查询 + 限制激活 → 走行内宿主枚举（非关键词匹配）。
+ * 纯空白是可搜索的字面量，不属于空查询。
  * 限制关或有关键词时返回 false。
  */
 export function shouldEnumerateRestrictInline(
     query: string,
     restrictTypes: readonly string[] | null | undefined,
 ): boolean {
-    return !String(query ?? "").trim() && isRestrictInlineActive(restrictTypes);
+    return !effectiveSearchQuery(String(query ?? "")) && isRestrictInlineActive(restrictTypes);
 }
 
 /** 「是否查找 · 行内备注」开启时，才允许开「限制查找 · 行内备注」 */
@@ -79,7 +82,7 @@ export function canRestrictInlineMemo(includeInlineMemo: boolean): boolean {
  */
 export function normalizeRestrictInlineTypes(
     raw: unknown,
-    options: {includeInlineMemo: boolean},
+    options: {includeInlineMemo: boolean;},
 ): RestrictInlineType[] {
     const seen = new Set<RestrictInlineType>();
     if (Array.isArray(raw)) {
@@ -108,7 +111,7 @@ export function toggleRestrictInlineType(
     current: readonly string[] | null | undefined,
     type: RestrictInlineType,
     enabled: boolean,
-    options: {includeInlineMemo: boolean},
+    options: {includeInlineMemo: boolean;},
 ): RestrictInlineType[] {
     if (type === INLINE_MEMO_TYPE && enabled && !canRestrictInlineMemo(options.includeInlineMemo)) {
         return normalizeRestrictInlineTypes(current, options);

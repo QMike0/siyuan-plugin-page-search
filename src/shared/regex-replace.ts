@@ -3,7 +3,12 @@
  * 在 haystack 的 [start, end) 处重新 exec，以保留 lookaround 与捕获组。
  */
 
-export interface ExpandRegexReplacementOptions {
+import {regexSearchFlags} from "./match-text";
+import type {MatchOptions} from "./types";
+
+export interface ExpandRegexReplacementOptions
+    extends Pick<MatchOptions, "regexUnicode" | "regexMultiline" | "regexDotAll">
+{
     haystack: string;
     start: number;
     end: number;
@@ -12,6 +17,56 @@ export interface ExpandRegexReplacementOptions {
     caseSensitive?: boolean;
     /** 替换模板：支持 $$ $& $` $' $n $<name> */
     template: string;
+}
+
+/** 可结构化克隆的正则替换展开请求；由 Worker 执行，避免主线程 RegExp.exec 卡住界面。 */
+export interface RegexReplacementUnitRequest {
+    id: string;
+    haystack: string;
+    replacements: Array<{
+        id: string;
+        start: number;
+        end: number;
+        matchedText: string;
+    }>;
+}
+
+export interface RegexReplacementExpansion {
+    id: string;
+    haystack: string;
+    replacement: string | null;
+}
+
+/**
+ * 一次处理一个文本单元中的全部命中。结果带回原始快照，主线程写回前可拒绝已漂移的内容。
+ */
+export function expandRegexReplacementUnits(
+    units: RegexReplacementUnitRequest[],
+    patternSource: string,
+    template: string,
+    options: Pick<ExpandRegexReplacementOptions, "caseSensitive" | "regexUnicode" | "regexMultiline" | "regexDotAll">,
+): RegexReplacementExpansion[] {
+    const expansions: RegexReplacementExpansion[] = [];
+    for (const unit of units) {
+        for (const replacement of unit.replacements) {
+            expansions.push({
+                id: replacement.id,
+                haystack: unit.haystack,
+                replacement: expandRegexReplacement({
+                    haystack: unit.haystack,
+                    start: replacement.start,
+                    end: replacement.end,
+                    patternSource,
+                    template,
+                    caseSensitive: options.caseSensitive === true,
+                    regexUnicode: options.regexUnicode === true,
+                    regexMultiline: options.regexMultiline === true,
+                    regexDotAll: options.regexDotAll === true,
+                }),
+            });
+        }
+    }
+    return expansions;
 }
 
 /**
@@ -27,28 +82,25 @@ export function expandRegexReplacement(options: ExpandRegexReplacementOptions): 
     const caseSensitive = options.caseSensitive === true;
 
     if (
-        !patternSource
-        || start < 0
-        || end < start
-        || end > haystack.length
+        !patternSource ||
+        start < 0 ||
+        end < start ||
+        end > haystack.length
     ) {
         return null;
     }
 
-    const matchedSlice = haystack.slice(start, end);
-    const match = execRegexAt(haystack, start, end, patternSource, caseSensitive)
-        ?? execRegexOnSlice(matchedSlice, patternSource, caseSensitive);
+    // 搜索阶段已经记录了原始 haystack 上的 UTF-16 偏移。替换时必须能在同一
+    // haystack、同一偏移处完整复现该命中；否则 lookaround、^/$（特别是 m）等
+    // 上下文语义会在切片中改变，不能安全地展开 $` / $' 或捕获组。
+    const match = execRegexAt(haystack, start, end, patternSource, options);
 
     if (!match) {
         return null;
     }
 
-    const before = typeof match.index === "number"
-        ? haystack.slice(0, match.index)
-        : haystack.slice(0, start);
-    const after = typeof match.index === "number"
-        ? haystack.slice(match.index + match[0].length)
-        : haystack.slice(end);
+    const before = haystack.slice(0, start);
+    const after = haystack.slice(end);
 
     return expandReplacementTemplate(template, match, match[0], before, after);
 }
@@ -58,11 +110,20 @@ function execRegexAt(
     start: number,
     end: number,
     patternSource: string,
-    caseSensitive: boolean,
+    options: ExpandRegexReplacementOptions,
 ): RegExpExecArray | null {
     let re: RegExp;
     try {
-        re = new RegExp(patternSource, caseSensitive ? "g" : "gi");
+        re = new RegExp(
+            patternSource,
+            regexSearchFlags({
+                regex: true,
+                caseSensitive: options.caseSensitive,
+                regexUnicode: options.regexUnicode,
+                regexMultiline: options.regexMultiline,
+                regexDotAll: options.regexDotAll,
+            }),
+        );
     } catch {
         return null;
     }
@@ -75,21 +136,6 @@ function execRegexAt(
         return null;
     }
     return match;
-}
-
-function execRegexOnSlice(
-    matchedSlice: string,
-    patternSource: string,
-    caseSensitive: boolean,
-): RegExpExecArray | null {
-    let re: RegExp;
-    try {
-        // 锚定整段命中，避免局部二次匹配跑偏
-        re = new RegExp(`^(?:${patternSource})$`, caseSensitive ? "" : "i");
-    } catch {
-        return null;
-    }
-    return re.exec(matchedSlice);
 }
 
 /**

@@ -1,19 +1,39 @@
-import type {IOperation, Protyle} from "siyuan";
-import {fetchSyncPost, getAllEditor} from "siyuan";
-import {ATTRIBUTE_VIEW_TYPE, isPreviewSyntheticBlock, isPreviewSyntheticBlockId} from "./blocks";
+import type {
+    IOperation,
+    Protyle,
+} from "siyuan";
+import {
+    fetchSyncPost,
+    getAllEditor,
+} from "siyuan";
+import {
+    effectiveSearchQuery,
+    logicalTableCells,
+    tableHostOmitsRows,
+} from "../shared";
+import {
+    ATTRIBUTE_VIEW_TYPE,
+    isPreviewSyntheticBlock,
+    isPreviewSyntheticBlockId,
+} from "./blocks";
 import {collectSearchableBlocks} from "./blocks";
 import {extractUnitsFromDoms} from "./corpus/extract";
 import {invalidateDocumentSearchCaches} from "./corpus/search";
+import {fetchBlockHashes} from "./corpus/sql";
+import {isDocTitleMatch} from "./doc-title-replace";
 import type {SearchableBlock} from "./dom-types";
 import type {SearchMatch} from "./dom-types";
-import {isDocTitleMatch} from "./doc-title-replace";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
+import type {RegexTextMatcher} from "./regex-matcher";
 import {
     applyMatchesToLiveUnits,
     applyMatchesToSubmitClone,
+    createReplacementUnitLookup,
+    collectRegexReplacementRequests,
+    createRegexReplacementPlan,
+    type RegexReplacementPlan,
 } from "./replacement";
 import {unitKey} from "./selection";
-import {tableHostOmitsRows} from "../shared";
 
 const DOC_TITLE_BLOCK_ID = "__doc-title__";
 
@@ -23,6 +43,11 @@ export interface ReplaceWriteOptions {
     regex?: boolean;
     searchQuery?: string;
     caseSensitive?: boolean;
+    regexUnicode?: boolean;
+    regexMultiline?: boolean;
+    regexDotAll?: boolean;
+    /** 正则模板展开必须通过 SearchBar 的 Worker，禁止退回主线程 RegExp.exec。 */
+    regexMatcher?: RegexTextMatcher;
 }
 
 export interface ReplaceWriteResult {
@@ -38,10 +63,10 @@ export interface ReplaceWriteResult {
  * 拿不到则拒绝写回（不静默 updateBlock）。
  */
 function resolveProtyleFromEdit(edit: Element): Protyle | null {
-    const protyleElement = edit.classList.contains("protyle")
-        ? edit as HTMLElement
-        : edit.querySelector<HTMLElement>(".protyle:not(.fn__none)")
-            ?? edit.closest(".protyle");
+    const protyleElement = edit.classList.contains("protyle") ?
+        edit as HTMLElement :
+        edit.querySelector<HTMLElement>(".protyle:not(.fn__none)") ??
+            edit.closest(".protyle");
 
     if (!protyleElement) {
         return null;
@@ -64,9 +89,9 @@ function resolveSubmitBlockElement(
     if (!blockId || blockId === DOC_TITLE_BLOCK_ID) {
         return null;
     }
-    const root = edit.classList.contains("protyle")
-        ? edit
-        : edit.querySelector(".protyle:not(.fn__none)") ?? edit;
+    const root = edit.classList.contains("protyle") ?
+        edit :
+        edit.querySelector(".protyle:not(.fn__none)") ?? edit;
 
     const candidates = Array.from(
         root.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"][data-type]`),
@@ -83,9 +108,9 @@ function resolveSubmitBlockElement(
         if (currentRendered !== bestRendered) {
             return currentRendered ? current : best;
         }
-        return (current.textContent?.length ?? 0) > (best.textContent?.length ?? 0)
-            ? current
-            : best;
+        return (current.textContent?.length ?? 0) > (best.textContent?.length ?? 0) ?
+            current :
+            best;
     });
 }
 
@@ -189,12 +214,62 @@ function replaceOptionsFrom(
     regex?: boolean;
     searchQuery?: string;
     caseSensitive?: boolean;
+    regexUnicode?: boolean;
+    regexMultiline?: boolean;
+    regexDotAll?: boolean;
 } {
     return {
         preserveCase: options.preserveCase,
         regex: options.regex,
         searchQuery: options.searchQuery,
         caseSensitive: options.caseSensitive,
+        regexUnicode: options.regexUnicode,
+        regexMultiline: options.regexMultiline,
+        regexDotAll: options.regexDotAll,
+    };
+}
+
+type PreparedReplaceOptions = ReturnType<typeof replaceOptionsFrom> & {
+    regexPlan?: RegexReplacementPlan;
+};
+
+/**
+ * 把捕获组/命名组展开限制在 Worker。主线程只接收纯文本计划，随后仍逐处核对文本快照。
+ * 计划失败时整次替换不写入，避免“部分替换 + 用户以为已全部完成”。
+ */
+async function prepareRegexReplaceOptions(
+    unitsByKey: Map<string, SearchableBlock>,
+    matches: Array<Pick<SearchMatch, "id" | "blockId" | "unitId" | "start" | "end" | "matchedText">>,
+    replacementText: string,
+    options: ReplaceWriteOptions,
+): Promise<{options: PreparedReplaceOptions; error?: string;}> {
+    const base = replaceOptionsFrom(options);
+    if (!options.regex) {
+        return {options: base};
+    }
+    const patternSource = effectiveSearchQuery(options.searchQuery ?? "");
+    if (!patternSource || !options.regexMatcher) {
+        return {options: base, error: "regex-expand-failed"};
+    }
+    const result = await options.regexMatcher.expandReplacements(
+        collectRegexReplacementRequests(unitsByKey, matches),
+        patternSource,
+        replacementText,
+        {
+            caseSensitive: options.caseSensitive === true,
+            regexUnicode: options.regexUnicode === true,
+            regexMultiline: options.regexMultiline === true,
+            regexDotAll: options.regexDotAll === true,
+        },
+    );
+    if (result.cancelled || result.error) {
+        return {options: base, error: "regex-expand-failed"};
+    }
+    return {
+        options: {
+            ...base,
+            regexPlan: createRegexReplacementPlan(result.expansions),
+        },
     };
 }
 
@@ -230,18 +305,29 @@ export async function replaceCurrentMatchInEditor(
 
     const submit = resolveSubmitBlockElement(edit, match.blockId);
     if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
-        return replaceFetchedBlockMatches(protyle, match.blockId, [match], replacementText, options);
+        return replaceFetchedBlockMatches(protyle, match.blockId, [match], replacementText, options, edit);
     }
 
     const blocks = collectSearchableBlocks(edit, {
         includeInlineMemo: true,
         includeImageTitle: true,
+        includeDocTitle: false,
+        scopeRoots: [submit],
     })
         .filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks);
-    const unit = unitsByKey.get(unitKey(match.blockId, match.unitId));
+    const unit = createReplacementUnitLookup(unitsByKey)(match);
     if (!unit) {
         return {replacedCount: 0, skippedCount: 1, error: "unit-missing"};
+    }
+    const preparedOptions = await prepareRegexReplaceOptions(
+        unitsByKey,
+        [match],
+        replacementText,
+        options,
+    );
+    if (preparedOptions.error) {
+        return {replacedCount: 0, skippedCount: 1, error: preparedOptions.error};
     }
 
     const typeBefore = submit.getAttribute("data-type");
@@ -250,15 +336,15 @@ export async function replaceCurrentMatchInEditor(
         unitsByKey,
         [match],
         replacementText,
-        replaceOptionsFrom(options),
+        preparedOptions.options,
     );
     if (outcome.appliedCount === 0) {
         return {
             replacedCount: 0,
             skippedCount: Math.max(1, outcome.skippedCount),
-            error: outcome.regexExpandFailedCount > 0
-                ? "regex-expand-failed"
-                : "apply-failed",
+            error: outcome.regexExpandFailedCount > 0 ?
+                "regex-expand-failed" :
+                "apply-failed",
         };
     }
     if ((submit.getAttribute("data-type") ?? "") !== (typeBefore ?? "")) {
@@ -398,15 +484,52 @@ const BLOCK_COMMIT_WAIT_MS = 8000;
 const BLOCK_COMMIT_POLL_MS = 80;
 
 /**
- * protyle.transaction 把请求放进编辑器队列后就返回。
- * 未加载块的刷新只能读内核 HTML，这里等到探针块的 DOM 离开替换前的快照。
+ * protyle.transaction 把请求放进编辑器队列后就返回，不等内核写完。
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/wysiwyg/transaction.ts promiseTransaction
  */
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+        window.setTimeout(resolve, ms);
+    });
+}
+
+async function blockHash(blockId: string): Promise<string> {
+    const hashes = await fetchBlockHashes([blockId]);
+    return hashes?.get(blockId) ?? "";
+}
+
+/**
+ * 等这一笔事务落盘。previousHash 必须在调用 transaction 之前读好。
+ * 事务返回时内核可能已经写完，那时再读到的是新哈希，不能当作替换前的值。
+ * 哈希读不到时，再退回比对这一块的 HTML。
+ */
+async function waitUntilReplacementVisible(
+    update: PreparedBlockUpdate,
+    previousHash: string,
+): Promise<void> {
+    if (previousHash) {
+        const deadline = Date.now() + BLOCK_COMMIT_WAIT_MS;
+        while (Date.now() < deadline) {
+            const after = await fetchBlockHashes([update.id]);
+            const nextHash = after?.get(update.id);
+            if (nextHash && nextHash !== previousHash) {
+                return;
+            }
+            await sleep(BLOCK_COMMIT_POLL_MS);
+        }
+        return;
+    }
+    await waitUntilBlockHtmlChanges(update.id, update.oldHTML);
+}
+
+function smallestFetchedUpdate(updates: readonly PreparedBlockUpdate[]): PreparedBlockUpdate {
+    return updates.reduce((best, item) => (item.newHTML.length < best.newHTML.length ? item : best));
+}
+
 async function waitUntilBlockHtmlChanges(blockId: string, previousHtml: string): Promise<void> {
     const deadline = Date.now() + BLOCK_COMMIT_WAIT_MS;
     while (Date.now() < deadline) {
-        await new Promise((resolve) => {
-            window.setTimeout(resolve, BLOCK_COMMIT_POLL_MS);
-        });
+        await sleep(BLOCK_COMMIT_POLL_MS);
         try {
             const response = await fetchSyncPost("/api/block/getBlockDOMs", {ids: [blockId]});
             if (response?.code !== 0 || !response.data || typeof response.data !== "object") {
@@ -445,12 +568,100 @@ async function fetchBlockHtmlBatch(ids: string[]): Promise<Map<string, string>> 
     return htmlById;
 }
 
+const CELL_CONTENT_ATTRS = ["data-sy-table-cell-rich", "data-sy-table-cell-inline", "contenteditable"];
+
+function cellPlainText(cell: HTMLElement): string {
+    const editor = cell.querySelector(":scope > .table__cell-editor .protyle-wysiwyg");
+    const root = editor instanceof HTMLElement ? editor : cell;
+    return (root.textContent ?? "").replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");
+}
+
+function copyMountedCell(target: HTMLElement, source: HTMLElement): void {
+    target.innerHTML = source.innerHTML;
+    for (let index = 0; index < CELL_CONTENT_ATTRS.length; index += 1) {
+        const name = CELL_CONTENT_ATTRS[index];
+        const value = source.getAttribute(name);
+        if (value === null) {
+            target.removeAttribute(name);
+        } else {
+            target.setAttribute(name, value);
+        }
+    }
+}
+
+/**
+ * 把画面上已经改过、内核 HTML 还没跟上的格子抄进底稿。
+ * 编辑器还开着并且文字已经不同时返回 false，调用方放弃这张表，避免把编辑器界面写进去。
+ */
+function overlayMountedVirtualCells(kernel: HTMLElement, live: HTMLElement): boolean {
+    const liveCells = logicalTableCells(live);
+    const kernelCells = logicalTableCells(kernel);
+    if (!liveCells || !kernelCells) {
+        return true;
+    }
+    for (const [position, liveCell] of liveCells) {
+        const kernelCell = kernelCells.get(position);
+        if (!kernelCell) {
+            continue;
+        }
+        if (cellPlainText(liveCell) === cellPlainText(kernelCell)) {
+            continue;
+        }
+        if (liveCell.querySelector(":scope > .table__cell-editor")) {
+            return false;
+        }
+        copyMountedCell(kernelCell, liveCell);
+    }
+    return true;
+}
+
+function liveVirtualTable(root: ParentNode, blockId: string): HTMLElement | null {
+    const nodes = root.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"]`);
+    for (let index = 0; index < nodes.length; index += 1) {
+        const node = nodes[index];
+        if (node.closest("[data-page-search-offscreen], .protyle-wysiwyg__embed")) {
+            continue;
+        }
+        if (editorTableOmitsRows(node)) {
+            return node;
+        }
+    }
+    return null;
+}
+
+/** 虚拟表用内核 HTML 做底稿前，先并入画面上未落盘的格子。冲突时 conflict 为 true。 */
+function mergeKernelHtmlWithLiveTable(
+    liveRoot: ParentNode | null,
+    blockId: string,
+    kernelHtml: string,
+): {html: string; conflict: boolean;} {
+    if (!liveRoot) {
+        return {html: kernelHtml, conflict: false};
+    }
+    const live = liveVirtualTable(liveRoot, blockId);
+    if (!live) {
+        return {html: kernelHtml, conflict: false};
+    }
+    const template = document.createElement("template");
+    template.innerHTML = kernelHtml;
+    const kernel = template.content.firstElementChild;
+    if (!(kernel instanceof HTMLElement)) {
+        return {html: kernelHtml, conflict: false};
+    }
+    if (!overlayMountedVirtualCells(kernel, live)) {
+        return {html: kernelHtml, conflict: true};
+    }
+    return {html: kernel.outerHTML, conflict: false};
+}
+
 async function prepareFetchedBlockUpdates(
     matchesById: Map<string, SearchMatch[]>,
     replacementText: string,
     options: ReplaceWriteOptions,
-): Promise<{updates: PreparedBlockUpdate[]; skippedCount: number; error?: string}> {
+    liveRoot: ParentNode | null,
+): Promise<{updates: PreparedBlockUpdate[]; skippedCount: number; error?: string; fatal?: boolean;}> {
     const ids = Array.from(matchesById.keys());
+    const totalMatches = Array.from(matchesById.values()).reduce((count, items) => count + items.length, 0);
     const updates: PreparedBlockUpdate[] = [];
     let skippedCount = 0;
     let error: string | undefined;
@@ -458,7 +669,6 @@ async function prepareFetchedBlockUpdates(
         return {updates, skippedCount};
     }
 
-    const replaceOpts = replaceOptionsFrom(options);
     for (let index = 0; index < ids.length; index += BLOCK_DOM_BATCH_SIZE) {
         const batch = ids.slice(index, index + BLOCK_DOM_BATCH_SIZE);
         const htmlById = await fetchBlockHtmlBatch(batch);
@@ -472,8 +682,14 @@ async function prepareFetchedBlockUpdates(
                 error ??= "block-missing";
                 continue;
             }
+            const merged = mergeKernelHtmlWithLiveTable(liveRoot, id, html);
+            if (merged.conflict) {
+                skippedCount += blockMatches.length;
+                error ??= "table-pending-edit";
+                continue;
+            }
             present.push(id);
-            doms[id] = html;
+            doms[id] = merged.html;
         }
         if (present.length === 0) {
             continue;
@@ -499,6 +715,21 @@ async function prepareFetchedBlockUpdates(
 
         try {
             const unitsByKey = buildUnitMap(extracted.blocks);
+            const batchMatches = present.flatMap((id) => matchesById.get(id) ?? []);
+            const preparedOptions = await prepareRegexReplaceOptions(
+                unitsByKey,
+                batchMatches,
+                replacementText,
+                options,
+            );
+            if (preparedOptions.error) {
+                return {
+                    updates: [],
+                    skippedCount: totalMatches,
+                    error: preparedOptions.error,
+                    fatal: true,
+                };
+            }
             for (const id of present) {
                 const blockMatches = matchesById.get(id) ?? [];
                 const unit = extracted.blocks.find((block) => block.blockId === id);
@@ -517,7 +748,7 @@ async function prepareFetchedBlockUpdates(
                     unitsByKey,
                     blockMatches,
                     replacementText,
-                    replaceOpts,
+                    preparedOptions.options,
                 );
                 skippedCount += prepared.skippedCount;
                 if (prepared.update) {
@@ -555,7 +786,6 @@ export async function replaceAllMatchesInEditor(
         return {replacedCount: 0, skippedCount: matches.length, error: "readonly-or-preview"};
     }
 
-    const replaceOpts = replaceOptionsFrom(options);
     const bodyMatches: SearchMatch[] = [];
     let skippedCount = 0;
 
@@ -583,6 +813,19 @@ export async function replaceAllMatchesInEditor(
     })
         .filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks);
+    const loadedOptions = await prepareRegexReplaceOptions(
+        unitsByKey,
+        bodyMatches,
+        replacementText,
+        options,
+    );
+    if (loadedOptions.error) {
+        return {
+            replacedCount: 0,
+            skippedCount: skippedCount + bodyMatches.length,
+            error: loadedOptions.error,
+        };
+    }
 
     const grouped = new Map<string, SearchMatch[]>();
     for (const match of bodyMatches) {
@@ -610,7 +853,7 @@ export async function replaceAllMatchesInEditor(
             unitsByKey,
             blockMatches,
             replacementText,
-            replaceOpts,
+            loadedOptions.options,
         );
         bodySkipped += prepared.skippedCount;
         if (prepared.update) {
@@ -624,8 +867,16 @@ export async function replaceAllMatchesInEditor(
         unloadedMatches,
         replacementText,
         options,
+        edit,
     );
     bodySkipped += fetched.skippedCount;
+    if (fetched.fatal) {
+        return {
+            replacedCount: 0,
+            skippedCount: skippedBeforeBody + bodyMatches.length,
+            error: fetched.error,
+        };
+    }
     if (fetched.error) {
         firstError ??= fetched.error;
     }
@@ -639,6 +890,9 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
+    const probe = fetched.updates.length > 0 ? smallestFetchedUpdate(fetched.updates) : undefined;
+    // 同一笔事务一起落盘。哈希要在入队前记下，探测最小的那一块。
+    const previousHash = probe ? await blockHash(probe.id) : "";
     try {
         protyle.transaction(
             ordered.map((update) => lockedUpdate(update.id, update.newHTML)),
@@ -653,9 +907,8 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
-    if (fetched.updates.length > 0) {
-        // 未加载块要等内核落盘后再清缓存，否则紧接着的刷新会读到替换前的 HTML。
-        await waitUntilBlockHtmlChanges(fetched.updates[0].id, fetched.updates[0].oldHTML);
+    if (probe) {
+        await waitUntilReplacementVisible(probe, previousHash);
         invalidateDocumentSearchCaches();
     }
 
@@ -702,11 +955,13 @@ async function replaceFetchedBlockMatches(
     matches: SearchMatch[],
     replacementText: string,
     options: ReplaceWriteOptions,
+    liveRoot: ParentNode,
 ): Promise<ReplaceWriteResult> {
     const prepared = await prepareFetchedBlockUpdates(
         new Map([[blockId, matches]]),
         replacementText,
         options,
+        liveRoot,
     );
     const update = prepared.updates[0];
     if (!update) {
@@ -716,10 +971,12 @@ async function replaceFetchedBlockMatches(
             error: prepared.error ?? "apply-failed",
         };
     }
+    const previousHash = await blockHash(update.id);
     const committed = await commitBlockHtml(protyle, update.id, update.oldHTML, update.newHTML);
     if (!committed) {
         return {replacedCount: 0, skippedCount: matches.length, error: "transaction-failed"};
     }
+    await waitUntilReplacementVisible(update, previousHash);
     invalidateDocumentSearchCaches();
     return {replacedCount: update.appliedCount, skippedCount: prepared.skippedCount};
 }
