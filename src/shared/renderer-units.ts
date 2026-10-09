@@ -4,8 +4,8 @@ export type RendererUnitSource = "rendered-text" | "source-fallback" | "block-on
 
 /**
  * Renderer 单元 ID 同时记录匹配来源和 renderer 类型。
- * 当前只产生 rendered-text；预留其余来源是为了避免以后把源码回退或块级命中
- * 混成可逐字定位的渲染文本。
+ * rendered-text 可按 SVG/HTML 的 Text 节点定位；source-fallback 只用于召回，
+ * 不能映射到可替换的 Text 节点。
  */
 export function rendererUnitId(
     source: RendererUnitSource,

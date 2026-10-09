@@ -1,9 +1,22 @@
 import {postJson} from "./api";
 
 const ORDER_CACHE_TTL_MS = 1500;
+const ORDER_CACHE_LIMIT = 16;
 const orderCache = new Map<string, {signature: string; ids: string[]; cachedAt: number;}>();
 const HEADING_CHILDREN_CACHE_LIMIT = 256;
 const headingChildrenCache = new Map<string, {signature: string; ids: string[];}>();
+
+function rememberOrder(rootId: string, entry: {signature: string; ids: string[]; cachedAt: number;}): void {
+    orderCache.delete(rootId);
+    orderCache.set(rootId, entry);
+    while (orderCache.size > ORDER_CACHE_LIMIT) {
+        const oldest = orderCache.keys().next().value as string | undefined;
+        if (!oldest) {
+            break;
+        }
+        orderCache.delete(oldest);
+    }
+}
 
 /** 只读已有文档序，不发起 getDocBlocksOrders。 */
 export function peekDocOrder(rootId: string): string[] | null {
@@ -32,14 +45,18 @@ export async function fetchDocBlocksOrders(
 ): Promise<string[] | null> {
     const cached = orderCache.get(rootId);
     if (cached && cached.signature === signature && Date.now() - cached.cachedAt < ORDER_CACHE_TTL_MS) {
+        rememberOrder(rootId, cached);
         return cached.ids;
+    }
+    if (cached && cached.signature !== signature) {
+        orderCache.delete(rootId);
     }
     const data = await postJson<unknown>("/api/block/getDocBlocksOrders", {id: rootId}, signal);
     if (!Array.isArray(data) || data.some((id) => typeof id !== "string")) {
         return null;
     }
     const ids = data as string[];
-    orderCache.set(rootId, {signature, ids, cachedAt: Date.now()});
+    rememberOrder(rootId, {signature, ids, cachedAt: Date.now()});
     return ids;
 }
 
@@ -59,6 +76,9 @@ export async function fetchHeadingChildrenIds(
         headingChildrenCache.delete(key);
         headingChildrenCache.set(key, cached);
         return cached.ids;
+    }
+    if (cached) {
+        headingChildrenCache.delete(key);
     }
     const data = await postJson<unknown>("/api/block/getHeadingChildrenIDs", {id: headingId}, signal);
     if (!Array.isArray(data) || data.some((id) => typeof id !== "string")) {

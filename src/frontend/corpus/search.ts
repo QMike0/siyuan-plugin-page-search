@@ -13,12 +13,14 @@ import {
     isBlockTreeEnabled,
     isHitReplaceableByUnit,
     isRendererUnitId,
+    rendererUnitSource,
     isSelfFoldedIal,
     logicalTableRows,
     mergeVirtualTableUnits,
     ownTableRows,
     TABLE_VIRTUAL_ROWS_ATTR,
     tableCellPosition,
+    tableOverlayKey,
     tableHostOmitsRows,
     isRestrictInlineActive,
     matchPassesRestrictInline,
@@ -42,11 +44,13 @@ import type {
     SearchMatch,
     TableReplaceLock,
 } from "../dom-types";
+import {isUnderNonHeadingCssFold} from "../fold-dom";
 import {buildListSnippet} from "../list-snippet";
 import type {
     SearchPipelineOptions,
     SearchPipelineResult,
 } from "../pipeline";
+import {diagramSourceText} from "../renderer-adapters";
 import {
     escSql,
     querySqlAll,
@@ -54,18 +58,23 @@ import {
 import {
     AttributeViewTruncatedError,
     invalidateAvCache,
+    invalidateAvCacheForBlocks,
     loadAvUnits,
     peekAvUnits,
     resolveMissingAvIds,
     type AvBlockRef,
 } from "./av";
-import {fetchAndExtractUnits} from "./extract";
+import {
+    extractDiagramUnitsFromLive,
+    fetchAndExtractUnits,
+} from "./extract";
 import {
     collectFocusScope,
     editorFocusId,
 } from "./focus";
 import {
     codeBlockLanguagesNeeded,
+    effectiveCodeLanguage,
     ensureCodeBlockLanguages,
     isBlockTypeEnabled,
     invalidateDocMeta,
@@ -113,6 +122,8 @@ interface TextCacheEntry {
 const textCache = new Map<string, TextCacheEntry>();
 /** 所有文本缓存共用的 LRU。Map 的插入顺序就是从最久未使用到最新。 */
 const textCacheLru = new Map<string, true>();
+const embedCacheKeys = new Set<string>();
+let renderSettingsStamp = "";
 let textCacheBytes = 0;
 /** 缓存内容主要是 UTF-16 字符串；12 MiB 让频繁切页仍有命中，同时封顶长会话内存。 */
 const TEXT_CACHE_LIMIT_BYTES = 12 * 1024 * 1024;
@@ -141,6 +152,18 @@ const JOB_FAILURE_RETRY_MS = 5000;
 const JOB_FAILURE_LIMIT = 100;
 const jobFailures = new Map<string, {rootId: string; retryAfter: number; truncated?: boolean;}>();
 
+/**
+ * 思源数据库的代码块 subtype 不含围栏语言；这里必须和开关判断使用同一有效语言。
+ * 否则未挂载 Mermaid 会被当成普通代码块，错过 diagram 渲染和特殊缓存。
+ */
+function isSpecialRenderMeta(meta: BlockMeta): boolean {
+    return isSpecialRenderType(meta.type, effectiveCodeLanguage(meta));
+}
+
+function isDiagramMeta(meta: BlockMeta): boolean {
+    return isDiagramBlock(meta.type, effectiveCodeLanguage(meta));
+}
+
 function currentCorpusEpoch(rootId: string): number {
     return corpusEpochs.get(rootId) ?? 0;
 }
@@ -154,6 +177,8 @@ export function invalidateTextCache(): void {
     activeSpecialCacheKeysByRoot.clear();
     specialCacheTrimBlocked = false;
     plainCacheKeys.clear();
+    embedCacheKeys.clear();
+    renderSettingsStamp = "";
 }
 
 export function invalidateDocumentSearchCaches(): void {
@@ -163,13 +188,59 @@ export function invalidateDocumentSearchCaches(): void {
     invalidateDocMeta();
     invalidateDocOrder();
     invalidateAvCache();
+    dropQueryMemo();
     jobFailures.clear();
 }
 
-/** savedoc 后只作废结构信息，保留哈希校验过的正文与特殊块缓存。 */
+function dropTextCacheForBlocks(rootId: string, blockIds: readonly string[]): void {
+    if (blockIds.length === 0) {
+        return;
+    }
+    const ids = new Set(blockIds);
+    const prefix = `${rootId}:`;
+    const doomed: string[] = [];
+    for (const key of textCache.keys()) {
+        if (!key.startsWith(prefix)) {
+            continue;
+        }
+        const rest = key.slice(prefix.length);
+        const splitAt = rest.indexOf(":");
+        const blockId = splitAt >= 0 ? rest.slice(0, splitAt) : rest;
+        if (ids.has(blockId)) {
+            doomed.push(key);
+        }
+    }
+    for (const key of doomed) {
+        dropTextCache(key);
+    }
+}
+
+/**
+ * 块替换后只作废这篇文档的结构、嵌入缓存和候选查询。
+ * 被改过的块丢掉文本和数据库单元格缓存；其余块仍按哈希复用，不重新离屏渲染。
+ */
+export function invalidateEditedDocument(rootId?: string, blockIds?: readonly string[]): void {
+    if (!rootId) {
+        invalidateDocumentSearchCaches();
+        return;
+    }
+    cancelBackgroundCorpusJobs(rootId);
+    invalidateDocMeta(rootId);
+    invalidateDocOrder(rootId);
+    dropEmbedRenderCaches();
+    dropQueryMemo(rootId);
+    if (blockIds && blockIds.length > 0) {
+        dropTextCacheForBlocks(rootId, blockIds);
+        invalidateAvCacheForBlocks(blockIds);
+    }
+}
+
+/** savedoc 后只作废结构信息。普通正文仍按块哈希复用；嵌入块的来源不在自身哈希里，必须丢掉。 */
 export function invalidateDocumentStructureCaches(rootId?: string): void {
     invalidateDocMeta(rootId);
     invalidateDocOrder(rootId);
+    dropEmbedRenderCaches();
+    dropQueryMemo(rootId);
 }
 
 /**
@@ -232,7 +303,7 @@ function estimateCacheEntryBytes(hash: string, units: readonly CachedUnit[]): nu
             textBytes(unit.highlightKind) +
             textBytes(unit.snippet);
         bytes += (unit.segmentLengths?.length ?? 0) * 8;
-        bytes += unit.restrictSpans.length * 40;
+        bytes += (unit.restrictSpans?.length ?? 0) * 40;
     }
     return bytes;
 }
@@ -253,6 +324,147 @@ function dropTextCache(key: string): void {
     textCacheLru.delete(key);
     specialCacheKeys.delete(key);
     plainCacheKeys.delete(key);
+    embedCacheKeys.delete(key);
+}
+
+function currentRenderSettingsStamp(): string {
+    const config = (window as Window & {
+        siyuan?: {config?: {appearance?: {mode?: unknown; theme?: unknown; themeDark?: unknown;};};};
+    }).siyuan?.config;
+    const appearance = config?.appearance;
+    return `${appearance?.mode ?? ""}|${appearance?.theme ?? ""}|${appearance?.themeDark ?? ""}`;
+}
+
+/** 主题或明暗模式变化后，图表和 HTML 的可见字可能不同，不能沿用上一套渲染结果。 */
+function syncRenderSettingsCache(): void {
+    const next = currentRenderSettingsStamp();
+    if (!renderSettingsStamp) {
+        renderSettingsStamp = next;
+        return;
+    }
+    if (next === renderSettingsStamp) {
+        return;
+    }
+    renderSettingsStamp = next;
+    for (const key of Array.from(specialCacheKeys.keys())) {
+        dropTextCache(key);
+    }
+}
+
+function dropEmbedRenderCaches(): void {
+    for (const key of Array.from(embedCacheKeys)) {
+        dropTextCache(key);
+    }
+}
+
+const queryMemo = new Map<string, {signature: string; value: unknown;}>();
+const QUERY_MEMO_LIMIT = 24;
+/** 数据库引用查询的代数。变更前已发出的请求完成后不能再写回缓存。 */
+const avRefEpoch = new Map<string, number>();
+
+function currentAvRefEpoch(rootId: string): number {
+    return avRefEpoch.get(rootId) ?? 0;
+}
+
+function pinAvRefEpoch(rootId: string): number {
+    if (!avRefEpoch.has(rootId)) {
+        avRefEpoch.set(rootId, 0);
+    }
+    return currentAvRefEpoch(rootId);
+}
+
+function bumpAvRefEpoch(rootId: string): void {
+    avRefEpoch.set(rootId, currentAvRefEpoch(rootId) + 1);
+}
+
+function bumpAllAvRefEpochs(): void {
+    for (const rootId of avRefEpoch.keys()) {
+        bumpAvRefEpoch(rootId);
+    }
+}
+
+function queryMemoKey(rootId: string, kind: string, detail = ""): string {
+    return JSON.stringify([rootId, kind, detail]);
+}
+
+function readQueryMemo<T>(key: string, signature: string): T | undefined {
+    const hit = queryMemo.get(key);
+    if (!hit || hit.signature !== signature) {
+        if (hit) {
+            queryMemo.delete(key);
+        }
+        return undefined;
+    }
+    queryMemo.delete(key);
+    queryMemo.set(key, hit);
+    return hit.value as T;
+}
+
+function writeQueryMemo<T>(key: string, signature: string, value: T): void {
+    queryMemo.delete(key);
+    queryMemo.set(key, {signature, value});
+    while (queryMemo.size > QUERY_MEMO_LIMIT) {
+        const oldest = queryMemo.keys().next().value as string | undefined;
+        if (!oldest) {
+            break;
+        }
+        queryMemo.delete(oldest);
+    }
+}
+
+/** 数据库事务或结构性重绘后只丢掉引用列表，正文候选和块文本缓存继续复用。 */
+export function invalidateAttributeViewSearch(rootId: string): void {
+    if (!rootId) {
+        return;
+    }
+    // 先推进代数，再停掉这一文档未完成的数据库任务，避免旧单元格写回。
+    bumpAvRefEpoch(rootId);
+    const prefix = `av:${rootId}:`;
+    const doomed: string[] = [];
+    for (const [key, job] of jobs) {
+        if (key.startsWith(prefix)) {
+            job.controller.abort();
+            doomed.push(key);
+        }
+    }
+    for (const key of doomed) {
+        jobs.delete(key);
+        jobFailures.delete(key);
+    }
+    queryMemo.delete(queryMemoKey(rootId, "avrefs"));
+}
+
+function dropQueryMemo(rootId?: string): void {
+    if (!rootId) {
+        bumpAllAvRefEpochs();
+        queryMemo.clear();
+        return;
+    }
+    // 保存或替换会清掉引用列表。进行中的查询若在清空之后返回，不能把旧列表写回去。
+    bumpAvRefEpoch(rootId);
+    const prefix = `[${JSON.stringify(rootId)},`;
+    for (const key of queryMemo.keys()) {
+        if (key.startsWith(prefix)) {
+            queryMemo.delete(key);
+        }
+    }
+}
+
+async function memoizedIds(
+    key: string,
+    signature: string,
+    load: () => Promise<string[] | null>,
+): Promise<string[] | null> {
+    const cached = readQueryMemo<string[]>(key, signature);
+    if (cached !== undefined) {
+        return cached;
+    }
+    const ids = await load();
+    // 失败和取消都是 null，不能记成“没有候选”，否则下一轮会漏召回。
+    if (ids !== null) {
+        writeQueryMemo(key, signature, ids);
+    }
+    return ids;
 }
 
 function trimTextCacheBudget(): void {
@@ -589,15 +801,23 @@ function passesRestrict(unit: CachedUnit, start: number, end: number, options: S
 
 function remember(rootId: string, meta: BlockMeta, units: CachedUnit[], scope: string): void {
     // 成功但没有可见文字也是稳定结果；缓存空数组可避免无限重渲染。
-    writeSpecialCache(cacheKey(rootId, meta.id, scope), {hash: meta.hash, units});
+    const key = cacheKey(rootId, meta.id, scope);
+    writeSpecialCache(key, {hash: meta.hash, units});
+    if (isEmbedType(meta.type)) {
+        embedCacheKeys.add(key);
+    }
 }
 
 function rememberUnrendered(rootId: string, meta: BlockMeta, scope: string): void {
-    writeSpecialCache(cacheKey(rootId, meta.id, scope), {
+    const key = cacheKey(rootId, meta.id, scope);
+    writeSpecialCache(key, {
         hash: meta.hash,
         units: [],
         retryAfter: Date.now() + SPECIAL_FAILURE_RETRY_MS,
     });
+    if (isEmbedType(meta.type)) {
+        embedCacheKeys.add(key);
+    }
 }
 
 function cachedUnits(
@@ -609,6 +829,7 @@ function cachedUnits(
     const missing: BlockMeta[] = [];
     let unrendered = 0;
     const now = Date.now();
+    syncRenderSettingsCache();
     pinSpecialCacheKeys(rootId, metas.map((meta) => cacheKey(rootId, meta.id, scope)));
     for (const meta of metas) {
         const key = cacheKey(rootId, meta.id, scope);
@@ -648,6 +869,13 @@ async function extractMetas(
     const canContinue = () => shouldContinue() && !signal?.aborted;
     const scope = collectionScope(options);
     const embedIds = new Set(metas.filter((meta) => isEmbedType(meta.type)).map((meta) => meta.id));
+    const codeLanguages = new Map<string, string>();
+    for (const meta of metas) {
+        const language = effectiveCodeLanguage(meta);
+        if (meta.type === "c" && isDiagramBlock(meta.type, language)) {
+            codeLanguages.set(meta.id, language);
+        }
+    }
     let extracted: Awaited<ReturnType<typeof fetchAndExtractUnits>>;
     try {
         extracted = await fetchAndExtractUnits(
@@ -658,6 +886,7 @@ async function extractMetas(
             mode,
             canContinue,
             signal,
+            codeLanguages,
         );
     } catch {
         // 渲染器异常与接口失败使用同一条有限重试路径，不能让后台任务永久停在 partial。
@@ -665,11 +894,11 @@ async function extractMetas(
     }
     if (!extracted) {
         const failedIds = metas
-            .filter((meta) => isSpecialRenderType(meta.type, meta.subtype))
+            .filter(isSpecialRenderMeta)
             .map((meta) => meta.id);
         if (epoch === currentCorpusEpoch(rootId)) {
             for (const meta of metas) {
-                if (isSpecialRenderType(meta.type, meta.subtype)) {
+                if (isSpecialRenderMeta(meta)) {
                     rememberUnrendered(rootId, meta, scope);
                 }
             }
@@ -692,7 +921,7 @@ async function extractMetas(
     const unrenderedIds = new Set(extracted.unrenderedIds);
     for (const meta of metas) {
         const list = byId.get(meta.id) ?? [];
-        const cacheSpecial = mode !== "light" || isSpecialRenderType(meta.type, meta.subtype);
+        const cacheSpecial = mode !== "light" || isSpecialRenderMeta(meta);
         if (keep && cacheSpecial) {
             if (unrenderedIds.has(meta.id)) {
                 rememberUnrendered(rootId, meta, scope);
@@ -711,7 +940,7 @@ async function extractMetas(
 }
 
 function canCachePlainText(meta: BlockMeta): boolean {
-    return !isEmbedType(meta.type) && !isSpecialRenderType(meta.type, meta.subtype);
+    return !isEmbedType(meta.type) && !isSpecialRenderMeta(meta);
 }
 
 function readPlainCache(rootId: string, blockId: string, scope: string, hash: string): CachedUnit[] | null {
@@ -996,8 +1225,8 @@ function scheduleSpecialWarmup(
             notifyIndexSettled(rootId);
             return;
         }
-        const diagrams = missing.filter((item) => isDiagramBlock(item.type, item.subtype));
-        const lights = missing.filter((item) => !isDiagramBlock(item.type, item.subtype));
+        const diagrams = missing.filter(isDiagramMeta);
+        const lights = missing.filter((item) => !isDiagramMeta(item));
         startJob(`special-rest:${rootId}`, rootId, async (isCurrent, signal) => {
             if (lights.length > 0) {
                 await extractMetas(rootId, notebookId, lights, options, "light", isCurrent, signal);
@@ -1007,9 +1236,7 @@ function scheduleSpecialWarmup(
                     return;
                 }
                 const pair = diagrams.slice(index, index + 2);
-                await Promise.all(pair.map((item) => {
-                    return extractMetas(rootId, notebookId, [item], options, "diagram", isCurrent, signal);
-                }));
+                await extractMetas(rootId, notebookId, pair, options, "diagram", isCurrent, signal);
             }
         });
     }, SPECIAL_WARMUP_MS);
@@ -1048,7 +1275,114 @@ function jobTruncated(prefix: string): boolean {
     return false;
 }
 
-async function loadAvRefs(rootId: string, signal?: AbortSignal): Promise<AvBlockRef[]> {
+type CandidateTriple = [string[] | null, string[] | null, string[] | null];
+
+interface CandidateQuery {
+    regexGroups: ReturnType<typeof extractRegexLiteralGroups>;
+    /** null 表示这次正则没有可下推的字面量，调用方保持原有全量或仅备注路径。 */
+    triple: Promise<CandidateTriple | null> | null;
+    memoHosts: Promise<string[] | null> | null;
+}
+
+/**
+ * 候选 SQL 只依赖文档签名和关键词，可以和顺序、语言查询以及同步 DOM 扫描重叠。
+ * 成功结果按签名复用；失败不写入，避免把“查询失败”记成空候选。
+ * 不另建文本索引：未改块已经按块哈希跳过离屏渲染，第二套索引会有召回分叉的风险。
+ */
+function beginCandidateQuery(input: {
+    rootId: string;
+    signature: string;
+    keyword: string;
+    caseSensitive: boolean;
+    regex: boolean;
+    regexUnicode: boolean;
+    needContentCandidates: boolean;
+    collectMemo: boolean;
+    needImageTitleCandidates: boolean;
+    memoOnlyRestriction: boolean;
+    signal?: AbortSignal;
+}): CandidateQuery {
+    const memoHosts = () =>
+        memoizedIds(
+            queryMemoKey(input.rootId, "memo-hosts"),
+            input.signature,
+            () => fetchMemoCandidateIds(input.rootId, input.signal),
+        );
+    if (input.regex) {
+        const groups = extractRegexLiteralGroups(input.keyword, input.caseSensitive, {
+            unicode: input.regexUnicode,
+        });
+        if (!groups) {
+            return {
+                regexGroups: null,
+                triple: null,
+                memoHosts: input.memoOnlyRestriction ? memoHosts().catch((): null => null) : null,
+            };
+        }
+        const detail = JSON.stringify(groups);
+        return {
+            regexGroups: groups,
+            triple: Promise.all([
+                input.needContentCandidates ?
+                    memoizedIds(
+                        queryMemoKey(input.rootId, "rg-content", `${input.caseSensitive}:${detail}`),
+                        input.signature,
+                        () =>
+                            fetchLiteralGroupCandidateIds(
+                                input.rootId,
+                                groups,
+                                input.caseSensitive,
+                                "content",
+                                input.signal,
+                            ),
+                    ) :
+                    Promise.resolve([] as string[]),
+                input.collectMemo ? memoHosts() : Promise.resolve([] as string[]),
+                input.needImageTitleCandidates ?
+                    memoizedIds(
+                        queryMemoKey(input.rootId, "rg-title", `${input.caseSensitive}:${detail}`),
+                        input.signature,
+                        () =>
+                            fetchLiteralGroupCandidateIds(
+                                input.rootId,
+                                groups,
+                                input.caseSensitive,
+                                "imageTitle",
+                                input.signal,
+                            ),
+                    ) :
+                    Promise.resolve([] as string[]),
+            ]).catch((): null => null),
+            memoHosts: null,
+        };
+    }
+    return {
+        regexGroups: null,
+        triple: Promise.all([
+            input.needContentCandidates ?
+                memoizedIds(
+                    queryMemoKey(input.rootId, "content", `${input.caseSensitive}:${input.keyword}`),
+                    input.signature,
+                    () => fetchContentCandidateIds(input.rootId, input.keyword, input.caseSensitive, input.signal),
+                ) :
+                Promise.resolve([] as string[]),
+            input.collectMemo ? memoHosts() : Promise.resolve([] as string[]),
+            input.needImageTitleCandidates ?
+                memoizedIds(
+                    queryMemoKey(input.rootId, "title", `${input.caseSensitive}:${input.keyword}`),
+                    input.signature,
+                    () => fetchImageTitleCandidateIds(input.rootId, input.keyword, input.caseSensitive, input.signal),
+                ) :
+                Promise.resolve([] as string[]),
+        ]).catch((): null => null),
+        memoHosts: null,
+    };
+}
+
+async function loadAvRefs(
+    rootId: string,
+    signal?: AbortSignal,
+): Promise<{refs: AvBlockRef[]; cacheable: boolean;} | null> {
     const root = escSql(rootId);
     const rows = await querySqlAll<{id: string; updated?: string; markdown?: string; ial?: string;}>(
         (afterId, limit) => {
@@ -1059,9 +1393,30 @@ async function loadAvRefs(rootId: string, signal?: AbortSignal): Promise<AvBlock
         signal,
     );
     if (!rows) {
-        return [];
+        return null;
     }
     return resolveMissingAvIds(rows, signal);
+}
+
+async function loadMemoizedAvRefs(
+    rootId: string,
+    signature: string,
+    signal?: AbortSignal,
+): Promise<{refs: AvBlockRef[]; failed: boolean;}> {
+    const key = queryMemoKey(rootId, "avrefs");
+    const epoch = pinAvRefEpoch(rootId);
+    const cached = readQueryMemo<AvBlockRef[]>(key, signature);
+    if (cached !== undefined) {
+        return {refs: cached, failed: false};
+    }
+    const loaded = await loadAvRefs(rootId, signal);
+    if (!loaded) {
+        return {refs: [], failed: true};
+    }
+    if (loaded.cacheable && signal?.aborted !== true && epoch === currentAvRefEpoch(rootId)) {
+        writeQueryMemo(key, signature, loaded.refs);
+    }
+    return {refs: loaded.refs, failed: false};
 }
 
 /**
@@ -1210,15 +1565,45 @@ export async function searchCurrentDocument(
         // 元数据失败时不能把“只查到已加载 DOM”伪装成完整结果；交给调用方走显式降级路径。
         return null;
     }
-    // 三个开关一致时语言不影响结果，不读 markdown。不一致时才补围栏语言，
-    // 这样关掉普通代码块不会把未加载的 Mermaid / flowchart 一起排除。
-    if (codeBlockLanguagesNeeded(options)) {
-        await ensureCodeBlockLanguages(context.rootId, meta, options.signal);
-        if (cancelled()) {
-            return {matches: [], error: "", cancelled: true};
-        }
-    }
-    const remoteOrder = await fetchDocBlocksOrders(context.rootId, meta.signature, options.signal);
+    // 围栏语言同时决定独立开关、图表渲染和缓存归类。三项都关闭时没有代码块候选，
+    // 才可跳过查询；查询失败会保守走普通代码路径，下轮搜索仍可重试。
+    const caseSensitive = options.caseSensitive === true;
+    const keepRestrict = isRestrictInlineActive(options.restrictInlineTypes);
+    // 限制只含备注时，正文、图片标题和行内公式都不会进入最终结果。
+    // 不能仍按正文关键词把大量无关块取回并离屏渲染；Memo 自身的 SQL 候选
+    // 已是完整超集（富文本属性可能把关键词拆开，故不能再按关键词缩窄）。
+    const collectBodyText = shouldCollectBodyTextForRestrict(options.restrictInlineTypes);
+    const collectMemo = shouldCollectInlineMemoUnits({
+        includeInlineMemo: options.includeInlineMemo === true,
+        restrictTypes: options.restrictInlineTypes,
+    });
+    const collectInlineMath = shouldCollectInlineMathUnits(options.restrictInlineTypes);
+    const memoOnlyRestriction = collectMemo && !collectBodyText && !collectInlineMath;
+    const needContentCandidates = collectBodyText || collectInlineMath;
+    const needImageTitleCandidates = !keepRestrict && options.includeImageTitle !== false;
+    const languagesPromise = (codeBlockLanguagesNeeded(options) ?
+        ensureCodeBlockLanguages(context.rootId, meta, options.signal) :
+        Promise.resolve(true)).catch((): false => false);
+    const orderPromise = fetchDocBlocksOrders(context.rootId, meta.signature, options.signal)
+        .catch((): null => null);
+    const candidateQuery = beginCandidateQuery({
+        rootId: context.rootId,
+        signature: meta.signature,
+        keyword,
+        caseSensitive,
+        regex: options.regex === true,
+        regexUnicode: options.regexUnicode === true,
+        needContentCandidates,
+        collectMemo,
+        needImageTitleCandidates,
+        memoOnlyRestriction,
+        signal: options.signal,
+    });
+    const avRefsPromise = options.includeAttributeView === false ?
+        Promise.resolve({refs: [] as AvBlockRef[], failed: false}) :
+        loadMemoizedAvRefs(context.rootId, meta.signature, options.signal)
+            .catch((): null => null);
+    const remoteOrder = await orderPromise;
     if (cancelled()) {
         return {matches: [], error: "", cancelled: true};
     }
@@ -1228,10 +1613,14 @@ export async function searchCurrentDocument(
     const orders = reliableOrder ?? meta.fallbackOrder;
     // fallbackOrder 的同级块按 id 排列，只能用于稳定展示，不能据此推断标题折叠边界。
     // getDocBlocksOrders 不可用时保守放行，避免把实际可见块误判成隐藏而漏召回。
-    const mountedFolds = options.includeFoldedBlocks === true ? null : mountedFoldState(edit);
-    const headingFoldedHidden = options.includeFoldedBlocks === true || !reliableOrder ?
+    // 即使允许搜索折叠内容，也要知道标题卸载了哪些后代，避免把折叠区域误判为可见。
+    const mountedFolds = mountedFoldState(edit);
+    const headingFoldedHidden = !reliableOrder ?
         new Set<string>() :
-        collectHeadingFoldedIds(reliableOrder, meta.links, mountedFolds?.headings);
+        collectHeadingFoldedIds(reliableOrder, meta.links, mountedFolds.headings);
+    /** 包含被更外层标题遮住的标题。 */
+    const foldedHeadingIds = new Set(mountedFolds.headings.foldedIds);
+    const focusId = editorFocusId(edit);
     if (mountedFolds) {
         // 标题被动态卸载后已经没有 DOM 可供 mountedFoldState 读取，但它的 IAL
         // 仍能指出该标题自身折叠。getHeadingChildrenIDs 由内核树判断后代范围，
@@ -1245,6 +1634,7 @@ export async function searchCurrentDocument(
                 !mountedFolds.headings.mountedIds.has(id) &&
                 isSelfFoldedIal(node.ial)
             ) {
+                foldedHeadingIds.add(id);
                 exactFoldedHeadingIds.add(id);
             }
         }
@@ -1260,11 +1650,24 @@ export async function searchCurrentDocument(
         }
         exactHeadingHidden.forEach((id) => headingFoldedHidden.add(id));
     }
-    const focusId = editorFocusId(edit);
+    // 折叠范围已经确定后再读编辑器。语言、候选 SQL 和数据库引用在这之前已经发出，
+    // 扫描期间可以继续返回。
+    const liveAll = collectSearchableBlocks(edit, {
+        ...collectOptions(options),
+        includeDocTitle: options.includeDocTitle !== false && !focusId,
+        includeAttributeView: options.includeAttributeView !== false,
+    });
+    const languagesReady = await languagesPromise;
+    if (cancelled()) {
+        return {matches: [], error: "", cancelled: true};
+    }
+    // 失败时仍按普通代码块继续，但不能把这次结果说成覆盖完整。
+    const languageQueryFailed = codeBlockLanguagesNeeded(options) && !languagesReady;
     const focusScope = focusId ? collectFocusScope(focusId, meta, orders) : null;
     // 聚焦但关系表里还没有这个块时，不把文档其余未加载块算进来。
     const inFocus = (id: string) => !focusId || Boolean(focusScope?.has(id));
     const orderIndex = orderIndexOf(orders);
+    const scope = collectionScope(options);
     const enabledCache = new Map<string, boolean>();
     const nonHeadingFoldedCache = new Map<string, boolean>();
     const enabled = (item: BlockMeta) => {
@@ -1287,26 +1690,10 @@ export async function searchCurrentDocument(
     // 离屏抽取仍关掉整块拼接，避免相邻单元格粘成一次误匹配。
     // 整张表都挂在画面里时直接用这些格子，未落库的修改不必再等 getBlockDOM。
     // 虚拟大表只替换已经挂出来的格子，屏外行仍用完整表。
-    const liveAll = collectSearchableBlocks(edit, {
-        ...collectOptions(options),
-        includeDocTitle: options.includeDocTitle !== false && !focusId,
-        includeAttributeView: options.includeAttributeView !== false,
-    });
     const liveIds = new Set<string>();
     let units: CachedUnit[] = [];
-    const keepRestrict = isRestrictInlineActive(options.restrictInlineTypes);
-    // 限制只含备注时，正文、图片标题和行内公式都不会进入最终结果。
-    // 不能仍按正文关键词把大量无关块取回并离屏渲染；Memo 自身的 SQL 候选
-    // 已是完整超集（富文本属性可能把关键词拆开，故不能再按关键词缩窄）。
-    const collectBodyText = shouldCollectBodyTextForRestrict(options.restrictInlineTypes);
-    const collectMemo = shouldCollectInlineMemoUnits({
-        includeInlineMemo: options.includeInlineMemo === true,
-        restrictTypes: options.restrictInlineTypes,
-    });
-    const collectInlineMath = shouldCollectInlineMathUnits(options.restrictInlineTypes);
-    const memoOnlyRestriction = collectMemo && !collectBodyText && !collectInlineMath;
-    const needContentCandidates = collectBodyText || collectInlineMath;
-    const needImageTitleCandidates = !keepRestrict && options.includeImageTitle !== false;
+    const foldedLiveDiagramBlocks = new Map<string, SearchableBlock>();
+    const foldedLiveDiagramFallback = new Map<string, CachedUnit[]>();
     // 预筛选若执行正则，灾难性回溯仍会卡住主线程。正则模式宁可多传几个表格单元给 Worker，
     // 也不能在此处调用 RegExp.test；最终匹配仍由 Worker 给出精确结果。
     const cellMayMatch = options.regex ?
@@ -1325,6 +1712,19 @@ export async function searchCurrentDocument(
         unstable: boolean;
     }>();
     const mountedTableUnits: CachedUnit[] = [];
+    /** 当前画面已有的块文本。行级公式必须连同同一父块的普通文本一起冻结，偏移才稳定。 */
+    const liveUnitsByBlockId = new Map<string, CachedUnit[]>();
+    const noteLiveUnit = (block: SearchableBlock, item: BlockMeta | undefined, unit: CachedUnit) => {
+        if (!item) {
+            return;
+        }
+        const existing = liveUnitsByBlockId.get(block.blockId);
+        if (existing) {
+            existing.push(unit);
+        } else {
+            liveUnitsByBlockId.set(block.blockId, [unit]);
+        }
+    };
     const visibleMountedTables = new Set<string>();
     const hiddenMountedTables = new Set<string>();
     const kernelOnlyTables = new Set<string>();
@@ -1364,10 +1764,13 @@ export async function searchCurrentDocument(
             return;
         }
         state.liveByKey.set(
-            position,
+            tableOverlayKey(block.unitId) || position,
             freezeLive(block, orderIndex.get(block.blockId) ?? block.blockIndex),
         );
     };
+    // folded live diagrams may consult the special cache before cachedUnits(); keep
+    // theme changes from reusing SVG text generated under the previous appearance.
+    syncRenderSettingsCache();
     for (const block of liveAll) {
         if (block.blockId === "__doc-title__") {
             if (focusId) {
@@ -1430,14 +1833,43 @@ export async function searchCurrentDocument(
         if (item && !enabled(item)) {
             continue;
         }
-        if (item && isSpecialRenderType(item.type, item.subtype) && !block.text.trim()) {
+        if (item && isSpecialRenderMeta(item) && !block.text.trim()) {
             continue;
         }
-        if (!isVisuallyInEditor(block.element)) {
+        // 非标题折叠只用 CSS 隐藏，正文和行内公式仍在 DOM 里。
+        // collectSearchableBlocks 已按开关和类型门闩过滤过；开启“搜索折叠块内容”后，
+        // 这里不能再以几何可见性丢掉这些已有文字，否则会先少计、再离屏重抽一次。
+        const reusableFoldedLiveText = options.includeFoldedBlocks === true &&
+            Boolean(block.text.trim()) &&
+            isUnderNonHeadingCssFold(block.element);
+        if (!isVisuallyInEditor(block.element) && !reusableFoldedLiveText) {
             continue;
         }
         liveIds.add(block.blockId);
-        units.push(freezeLive(block, orderIndex.get(block.blockId) ?? block.blockIndex));
+        const frozen = freezeLive(block, orderIndex.get(block.blockId) ?? block.blockIndex);
+        if (
+            item &&
+            isDiagramMeta(item) &&
+            !memoOnlyRestriction &&
+            isUnderNonHeadingCssFold(block.element)
+        ) {
+            const cached = textCache.get(cacheKey(context.rootId, item.id, scope));
+            if (cached && cached.hash === item.hash && cached.retryAfter === undefined) {
+                touchTextCache(cacheKey(context.rootId, item.id, scope));
+                units.push(...cached.units);
+                continue;
+            }
+            foldedLiveDiagramBlocks.set(block.blockId, block);
+            const fallback = foldedLiveDiagramFallback.get(block.blockId);
+            if (fallback) {
+                fallback.push(frozen);
+            } else {
+                foldedLiveDiagramFallback.set(block.blockId, [frozen]);
+            }
+            continue;
+        }
+        units.push(frozen);
+        noteLiveUnit(block, item, frozen);
     }
     for (const tableId of visibleMountedTables) {
         if (!hiddenMountedTables.has(tableId)) {
@@ -1450,10 +1882,24 @@ export async function searchCurrentDocument(
         }
     }
 
+    // 标题折叠会直接卸载其后代 DOM。若该后代刚刚显示过，就把已经得到的“可见文字”
+    // 写入现有的版本化缓存：特殊渲染块无需等首次离屏渲染，行级公式保留与父正文相同的偏移。
+    for (const [blockId, liveUnits] of liveUnitsByBlockId) {
+        const item = meta.byId.get(blockId);
+        if (!item) {
+            continue;
+        }
+        if (isSpecialRenderMeta(item)) {
+            remember(context.rootId, item, liveUnits, scope);
+            continue;
+        }
+        if (canCachePlainText(item) && liveUnits.some(isInlineMathSearchUnit)) {
+            rememberPlain(context.rootId, blockId, scope, item.hash, liveUnits);
+        }
+    }
     let unrendered = 0;
     let truncated = 0;
-    let degraded = false;
-    const caseSensitive = options.caseSensitive === true;
+    let degraded = languageQueryFailed;
     const plainTargets: BlockMeta[] = [];
     const specialTargets: BlockMeta[] = [];
 
@@ -1473,19 +1919,27 @@ export async function searchCurrentDocument(
         if (meta.byId.has(id) && (!enabled(item) || isAttributeViewType(item.type))) {
             return;
         }
-        if (isSpecialRenderType(item.type, item.subtype)) {
+        if (isSpecialRenderMeta(item)) {
             specialTargets.push(item);
         } else {
             plainTargets.push(item);
         }
     };
-    const queueRemainingSpecials = () => {
+    const queueRemainingSpecials = (includeDiagrams = true) => {
         const queued = new Set(specialTargets.map((item) => item.id));
         for (const item of meta.byId.values()) {
             if (!enabled(item) || liveIds.has(item.id) || queued.has(item.id) || !inFocus(item.id)) {
                 continue;
             }
-            if (!isSpecialRenderType(item.type, item.subtype)) {
+            if (!isSpecialRenderMeta(item)) {
+                continue;
+            }
+            // blocks.content 包含并反转义 NodeCodeBlockCode；图表的可见标签
+            // 来自这段源码，所以候选 SQL 已经是安全超集。只有公式/HTML
+            // 仍可能在源码与 renderer 文字之间发生不可下推的变化。
+            // 无关图表交给后台缓存会触发 Mermaid/flowchart 的异步 renderer，
+            // 让每次普通搜索都长时间停在索引中；SQL 失败时走下方全量回退。
+            if (!includeDiagrams && isDiagramMeta(item)) {
                 continue;
             }
             specialTargets.push(item);
@@ -1497,39 +1951,37 @@ export async function searchCurrentDocument(
             if (!enabled(item) || isAttributeViewType(item.type) || liveIds.has(item.id) || !inFocus(item.id)) {
                 continue;
             }
-            (isSpecialRenderType(item.type, item.subtype) ? specialTargets : plainTargets).push(item);
+            (isSpecialRenderMeta(item) ? specialTargets : plainTargets).push(item);
         }
     };
 
     let prefiltered = false;
     let storePlainCache = !options.regex;
+    let contentCandidateIds: Set<string> | null = null;
     if (options.regex) {
-        const groups = extractRegexLiteralGroups(keyword, caseSensitive);
-        if (groups) {
-            const [contentIds, memoIds, titleIds] = await Promise.all([
-                needContentCandidates ?
-                    fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "content", options.signal) :
-                    Promise.resolve([] as string[]),
-                collectMemo ?
-                    fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "memo", options.signal) :
-                    Promise.resolve([] as string[]),
-                needImageTitleCandidates ?
-                    fetchLiteralGroupCandidateIds(context.rootId, groups, caseSensitive, "imageTitle", options.signal) :
-                    Promise.resolve([] as string[]),
-            ]);
+        const groups = candidateQuery.regexGroups;
+        if (groups && candidateQuery.triple) {
+            const triple = await candidateQuery.triple;
             if (cancelled()) {
                 return {matches: [], error: "", cancelled: true};
             }
-            if (contentIds && memoIds && titleIds) {
+            const contentIds = triple?.[0] ?? null;
+            const memoIds = triple?.[1] ?? null;
+            const titleIds = triple?.[2] ?? null;
+            // 空数组是“查到了但没有候选”，不能当成查询失败。
+            if (contentIds !== null && memoIds !== null && titleIds !== null) {
                 prefiltered = true;
+                contentCandidateIds = new Set(contentIds);
                 storePlainCache = regexPrefilterStoresPlainCache(groups);
                 for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
                     queueUnloaded(id);
                 }
-                // 公式、图表、HTML 的可见文字常常不在 content 里，不能靠字面量丢掉。
-                // 仅备注时 memoIds 已覆盖全部备注宿主，额外预热无备注的特殊块只会争用前台请求。
+                // 公式和 HTML 的可见文字可能不在 content 里，不能靠字面量丢掉。
+                // 图表源码由 blocks.content 提供安全候选，只有命中的图表进入前台
+                // 渲染；仅备注时 memoIds 已覆盖全部备注宿主，额外预热无备注的特殊
+                // 块只会争用前台请求。
                 if (!memoOnlyRestriction) {
-                    queueRemainingSpecials();
+                    queueRemainingSpecials(false);
                 }
             }
         }
@@ -1538,7 +1990,9 @@ export async function searchCurrentDocument(
             // 但“仅备注”已知所有候选都带 data-inline-memo-content，可保持完整召回
             // 的同时避开与备注无关的块。
             if (memoOnlyRestriction) {
-                const memoIds = await fetchMemoCandidateIds(context.rootId, options.signal);
+                const memoIds = candidateQuery.memoHosts ?
+                    await candidateQuery.memoHosts :
+                    await fetchMemoCandidateIds(context.rootId, options.signal);
                 if (cancelled()) {
                     return {matches: [], error: "", cancelled: true};
                 }
@@ -1552,24 +2006,18 @@ export async function searchCurrentDocument(
             }
         }
     } else {
-        const [contentIds, memoIds, titleIds] = await Promise.all([
-            needContentCandidates ?
-                fetchContentCandidateIds(context.rootId, keyword, caseSensitive, options.signal) :
-                Promise.resolve([] as string[]),
-            collectMemo ?
-                fetchMemoCandidateIds(context.rootId, options.signal) :
-                Promise.resolve([] as string[]),
-            needImageTitleCandidates ?
-                fetchImageTitleCandidateIds(context.rootId, keyword, caseSensitive, options.signal) :
-                Promise.resolve([] as string[]),
-        ]);
+        const triple = await candidateQuery.triple;
         if (cancelled()) {
             return {matches: [], error: "", cancelled: true};
         }
-        if (!contentIds || !memoIds || !titleIds) {
+        const contentIds = triple?.[0] ?? null;
+        const memoIds = triple?.[1] ?? null;
+        const titleIds = triple?.[2] ?? null;
+        if (contentIds === null || memoIds === null || titleIds === null) {
             // SQL 不可用时由文档元数据扩大到全部未加载叶子，保持结果完整性。
             queueEveryUnloaded();
         } else {
+            contentCandidateIds = new Set(contentIds);
             for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
                 queueUnloaded(id);
             }
@@ -1581,7 +2029,14 @@ export async function searchCurrentDocument(
                 if (!enabled(item) || liveIds.has(item.id) || queuedSpecials.has(item.id) || !inFocus(item.id)) {
                     continue;
                 }
-                if (!isSpecialRenderType(item.type, item.subtype)) {
+                if (!isSpecialRenderMeta(item)) {
+                    continue;
+                }
+                // 图表只在当前查询确实需要时离屏渲染。无关图表的后台预热会
+                // 触发 Mermaid/flowchart 的异步脚本和布局等待，导致搜索计数
+                // 长时间处于索引状态，却不会增加本次查询的召回。
+                const language = effectiveCodeLanguage(item);
+                if (language === "mermaid" || language === "flowchart") {
                     continue;
                 }
                 restSpecials.push(item);
@@ -1594,7 +2049,6 @@ export async function searchCurrentDocument(
         }
     }
 
-    const scope = collectionScope(options);
     // 全文抽块的正则不写入普通正文缓存，避免把关键词缓存挤掉。
     if (plainTargets.length > 0) {
         const loaded = await loadPlainUnits(
@@ -1619,40 +2073,139 @@ export async function searchCurrentDocument(
     const specialState = cachedUnits(context.rootId, specialTargets, scope);
     units.push(...specialState.ready);
     unrendered += specialState.unrendered;
-    const specialMissing = specialState.missing;
-    if (specialMissing.length > 0 && allowBackgroundJobs) {
-        const diagrams = specialMissing.filter((item) => isDiagramBlock(item.type, item.subtype));
-        const lights = specialMissing.filter((item) => !isDiagramBlock(item.type, item.subtype));
-        startJob(`special:${context.rootId}`, context.rootId, async (isCurrent, signal) => {
-            await extractMetas(context.rootId, context.notebookId, lights, options, "light", isCurrent, signal);
-            for (let index = 0; index < diagrams.length; index += 2) {
-                if (!isCurrent()) {
-                    return;
-                }
-                const pair = diagrams.slice(index, index + 2);
-                await Promise.all(pair.map((item) => {
-                    return extractMetas(
-                        context.rootId,
-                        context.notebookId,
-                        [item],
-                        options,
-                        "diagram",
-                        isCurrent,
-                        signal,
-                    );
-                }));
-            }
-        });
-    }
-
-    if (options.includeAttributeView !== false) {
-        const refs = (await loadAvRefs(context.rootId, options.signal)).filter((ref) => {
-            const item = meta.byId.get(ref.blockId);
-            return (!item || enabled(item)) && inFocus(ref.blockId);
-        });
+    // Mermaid / flowchart 的可搜索文字只存在 renderer 生成的 SVG/foreignObject 中。
+    // 折叠标题、折叠列表和未加载区域没有 live SVG；如果把它们全部交给后台任务，
+    // 首轮搜索只能等缓存完成后再命中。候选图块在当前搜索中同步离屏渲染，保证
+    // 首次搜索的召回；普通公式/HTML 及未被候选命中的特殊块仍走后台补全，避免把
+    // 大量无关图表的渲染成本放到每次输入的前台路径。
+    const missingDiagrams = specialState.missing.filter(isDiagramMeta);
+    const specialMissing = specialState.missing.filter((item) => !isDiagramMeta(item));
+    if (missingDiagrams.length > 0) {
+        const rendered = await extractMetas(
+            context.rootId,
+            context.notebookId,
+            missingDiagrams,
+            options,
+            "diagram",
+            () => !cancelled(),
+            options.signal,
+        );
         if (cancelled()) {
             return {matches: [], error: "", cancelled: true};
         }
+        units.push(...rendered.units);
+        unrendered += rendered.unrendered;
+        degraded ||= rendered.failed;
+    }
+    if (specialMissing.length > 0 && allowBackgroundJobs) {
+        startJob(`special:${context.rootId}`, context.rootId, async (isCurrent, signal) => {
+            await extractMetas(context.rootId, context.notebookId, specialMissing, options, "light", isCurrent, signal);
+        });
+    }
+
+    if (foldedLiveDiagramBlocks.size > 0) {
+        const languages = new Map<string, string>();
+        for (const id of foldedLiveDiagramBlocks.keys()) {
+            const item = meta.byId.get(id);
+            const language = item ? effectiveCodeLanguage(item) : "";
+            if (language) {
+                languages.set(id, language);
+            }
+        }
+        const sourceProbe = !options.regex ?
+            createTextMatchProbe(keyword, {
+                caseSensitive: options.caseSensitive === true,
+                wholeWord: options.wholeWord === true,
+            }) :
+            null;
+        const selected = Array.from(foldedLiveDiagramBlocks.entries()).filter(([id, block]) => {
+            if (contentCandidateIds === null || contentCandidateIds.has(id)) {
+                return true;
+            }
+            if (options.regex) {
+                // 没有必现字面量时无法安全地用 SQL 缩小范围；有字面量时
+                // content 候选是安全超集，继续保留轻量路径。
+                return candidateQuery.regexGroups === null;
+            }
+            // SQL 只看 blocks.content。图表源码可能含 HTML 实体或其它内核
+            // 规范化差异，直接检查 data-content 可把这类折叠图表重新纳入，
+            // 同时避免无关图表全部离屏渲染。
+            const source = diagramSourceText(block.element);
+            return source.length === 0 || Boolean(sourceProbe?.(source));
+        });
+        if (selected.length === 0) {
+            for (const fallback of foldedLiveDiagramFallback.values()) {
+                units.push(...fallback);
+            }
+        } else {
+            const selectedIds = new Set(selected.map(([id]) => id));
+            const selectedBlocks = selected.map(([, block]) => block);
+            const selectedLanguages = new Map(
+                selectedBlocks.map((block) => [block.blockId, languages.get(block.blockId) ?? ""]),
+            );
+            let refreshed: Awaited<ReturnType<typeof extractDiagramUnitsFromLive>> | null = null;
+            try {
+                refreshed = await extractDiagramUnitsFromLive(
+                    selectedBlocks,
+                    extractionCollectOptions(options),
+                    selectedLanguages,
+                    () => !cancelled(),
+                    options.signal,
+                );
+            } catch {
+                // 保留当前 live 文字；一次 renderer 异常不能让整个搜索链路失败。
+            }
+            if (cancelled()) {
+                refreshed?.dispose();
+                return {matches: [], error: "", cancelled: true};
+            }
+            try {
+                const refreshedById = new Map<string, CachedUnit[]>();
+                for (const unit of (refreshed?.blocks ?? []).map((block) => freezeBlock(block))) {
+                    const list = refreshedById.get(unit.blockId) ?? [];
+                    list.push(unit);
+                    refreshedById.set(unit.blockId, list);
+                }
+                for (const id of foldedLiveDiagramBlocks.keys()) {
+                    const full = refreshedById.get(id);
+                    const fallback = foldedLiveDiagramFallback.get(id);
+                    if (!selectedIds.has(id)) {
+                        units.push(...(fallback ?? []));
+                        continue;
+                    }
+                    const chosen = full && full.length > 0 ? full : (fallback ?? []);
+                    units.push(...chosen);
+                    const item = meta.byId.get(id);
+                    const rendererFailed = refreshed?.unrenderedIds.includes(id) === true;
+                    if (item && full && full.length > 0) {
+                        remember(context.rootId, item, chosen, scope);
+                    } else if (item && rendererFailed) {
+                        rememberUnrendered(context.rootId, item, scope);
+                    } else if (item && chosen.length > 0 && refreshed) {
+                        // A successful fallback remains usable; exceptions are retried
+                        // on the next search instead of being cached as complete output.
+                        remember(context.rootId, item, chosen, scope);
+                    }
+                }
+                unrendered += refreshed?.unrenderedIds.length ?? 0;
+            } finally {
+                refreshed?.dispose();
+            }
+        }
+    }
+
+    if (options.includeAttributeView !== false) {
+        const loadedRefs = await avRefsPromise;
+        if (cancelled()) {
+            return {matches: [], error: "", cancelled: true};
+        }
+        if (!loadedRefs || loadedRefs.failed) {
+            degraded = true;
+        }
+        const refs = (loadedRefs?.refs ?? []).filter((ref) => {
+            const item = meta.byId.get(ref.blockId);
+            return (!item || enabled(item)) && inFocus(ref.blockId);
+        });
         const avDom = collectAvDomCoverage(units);
         const usedRowLabels = new Map<string, Set<string>>();
         const avViewTypes = new Map<string, string>();
@@ -1712,6 +2265,14 @@ export async function searchCurrentDocument(
         tableStale = merged.staleKeys;
     }
 
+    // live、缓存和离屏提取可能在同一轮为同一个块提供同一份 renderer 单元。
+    // 匹配器按数组元素计数，因此这里必须在匹配前收敛单元身份。renderer 的
+    // block/unit 身份代表同一视觉标签；普通单元还要把文本纳入 key。这样同一
+    // 图表中不同标签即使文字相同，unitId 也不同，仍然保留各自的可见命中。
+    // 若同一图表同时出现 renderer 文字和普通代码/源码兜底，只保留 renderer
+    // 文字，避免异常 DOM 或重复提取把同一可见词计两次。
+    units = dedupeCorpusUnits(units);
+
     const matchOptions = {
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
@@ -1723,13 +2284,13 @@ export async function searchCurrentDocument(
     };
     const matched = options.regexMatcher ?
         await options.regexMatcher.match(
-            toSearchUnits(dedupeMathUnits(units), orderIndex),
+            toSearchUnits(units, orderIndex),
             value,
             matchOptions,
             options.signal,
         ) :
-        matchTextUnitsDetailed(toSearchUnits(dedupeMathUnits(units), orderIndex), value, matchOptions);
-    if (matched.cancelled) {
+        matchTextUnitsDetailed(toSearchUnits(units, orderIndex), value, matchOptions);
+    if ("cancelled" in matched && matched.cancelled) {
         return {matches: [], error: "", cancelled: true};
     }
     if (matched.error) {
@@ -1819,7 +2380,7 @@ function virtualTableReplaceLock(
     if (!state || state.unstable) {
         return undefined;
     }
-    const position = tableCellPosition(unit.unitId);
+    const position = tableOverlayKey(unit.unitId);
     if (!position) {
         return undefined;
     }
@@ -1914,6 +2475,14 @@ function structuralNavSeq(
             // 同一图表的标签各自从 0 起算偏移；用单位顺序确保冷数据导航仍按 SVG DOM 顺序。
             seq.set(key, index);
         }
+        const textRun = textRunIndex(unit.unitId);
+        if (
+            textRun !== undefined &&
+            unit.blockType !== "NodeTable" &&
+            unit.blockType !== "NodeAttributeView"
+        ) {
+            seq.set(key, textRun);
+        }
         if (unit.blockType === "NodeTable") {
             tableRank.set(key, index);
             const place = unit.tableSlot ?? tableCellPlace(unit.unitId);
@@ -1983,9 +2552,21 @@ function structuralNavSeq(
         const slot = unit.highlightKind === "inline-memo" ?
             2 :
             (unit.tableSlot ? 0 : 1);
-        const inner = at * TABLE_CELL_SLOT + slot;
+        const run = tableRunIndex(unit.unitId);
+        // 没切开的格子保持原来的偏移序号。切开后每一段独占一段序号，段内仍按命中位置排。
+        const atInRun = run === 0 ? at : Math.min(at, 1023);
+        const inner = (run === 0 ? atInRun : run * 1024 + atInRun) * TABLE_CELL_SLOT + slot;
         return rank * TABLE_CELL_SEQ_SPAN + Math.min(inner, TABLE_CELL_SEQ_SPAN - 1);
     };
+}
+
+function textRunIndex(unitId: string | undefined): number | undefined {
+    const matched = /(?:^|#)run-(\d+)$/.exec(unitId ?? "");
+    return matched ? Number(matched[1]) : undefined;
+}
+
+function tableRunIndex(unitId: string | undefined): number {
+    return textRunIndex(unitId) ?? 0;
 }
 
 function tableCellPlace(unitId: string | undefined): {row: number; column: number;} | null {
@@ -2097,6 +2678,41 @@ function dedupeMathUnits(units: CachedUnit[]): CachedUnit[] {
         }
         const text = unit.text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");
         const key = `${unit.blockId}\0${text}\0${unit.mathOrdinal ?? ""}`;
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        kept.push(unit);
+    }
+    return kept;
+}
+
+function dedupeCorpusUnits(units: CachedUnit[]): CachedUnit[] {
+    const mathDeduped = dedupeMathUnits(units);
+    const rendererBlocks = new Set<string>();
+    for (const unit of mathDeduped) {
+        if (rendererUnitSource(unit.unitId)) {
+            rendererBlocks.add(unit.blockId);
+        }
+    }
+
+    const seen = new Set<string>();
+    const kept: CachedUnit[] = [];
+    for (const unit of mathDeduped) {
+        const source = rendererUnitSource(unit.unitId);
+        if (
+            rendererBlocks.has(unit.blockId) &&
+            unit.blockType === "NodeCodeBlock" &&
+            !source
+        ) {
+            // renderer 单元（包括 source-fallback）已经代表了整个图表块。
+            // 异常 DOM 同时留下的普通代码文本不能再参与计数，否则同一
+            // 个可见标签会在 renderer 与代码文本两条路径各命中一次。
+            continue;
+        }
+        const key = source ?
+            `${unit.blockId}\0${unit.unitId}` :
+            `${unit.blockId}\0${unit.unitId ?? ""}\0${unit.highlightKind}\0${unit.text}`;
         if (seen.has(key)) {
             continue;
         }

@@ -18,7 +18,7 @@ import {
 } from "./blocks";
 import {collectSearchableBlocks} from "./blocks";
 import {extractUnitsFromDoms} from "./corpus/extract";
-import {invalidateDocumentSearchCaches} from "./corpus/search";
+import {editorRootId, invalidateEditedDocument} from "./corpus/search";
 import {fetchBlockHashes} from "./corpus/sql";
 import {isDocTitleMatch} from "./doc-title-replace";
 import type {SearchableBlock} from "./dom-types";
@@ -359,6 +359,7 @@ export async function replaceCurrentMatchInEditor(
         return {replacedCount: 0, skippedCount: 1, error: "transaction-failed"};
     }
 
+    invalidateEditedDocument(editorRootId(edit), [match.blockId]);
     return {
         replacedCount: outcome.appliedCount,
         skippedCount: outcome.skippedCount,
@@ -909,8 +910,8 @@ export async function replaceAllMatchesInEditor(
 
     if (probe) {
         await waitUntilReplacementVisible(probe, previousHash);
-        invalidateDocumentSearchCaches();
     }
+    invalidateEditedDocument(editorRootId(edit), ordered.map((update) => update.id));
 
     return {
         replacedCount: ordered.reduce((count, update) => count + update.appliedCount, 0),
@@ -977,6 +978,6 @@ async function replaceFetchedBlockMatches(
         return {replacedCount: 0, skippedCount: matches.length, error: "transaction-failed"};
     }
     await waitUntilReplacementVisible(update, previousHash);
-    invalidateDocumentSearchCaches();
+    invalidateEditedDocument(protyle.protyle?.block?.rootID, [update.id]);
     return {replacedCount: update.appliedCount, skippedCount: prepared.skippedCount};
 }

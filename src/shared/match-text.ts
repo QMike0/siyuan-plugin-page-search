@@ -416,6 +416,19 @@ function findOffsetMatchesAdvanced(
 }
 
 /**
+ * 零长度命中不进入结果。继续扫描时必须严格离开当前起点：
+ * 非 u 模式前进一个 UTF-16 code unit；u 模式按 AdvanceStringIndex 跳过整个码点。
+ * 只做 lastIndex += 1 会落在 emoji 代理对中间，带 u 的 exec 会退回同一码点并永远重入。
+ */
+function advanceStringIndex(text: string, index: number, unicode: boolean): number {
+    if (!unicode || index < 0 || index >= text.length) {
+        return index + 1;
+    }
+    const codePoint = text.codePointAt(index);
+    return index + (codePoint !== undefined && codePoint > 0xFFFF ? 2 : 1);
+}
+
+/**
  * RegExp 带有 lastIndex 状态，但同一查询的 pattern 可以在每个单元开始时重置后安全复用。
  * 这让整轮搜索只编译一次正则，同时保留原有的 g/u/m/s 和零长度命中语义。
  */
@@ -425,12 +438,17 @@ function findOffsetMatchesWithPattern(
     options: MatchOptions,
 ): TextOffsetMatch[] {
     const allMatches: TextOffsetMatch[] = [];
+    const unicode = pattern.unicode;
     pattern.lastIndex = 0;
     let match = pattern.exec(blockText);
     while (match) {
         const matchedText = match[0];
         if (!matchedText.length) {
-            pattern.lastIndex += 1;
+            const nextIndex = advanceStringIndex(blockText, match.index, unicode);
+            if (nextIndex <= match.index) {
+                break;
+            }
+            pattern.lastIndex = nextIndex;
             match = pattern.exec(blockText);
             continue;
         }

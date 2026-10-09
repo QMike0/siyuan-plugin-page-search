@@ -37,6 +37,37 @@ function usableLiteral(text: string): boolean {
     return text.length === 1 && text.charCodeAt(0) > 127;
 }
 
+const FINAL_SIGMA = "\u03C2";
+const CAPITAL_I_WITH_DOT = "\u0130";
+const LATIN_I_WITH_COMBINING_DOT = "i\u0307";
+
+/**
+ * 不区分大小写的字面量预筛使用思源 search_normalize，也就是 Go strings.ToLower
+ * （hanSensitive=1，不做简繁折叠）。最终匹配用 JS toLowerCase。
+ * 二者在 İ（展开成 i + 组合点）和词尾 Σ（JS 变成 ς，Go 始终是 σ）上不是超集。
+ * 返回 false 时调用方必须丢掉内容谓词，退回同一范围内的全部块。
+ * ASCII、汉字，以及一对一且无上下文的小写仍可以预筛。
+ */
+export function searchNormalizeFoldIsSuperset(needle: string): boolean {
+    const folded = needle.toLowerCase();
+    if (
+        needle.includes(CAPITAL_I_WITH_DOT) ||
+        folded.includes(FINAL_SIGMA) ||
+        folded.includes(LATIN_I_WITH_COMBINING_DOT)
+    ) {
+        return false;
+    }
+    let perCodePoint = "";
+    for (const char of needle) {
+        const lower = char.toLowerCase();
+        if (lower.length !== char.length) {
+            return false;
+        }
+        perCodePoint += lower;
+    }
+    return perCodePoint === folded;
+}
+
 /** SQLite lower() 只折叠 ASCII。这类字母交给全文抽块，避免漏掉未加载命中。 */
 function needsUnicodeCaseFold(text: string): boolean {
     for (let index = 0; index < text.length; index += 1) {
@@ -633,17 +664,65 @@ class PatternParser {
     }
 }
 
+export interface RegexPrefilterOptions {
+    /** 与搜索的 u 开关一致。和忽略大小写同时打开时，Unicode case folding 会让 ASCII 字面量和 \w 不再是超集。 */
+    unicode?: boolean;
+}
+
+/**
+ * iu 下 \w 会匹配折叠到 ASCII 单词字符的字母（如 ſ），ss 也会命中 ſſ。
+ * 数字类仍然只是 ASCII。一组「且」里只要还留着证明安全的条件，就丢掉不安全的原子；
+ * 某一组被拿空时，整条预筛无法证明，返回 null，调用方全文抽块。
+ */
+function retainUnicodeIgnoreCaseSafeGroups(
+    groups: RegexPrefilterAtom[][],
+): RegexPrefilterAtom[][] | null {
+    const safeGroups: RegexPrefilterAtom[][] = [];
+    for (const group of groups) {
+        const safe = group.filter(atomSafeUnderUnicodeIgnoreCase);
+        if (safe.length === 0) {
+            return null;
+        }
+        safeGroups.push(safe);
+    }
+    return safeGroups;
+}
+
+function atomSafeUnderUnicodeIgnoreCase(atom: RegexPrefilterAtom): boolean {
+    if (atom.kind === "digit") {
+        return true;
+    }
+    if (atom.kind !== "lit" || !atom.text) {
+        return false;
+    }
+    for (const char of atom.text) {
+        if ((char >= "A" && char <= "Z") || (char >= "a" && char <= "z")) {
+            return false;
+        }
+        if (char.toLowerCase() !== char.toUpperCase()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /**
  * 外层是「或」，内层是「且」。null 表示不能安全预筛。
  * caseSensitive 为 false 时，字面量里若有 SQLite 无法折叠的字母，也返回 null。
+ * unicode 且忽略大小写时，无法证明的字面量或 \w 同样返回 null。
  */
-export function extractRegexLiteralGroups(pattern: string, caseSensitive = true): RegexPrefilterAtom[][] | null {
+export function extractRegexLiteralGroups(
+    pattern: string,
+    caseSensitive = true,
+    options: RegexPrefilterOptions = {},
+): RegexPrefilterAtom[][] | null {
     if (!pattern || pattern.length > 2000) {
         return null;
     }
+    const unicode = options.unicode === true;
     try {
-        // 与搜索使用的标志一致：不额外打开 unicode，避免抽出搜索引擎认不出的字面量。
-        new RegExp(pattern);
+        // 标志与正式搜索一致，避免抽出当前引擎认不出的字面量。
+        new RegExp(pattern, unicode ? "u" : "");
     } catch {
         return null;
     }
@@ -657,6 +736,9 @@ export function extractRegexLiteralGroups(pattern: string, caseSensitive = true)
     }
     if (!caseSensitive && groups.some((group) => group.some((atom) => atom.kind === "lit" && needsUnicodeCaseFold(atom.text)))) {
         return null;
+    }
+    if (unicode && !caseSensitive) {
+        return retainUnicodeIgnoreCaseSafeGroups(groups);
     }
     return groups;
 }

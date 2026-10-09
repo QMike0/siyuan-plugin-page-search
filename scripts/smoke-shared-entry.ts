@@ -8,6 +8,12 @@ import {
     stableSearchHistoryDocId,
 } from "../src/frontend/search-history";
 import {
+    codeBlockLanguagesNeeded,
+    effectiveCodeBlockLanguage,
+    isCodeBlockLanguageEnabled,
+    isDiagramCodeLanguage,
+} from "../src/shared";
+import {
     ATTRIBUTE_VIEW_TYPE,
     DEFAULT_PREFS,
     PREFS_STORAGE_PATH,
@@ -17,6 +23,7 @@ import {
     expandRegexReplacementUnits,
     extractRegexLiteralGroups,
     regexPrefilterStoresPlainCache,
+    searchNormalizeFoldIsSuperset,
     avApiUnitInView,
     avApiUnitShown,
     collectAvDomCoverage,
@@ -69,6 +76,25 @@ function assert(condition: boolean, message: string) {
         throw new Error(message);
     }
 }
+
+const unloadedMermaidLanguage = effectiveCodeBlockLanguage("c", "", "mermaid");
+assert(unloadedMermaidLanguage === "mermaid", "code language wins over empty database subtype");
+assert(
+    isCodeBlockLanguageEnabled(unloadedMermaidLanguage, {includeCodeBlock: false, includeMermaid: true}),
+    "unloaded Mermaid keeps its independent switch",
+);
+assert(
+    isDiagramCodeLanguage(unloadedMermaidLanguage),
+    "unloaded Mermaid reaches the diagram renderer instead of the plain-text path",
+);
+assert(
+    codeBlockLanguagesNeeded({includeCodeBlock: true, includeMermaid: true, includeFlowchart: true}),
+    "equal enabled code switches still load languages for diagram routing and cache selection",
+);
+assert(
+    !codeBlockLanguagesNeeded({includeCodeBlock: false, includeMermaid: false, includeFlowchart: false}),
+    "all disabled code switches avoid the fence query",
+);
 
 const documentSearchIndices = new DocumentSearchIndexMemory("A");
 documentSearchIndices.remember(10, 31);
@@ -515,6 +541,56 @@ assert(
     unicodeDotHits.length === 1 && unicodeDotHits[0].start === 0 && unicodeDotHits[0].end === 2,
     "Unicode dot keeps a surrogate pair as one match while retaining DOM UTF-16 offsets",
 );
+const emojiHaystack = "😀a";
+for (const unicode of [false, true]) {
+    const flags = unicode ? "u" : "BMP";
+    const zeroLengthPatterns = ["^", "(?=a)", "(?=😀)"];
+    for (const pattern of zeroLengthPatterns) {
+        const skipped = matchTextUnits(
+            [{blockId: "zw", blockType: "p", blockIndex: 0, text: emojiHaystack, segmentLengths: [emojiHaystack.length]}],
+            pattern,
+            {regex: true, regexUnicode: unicode, caseSensitive: true},
+        );
+        assert(skipped.length === 0, `${flags} ${pattern} keeps the zero-length policy on emoji text`);
+    }
+    const alternation = matchTextUnits(
+        [{blockId: "alt", blockType: "p", blockIndex: 0, text: emojiHaystack, segmentLengths: [emojiHaystack.length]}],
+        "^|a",
+        {regex: true, regexUnicode: unicode, caseSensitive: true},
+    );
+    assert(
+        alternation.length === 1 && alternation[0].start === 2 && alternation[0].end === 3 &&
+            alternation[0].matchedText === "a",
+        `${flags} ^|a terminates and keeps the later non-empty match`,
+    );
+}
+const starAfterEmoji = matchTextUnits(
+    [{blockId: "star", blockType: "p", blockIndex: 0, text: emojiHaystack, segmentLengths: [emojiHaystack.length]}],
+    "a*",
+    {regex: true, regexUnicode: true, caseSensitive: true},
+);
+assert(
+    starAfterEmoji.length === 1 && starAfterEmoji[0].start === 2 && starAfterEmoji[0].matchedText === "a",
+    "unicode a* skips the empty match on an emoji and still finds the following a",
+);
+const multilineAnchor = matchTextUnits(
+    [{blockId: "ml", blockType: "p", blockIndex: 0, text: "😀\na", segmentLengths: [4]}],
+    "^|a",
+    {regex: true, regexUnicode: true, regexMultiline: true, caseSensitive: true},
+);
+assert(
+    multilineAnchor.length === 0,
+    "unicode multiline ^|a terminates; a zero-length ^ at the same index still hides that alternative",
+);
+const multilineLetter = matchTextUnits(
+    [{blockId: "ml2", blockType: "p", blockIndex: 0, text: "😀\na", segmentLengths: [4]}],
+    "a|^",
+    {regex: true, regexUnicode: true, regexMultiline: true, caseSensitive: true},
+);
+assert(
+    multilineLetter.length === 1 && multilineLetter[0].start === 3 && multilineLetter[0].matchedText === "a",
+    "unicode multiline still reports a non-empty alternative after advancing past an emoji",
+);
 const reusedRegexHits = matchTextUnitsDetailed(
     [
         {blockId: "reuse-a", blockType: "p", blockIndex: 0, text: "a", segmentLengths: [1]},
@@ -551,8 +627,13 @@ function literalKey(groups: RegexPrefilterAtom[][] | null): string {
 const lit = (text: string): RegexPrefilterAtom => ({kind: "lit", text});
 const digit: RegexPrefilterAtom = {kind: "digit"};
 const word: RegexPrefilterAtom = {kind: "word"};
-function assertLiterals(pattern: string, expected: RegexPrefilterAtom[][] | null, caseSensitive = true) {
-    const actual = extractRegexLiteralGroups(pattern, caseSensitive);
+function assertLiterals(
+    pattern: string,
+    expected: RegexPrefilterAtom[][] | null,
+    caseSensitive = true,
+    options: {unicode?: boolean;} = {},
+) {
+    const actual = extractRegexLiteralGroups(pattern, caseSensitive, options);
     assert(
         literalKey(actual) === literalKey(expected),
         `regex literals ${pattern}: expected ${literalKey(expected)}, got ${literalKey(actual)}`,
@@ -585,6 +666,103 @@ assertLiterals("École", null, false);
 assertLiterals("fooÉ", null, false);
 assertLiterals("中文", [[lit("中文")]], false);
 assertLiterals("foo", [[lit("foo")]], false);
+assertLiterals("ss", null, false, {unicode: true});
+assertLiterals("\\w+", null, false, {unicode: true});
+assertLiterals("\\w+", [[word]], true, {unicode: true});
+assertLiterals("\\d+", [[digit]], false, {unicode: true});
+assertLiterals("中文\\w+", [[lit("中文")]], false, {unicode: true});
+assertLiterals("ss", [[lit("ss")]], false);
+
+assert(searchNormalizeFoldIsSuperset("hello"), "ASCII case folding can stay on search_normalize");
+assert(searchNormalizeFoldIsSuperset("école"), "one-to-one accented letters can stay on search_normalize");
+assert(searchNormalizeFoldIsSuperset("中文"), "unscoped Han text can stay on search_normalize");
+assert(!searchNormalizeFoldIsSuperset("ος"), "final sigma is not a Go simple-lower superset");
+assert(!searchNormalizeFoldIsSuperset("i\u0307x"), "dotted i expansion is not a Go simple-lower superset");
+assert(!searchNormalizeFoldIsSuperset("İx"), "capital I with dot is not a Go simple-lower superset");
+
+function goSimpleLower(text: string): string {
+    let lowered = "";
+    for (const char of text) {
+        if (char === "\u0130") {
+            lowered += "i";
+            continue;
+        }
+        if (char === "\u03A3") {
+            lowered += "\u03C3";
+            continue;
+        }
+        lowered += char.toLowerCase();
+    }
+    return lowered;
+}
+
+function modeledLiteralPrefilterKeeps(content: string, needle: string, caseSensitive: boolean): boolean {
+    if (!caseSensitive && !searchNormalizeFoldIsSuperset(needle)) {
+        return true;
+    }
+    const fold = (value: string) => caseSensitive ? value : goSimpleLower(value);
+    return generateSearchVariants(needle, true).some((variant) => fold(content).includes(fold(variant)));
+}
+
+const literalSupersetCases = [
+    ["İx", "i\u0307x"],
+    ["ΟΣ", "ος"],
+    ["Hello", "hello"],
+    ["École", "école"],
+    ["中文", "中文"],
+];
+for (const [content, needle] of literalSupersetCases) {
+    const hits = findOffsetMatchesInText(content, needle, {caseSensitive: false});
+    assert(hits.length > 0, `literal ${needle} should match ${content}`);
+    assert(
+        modeledLiteralPrefilterKeeps(content, needle, false),
+        `SQL prefilter must not drop literal hit ${needle} in ${content}`,
+    );
+}
+
+function modeledRegexPrefilterKeeps(
+    content: string,
+    pattern: string,
+    caseSensitive: boolean,
+    unicode: boolean,
+): boolean {
+    const groups = extractRegexLiteralGroups(pattern, caseSensitive, {unicode});
+    if (!groups) {
+        return true;
+    }
+    const fold = (value: string) => caseSensitive ? value : goSimpleLower(value);
+    const haystack = fold(content);
+    return groups.some((group) => group.every((atom) => {
+        if (atom.kind === "digit") {
+            return /[0-9]/.test(content);
+        }
+        if (atom.kind === "word") {
+            return /[A-Za-z0-9_]/.test(content);
+        }
+        return haystack.includes(fold(atom.text));
+    }));
+}
+
+const regexSupersetCases: Array<[string, string, boolean, boolean]> = [
+    ["ſſ", "ss", false, true],
+    ["ſ", "\\w+", false, true],
+    ["中文ſ", "中文\\w+", false, true],
+    ["12", "\\d+", false, true],
+    ["Ab", "\\w+", true, true],
+];
+for (const [content, pattern, caseSensitive, unicode] of regexSupersetCases) {
+    const hits = matchTextUnits(
+        [{blockId: "fold", blockType: "p", blockIndex: 0, text: content, segmentLengths: [content.length]}],
+        pattern,
+        {regex: true, caseSensitive, regexUnicode: unicode},
+    );
+    assert(hits.length > 0, `regex ${pattern} should match ${content}`);
+    assert(
+        modeledRegexPrefilterKeeps(content, pattern, caseSensitive, unicode),
+        `SQL prefilter must not drop regex hit ${pattern} in ${content}`,
+    );
+}
+
 assert(!regexPrefilterStoresPlainCache([[digit]]), "digit-only prefilter does not fill the plain cache");
 assert(!regexPrefilterStoresPlainCache([[lit("foo")], [digit]]), "a digit branch does not fill the plain cache");
 assert(regexPrefilterStoresPlainCache([[lit("中"), digit]]), "a literal plus digit may use the plain cache");

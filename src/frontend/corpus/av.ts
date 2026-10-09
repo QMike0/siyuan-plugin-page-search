@@ -12,6 +12,14 @@ export class AttributeViewTruncatedError extends Error {
     }
 }
 
+/** 重复页、总数对不上或翻页期间顺序变了。不能当成完整结果写入缓存。 */
+class AttributeViewPageError extends Error {
+    constructor() {
+        super("renderAttributeView page is incomplete");
+        this.name = "AttributeViewPageError";
+    }
+}
+
 export interface AvBlockRef {
     blockId: string;
     avId: string;
@@ -32,9 +40,67 @@ interface AvUnitDraft {
 }
 
 const cache = new Map<string, SearchableUnit[]>();
+const AV_CACHE_LIMIT = 32;
+const AV_CACHE_BYTE_LIMIT = 4 * 1024 * 1024;
+
+export function invalidateAvCacheForBlocks(blockIds: readonly string[]): void {
+    if (blockIds.length === 0) {
+        return;
+    }
+    const prefixes = blockIds.map((blockId) => `${blockId}:`);
+    const doomed: string[] = [];
+    for (const key of cache.keys()) {
+        if (prefixes.some((prefix) => key.startsWith(prefix))) {
+            doomed.push(key);
+        }
+    }
+    for (const key of doomed) {
+        cache.delete(key);
+    }
+}
 
 export function invalidateAvCache(): void {
     cache.clear();
+}
+
+function avUnitsBytes(units: readonly SearchableUnit[]): number {
+    let bytes = 64;
+    for (const unit of units) {
+        bytes += 48 + unit.text.length * 2 + (unit.unitId?.length ?? 0) * 2;
+    }
+    return bytes;
+}
+
+function trimAvCache(): void {
+    while (cache.size > AV_CACHE_LIMIT) {
+        const oldest = cache.keys().next().value as string | undefined;
+        if (!oldest) {
+            return;
+        }
+        cache.delete(oldest);
+    }
+    let bytes = 0;
+    for (const units of cache.values()) {
+        bytes += avUnitsBytes(units);
+    }
+    while (cache.size > 1 && bytes > AV_CACHE_BYTE_LIMIT) {
+        const oldest = cache.keys().next().value as string | undefined;
+        if (!oldest) {
+            return;
+        }
+        const removed = cache.get(oldest);
+        cache.delete(oldest);
+        bytes -= removed ? avUnitsBytes(removed) : 0;
+    }
+}
+
+function touchAvCache(key: string): void {
+    const units = cache.get(key);
+    if (!units) {
+        return;
+    }
+    cache.delete(key);
+    cache.set(key, units);
 }
 
 export function readAvId(...sources: string[]): string {
@@ -233,11 +299,87 @@ function groupSnapshots(view: Record<string, unknown>): Array<{id: string; rows:
     return snapshots;
 }
 
-function pageDone(rows: number, page: number, total: number): boolean {
-    if (rows < PAGE_SIZE) {
+function pageDone(shown: number, total: number, accumulated: number): boolean {
+    // 这一页或累计行数已经盖住声明的总数时结束。
+    // 短页只有在内核没给总数时才表示末页，避免总数还没到就当成读完。
+    if (total > 0 && (accumulated >= total || shown >= total)) {
         return true;
     }
-    return total > 0 && page * PAGE_SIZE >= total;
+    if (total > 0) {
+        return false;
+    }
+    return shown < PAGE_SIZE;
+}
+
+function subtreeRowIds(view: Record<string, unknown>): string[] {
+    const ids: string[] = [];
+    for (const row of rowList(view)) {
+        const id = String(asRecord(row)?.id ?? "");
+        if (id) {
+            ids.push(id);
+        }
+    }
+    if (!Array.isArray(view.groups)) {
+        return ids;
+    }
+    for (const group of view.groups) {
+        const record = asRecord(group);
+        if (record) {
+            ids.push(...subtreeRowIds(record));
+        }
+    }
+    return ids;
+}
+
+function groupSubtreeIds(view: Record<string, unknown>, groupIds: ReadonlySet<string>): string[] {
+    const ids: string[] = [];
+    if (!Array.isArray(view.groups)) {
+        return ids;
+    }
+    for (const group of view.groups) {
+        const record = asRecord(group);
+        if (!record) {
+            continue;
+        }
+        const id = String(record.id ?? record.groupID ?? "");
+        if (!groupIds.has(id)) {
+            continue;
+        }
+        ids.push(...subtreeRowIds(record));
+    }
+    return ids;
+}
+
+/** 同一页里重复的行号只计一次。跨页又出现，说明翻页窗口变了。 */
+function observeRowIds(ids: readonly string[], seen: Set<string>): {fresh: number; duplicate: number;} {
+    const local = new Set<string>();
+    let fresh = 0;
+    let duplicate = 0;
+    for (const id of ids) {
+        if (!id || local.has(id)) {
+            continue;
+        }
+        local.add(id);
+        if (seen.has(id)) {
+            duplicate += 1;
+            continue;
+        }
+        seen.add(id);
+        fresh += 1;
+    }
+    return {fresh, duplicate};
+}
+
+function assertFreshPage(stats: {fresh: number; duplicate: number;}): void {
+    if (stats.fresh === 0 || stats.duplicate > 0) {
+        throw new AttributeViewPageError();
+    }
+}
+
+function assertSameTotal(previous: number, next: number): void {
+    if (previous > 0 && next > 0 && previous !== next) {
+        throw new AttributeViewPageError();
+    }
 }
 
 async function renderView(
@@ -273,56 +415,51 @@ async function renderView(
         return true;
     }
     const seenRows = new Set<string>();
-    const noteRows = (view: Record<string, unknown>): number => {
-        let added = 0;
-        for (const row of rowList(view)) {
-            const id = String(asRecord(row)?.id ?? "");
-            if (!id || seenRows.has(id)) {
-                continue;
-            }
-            seenRows.add(id);
-            added += 1;
-        }
-        if (Array.isArray(view.groups)) {
-            for (const group of view.groups) {
-                const record = asRecord(group);
-                if (record) {
-                    added += noteRows(record);
-                }
-            }
-        }
-        return added;
-    };
-    noteRows(firstView);
+    observeRowIds(subtreeRowIds(firstView), seenRows);
     absorbRows(target, firstView, viewName, true);
     const groups = groupSnapshots(firstView);
     if (groups.length > 0) {
         const pages = new Map<string, number>();
+        const seenInGroup = new Map<string, number>();
         for (const group of groups) {
             if (group.id) {
                 pages.set(group.id, 1);
+                seenInGroup.set(group.id, group.rows);
             }
         }
         for (let round = 0; round < MAX_PAGES; round += 1) {
             const groupPaging: Record<string, {page: number; pageSize: number;}> = {};
+            const requested = new Set<string>();
             let pending = false;
             for (const group of groups) {
                 if (!group.id) {
                     continue;
                 }
-                const page = pages.get(group.id) ?? 1;
-                if (!pageDone(group.rows, page, group.total) && group.rows > 0) {
+                const seen = seenInGroup.get(group.id) ?? group.rows;
+                if (!pageDone(group.rows, group.total, seen) && group.rows > 0) {
+                    const page = pages.get(group.id) ?? 1;
                     pages.set(group.id, page + 1);
                     groupPaging[group.id] = {page: page + 1, pageSize: PAGE_SIZE};
+                    requested.add(group.id);
                     pending = true;
                 }
             }
             if (!pending) {
+                for (const group of groups) {
+                    if (!group.id) {
+                        continue;
+                    }
+                    const seen = seenInGroup.get(group.id) ?? group.rows;
+                    if (!pageDone(group.rows, group.total, seen)) {
+                        throw new AttributeViewPageError();
+                    }
+                }
                 return true;
             }
             if (!shouldContinue()) {
                 return false;
             }
+            const previousTotals = new Map(groups.map((group) => [group.id, group.total]));
             const data = await postJson<Record<string, unknown>>("/api/av/renderAttributeView", {
                 id: avId,
                 blockID: blockId,
@@ -340,14 +477,27 @@ async function renderView(
                 throw new Error("renderAttributeView page failed");
             }
             const view = asRecord(data?.view);
-            if (!view || noteRows(view) === 0) {
-                return true;
+            if (!view) {
+                throw new AttributeViewPageError();
+            }
+            const scoped = groupSubtreeIds(view, requested);
+            const stats = observeRowIds(scoped.length > 0 ? scoped : subtreeRowIds(view), seenRows);
+            if (scoped.length > 0) {
+                assertFreshPage(stats);
+            } else if (stats.fresh === 0) {
+                throw new AttributeViewPageError();
+            }
+            const next = groupSnapshots(view);
+            for (const group of next) {
+                assertSameTotal(previousTotals.get(group.id) ?? 0, group.total);
+                if (group.id && requested.has(group.id)) {
+                    seenInGroup.set(group.id, (seenInGroup.get(group.id) ?? 0) + group.rows);
+                }
             }
             absorbRows(target, view, viewName, true);
-            const next = groupSnapshots(view);
             groups.splice(0, groups.length, ...next.filter((group) => pages.has(group.id)));
             if (!groups.length) {
-                return true;
+                throw new AttributeViewPageError();
             }
         }
         throw new AttributeViewTruncatedError();
@@ -357,7 +507,7 @@ async function renderView(
     let rows = rowList(firstView).length;
     let total = Number(firstView.rowCount ?? firstView.cardCount ?? 0) || 0;
     const pageCount = Number(firstView.pageCount ?? 0) || 0;
-    while (!pageDone(rows, page, total) && (pageCount === 0 || page < pageCount) && page < MAX_PAGES) {
+    while (!pageDone(rows, total, seenRows.size) && (pageCount === 0 || page < pageCount) && page < MAX_PAGES) {
         if (!shouldContinue()) {
             return false;
         }
@@ -379,15 +529,23 @@ async function renderView(
             throw new Error("renderAttributeView page failed");
         }
         const view = asRecord(data?.view);
-        if (!view || noteRows(view) === 0) {
-            return true;
+        if (!view) {
+            throw new AttributeViewPageError();
         }
+        const nextTotal = Number(view.rowCount ?? view.cardCount ?? 0) || 0;
+        assertSameTotal(total, nextTotal);
+        if (nextTotal > 0) {
+            total = nextTotal;
+        }
+        assertFreshPage(observeRowIds(subtreeRowIds(view), seenRows));
         absorbRows(target, view, viewName, true);
         rows = rowList(view).length;
-        total = Number(view.rowCount ?? view.cardCount ?? total) || total;
     }
-    if (!pageDone(rows, page, total) && (pageCount === 0 || page < pageCount) && page >= MAX_PAGES) {
-        throw new AttributeViewTruncatedError();
+    if (!pageDone(rows, total, seenRows.size)) {
+        if (page >= MAX_PAGES) {
+            throw new AttributeViewTruncatedError();
+        }
+        throw new AttributeViewPageError();
     }
     return true;
 }
@@ -463,13 +621,15 @@ function selectedViewId(ref: AvBlockRef, viewIds: ReadonlyMap<string, string>): 
 }
 
 function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUnit[]): void {
-    const prefix = `${ref.blockId}:${ref.avId}:${ref.updated}:`;
-    for (const key of cache.keys()) {
+    // updated 变了也要清掉同一数据库的旧视图，避免长会话留下过期单元格文字。
+    const prefix = `${ref.blockId}:${ref.avId}:`;
+    for (const key of Array.from(cache.keys())) {
         if (key.startsWith(prefix)) {
             cache.delete(key);
         }
     }
     cache.set(cacheKey(ref, viewId), units);
+    trimAvCache();
 }
 
 export function peekAvUnits(
@@ -481,6 +641,7 @@ export function peekAvUnits(
     for (const ref of refs) {
         const cached = cache.get(cacheKey(ref, selectedViewId(ref, viewIds)));
         if (cached) {
+            touchAvCache(cacheKey(ref, selectedViewId(ref, viewIds)));
             units.push(...cached);
         } else {
             missing.push(ref);
@@ -501,8 +662,10 @@ export async function loadAvUnits(
             return units;
         }
         const viewId = selectedViewId(ref, viewIds);
-        const cached = cache.get(cacheKey(ref, viewId));
+        const key = cacheKey(ref, viewId);
+        const cached = cache.get(key);
         if (cached) {
+            touchAvCache(key);
             units.push(...cached);
             continue;
         }
@@ -535,6 +698,7 @@ export async function loadAvUnits(
                 drafts.push({unitId: `av-view:${view.id}`, text: view.name, snippet: view.name});
             }
             if (!await renderView(ref.avId, ref.blockId, view.id, view.name, cells, shouldContinue, signal)) {
+                // 取消时分页还没结束。不写入这一库，避免把半截单元格当成完整缓存。
                 return units;
             }
         }
@@ -556,7 +720,7 @@ export async function loadAvUnits(
 export async function resolveMissingAvIds(
     rows: Array<{id: string; updated?: string; markdown?: string; ial?: string;}>,
     signal?: AbortSignal,
-): Promise<AvBlockRef[]> {
+): Promise<{refs: AvBlockRef[]; cacheable: boolean;}> {
     const refs: AvBlockRef[] = [];
     const missing: string[] = [];
     for (const row of rows) {
@@ -576,10 +740,14 @@ export async function resolveMissingAvIds(
         }
     }
     if (missing.length === 0) {
-        return refs;
+        return {refs, cacheable: true};
     }
     try {
-        const doms = await postJson<Record<string, string>>("/api/block/getBlockDOMs", {ids: missing}, signal) ?? {};
+        const doms = await postJson<Record<string, string>>("/api/block/getBlockDOMs", {ids: missing}, signal);
+        if (!doms) {
+            // 这一轮仍用已经解析出的引用；补全失败的结果不能写入缓存。
+            return {refs, cacheable: false};
+        }
         for (const id of missing) {
             const avId = readAvId(String(doms[id] ?? ""));
             if (!avId) {
@@ -598,7 +766,7 @@ export async function resolveMissingAvIds(
             });
         }
     } catch {
-        return refs;
+        return {refs, cacheable: false};
     }
-    return refs;
+    return {refs, cacheable: true};
 }
