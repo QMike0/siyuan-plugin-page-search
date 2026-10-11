@@ -1,12 +1,17 @@
 import {parentElementCrossingShadow} from "./dom-parent";
 import {isUnderNonHeadingCssFold} from "./fold-dom";
 
-const cssHideBoundaryCache = new Map<Element, boolean>();
+interface TextStyle {
+    display: string;
+    displayHidden: boolean;
+    visibilityHidden: boolean;
+}
+let textStyleCache = new WeakMap<Element, TextStyle>();
 let collectAllowsFoldedHidden = true;
 
 /** 每次采集开始时清掉。样式会变，不能把上一次搜索的 display 留到下一次。 */
 export function beginTextCollection(allowFoldedHidden: boolean): void {
-    cssHideBoundaryCache.clear();
+    textStyleCache = new WeakMap<Element, TextStyle>();
     collectAllowsFoldedHidden = allowFoldedHidden;
 }
 
@@ -15,58 +20,88 @@ export function beginTextCollection(allowFoldedHidden: boolean): void {
  * 思源用 .fn__none 收起页签等界面，离屏宿主和 fold="1" 也不是正文里的隐藏字。
  */
 export function isCssHideBoundary(element: Element): boolean {
-    if (!(element instanceof HTMLElement)) {
-        return false;
-    }
-    const cached = cssHideBoundaryCache.get(element);
-    if (cached !== undefined) {
+    const style = textStyle(element);
+    return style.displayHidden || style.visibilityHidden;
+}
+
+/** Shared within one collection; CSS layout and hiding need only one style read per element. */
+export function textDisplay(element: Element): string {
+    return textStyle(element).display;
+}
+
+function textStyle(element: Element): TextStyle {
+    const cached = textStyleCache.get(element);
+    if (cached) {
         return cached;
     }
-    let hidden = false;
-    const inlineHidden = element.hasAttribute("hidden") ||
-        element.style.display === "none" ||
-        element.style.visibility === "hidden";
-    if (inlineHidden) {
-        hidden = true;
-    } else if (
-        !element.classList.contains("fn__none") &&
-        !element.classList.contains("katex-html") &&
-        !element.hasAttribute("data-page-search-offscreen") &&
-        element.getAttribute("fold") !== "1"
-    ) {
-        if (typeof getComputedStyle !== "function") {
-            cssHideBoundaryCache.set(element, false);
-            return false;
-        }
-        const own = getComputedStyle(element);
-        const parent = parentElementCrossingShadow(element);
-        const parentStyle = parent instanceof HTMLElement ? getComputedStyle(parent) : null;
-        if (own.visibility === "hidden" && parentStyle?.visibility !== "hidden") {
-            hidden = true;
-        } else if (own.display === "none" && parentStyle?.display !== "none") {
-            hidden = true;
-        }
-    }
-    cssHideBoundaryCache.set(element, hidden);
-    return hidden;
+    const inlineStyle = (element as HTMLElement).style;
+    const own = typeof getComputedStyle === "function" ? getComputedStyle(element) : inlineStyle;
+    const display = own?.display ?? "";
+    const uiShell = element.classList.contains("fn__none") || element.hasAttribute("data-page-search-offscreen");
+    const style = {
+        display,
+        displayHidden: element.hasAttribute("hidden") || inlineStyle?.display === "none" ||
+            (!uiShell && display === "none" && !isSiyuanFoldDisplayBoundary(element)),
+        visibilityHidden: own?.visibility === "hidden" || own?.visibility === "collapse",
+    };
+    textStyleCache.set(element, style);
+    return style;
+}
+
+/** SiYuan v3.8.6 _wysiwyg.scss: only these boundaries hide later folded blocks. */
+function isSiyuanFoldDisplayBoundary(element: Element): boolean {
+    return element.matches(
+        '.li[fold="1"] > div:nth-child(n+3):not(.protyle-attr), ' +
+            '.bq[fold="1"] > [data-node-id] ~ [data-node-id], ' +
+            '.callout[fold="1"] > .callout-content > [data-node-id] ~ [data-node-id]',
+    );
 }
 
 /** 文本落在作者 CSS 隐藏里。打开折叠块时，折叠树内的字仍保留。 */
 export function isAuthorCssHiddenText(node: Text, allowFoldedHidden: boolean): boolean {
-    if (allowFoldedHidden && isUnderNonHeadingCssFold(node.parentElement)) {
-        return false;
+    const parent = node.parentElement ?? (node.parentNode instanceof ShadowRoot ? node.parentNode.host : null);
+    if (!allowFoldedHidden && isUnderNonHeadingCssFold(parent)) {
+        return true;
     }
-    let current = node.parentElement;
+    return isAuthorCssHiddenElement(parent);
+}
+
+export function isAuthorCssHiddenElement(element: Element | null): boolean {
+    // visibility is inherited but a descendant can restore visible. display:none
+    // hides the entire subtree and cannot be restored by a descendant.
+    if (element && textStyle(element).visibilityHidden) {
+        return true;
+    }
+    let current = element;
     while (current && current !== document.body) {
         if (current.hasAttribute("data-page-search-offscreen")) {
             break;
         }
-        if (isCssHideBoundary(current)) {
+        if (textStyle(current).displayHidden) {
             return true;
         }
         current = parentElementCrossingShadow(current);
     }
     return false;
+}
+
+/** A mounted hidden block must not be reintroduced via detached kernel DOM. */
+export function collectAuthorHiddenBlockIds(root: ParentNode): Set<string> {
+    const hidden = new Set<string>();
+    const visible = new Set<string>();
+    root.querySelectorAll<HTMLElement>("[data-node-id][data-type], [data-mindmap-source-id]").forEach((element) => {
+        // Embedded copies have a different search owner from their source block.
+        const embed = element.closest('[data-type="NodeBlockQueryEmbed"]');
+        if (embed && embed !== element) {
+            return;
+        }
+        const id = element.dataset.mindmapSourceId || element.dataset.nodeId;
+        if (id) {
+            (isAuthorCssHiddenElement(element) ? hidden : visible).add(id);
+        }
+    });
+    visible.forEach((id) => hidden.delete(id));
+    return hidden;
 }
 
 export function omitAuthorCssHiddenText(nodes: readonly Text[]): Text[] {
@@ -106,8 +141,8 @@ export function isElementVisible(
     // 关「折叠块内容」：非标题 fold 下整棵子树都不计命中
     // （Callout/引述首段虽非 display:none，也与折叠列表项隐藏内容同样排除）
     if (
-        options.allowFoldedHidden !== true
-        && isUnderNonHeadingCssFold(htmlElement)
+        options.allowFoldedHidden !== true &&
+        isUnderNonHeadingCssFold(htmlElement)
     ) {
         return false;
     }
@@ -115,8 +150,8 @@ export function isElementVisible(
     // 思源数据库 / Callout / 文档标题 / Mermaid(SVG) / HTML 块 Shadow：半透明与非标准盒模型较多，避免 checkVisibility+opacity 误杀
     // protyle-html：渲染字在 open shadow；Element.closest 不穿 Shadow，故另判 host
     if (
-        isInsideProtyleHtmlShadow(htmlElement)
-        || htmlElement.closest(
+        isInsideProtyleHtmlShadow(htmlElement) ||
+        htmlElement.closest(
             '.av, .callout, .callout-title, .callout-info, .protyle-title, .protyle-title__input, [data-subtype="mermaid"], svg, foreignObject, protyle-html, [data-type="NodeHTMLBlock"], .katex-html, .mindmap-view',
         )
     ) {
@@ -124,16 +159,16 @@ export function isElementVisible(
             return true;
         }
         // 开开关且仍因 display:none 等不可见 → 允许折叠内隐藏节点
-        return options.allowFoldedHidden === true
-            && isMatchableFoldedHidden(htmlElement);
+        return options.allowFoldedHidden === true &&
+            isMatchableFoldedHidden(htmlElement);
     }
 
     if (isStrictlyVisible(htmlElement)) {
         return true;
     }
 
-    return options.allowFoldedHidden === true
-        && isMatchableFoldedHidden(htmlElement);
+    return options.allowFoldedHidden === true &&
+        isMatchableFoldedHidden(htmlElement);
 }
 
 /**
@@ -148,22 +183,22 @@ function isKatexDecorativeAriaHidden(element: HTMLElement): boolean {
     if (element.getAttribute("aria-hidden") !== "true") {
         return false;
     }
-    return element.classList.contains("katex-html")
-        || Boolean(element.closest(".katex-html"));
+    return element.classList.contains("katex-html") ||
+        Boolean(element.closest(".katex-html"));
 }
 
 /** 是否落在思源 HTML 块 `protyle-html` 的 open shadow 内（closest 穿不出） */
 function isInsideProtyleHtmlShadow(element: Element): boolean {
     const root = element.getRootNode();
-    return root instanceof ShadowRoot
-        && root.host instanceof HTMLElement
-        && root.host.tagName.toLowerCase() === "protyle-html";
+    return root instanceof ShadowRoot &&
+        root.host instanceof HTMLElement &&
+        root.host.tagName.toLowerCase() === "protyle-html";
 }
 
 /** 对页内搜索而言应视为「硬隐藏」的 aria-hidden（排除 KaTeX 装饰层） */
 function isSearchBlockingAriaHidden(element: HTMLElement): boolean {
-    return element.getAttribute("aria-hidden") === "true"
-        && !isKatexDecorativeAriaHidden(element);
+    return element.getAttribute("aria-hidden") === "true" &&
+        !isKatexDecorativeAriaHidden(element);
 }
 
 /** 真正不可搜的壳（与折叠无关） */
@@ -171,9 +206,9 @@ function isHardHiddenShell(element: HTMLElement): boolean {
     let current: HTMLElement | null = element;
     while (current && current !== document.body) {
         if (
-            current.classList.contains("fn__none")
-            || current.hasAttribute("hidden")
-            || isSearchBlockingAriaHidden(current)
+            current.classList.contains("fn__none") ||
+            current.hasAttribute("hidden") ||
+            isSearchBlockingAriaHidden(current)
         ) {
             return true;
         }
@@ -190,7 +225,7 @@ function isMatchableFoldedHidden(element: HTMLElement): boolean {
     if (isHardHiddenShell(element)) {
         return false;
     }
-    return isUnderNonHeadingCssFold(element);
+    return isUnderNonHeadingCssFold(element) && !isAuthorCssHiddenElement(element);
 }
 
 function isStrictlyVisible(htmlElement: HTMLElement): boolean {
@@ -203,33 +238,36 @@ function isStrictlyVisible(htmlElement: HTMLElement): boolean {
     }
 
     if (typeof htmlElement.checkVisibility === "function") {
-        return htmlElement.checkVisibility({
-            visibilityProperty: true,
-            opacityProperty: true,
-            // 大列表用 content-visibility: auto 跳过布局，文字仍在 DOM 里，应继续高亮
-            contentVisibilityAuto: true,
-        } as Parameters<HTMLElement["checkVisibility"]>[0]);
+        return htmlElement.checkVisibility(
+            {
+                visibilityProperty: true,
+                opacityProperty: true,
+                // 大列表用 content-visibility: auto 跳过布局，文字仍在 DOM 里，应继续高亮
+                contentVisibilityAuto: true,
+            } as Parameters<HTMLElement["checkVisibility"]>[0],
+        );
     }
 
     if (typeof getComputedStyle !== "function") {
         return true;
     }
 
-    const style = window.getComputedStyle(htmlElement);
-    if (style.display === "none" || style.visibility === "hidden") {
-        return false;
-    }
-
-    return isElementVisible(parentElementCrossingShadow(htmlElement));
+    return !isAuthorCssHiddenElement(htmlElement);
 }
 
 function isLooseUiElementVisible(element: HTMLElement): boolean {
+    if (typeof getComputedStyle === "function") {
+        const visibility = getComputedStyle(element).visibility;
+        if (visibility === "hidden" || visibility === "collapse") {
+            return false;
+        }
+    }
     let current: HTMLElement | null = element;
     while (current && current !== document.body) {
         if (
-            current.classList.contains("fn__none")
-            || current.hasAttribute("hidden")
-            || isSearchBlockingAriaHidden(current)
+            current.classList.contains("fn__none") ||
+            current.hasAttribute("hidden") ||
+            isSearchBlockingAriaHidden(current)
         ) {
             return false;
         }
@@ -238,7 +276,7 @@ function isLooseUiElementVisible(element: HTMLElement): boolean {
             return true;
         }
         const style = window.getComputedStyle(current);
-        if (style.display === "none" || style.visibility === "hidden") {
+        if (style.display === "none") {
             return false;
         }
 

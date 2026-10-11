@@ -1,4 +1,7 @@
-import {matchTextUnitsDetailed} from "../shared/match-text";
+import {
+    createTextUnitsMatchIterator,
+    matchTextUnitsDetailed,
+} from "../shared/match-text";
 import type {
     RegexReplacementExpansion,
     RegexReplacementUnitRequest,
@@ -10,7 +13,9 @@ import type {
 } from "../shared/types";
 
 const REGEX_EXECUTION_BUDGET_MS = 2500;
+const REGEX_WORKER_STARTUP_BUDGET_MS = 10000;
 const REGEX_TIMEOUT_ERROR = "正则执行超时，请简化表达式";
+const REGEX_WORKER_STARTUP_TIMEOUT_ERROR = "正则 Worker 加载超时，请稍后重试";
 const REGEX_WORKER_UNAVAILABLE_ERROR = "当前环境不支持正则 Worker；为避免界面卡住，未执行正则搜索";
 
 export interface AsyncMatchTextUnitsResult extends MatchTextUnitsResult {
@@ -31,7 +36,9 @@ interface PendingRequest {
     id: number;
     kind: WorkerTaskKind;
     resolve: (result: WorkerTaskResult) => void;
-    timer: number;
+    timer: number | null;
+    /** 就绪前保留请求；发出后立即释放，避免复用 Worker 时仍持有上一轮全文。 */
+    message: Record<string, unknown> | null;
     signal?: AbortSignal;
     onAbort?: () => void;
 }
@@ -60,6 +67,8 @@ export class RegexTextMatcher {
     private pending: PendingRequest | null = null;
     private nextId = 1;
     private workerUnavailable = false;
+    private workerReady = false;
+    private matchGeneration = 0;
 
     async match(
         units: SearchableUnit[],
@@ -67,8 +76,31 @@ export class RegexTextMatcher {
         options: MatchTextUnitsOptions,
         signal?: AbortSignal,
     ): Promise<AsyncMatchTextUnitsResult> {
+        const generation = ++this.matchGeneration;
+        const cancelled = () => signal?.aborted || generation !== this.matchGeneration;
+        if (cancelled()) return {hits: [], error: "", cancelled: true};
         if (!options.regex) {
-            return matchTextUnitsDetailed(units, query, options);
+            this.cancelPending();
+            let chars = 0;
+            for (const unit of units) chars += unit.text.length;
+            if (chars < 64 * 1024 && units.length < 2000) {
+                const result = matchTextUnitsDetailed(units, query, options);
+                return cancelled() ? {hits: [], error: "", cancelled: true} : result;
+            }
+            // 大字面量仍留在主线程分片执行；Worker 只服务正则，避免普通查询受 Worker
+            // 启动/序列化/超时策略影响，同时保留完全相同的匹配语义。
+            const iterator = createTextUnitsMatchIterator(query, options)(units);
+            let started = performance.now();
+            let checkpoints = 0;
+            while (true) {
+                if (cancelled()) return {hits: [], error: "", cancelled: true};
+                const step = iterator.next();
+                if (step.done) return step.value;
+                if ((++checkpoints & 255) === 0 || performance.now() - started >= 8) {
+                    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+                    started = performance.now();
+                }
+            }
         }
         if (signal?.aborted) {
             return {hits: [], error: "", cancelled: true};
@@ -84,12 +116,10 @@ export class RegexTextMatcher {
         units: RegexReplacementUnitRequest[],
         patternSource: string,
         template: string,
-        options: Pick<
-            MatchTextUnitsOptions,
-            "caseSensitive" | "regexUnicode" | "regexMultiline" | "regexDotAll"
-        >,
+        options: Pick<MatchTextUnitsOptions, "caseSensitive">,
         signal?: AbortSignal,
     ): Promise<AsyncRegexReplacementResult> {
+        this.matchGeneration += 1;
         if (signal?.aborted) {
             return {expansions: [], error: "", cancelled: true};
         }
@@ -97,6 +127,7 @@ export class RegexTextMatcher {
     }
 
     dispose() {
+        this.matchGeneration += 1;
         this.cancelPending();
         this.terminateWorker();
     }
@@ -120,10 +151,7 @@ export class RegexTextMatcher {
         units: RegexReplacementUnitRequest[],
         patternSource: string,
         template: string,
-        options: Pick<
-            MatchTextUnitsOptions,
-            "caseSensitive" | "regexUnicode" | "regexMultiline" | "regexDotAll"
-        >,
+        options: Pick<MatchTextUnitsOptions, "caseSensitive">,
         signal?: AbortSignal,
     ): Promise<AsyncRegexReplacementResult> {
         const result = await this.execute(
@@ -151,13 +179,8 @@ export class RegexTextMatcher {
                 id,
                 kind,
                 resolve,
-                timer: window.setTimeout(() => {
-                    if (this.pending?.id !== id) {
-                        return;
-                    }
-                    this.finishPending(regexTimeoutResult(kind));
-                    this.terminateWorker();
-                }, REGEX_EXECUTION_BUDGET_MS),
+                timer: null,
+                message: {id, kind, ...payload},
                 signal,
             };
             if (signal) {
@@ -171,17 +194,44 @@ export class RegexTextMatcher {
                 signal.addEventListener("abort", pending.onAbort, {once: true});
             }
             this.pending = pending;
-            try {
-                worker.postMessage({id, kind, ...payload});
-            } catch (error) {
-                this.finishPending(
-                    kind === "match" ?
-                        {hits: [], error: error instanceof Error ? error.message : "正则 Worker 无法启动"} :
-                        {expansions: [], error: error instanceof Error ? error.message : "正则 Worker 无法启动"},
-                );
-                this.terminateWorker();
+            if (this.workerReady) {
+                this.startPendingExecution(pending);
+            } else {
+                // Worker 的下载/初始化不占正则回溯预算；加载也有上限，不能无限闪烁。
+                pending.timer = window.setTimeout(() => {
+                    if (this.pending !== pending) return;
+                    this.finishPending(
+                        kind === "match" ?
+                            {hits: [], error: REGEX_WORKER_STARTUP_TIMEOUT_ERROR} :
+                            {expansions: [], error: REGEX_WORKER_STARTUP_TIMEOUT_ERROR},
+                    );
+                    this.terminateWorker();
+                }, REGEX_WORKER_STARTUP_BUDGET_MS);
             }
         });
+    }
+
+    private startPendingExecution(pending: PendingRequest) {
+        const worker = this.worker;
+        if (this.pending !== pending || !worker || !this.workerReady || !pending.message) return;
+        if (pending.timer !== null) window.clearTimeout(pending.timer);
+        pending.timer = window.setTimeout(() => {
+            if (this.pending !== pending) return;
+            this.finishPending(regexTimeoutResult(pending.kind));
+            this.terminateWorker();
+        }, REGEX_EXECUTION_BUDGET_MS);
+        const message = pending.message;
+        pending.message = null;
+        try {
+            worker.postMessage(message);
+        } catch (error) {
+            this.finishPending(
+                pending.kind === "match" ?
+                    {hits: [], error: error instanceof Error ? error.message : "正则 Worker 无法启动"} :
+                    {expansions: [], error: error instanceof Error ? error.message : "正则 Worker 无法启动"},
+            );
+            this.terminateWorker();
+        }
     }
 
     private asMatchResult(result: WorkerTaskResult): AsyncMatchTextUnitsResult {
@@ -208,6 +258,7 @@ export class RegexTextMatcher {
                     import.meta.url,
                 ),
             );
+            this.workerReady = false;
             worker.addEventListener("message", this.onWorkerMessage);
             worker.addEventListener("error", this.onWorkerError);
             this.worker = worker;
@@ -222,10 +273,17 @@ export class RegexTextMatcher {
     private readonly onWorkerMessage = (
         event: MessageEvent<{
             id?: number;
-            kind?: WorkerTaskKind;
+            kind?: WorkerTaskKind | "ready";
             result?: MatchTextUnitsResult | RegexReplacementExpansion[];
         }>,
     ) => {
+        if (!this.worker || event.currentTarget !== this.worker) return;
+        if (event.data?.kind === "ready") {
+            if (this.workerReady) return;
+            this.workerReady = true;
+            if (this.pending) this.startPendingExecution(this.pending);
+            return;
+        }
         const pending = this.pending;
         if (!pending || event.data?.id !== pending.id || event.data?.kind !== pending.kind) {
             return;
@@ -246,7 +304,13 @@ export class RegexTextMatcher {
         );
     };
 
-    private readonly onWorkerError = () => {
+    private readonly onWorkerError = (event: ErrorEvent) => {
+        if (!this.worker || event.currentTarget !== this.worker) return;
+        console.warn("[page-search] regex worker failed", {
+            message: event.message,
+            filename: event.filename,
+            lineno: event.lineno,
+        });
         if (this.pending) {
             this.finishPending(
                 this.pending.kind === "match" ?
@@ -271,7 +335,8 @@ export class RegexTextMatcher {
             return;
         }
         this.pending = null;
-        window.clearTimeout(pending.timer);
+        if (pending.timer !== null) window.clearTimeout(pending.timer);
+        pending.message = null;
         if (pending.signal && pending.onAbort) {
             pending.signal.removeEventListener("abort", pending.onAbort);
         }
@@ -286,5 +351,6 @@ export class RegexTextMatcher {
         this.worker.removeEventListener("error", this.onWorkerError);
         this.worker.terminate();
         this.worker = null;
+        this.workerReady = false;
     }
 }

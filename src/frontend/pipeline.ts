@@ -4,6 +4,7 @@ import {
     NON_REPLACEABLE_DOM_CLOSEST,
     effectiveSearchQuery,
     isRestrictInlineActive,
+    isRendererUnitId,
     shouldEnumerateRestrictInline,
     type RestrictInlineType,
 } from "../shared";
@@ -13,6 +14,7 @@ import type {
     SearchableUnit,
 } from "../shared";
 import {matchTextUnitsDetailed} from "../shared";
+import {isRendererSourceFallbackUnitId} from "../shared/renderer-units";
 import {
     CALLOUT_TYPE,
     TABLE_TYPE,
@@ -31,6 +33,11 @@ import type {
     SearchMatch,
 } from "./dom-types";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
+import {
+    compareEmbeddedPositions,
+    embeddedPositionAt,
+    orderEmbeddedVisualMatches,
+} from "./embedded-order";
 import {buildListSnippet} from "./list-snippet";
 import {
     createRangeFromBlockOffsets,
@@ -48,6 +55,8 @@ import {
 } from "./selection";
 
 export interface SearchPipelineOptions extends MatchOptions {
+    /** 正文采集快照，包含零命中单元；用于核对异步图表渲染后的搜索语义。 */
+    onLiveUnitsCollected?: (blocks: readonly SearchableBlock[]) => void;
     /** 当前搜索框的正则隔离器；未提供时保留纯函数/内核调用的同步行为。 */
     regexMatcher?: RegexTextMatcher;
     /** 新输入或销毁 SearchBar 后作废本轮正则任务。 */
@@ -132,6 +141,8 @@ export interface SearchPipelineResult {
     unrendered?: number;
     /** 属性视图达到安全分页上限，结果未写入缓存且当前覆盖不完整 */
     truncated?: number;
+    /** 未完成 API 解析的数据库载体，用于定位和手动重试；不把部分结果标成完整。 */
+    incompleteBlockIds?: string[];
     /** 已被较新的搜索作废；调用方应保留现有 UI 状态。 */
     cancelled?: boolean;
 }
@@ -324,6 +335,7 @@ async function calculateLoadedDomMatches(
         }
         return {
             matches: enumerateRestrictInlineMatches(edit, {
+                onLiveUnitsCollected: options.onLiveUnitsCollected,
                 selectionOnly: options.selectionOnly,
                 selectionScope: options.selectionScope,
                 includeDocTitle,
@@ -389,6 +401,7 @@ async function calculateLoadedDomMatches(
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,
     });
+    options.onLiveUnitsCollected?.(blocks);
     if (!blocks.length) {
         return {matches: [], error: ""};
     }
@@ -407,9 +420,6 @@ async function calculateLoadedDomMatches(
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
         regex: options.regex,
-        regexUnicode: options.regexUnicode,
-        regexMultiline: options.regexMultiline,
-        regexDotAll: options.regexDotAll,
     };
     const matched = options.regexMatcher ?
         await options.regexMatcher.match(units, value, matchOptions, options.signal) :
@@ -439,6 +449,7 @@ async function calculateLoadedDomMatches(
         matches: attachRangesToHits(blockMap, scopedHits, edit, {
             allowFoldedHidden: options.includeFoldedBlocks === true,
             restrictInlineTypes: options.restrictInlineTypes,
+            includeSourceFallback: !selectionOnly,
         }),
         error: "",
     };
@@ -451,6 +462,7 @@ function attachRangesToHits(
     visibility: {
         allowFoldedHidden?: boolean;
         restrictInlineTypes?: RestrictInlineType[];
+        includeSourceFallback?: boolean;
     } = {},
 ): SearchMatch[] {
     const result: SearchMatch[] = [];
@@ -474,6 +486,19 @@ function attachRangesToHits(
             continue;
         }
 
+        if (
+            visibility.includeSourceFallback && !restrictActive &&
+            isRendererSourceFallbackUnitId(hit.unitId)
+        ) {
+            acceptedEndByUnit.set(key, hit.end);
+            result.push({
+                ...hit,
+                embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
+                replaceable: false,
+                ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
+            });
+            continue;
+        }
         const range = createRangeFromBlockOffsets(block, hit.start, hit.end, visibility);
         if (!range) {
             continue;
@@ -501,6 +526,8 @@ function attachRangesToHits(
             tableCellReplaceLock(block.element) :
             undefined;
         const replaceable = !replaceLock &&
+            !isRendererUnitId(hit.unitId) &&
+            !hit.unitId?.startsWith("embed:") &&
             !isDocTitle &&
             !isMath &&
             !modeBlocked &&
@@ -513,6 +540,7 @@ function attachRangesToHits(
             blockType: hit.blockType,
             blockIndex: hit.blockIndex,
             unitId: hit.unitId,
+            embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
             start: hit.start,
             end: hit.end,
             matchedText: hit.matchedText,
@@ -534,6 +562,7 @@ function attachRangesToHits(
 
     // 按文档位置排序；同位置正文优先于公式/备注（导航顺序可读）
     result.sort(compareSearchMatches);
+    orderEmbeddedVisualMatches(result, blockMap.values());
     return result;
 }
 
@@ -551,6 +580,8 @@ function compareSearchMatches(a: SearchMatch, b: SearchMatch): number {
     if (a.blockIndex !== b.blockIndex) {
         return a.blockIndex - b.blockIndex;
     }
+    const embedded = compareEmbeddedPositions(a, b);
+    if (embedded !== undefined && embedded !== 0) return embedded;
     if (a.range && b.range && !textStartInsideMemoRange(a, b) && !textStartInsideMemoRange(b, a)) {
         try {
             const startCmp = a.range.compareBoundaryPoints(Range.START_TO_START, b.range);

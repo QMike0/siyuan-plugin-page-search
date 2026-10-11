@@ -21,9 +21,6 @@ export interface MatchRequest {
     caseSensitive?: boolean;
     wholeWord?: boolean;
     regex?: boolean;
-    regexUnicode?: boolean;
-    regexMultiline?: boolean;
-    regexDotAll?: boolean;
 }
 
 /** 内核 match RPC 响应 */
@@ -136,12 +133,6 @@ export interface PluginPrefs {
      * 跨次打开搜索条保持；发布服务/全局只读下不写 petal（与其它 prefs 相同）。
      */
     useRegex: boolean;
-    /** 正则 Unicode (u) 语义；默认 false，保持既有 UTF-16 行为。 */
-    regexUnicode: boolean;
-    /** 正则多行锚点 (m)；默认 false。 */
-    regexMultiline: boolean;
-    /** 正则点号匹配换行 (s)；默认 false。 */
-    regexDotAll: boolean;
 }
 
 /** 跨窗口搜索状态同步（内核 broadcast → 前端 bind） */
@@ -191,14 +182,11 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeInlineMemo: false,
     restrictInlineTypes: [],
     useRegex: false,
-    regexUnicode: false,
-    regexMultiline: false,
-    regexDotAll: false,
 };
 
 export const PREFS_STORAGE_PATH = "prefs.json";
 
-/** 将任意 prefs 形态收成合法 PluginPrefs（含备注门闩） */
+/** 将任意 prefs 形态收成合法 PluginPrefs（含备注门闩）；忽略已移除的 u/m/s 偏好字段。 */
 export function coercePluginPrefs(
     raw: Partial<PluginPrefs> | null | undefined,
 ): PluginPrefs {
@@ -239,9 +227,6 @@ export function coercePluginPrefs(
             includeInlineMemo,
         }),
         useRegex: base.useRegex === true,
-        regexUnicode: base.regexUnicode === true,
-        regexMultiline: base.regexMultiline === true,
-        regexDotAll: base.regexDotAll === true,
     };
 }
 
@@ -343,15 +328,6 @@ export function mergePrefs(
         useRegex: patch.useRegex !== undefined ?
             patch.useRegex :
             base.useRegex,
-        regexUnicode: patch.regexUnicode !== undefined ?
-            patch.regexUnicode :
-            base.regexUnicode,
-        regexMultiline: patch.regexMultiline !== undefined ?
-            patch.regexMultiline :
-            base.regexMultiline,
-        regexDotAll: patch.regexDotAll !== undefined ?
-            patch.regexDotAll :
-            base.regexDotAll,
     });
 }
 
@@ -366,9 +342,6 @@ export function normalizeMatchRequest(args: any[]): MatchRequest {
             caseSensitive: boolOrUndef(nested.caseSensitive ?? obj.caseSensitive),
             wholeWord: boolOrUndef(nested.wholeWord ?? obj.wholeWord),
             regex: boolOrUndef(nested.regex ?? obj.regex),
-            regexUnicode: boolOrUndef(nested.regexUnicode ?? obj.regexUnicode),
-            regexMultiline: boolOrUndef(nested.regexMultiline ?? obj.regexMultiline),
-            regexDotAll: boolOrUndef(nested.regexDotAll ?? obj.regexDotAll),
         };
     }
 
@@ -384,9 +357,6 @@ export function normalizeMatchRequest(args: any[]): MatchRequest {
         caseSensitive: boolOrUndef(fromThird.caseSensitive),
         wholeWord: boolOrUndef(fromThird.wholeWord),
         regex: boolOrUndef(fromThird.regex),
-        regexUnicode: boolOrUndef(fromThird.regexUnicode),
-        regexMultiline: boolOrUndef(fromThird.regexMultiline),
-        regexDotAll: boolOrUndef(fromThird.regexDotAll),
     };
 }
 
@@ -396,9 +366,6 @@ export function matchOptionsFromRequest(request: MatchRequest): MatchTextUnitsOp
         caseSensitive: request.caseSensitive,
         wholeWord: request.wholeWord,
         regex: request.regex,
-        regexUnicode: request.regexUnicode,
-        regexMultiline: request.regexMultiline,
-        regexDotAll: request.regexDotAll,
     };
 }
 

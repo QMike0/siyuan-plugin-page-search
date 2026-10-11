@@ -18,7 +18,10 @@ import {
 } from "./blocks";
 import {collectSearchableBlocks} from "./blocks";
 import {extractUnitsFromDoms} from "./corpus/extract";
-import {editorRootId, invalidateEditedDocument} from "./corpus/search";
+import {
+    editorRootId,
+    invalidateEditedDocument,
+} from "./corpus/search";
 import {fetchBlockHashes} from "./corpus/sql";
 import {isDocTitleMatch} from "./doc-title-replace";
 import type {SearchableBlock} from "./dom-types";
@@ -43,11 +46,10 @@ export interface ReplaceWriteOptions {
     regex?: boolean;
     searchQuery?: string;
     caseSensitive?: boolean;
-    regexUnicode?: boolean;
-    regexMultiline?: boolean;
-    regexDotAll?: boolean;
     /** 正则模板展开必须通过 SearchBar 的 Worker，禁止退回主线程 RegExp.exec。 */
     regexMatcher?: RegexTextMatcher;
+    /** 查询/范围在异步准备期间改变时，提交前取消。 */
+    isCurrent?: () => boolean;
 }
 
 export interface ReplaceWriteResult {
@@ -214,24 +216,48 @@ function replaceOptionsFrom(
     regex?: boolean;
     searchQuery?: string;
     caseSensitive?: boolean;
-    regexUnicode?: boolean;
-    regexMultiline?: boolean;
-    regexDotAll?: boolean;
 } {
     return {
         preserveCase: options.preserveCase,
         regex: options.regex,
         searchQuery: options.searchQuery,
         caseSensitive: options.caseSensitive,
-        regexUnicode: options.regexUnicode,
-        regexMultiline: options.regexMultiline,
-        regexDotAll: options.regexDotAll,
     };
 }
 
 type PreparedReplaceOptions = ReturnType<typeof replaceOptionsFrom> & {
     regexPlan?: RegexReplacementPlan;
 };
+
+/** 异步准备只能使用开始时的编辑器和目标；提交前同步复核，不能覆盖等待期间的新编辑。 */
+function createWriteGuard(
+    edit: Element,
+    protyle: Protyle,
+    blockIds: Iterable<string>,
+    isCurrent?: () => boolean,
+): () => string | undefined {
+    const rootId = editorRootId(edit);
+    const snapshots = Array.from(blockIds, (id) => {
+        const element = resolveSubmitBlockElement(edit, id);
+        return {id, element, html: element?.outerHTML};
+    });
+    return () => {
+        if (isCurrent && !isCurrent()) return "stale-target";
+        if (isEditorReplaceModeBlocked(edit) || protyle.protyle?.disabled) {
+            return "readonly-or-preview";
+        }
+        if (!edit.isConnected || resolveProtyleFromEdit(edit) !== protyle || editorRootId(edit) !== rootId) {
+            return "stale-target";
+        }
+        for (const snapshot of snapshots) {
+            const current = resolveSubmitBlockElement(edit, snapshot.id);
+            if (current !== snapshot.element || current?.outerHTML !== snapshot.html) {
+                return "stale-target";
+            }
+        }
+        return undefined;
+    };
+}
 
 /**
  * 把捕获组/命名组展开限制在 Worker。主线程只接收纯文本计划，随后仍逐处核对文本快照。
@@ -257,9 +283,6 @@ async function prepareRegexReplaceOptions(
         replacementText,
         {
             caseSensitive: options.caseSensitive === true,
-            regexUnicode: options.regexUnicode === true,
-            regexMultiline: options.regexMultiline === true,
-            regexDotAll: options.regexDotAll === true,
         },
     );
     if (result.cancelled || result.error) {
@@ -304,8 +327,9 @@ export async function replaceCurrentMatchInEditor(
     }
 
     const submit = resolveSubmitBlockElement(edit, match.blockId);
+    const guard = createWriteGuard(edit, protyle, [match.blockId], options.isCurrent);
     if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
-        return replaceFetchedBlockMatches(protyle, match.blockId, [match], replacementText, options, edit);
+        return replaceFetchedBlockMatches(protyle, match.blockId, [match], replacementText, options, edit, guard);
     }
 
     const blocks = collectSearchableBlocks(edit, {
@@ -328,6 +352,10 @@ export async function replaceCurrentMatchInEditor(
     );
     if (preparedOptions.error) {
         return {replacedCount: 0, skippedCount: 1, error: preparedOptions.error};
+    }
+    const conflict = guard();
+    if (conflict) {
+        return {replacedCount: 0, skippedCount: 1, error: conflict};
     }
 
     const typeBefore = submit.getAttribute("data-type");
@@ -373,6 +401,8 @@ interface PreparedBlockUpdate {
     oldHTML: string;
     newHTML: string;
     appliedCount: number;
+    /** 获取时的内核底稿，可能与并入未落盘虚拟表格后的 oldHTML 不同。 */
+    kernelHTML?: string;
 }
 
 interface PreparedBlockResult {
@@ -753,6 +783,7 @@ async function prepareFetchedBlockUpdates(
                 );
                 skippedCount += prepared.skippedCount;
                 if (prepared.update) {
+                    prepared.update.kernelHTML = htmlById.get(id);
                     updates.push(prepared.update);
                 } else if (prepared.error) {
                     error ??= prepared.error;
@@ -808,6 +839,13 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
+    const guard = createWriteGuard(
+        edit,
+        protyle,
+        new Set(bodyMatches.map((match) => match.blockId)),
+        options.isCurrent,
+    );
+
     const blocks = collectSearchableBlocks(edit, {
         includeInlineMemo: true,
         includeImageTitle: true,
@@ -826,6 +864,10 @@ export async function replaceAllMatchesInEditor(
             skippedCount: skippedCount + bodyMatches.length,
             error: loadedOptions.error,
         };
+    }
+    const loadedConflict = guard();
+    if (loadedConflict) {
+        return {replacedCount: 0, skippedCount: matches.length, error: loadedConflict};
     }
 
     const grouped = new Map<string, SearchMatch[]>();
@@ -881,6 +923,10 @@ export async function replaceAllMatchesInEditor(
     if (fetched.error) {
         firstError ??= fetched.error;
     }
+    // 搜索时标为可替换的目标现在准备失败，说明快照已陈旧或覆盖丢失；全部替换不得部分提交。
+    if (bodySkipped > 0) {
+        return {replacedCount: 0, skippedCount: matches.length, error: firstError ?? "stale-target"};
+    }
 
     const ordered = orderBlockUpdates([...fetched.updates, ...loadedUpdates]);
     if (ordered.length === 0) {
@@ -894,6 +940,11 @@ export async function replaceAllMatchesInEditor(
     const probe = fetched.updates.length > 0 ? smallestFetchedUpdate(fetched.updates) : undefined;
     // 同一笔事务一起落盘。哈希要在入队前记下，探测最小的那一块。
     const previousHash = probe ? await blockHash(probe.id) : "";
+    const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates);
+    const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
+    if (conflict) {
+        return {replacedCount: 0, skippedCount: matches.length, error: conflict};
+    }
     try {
         protyle.transaction(
             ordered.map((update) => lockedUpdate(update.id, update.newHTML)),
@@ -949,6 +1000,18 @@ async function commitBlockHtml(
     }
 }
 
+/** getBlockDOMs 是 cleanRenderNode 底稿；无法再次确认或底稿改变时保守拒绝写回。 */
+async function fetchedUpdatesUnchanged(updates: readonly PreparedBlockUpdate[]): Promise<boolean> {
+    for (let index = 0; index < updates.length; index += BLOCK_DOM_BATCH_SIZE) {
+        const batch = updates.slice(index, index + BLOCK_DOM_BATCH_SIZE);
+        const current = await fetchBlockHtmlBatch(batch.map((update) => update.id));
+        if (batch.some((update) => current.get(update.id) !== update.kernelHTML)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /** 单条替换：块不在当前 DOM 时单独提交，仍是一次 Ctrl+Z。全部替换不走这里。 */
 async function replaceFetchedBlockMatches(
     protyle: Protyle,
@@ -957,6 +1020,7 @@ async function replaceFetchedBlockMatches(
     replacementText: string,
     options: ReplaceWriteOptions,
     liveRoot: ParentNode,
+    guard: () => string | undefined,
 ): Promise<ReplaceWriteResult> {
     const prepared = await prepareFetchedBlockUpdates(
         new Map([[blockId, matches]]),
@@ -973,6 +1037,11 @@ async function replaceFetchedBlockMatches(
         };
     }
     const previousHash = await blockHash(update.id);
+    const kernelCurrent = await fetchedUpdatesUnchanged(prepared.updates);
+    const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
+    if (conflict) {
+        return {replacedCount: 0, skippedCount: matches.length, error: conflict};
+    }
     const committed = await commitBlockHtml(protyle, update.id, update.oldHTML, update.newHTML);
     if (!committed) {
         return {replacedCount: 0, skippedCount: matches.length, error: "transaction-failed"};

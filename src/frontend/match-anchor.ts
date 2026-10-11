@@ -1,4 +1,168 @@
+import {containsNodeCrossingShadow} from "./dom-parent";
 import type {SearchMatch} from "./dom-types";
+
+interface RetainedAnchorOptions {
+    previousMatches?: readonly SearchMatch[];
+    edit?: Element;
+}
+
+/** 同步入口供小夹具使用；搜索栏使用下方可取消的分片入口。 */
+export function resolveRetainedMatchIndex(
+    matches: SearchMatch[],
+    previous: SearchMatch,
+    currentIndex: number,
+    options: RetainedAnchorOptions = {},
+): number {
+    const iterator = retainedMatchIndex(matches, previous, currentIndex, options);
+    let step = iterator.next();
+    while (!step.done) step = iterator.next();
+    return step.value;
+}
+
+export async function resolveRetainedMatchIndexWithBudget(
+    matches: SearchMatch[],
+    previous: SearchMatch,
+    currentIndex: number,
+    options: RetainedAnchorOptions,
+    isCurrent: () => boolean,
+): Promise<number | undefined> {
+    const iterator = retainedMatchIndex(matches, previous, currentIndex, options);
+    let started = performance.now();
+    while (isCurrent()) {
+        const step = iterator.next();
+        if (step.done) return isCurrent() ? step.value : undefined;
+        if (performance.now() - started >= 8) {
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+            started = performance.now();
+        }
+    }
+    return undefined;
+}
+
+/** 不保存全文或额外索引。可靠 Range 优先；命中快照未变时用偏移，否则仅接受唯一前后文。 */
+function* retainedMatchIndex(
+    matches: SearchMatch[],
+    previous: SearchMatch,
+    currentIndex: number,
+    options: RetainedAnchorOptions,
+): Generator<void, number> {
+    if (!matches.length) return 0;
+    const context = matchContext(previous);
+    let contextIndex = 0;
+    let contextCount = 0;
+    let textIndex = 0;
+    let textCount = 0;
+    let offsetIndex = 0;
+    let unchangedIndex = 0;
+    let oldCursor = 0;
+    let steps = 0;
+    const old = options.previousMatches;
+    let unchanged = Boolean(old);
+    for (let index = 0; index < matches.length; index++) {
+        if ((++steps & 255) === 0) yield;
+        const match = matches[index];
+        if (!sameAnchorUnit(match, previous)) continue;
+        // 词级 Range 已证明身份时，不再遍历旧快照。备注枚举 Range 无法区分宿主内命中。
+        if (match.matchedText === previous.matchedText && sameLiveTextRange(match, previous, options.edit)) {
+            return index + 1;
+        }
+        if (unchanged && old) {
+            while (oldCursor < old.length && !sameAnchorUnit(old[oldCursor], previous)) {
+                oldCursor++;
+                if ((++steps & 255) === 0) yield;
+            }
+            const prior = old[oldCursor++];
+            unchanged = Boolean(prior && sameOccurrenceSnapshot(prior, match));
+        }
+        if (match.start === previous.start) offsetIndex = index + 1;
+        if (match.matchedText !== previous.matchedText) continue;
+        if (match.start === previous.start && match.end === previous.end) unchangedIndex = index + 1;
+        textCount++;
+        textIndex = index + 1;
+        if (!context) continue;
+        if (matchesContext(match, context)) {
+            contextCount++;
+            contextIndex = index + 1;
+        }
+    }
+    if (unchanged && unchangedIndex && old) {
+        while (oldCursor < old.length) {
+            if ((++steps & 255) === 0) yield;
+            if (sameAnchorUnit(old[oldCursor++], previous)) {
+                unchanged = false;
+                break;
+            }
+        }
+    }
+    if (unchanged && unchangedIndex) return unchangedIndex;
+    if (contextCount === 1) return contextIndex;
+    // 旧调用方未携带摘要元数据时保持原有按偏移的兼容路径。
+    if (previous.listContextClipped === undefined && offsetIndex) return offsetIndex;
+    if (textCount === 1) return textIndex;
+    return Math.min(currentIndex, matches.length);
+}
+
+function sameOccurrenceSnapshot(a: SearchMatch, b: SearchMatch): boolean {
+    return a.start === b.start && a.end === b.end && a.matchedText === b.matchedText &&
+        a.listText === b.listText && a.listContextClipped === b.listContextClipped &&
+        a.listMark?.start === b.listMark?.start && a.listMark?.end === b.listMark?.end;
+}
+
+function sameLiveTextRange(match: SearchMatch, previous: SearchMatch, edit?: Element): boolean {
+    if (!edit || match.highlightKind === "inline-memo" || previous.highlightKind === "inline-memo") return false;
+    const range = match.range;
+    const anchor = previous.range;
+    if (!range || !anchor) return false;
+    try {
+        return !anchor.collapsed && anchor.startContainer.nodeType === Node.TEXT_NODE &&
+            anchor.endContainer.nodeType === Node.TEXT_NODE && anchor.startContainer.isConnected &&
+            anchor.endContainer.isConnected && containsNodeCrossingShadow(edit, anchor.startContainer) &&
+            containsNodeCrossingShadow(edit, anchor.endContainer) &&
+            range.startContainer === anchor.startContainer && range.startOffset === anchor.startOffset &&
+            range.endContainer === anchor.endContainer && range.endOffset === anchor.endOffset;
+    } catch {
+        return false;
+    }
+}
+
+function sameAnchorUnit(match: SearchMatch, previous: SearchMatch): boolean {
+    if (match.blockId !== previous.blockId) return false;
+    if (
+        !previous.unitId?.startsWith("embed:") && previous.highlightKind === "inline-math" &&
+        previous.mathOrdinal !== undefined && previous.mathUnitText !== undefined
+    ) {
+        return match.highlightKind === "inline-math" && match.mathOrdinal === previous.mathOrdinal &&
+            match.mathUnitText === previous.mathUnitText && !match.unitId?.startsWith("embed:");
+    }
+    if (
+        !previous.unitId?.startsWith("embed:") && !previous.unitId?.startsWith("table-memo:") &&
+        previous.highlightKind === "inline-memo" && previous.anchorOffset !== undefined
+    ) {
+        return match.highlightKind === "inline-memo" && match.anchorOffset === previous.anchorOffset &&
+            !match.unitId?.startsWith("embed:") && !match.unitId?.startsWith("table-memo:");
+    }
+    return match.unitId === previous.unitId;
+}
+
+function matchesContext(match: SearchMatch, context: {before: string; after: string;}): boolean {
+    const clipped = match.listContextClipped;
+    const mark = match.listMark;
+    const text = match.listText;
+    if (clipped === undefined || (clipped & 4) || !mark || !text) return false;
+    return mark.start - (clipped & 1 ? 1 : 0) >= context.before.length &&
+        text.length - (clipped & 2 ? 1 : 0) - mark.end >= context.after.length &&
+        text.endsWith(context.before, mark.start) && text.startsWith(context.after, mark.end);
+}
+
+function matchContext(match: SearchMatch): {before: string; after: string;} | null {
+    const clipped = match.listContextClipped;
+    const mark = match.listMark;
+    const text = match.listText;
+    if (clipped === undefined || (clipped & 4) || !mark || !text) return null;
+    const before = text.slice(clipped & 1 ? 1 : 0, mark.start);
+    const after = text.slice(mark.end, clipped & 2 ? -1 : undefined);
+    return before || after ? {before, after} : null;
+}
 
 /**
  * 新一轮搜索（change=true）时解析初始当前项（1-based）。
@@ -60,7 +224,7 @@ function isUsableRange(range: Range): boolean {
     }
 }
 
-function isMatchRangeUsable(match: SearchMatch): match is SearchMatch & {range: Range} {
+function isMatchRangeUsable(match: SearchMatch): match is SearchMatch & {range: Range;} {
     return Boolean(match.range && isUsableRange(match.range));
 }
 

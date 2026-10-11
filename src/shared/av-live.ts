@@ -29,6 +29,7 @@ export function collectAvDomCoverage(
     units: Array<{blockId: string; blockType: string; unitId?: string; text: string;}>,
 ): Map<string, AvDomCoverage> {
     const coverage = new Map<string, AvDomCoverage>();
+    const runTexts = new Map<AvDomCoverage, Map<string, string[]>>();
     for (const unit of units) {
         if (unit.blockType !== "NodeAttributeView" || !unit.unitId) {
             continue;
@@ -38,7 +39,24 @@ export function collectAvDomCoverage(
             current = emptyAvDomCoverage();
             coverage.set(unit.blockId, current);
         }
-        noteAvDomUnit(current, unit.unitId, unit.text);
+        if (/#run-\d+$/.test(unit.unitId)) {
+            let grouped = runTexts.get(current);
+            if (!grouped) {
+                grouped = new Map<string, string[]>();
+                runTexts.set(current, grouped);
+            }
+            const id = unit.unitId.replace(/#run-\d+$/, "");
+            const texts = grouped.get(id) ?? [];
+            texts.push(unit.text);
+            grouped.set(id, texts);
+        } else {
+            noteAvDomUnit(current, unit.unitId, unit.text);
+        }
+    }
+    for (const [current, grouped] of runTexts) {
+        for (const [id, texts] of grouped) {
+            noteAvDomUnit(current, id, texts.join(""));
+        }
     }
     return coverage;
 }
@@ -109,6 +127,7 @@ export function avApiUnitInView(
 }
 
 function noteAvDomUnit(coverage: AvDomCoverage, unitId: string, text: string): void {
+    unitId = unitId.replace(/#run-\d+$/, "");
     if (unitId === "title") {
         coverage.title = true;
         return;
@@ -144,8 +163,8 @@ function noteAvDomUnit(coverage: AvDomCoverage, unitId: string, text: string): v
 }
 
 function parseShownCell(unitId: string): {row: string; col: string; unstable: boolean; label: boolean;} | null {
-    let row = "";
-    let col = "";
+    let row: string;
+    let col: string;
     if (unitId.startsWith("cell:")) {
         const parts = unitId.split(":");
         if (parts.length < 4) {

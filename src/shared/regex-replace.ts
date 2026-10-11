@@ -4,11 +4,8 @@
  */
 
 import {regexSearchFlags} from "./match-text";
-import type {MatchOptions} from "./types";
 
-export interface ExpandRegexReplacementOptions
-    extends Pick<MatchOptions, "regexUnicode" | "regexMultiline" | "regexDotAll">
-{
+export interface ExpandRegexReplacementOptions {
     haystack: string;
     start: number;
     end: number;
@@ -44,7 +41,7 @@ export function expandRegexReplacementUnits(
     units: RegexReplacementUnitRequest[],
     patternSource: string,
     template: string,
-    options: Pick<ExpandRegexReplacementOptions, "caseSensitive" | "regexUnicode" | "regexMultiline" | "regexDotAll">,
+    options: Pick<ExpandRegexReplacementOptions, "caseSensitive">,
 ): RegexReplacementExpansion[] {
     const expansions: RegexReplacementExpansion[] = [];
     for (const unit of units) {
@@ -59,9 +56,6 @@ export function expandRegexReplacementUnits(
                     patternSource,
                     template,
                     caseSensitive: options.caseSensitive === true,
-                    regexUnicode: options.regexUnicode === true,
-                    regexMultiline: options.regexMultiline === true,
-                    regexDotAll: options.regexDotAll === true,
                 }),
             });
         }
@@ -91,7 +85,7 @@ export function expandRegexReplacement(options: ExpandRegexReplacementOptions): 
     }
 
     // 搜索阶段已经记录了原始 haystack 上的 UTF-16 偏移。替换时必须能在同一
-    // haystack、同一偏移处完整复现该命中；否则 lookaround、^/$（特别是 m）等
+    // haystack、同一偏移处完整复现该命中；否则 lookaround、^/$ 等
     // 上下文语义会在切片中改变，不能安全地展开 $` / $' 或捕获组。
     const match = execRegexAt(haystack, start, end, patternSource, options);
 
@@ -119,9 +113,6 @@ function execRegexAt(
             regexSearchFlags({
                 regex: true,
                 caseSensitive: options.caseSensitive,
-                regexUnicode: options.regexUnicode,
-                regexMultiline: options.regexMultiline,
-                regexDotAll: options.regexDotAll,
             }),
         );
     } catch {

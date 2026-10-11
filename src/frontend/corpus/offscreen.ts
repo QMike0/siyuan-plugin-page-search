@@ -1,12 +1,15 @@
-import {DIAGRAM_SUBTYPES, type DiagramSubtype} from "../renderer-adapters";
+import {supportsDiagramSourceSearch} from "../../shared/code-block-language";
+import {
+    DIAGRAM_SUBTYPES,
+    type DiagramSubtype,
+} from "../renderer-adapters";
 
 const OFFSCREEN_WIDTH_PX = 800;
+const OFFSCREEN_DIAGRAM_SUBTYPES = DIAGRAM_SUBTYPES.filter((kind) => !supportsDiagramSourceSearch(kind));
 
 type RenderMethod =
     | "mathRender"
     | "highlightRender"
-    | "mermaidRender"
-    | "flowchartRender"
     | "chartRender"
     | "graphvizRender"
     | "abcRender"
@@ -21,8 +24,6 @@ type ProtyleRenderer = Partial<Record<RenderMethod, (el: Element) => void>>;
 const LIGHT_METHODS = ["mathRender", "htmlRender"] as const;
 const DIAGRAM_METHODS = [
     "mathRender",
-    "mermaidRender",
-    "flowchartRender",
     "chartRender",
     "graphvizRender",
     "abcRender",
@@ -103,7 +104,7 @@ export function callRenders(host: Element, mode: OffscreenRenderMode = "light"):
  * 克隆上移除这些状态，并给其首个渲染宿主一个确定宽度。
  */
 function prepareOffscreenDiagrams(root: ParentNode, forceRender = false): void {
-    const selector = DIAGRAM_SUBTYPES.map((subtype) => `[data-subtype="${subtype}"]`).join(",");
+    const selector = OFFSCREEN_DIAGRAM_SUBTYPES.map((subtype) => `[data-subtype="${subtype}"]`).join(",");
     root.querySelectorAll<HTMLElement>(selector).forEach((el) => {
         let current: HTMLElement | null = el;
         while (current && current !== root) {
@@ -114,8 +115,7 @@ function prepareOffscreenDiagrams(root: ParentNode, forceRender = false): void {
         el.style.width = `${OFFSCREEN_WIDTH_PX}px`;
         el.style.minWidth = `${OFFSCREEN_WIDTH_PX}px`;
         el.style.maxWidth = "none";
-        // 思源 Mermaid / flowchart 渲染器以 firstElementChild.clientWidth 判断是否
-        // 延迟到展开后再画。离屏节点没有正常编辑器的布局上下文，显式给它宽度。
+        // 离屏节点没有正常编辑器的布局上下文，显式给渲染宿主宽度。
         // Lute 的标准 render-node 至少有一个 <div spin="1">。保守兼容缺失壳的
         // 旧/异常 DOM；只改离屏克隆，不碰编辑器里的真实块。
         let layoutProbe = el.firstElementChild as HTMLElement | null;
@@ -143,9 +143,7 @@ function prepareOffscreenDiagrams(root: ParentNode, forceRender = false): void {
             el.removeAttribute("data-render");
         }
     });
-    // Mermaid / flowchart 在异步脚本加载完成后立即读取 firstElementChild.clientWidth。
-    // 在调用 renderer 前强制提交以上样式，避免首次布局仍返回 0 后进入永不触发的
-    // “等待折叠展开” MutationObserver 分支。
+    // 在调用其余图表 renderer 前提交以上样式，保证它们读取已布局的尺寸。
     if (root instanceof HTMLElement) {
         void root.offsetWidth;
     }
@@ -158,9 +156,18 @@ function hasDiagramOutput(node: Element): boolean {
     });
 }
 
+/**
+ * SiYuan sets data-render after loading scripts, but before awaiting SVG rendering.
+ * Mermaid / flowchart use source extraction and do not enter this wait path.
+ */
+function hasPendingDiagramOutput(node: Element): boolean {
+    if (hasDiagramOutput(node)) {
+        return false;
+    }
+    return Boolean(node.getAttribute("data-content"));
+}
+
 const DIAGRAM_RENDER_METHOD_BY_SUBTYPE: Partial<Record<DiagramSubtype, RenderMethod>> = {
-    mermaid: "mermaidRender",
-    flowchart: "flowchartRender",
     chart: "chartRender",
     graphviz: "graphvizRender",
     abc: "abcRender",
@@ -173,13 +180,13 @@ function hasPendingDiagramRenderer(root: ParentNode): boolean {
     if (!renderer) {
         return false;
     }
-    return DIAGRAM_SUBTYPES.some((subtype) => {
+    return OFFSCREEN_DIAGRAM_SUBTYPES.some((subtype) => {
         const method = DIAGRAM_RENDER_METHOD_BY_SUBTYPE[subtype];
         if (!method || typeof renderer[method] !== "function") {
             return false;
         }
         return Array.from(root.querySelectorAll(`[data-subtype="${subtype}"]`)).some((node) => {
-            return Boolean(node.getAttribute("data-content")) && !hasDiagramOutput(node);
+            return hasPendingDiagramOutput(node);
         });
     });
 }
@@ -197,18 +204,19 @@ export async function waitForRender(
         }
         const pendingMath = wait.math &&
             root.querySelector('[data-subtype="math"]:not([data-render="true"])');
-        const pendingDiagram = wait.diagram && DIAGRAM_SUBTYPES.some((subtype) => {
+        const pendingDiagram = wait.diagram && OFFSCREEN_DIAGRAM_SUBTYPES.some((subtype) => {
             return Array.from(root.querySelectorAll(`[data-subtype="${subtype}"]`)).some((node) => {
                 // PlantUML 是 img，Chart 常为 canvas；它们没有可投影的 Text，但也不能
-                // 因等待 SVG 每块白耗完整超时。空源码的 ZWSP 壳同样已经完成。
-                const content = node.getAttribute("data-content") ?? "";
-                return Boolean(content) && !hasDiagramOutput(node);
+                // 因等待 SVG 每块白耗完整超时。
+                return hasPendingDiagramOutput(node);
             });
         });
         const pendingHtml = wait.html &&
             Array.from(root.querySelectorAll("protyle-html, [data-type='NodeHTMLBlock'] protyle-html")).some((node) => {
                 const host = node as HTMLElement & {shadowRoot?: ShadowRoot | null;};
-                return !host.shadowRoot || !host.shadowRoot.textContent?.trim();
+                // The official custom element fills an open shadow synchronously.
+                // An empty rendered HTML block is not a pending renderer.
+                return !host.shadowRoot;
             });
         if (!pendingMath && !pendingDiagram && !pendingHtml) {
             return;
@@ -231,16 +239,14 @@ export async function renderOffscreenBlocks(
         prepareOffscreenDiagrams(wysiwyg, forceDiagramRender);
     }
     callRenders(wysiwyg, mode);
-    const hasDiagram = mode === "diagram" && DIAGRAM_SUBTYPES.some((subtype) => {
+    const hasDiagram = mode === "diagram" && OFFSCREEN_DIAGRAM_SUBTYPES.some((subtype) => {
         return Boolean(wysiwyg.querySelector(`[data-subtype="${subtype}"]`));
     });
     const pendingDiagramRenderer = hasDiagram && hasPendingDiagramRenderer(wysiwyg);
     const hasHtml = Boolean(wysiwyg.querySelector("[data-type='NodeHTMLBlock'], protyle-html"));
     const hasMath = Boolean(wysiwyg.querySelector('[data-subtype="math"], [data-type="NodeMathBlock"]'));
-    // Mermaid / flowchart retain a data-content fallback, so waiting the full CDN
-    // timeout only delays the first search when the renderer is unavailable or a
-    // folded clone cannot be laid out. Keep a short settle window for normal async
-    // rendering while allowing the fallback to return promptly on failure.
+    // Bounded settle window: a missing/failed renderer is reported by extraction,
+    // never treated as complete searchable source text.
     const timeout = pendingDiagramRenderer ? 2500 : ((hasMath || hasHtml) ? 4000 : 0);
     if (timeout > 0) {
         await waitForRender(wysiwyg, timeout, {

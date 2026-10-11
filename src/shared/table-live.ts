@@ -6,7 +6,7 @@
  * 文字不同的格子用画面单元，并记入 staleKeys，这次不能替换。
  */
 
-export interface VirtualTableLiveState<T extends {unitId?: string; text: string}> {
+export interface VirtualTableLiveState<T extends {unitId?: string; text: string;}> {
     /** 已挂载格子的 `行:列`，含已经清空、以及这次关键词对不上的格子。 */
     shownKeys: ReadonlySet<string>;
     /** 画面上还有文字、并且可能命中的格子。键是逻辑位置，不是画面 unitId。 */
@@ -73,9 +73,9 @@ function ownHtmlTable(element: HTMLElement): HTMLTableElement | null {
 export function tableHostOmitsRows(element: HTMLElement): boolean {
     const table = ownHtmlTable(element);
     if (!table) {
-        return element.hasAttribute("data-sy-table-virtual-id")
-            || element.hasAttribute("data-sy-table-virtual-rows")
-            || element.hasAttribute("data-sy-table-virtual-columns");
+        return element.hasAttribute("data-sy-table-virtual-id") ||
+            element.hasAttribute("data-sy-table-virtual-rows") ||
+            element.hasAttribute("data-sy-table-virtual-columns");
     }
     if (table.hasAttribute("data-sy-table-virtual-id")) {
         return true;
@@ -110,6 +110,7 @@ export function tableCellPosition(unitId: string | undefined): string {
     if (!unitId || unitId.indexOf(TABLE_CELL_PREFIX) !== 0) {
         return "";
     }
+    unitId = unitId.replace(/#run-\d+$/, "");
     const rowStart = TABLE_CELL_PREFIX.length;
     const rowEnd = unitId.indexOf(":", rowStart);
     if (rowEnd <= rowStart) {
@@ -134,6 +135,7 @@ export function tableCellNodeId(unitId: string | undefined): string {
     if (!tableCellPosition(unitId) || !unitId) {
         return "";
     }
+    unitId = unitId.replace(/#run-\d+$/, "");
     const rowStart = TABLE_CELL_PREFIX.length;
     const rowEnd = unitId.indexOf(":", rowStart);
     const colEnd = unitId.indexOf(":", rowEnd + 1);
@@ -160,9 +162,9 @@ function isVirtualTableSideUnit(unitId: string | undefined): boolean {
     if (!unitId) {
         return false;
     }
-    return unitId.startsWith("inline-memo:")
-        || unitId.startsWith("inline-math:")
-        || unitId.startsWith("table-memo:");
+    return unitId.startsWith("inline-memo:") ||
+        unitId.startsWith("inline-math:") ||
+        unitId.startsWith("table-memo:");
 }
 
 function sameCellText(left: string, right: string): boolean {
@@ -195,7 +197,7 @@ export interface LogicalTableLayout {
  * 占位行按属性里的 tr 个数展开，本身不占一个数据行。
  * 数不清时停住：前缀仍然和完整表对齐，后面的行不猜。
  */
-export function logicalTableRows(rows: readonly {getAttribute(name: string): string | null}[]): LogicalTableLayout {
+export function logicalTableRows(rows: readonly {getAttribute(name: string): string | null;}[]): LogicalTableLayout {
     const placed: LogicalTableRow[] = [];
     let logical = 0;
     for (let index = 0; index < rows.length; index += 1) {
@@ -277,15 +279,17 @@ export function ownTableRows(element: HTMLElement): HTMLTableRowElement[] | null
  * 画面单元不要放进 units：文字相同的格子必须留下内核单元。
  * 键是逻辑 `行:列`。对齐用这个键，不拿 unitId 里的字面行号互相比。
  */
-export function mergeVirtualTableUnits<T extends {
-    blockId: string;
-    blockType: string;
-    unitId?: string;
-    text: string;
-}>(
+export function mergeVirtualTableUnits<
+    T extends {
+        blockId: string;
+        blockType: string;
+        unitId?: string;
+        text: string;
+    },
+>(
     units: readonly T[],
     virtual: ReadonlyMap<string, VirtualTableLiveState<T>>,
-): {units: T[]; staleKeys: Set<string>} {
+): {units: T[]; staleKeys: Set<string>;} {
     if (virtual.size === 0) {
         return {units: units as T[], staleKeys: new Set()};
     }

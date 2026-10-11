@@ -27,7 +27,7 @@ export function unitKeyOf(block: Pick<SearchableBlock, "blockId" | "unitId">): s
  * 整库块选后，用当前 DOM 重建该数据库下的选区单元。
  *
  * 思源切换视图 / 布局会 avRender 重建内部 DOM，cell / group / header 的 unitId
- *（含 groupId、rowId 等）会变；若继续用捕获时冻结的 unitKey 过滤，就会出现：
+ * （含 groupId、rowId 等）会变；若继续用捕获时冻结的 unitKey 过滤，就会出现：
  * - 只能命中稳定的「数据库标题」
  * - 或只能命中部分字段值、列名 / 分组标题对不上
  *
@@ -56,9 +56,9 @@ export function refreshWholeAttributeViewSelectionScope(
         }
         for (const block of blocks) {
             if (
-                block.blockId !== avId
-                || block.blockType !== ATTRIBUTE_VIEW_TYPE
-                || block.text.length <= 0
+                block.blockId !== avId ||
+                block.blockType !== ATTRIBUTE_VIEW_TYPE ||
+                block.text.length <= 0
             ) {
                 continue;
             }
@@ -83,8 +83,8 @@ function collectWholeSelectedAttributeViewIds(
         }
         const escaped = CSS.escape(id);
         const el = edit.querySelector(
-            `.protyle-wysiwyg [data-node-id="${escaped}"][data-type="${ATTRIBUTE_VIEW_TYPE}"],`
-            + `.protyle-wysiwyg [data-node-id="${escaped}"].av`,
+            `.protyle-wysiwyg [data-node-id="${escaped}"][data-type="${ATTRIBUTE_VIEW_TYPE}"],` +
+                `.protyle-wysiwyg [data-node-id="${escaped}"].av`,
         );
         if (el) {
             ids.add(id);
@@ -241,7 +241,7 @@ export interface TableCellTextSelection {
     end: number;
     /** 去掉零宽字符后的正文，用来核对写回后的格子文本。 */
     text: string;
-    inlineMarks: ReadonlyArray<{kind: "math" | "memo"; index: number}>;
+    inlineMarks: ReadonlyArray<{kind: "math" | "memo"; index: number;}>;
 }
 
 /**
@@ -294,16 +294,21 @@ export function selectionScopeFromTableCellText(
     if (!snap.cell.isConnected) {
         return scope;
     }
-    for (let index = 0; index < blocks.length; index += 1) {
-        const block = blocks[index];
-        if (block.element !== snap.cell || isAttributeInlineSearchUnit(block) || block.text.length <= 0) {
-            continue;
+    const body = blocks.filter((block) =>
+        block.element === snap.cell && !isAttributeInlineSearchUnit(block) && block.text.length > 0
+    );
+    // Snapshot offsets belong to the whole cell, not to each independent visual run.
+    const range = reconcileCellTextRange(body.map((block) => block.text).join(""), snap.start, snap.end, snap.text);
+    let cursor = 0;
+    for (const block of body) {
+        const end = cursor + block.text.length;
+        if (range && range.start < end && range.end > cursor) {
+            scope.set(unitKeyOf(block), [{
+                start: Math.max(0, range.start - cursor),
+                end: Math.min(block.text.length, range.end - cursor),
+            }]);
         }
-        const range = reconcileCellTextRange(block.text, snap.start, snap.end, snap.text);
-        if (!range) {
-            continue;
-        }
-        scope.set(unitKeyOf(block), [range]);
+        cursor = end;
     }
     if (snap.inlineMarks.length === 0) {
         return scope;
@@ -342,8 +347,8 @@ function tableCellFromNode(node: Node): HTMLTableCellElement | null {
 function inlineMarksInRange(
     cell: HTMLTableCellElement,
     range: Range,
-): Array<{kind: "math" | "memo"; index: number}> {
-    const marks: Array<{kind: "math" | "memo"; index: number}> = [];
+): Array<{kind: "math" | "memo"; index: number;}> {
+    const marks: Array<{kind: "math" | "memo"; index: number;}> = [];
     const kinds: Array<"math" | "memo"> = ["math", "memo"];
     for (let kindIndex = 0; kindIndex < kinds.length; kindIndex += 1) {
         const kind = kinds[kindIndex];
@@ -360,9 +365,9 @@ function inlineMarksInRange(
 
 function inlineHostsInCell(cell: HTMLTableCellElement, kind: "math" | "memo"): HTMLElement[] {
     const root = tableCellSearchRoot(cell);
-    const selector = kind === "math"
-        ? "span[data-type~=\"inline-math\"]"
-        : "span[data-type~=\"inline-memo\"]";
+    const selector = kind === "math" ?
+        'span[data-type~="inline-math"]' :
+        'span[data-type~="inline-memo"]';
     const hosts: HTMLElement[] = [];
     const found = root.querySelectorAll<HTMLElement>(selector);
     for (let index = 0; index < found.length; index += 1) {
@@ -392,8 +397,10 @@ function reconcileCellTextRange(
     if (selected.length === 0) {
         return null;
     }
-    if (start >= 0 && end > start && end <= blockText.length
-        && stripZwsp(blockText.slice(start, end)) === selected) {
+    if (
+        start >= 0 && end > start && end <= blockText.length &&
+        stripZwsp(blockText.slice(start, end)) === selected
+    ) {
         return {start, end};
     }
     return findClosestText(blockText, selected, start);
@@ -581,9 +588,9 @@ function getSelectionScopeFromSelectedBlocks(
             continue;
         }
         const covered = selectedElements.some((selected) =>
-            selected === block.element
-            || selected.contains(block.element)
-            || block.element.contains(selected)
+            selected === block.element ||
+            selected.contains(block.element) ||
+            block.element.contains(selected)
         );
         if (!covered) {
             continue;
@@ -617,9 +624,9 @@ function getSelectionScopeFromTableSelect(
         for (let cellIndex = 0; cellIndex < selectedCells.length; cellIndex += 1) {
             const cell = selectedCells[cellIndex];
             if (
-                cell === block.element
-                || cell.contains(block.element)
-                || block.element.contains(cell)
+                cell === block.element ||
+                cell.contains(block.element) ||
+                block.element.contains(cell)
             ) {
                 covered = true;
                 break;
@@ -658,12 +665,14 @@ function collectActiveTableSelectCells(edit: Element): HTMLTableCellElement[] {
             if (owner && owner !== tableBlock) {
                 return;
             }
-            if (isIncludeTableCell({
-                tableSelectElement: tableSelectElement!,
-                scrollLeft,
-                scrollTop,
-                item: cell,
-            })) {
+            if (
+                isIncludeTableCell({
+                    tableSelectElement: tableSelectElement!,
+                    scrollLeft,
+                    scrollTop,
+                    item: cell,
+                })
+            ) {
                 cells.push(cell);
             }
         });
@@ -690,12 +699,12 @@ function isIncludeTableCell(options: {
     item: HTMLTableCellElement;
 }): boolean {
     const {tableSelectElement, scrollLeft, scrollTop, item} = options;
-    return item.offsetLeft + 6 > tableSelectElement.offsetLeft + scrollLeft
-        && item.offsetLeft + item.clientWidth - 6
-            < tableSelectElement.offsetLeft + scrollLeft + tableSelectElement.clientWidth
-        && item.offsetTop + 6 > tableSelectElement.offsetTop + scrollTop
-        && item.offsetTop + item.clientHeight - 6
-            < tableSelectElement.offsetTop + scrollTop + tableSelectElement.clientHeight;
+    return item.offsetLeft + 6 > tableSelectElement.offsetLeft + scrollLeft &&
+        item.offsetLeft + item.clientWidth - 6 <
+            tableSelectElement.offsetLeft + scrollLeft + tableSelectElement.clientWidth &&
+        item.offsetTop + 6 > tableSelectElement.offsetTop + scrollTop &&
+        item.offsetTop + item.clientHeight - 6 <
+            tableSelectElement.offsetTop + scrollTop + tableSelectElement.clientHeight;
 }
 
 export function mergeSelectionScopes(
@@ -709,10 +718,13 @@ export function mergeSelectionScopes(
                 merged.set(key, ranges.map((range) => ({...range})));
                 continue;
             }
-            merged.set(key, mergeTextOffsetRanges([
-                ...existing,
-                ...ranges.map((range) => ({...range})),
-            ]));
+            merged.set(
+                key,
+                mergeTextOffsetRanges([
+                    ...existing,
+                    ...ranges.map((range) => ({...range})),
+                ]),
+            );
         }
     }
     return merged;
@@ -769,8 +781,8 @@ function selectionRangeIntersectsElement(range: Range, element: Element): boolea
         const hostRange = range.ownerDocument?.createRange() ?? document.createRange();
         hostRange.selectNodeContents(element);
         return (
-            range.compareBoundaryPoints(Range.END_TO_START, hostRange) < 0
-            && range.compareBoundaryPoints(Range.START_TO_END, hostRange) > 0
+            range.compareBoundaryPoints(Range.END_TO_START, hostRange) < 0 &&
+            range.compareBoundaryPoints(Range.START_TO_END, hostRange) > 0
         );
     } catch {
         return false;
@@ -814,12 +826,12 @@ function getIntersectedTextRanges(textNodes: Text[], selectionRange: Range): Tex
             continue;
         }
 
-        const start = startRelation === -1
-            ? 0
-            : measureTextOffset(nodeRange, selectionRange.startContainer, selectionRange.startOffset);
-        const end = endRelation === 1
-            ? text.length
-            : measureTextOffset(nodeRange, selectionRange.endContainer, selectionRange.endOffset);
+        const start = startRelation === -1 ?
+            0 :
+            measureTextOffset(nodeRange, selectionRange.startContainer, selectionRange.startOffset);
+        const end = endRelation === 1 ?
+            text.length :
+            measureTextOffset(nodeRange, selectionRange.endContainer, selectionRange.endOffset);
 
         if (end > start) {
             ranges.push({

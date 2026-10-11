@@ -5,12 +5,13 @@ const {EsbuildPlugin} = require("esbuild-loader");
 const MiniCssExtractPlugin = require("mini-css-extract-plugin");
 const CopyPlugin = require("copy-webpack-plugin");
 const ZipPlugin = require("zip-webpack-plugin");
+const {name: pluginName} = require("./plugin.json");
 
 module.exports = (env, argv) => {
     const production = argv.mode === "production";
     const plugins = [
         new MiniCssExtractPlugin({
-            filename: production ? "dist/index.css" : "index.css",
+            filename: "index.css",
         }),
     ];
     if (production) {
@@ -24,23 +25,20 @@ module.exports = (env, argv) => {
         plugins.push(
             new CopyPlugin({
                 patterns: [
-                    {from: "preview.png", to: "./dist/"},
-                    {from: "icon.png", to: "./dist/"},
-                    {from: "README*.md", to: "./dist/"},
-                    {from: "plugin.json", to: "./dist/"},
-                    {from: "src/i18n/", to: "./dist/i18n/"},
-                    {from: "dist/kernel.js", to: "./dist/"},
+                    {from: "preview.png", to: "./"},
+                    {from: "icon.png", to: "./"},
+                    {from: "README*.md", to: "./"},
+                    {from: "plugin.json", to: "./"},
+                    {from: "src/i18n/", to: "./i18n/"},
+                    {from: "dist/kernel.js", to: "./"},
                 ],
             }),
         );
         plugins.push(
             new ZipPlugin({
                 filename: "package.zip",
+                path: __dirname,
                 algorithm: "gzip",
-                include: [/dist/],
-                pathMapper: (assetPath) => {
-                    return assetPath.replace("dist/", "");
-                },
             }),
         );
     } else {
@@ -58,20 +56,22 @@ module.exports = (env, argv) => {
         devtool: production ? false : "eval-source-map",
         output: {
             filename: "[name].js",
-            // 生产入口在 dist/index.js，而 webpack 的 Worker publicPath 指向插件根目录。
-            // 因而 Worker 同样写入 dist，才能被 ZipPlugin 一并装入发布包。
-            chunkFilename: production ? "dist/[name].js" : "[name].js",
-            path: path.resolve(__dirname),
-            libraryTarget: "commonjs2",
-            library: {
-                type: "commonjs2",
-            },
+            chunkFilename: "[name].js",
+            path: path.resolve(__dirname, production ? "dist" : "."),
+            // 思源以 eval 执行插件代码，不能从 document.currentScript 推导插件地址。
+            // 构建目录和安装包内部保持同一布局，Worker 使用思源的插件静态资源路由。
+            publicPath: `/plugins/${encodeURIComponent(pluginName)}/`,
         },
+        externalsType: "commonjs",
         externals: {
             siyuan: "siyuan",
         },
         entry: {
-            [production ? "dist/index" : "index"]: "./src/index.ts",
+            // CommonJS 仅用于思源插件入口；Worker 不具备 module / exports 全局变量。
+            index: {
+                import: "./src/index.ts",
+                library: {type: "commonjs2"},
+            },
         },
         optimization: {
             minimize: production,

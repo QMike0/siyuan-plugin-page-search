@@ -21,6 +21,10 @@ globalThis.Element = dom.window.Element;
 globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.Text = dom.window.Text;
 globalThis.ShadowRoot = dom.window.ShadowRoot;
+globalThis.HTMLTableElement = dom.window.HTMLTableElement;
+globalThis.HTMLTableRowElement = dom.window.HTMLTableRowElement;
+globalThis.HTMLTableCellElement = dom.window.HTMLTableCellElement;
+globalThis.CSS = {escape: (value) => value};
 globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
 
 await build({

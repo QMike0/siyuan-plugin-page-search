@@ -21,6 +21,26 @@ const AV_BLOCK_SELECTOR = '[data-type="NodeAttributeView"], .av[data-av-id]';
 /** 虚拟滚动 / 行级更新发生在这些容器内，跳转时会频繁突变 */
 const AV_VIRTUAL_SCROLL_INNER = ".av__body, .av__gallery, .av__kanban, .av__row, .av__gallery-item";
 
+export function attributeViewTransactionIds(detail: unknown): string[] {
+    const payload = detail as {
+        data?: Array<{doOperations?: Array<{avID?: string;}>; undoOperations?: Array<{avID?: string;}>;}>;
+    } | null;
+    const ids = new Set<string>();
+    if (Array.isArray(payload?.data)) {
+        for (const tx of payload.data) {
+            for (
+                const op of [
+                    ...(Array.isArray(tx?.doOperations) ? tx.doOperations : []),
+                    ...(Array.isArray(tx?.undoOperations) ? tx.undoOperations : []),
+                ]
+            ) {
+                if (typeof op?.avID === "string" && op.avID) ids.add(op.avID);
+            }
+        }
+    }
+    return [...ids];
+}
+
 /**
  * 判断 ws-main 事件是否为 Attribute View 相关事务。
  */
@@ -31,8 +51,8 @@ export function isAttrViewWsTransaction(detail: unknown): boolean {
     const payload = detail as {
         cmd?: string;
         data?: Array<{
-            doOperations?: Array<{action?: string; avID?: string}>;
-            undoOperations?: Array<{action?: string; avID?: string}>;
+            doOperations?: Array<{action?: string; avID?: string;}>;
+            undoOperations?: Array<{action?: string; avID?: string;}>;
         }>;
     };
     if (payload.cmd !== "transactions" || !Array.isArray(payload.data)) {
@@ -65,8 +85,8 @@ export function isAttrViewRelevantToEdit(edit: Element, detail?: unknown): boole
     }
     const payload = detail as {
         data?: Array<{
-            doOperations?: Array<{avID?: string}>;
-            undoOperations?: Array<{avID?: string}>;
+            doOperations?: Array<{avID?: string;}>;
+            undoOperations?: Array<{avID?: string;}>;
         }>;
     };
     if (!Array.isArray(payload.data)) {
@@ -74,19 +94,21 @@ export function isAttrViewRelevantToEdit(edit: Element, detail?: unknown): boole
     }
     const avIds = new Set<string>();
     for (const tx of payload.data) {
-        for (const op of [
-            ...(Array.isArray(tx?.doOperations) ? tx.doOperations : []),
-            ...(Array.isArray(tx?.undoOperations) ? tx.undoOperations : []),
-        ]) {
+        for (
+            const op of [
+                ...(Array.isArray(tx?.doOperations) ? tx.doOperations : []),
+                ...(Array.isArray(tx?.undoOperations) ? tx.undoOperations : []),
+            ]
+        ) {
             if (typeof op?.avID === "string" && op.avID) {
                 avIds.add(op.avID);
             }
         }
     }
     for (const avId of avIds) {
-        const safeId = typeof CSS !== "undefined" && typeof CSS.escape === "function"
-            ? CSS.escape(avId)
-            : avId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        const safeId = typeof CSS !== "undefined" && typeof CSS.escape === "function" ?
+            CSS.escape(avId) :
+            avId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
         if (edit.querySelector(`[data-av-id="${safeId}"]`)) {
             return true;
         }
@@ -148,9 +170,9 @@ function isStructuralAttributeViewMutation(mutation: MutationRecord): boolean {
         return false;
     }
 
-    const parent = mutation.target instanceof Element
-        ? mutation.target
-        : mutation.target.parentElement;
+    const parent = mutation.target instanceof Element ?
+        mutation.target :
+        mutation.target.parentElement;
     if (!parent) {
         return false;
     }
@@ -181,8 +203,8 @@ function isStructuralAttributeViewMutation(mutation: MutationRecord): boolean {
         if (
             node.matches(
                 `${AV_BLOCK_SELECTOR}, .av__group-title, .av__body, .av__header, .av__views, .av__scroll`,
-            )
-            || node.querySelector?.(
+            ) ||
+            node.querySelector?.(
                 ".av__group-title, .av__body, .av__header, .av__views",
             )
         ) {
@@ -192,8 +214,8 @@ function isStructuralAttributeViewMutation(mutation: MutationRecord): boolean {
 
     // 父级本身是 scroll/header 容器被清空重填
     if (
-        parent.matches(".av__scroll, .av__header, .av__views")
-        || parent.classList.contains("av__scroll")
+        parent.matches(".av__scroll, .av__header, .av__views") ||
+        parent.classList.contains("av__scroll")
     ) {
         return true;
     }

@@ -18,3 +18,14 @@ export function parentElementCrossingShadow(element: Element | null): HTMLElemen
     }
     return null;
 }
+
+/** 原生 contains 不穿透 ShadowRoot；只沿 host 检查归属，不扫描子树。 */
+export function containsNodeCrossingShadow(container: Node, node: Node): boolean {
+    let current = node;
+    while (true) {
+        if (container.contains(current)) return true;
+        const root = current.getRootNode();
+        if (!(root instanceof ShadowRoot)) return false;
+        current = root.host;
+    }
+}

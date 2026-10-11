@@ -14,6 +14,11 @@ import type {
     TableReplaceLock,
     TableSlot,
 } from "./dom-types";
+import {
+    createEmbeddedSourceReader,
+    embeddedOwner,
+    recordEmbeddedOrder,
+} from "./embedded-order";
 import {isUnderNonHeadingCssFold} from "./fold-dom";
 import {
     collectRendererSearchUnits,
@@ -23,6 +28,7 @@ import {
 import {splitTextNodesAtBarriers} from "./text-runs";
 import {
     beginTextCollection,
+    isAuthorCssHiddenElement,
     omitAuthorCssHiddenText,
 } from "./visibility";
 
@@ -221,6 +227,10 @@ export function isDocTitleSearchUnit(
  * 预览模式无 data-node-id 时回退为整根合成块，保证行为不回退。
  */
 export interface CollectSearchableBlocksOptions {
+    /** 内部离屏提取先按源块检查 renderer，再将结果归到嵌入宿主。 */
+    preserveEmbedSourceIds?: boolean;
+    /** Text-only change detection does not consume ordering snapshots. */
+    skipEmbeddedOrder?: boolean;
     /** 是否采集文档标题（.protyle-title__input）；默认 true */
     includeDocTitle?: boolean;
     /** 是否采集图片标题（`.img .protyle-action__title`）；默认 true */
@@ -388,18 +398,19 @@ export function collectSearchableBlocks(
         scoped ?
         collectScopedBlockElements(scopeRoots, !includeEmbedBlock) :
         getUniqueBlockElements(docRoot as HTMLElement, {excludeEmbed: !includeEmbedBlock});
-    if (!scoped && docRoot && collectBodyText && blockElements.length === 0) {
+    if (
+        !scoped && docRoot && collectBodyText && blockElements.length === 0 &&
+        !docRoot.querySelector("[data-node-id][data-type]")
+    ) {
         const textNodes = collectTextNodes(docRoot, null, includeImageTitle);
         const text = textNodes.map((node) => node.nodeValue ?? "").join("");
         if (text) {
-            blocks.push({
+            blocks.push(...unitsFromTextNodes({
                 blockId: PREVIEW_BLOCK_ID,
                 blockType: PREVIEW_BLOCK_TYPE,
                 blockIndex: 0,
                 element: docRoot,
-                text,
-                textNodes,
-            });
+            }, textNodes));
         }
         if (collectMemo) {
             blocks.push(...filterAttributeUnitsByIncludeGates(
@@ -413,7 +424,9 @@ export function collectSearchableBlocks(
                 includeGates,
             ));
         }
-        return filterFoldedSearchableBlocks(blocks, includeFoldedBlocks);
+        return finishSearchableBlocks(blocks, includeFoldedBlocks, options.preserveEmbedSourceIds === true, [], [
+            docRoot,
+        ], options.skipEmbeddedOrder === true);
     }
 
     blockElements.forEach((element, blockIndex) => {
@@ -559,7 +572,7 @@ export function collectSearchableBlocks(
         }
 
         // 公式 / HTML / 各类图表均走同一 adapter。live 与 offscreen 因此会产生相同的
-        // unitId、搜索边界和 Text 偏移；没有真实 Text 的 img/canvas 图表不回退源码。
+        // unitId 和搜索边界。Mermaid / flowchart 的冷态源码单元没有可映射的 Text 偏移。
         const rendererKind = rendererAdapterKind(element);
         if (rendererKind) {
             if (
@@ -634,7 +647,78 @@ export function collectSearchableBlocks(
 
     // 备注、行内公式、页签标题等独立单元不会经过上面的 blockElements 循环，
     // 因而在统一出口按其实际元素再过滤一次。
-    return filterFoldedSearchableBlocks(blocks, includeFoldedBlocks);
+    return finishSearchableBlocks(
+        blocks,
+        includeFoldedBlocks,
+        options.preserveEmbedSourceIds === true,
+        blockElements,
+        attributeRoots,
+        options.skipEmbeddedOrder === true,
+    );
+}
+
+/** Source IDs identify copied labels; the embed ID identifies their search/navigation owner. */
+export function ownEmbeddedSearchUnit(block: SearchableBlock, ownerId: string): SearchableBlock {
+    let sourceUnit = block.unitId ?? "text";
+    if (isInlineMathSearchUnit(block)) {
+        sourceUnit = `inline-math:${inlineMathIdentityText(block.text)}:${block.mathOrdinal ?? 0}`;
+    } else if (isInlineMemoSearchUnit(block)) {
+        sourceUnit = `inline-memo:${block.anchorOffset ?? 0}`;
+    }
+    return {
+        ...block,
+        blockId: ownerId,
+        blockType: EMBED_BLOCK_TYPE,
+        unitId: `embed:${block.embeddedSourceId ?? block.blockId}:${sourceUnit}`,
+    };
+}
+
+function finishSearchableBlocks(
+    blocks: SearchableBlock[],
+    includeFoldedBlocks: boolean,
+    preserveEmbedSourceIds: boolean,
+    blockElements: readonly HTMLElement[] = [],
+    orderRoots: HTMLElement[] = [],
+    skipEmbeddedOrder = false,
+): SearchableBlock[] {
+    const filtered = filterFoldedSearchableBlocks(blocks, includeFoldedBlocks);
+    const embedded = new Map<HTMLElement, SearchableBlock[]>();
+    const owners = new Map<SearchableBlock, HTMLElement>();
+    const sourceOf = createEmbeddedSourceReader();
+    for (const block of filtered) {
+        const owner = embeddedOwner(block.element);
+        if (!owner) continue;
+        owners.set(block, owner);
+        block.embeddedSourceId = sourceOf(block.element, block.blockId);
+        const group = embedded.get(owner) ?? [];
+        group.push(block);
+        embedded.set(owner, group);
+    }
+    if (embedded.size > 0) {
+        const ownerIndexes = new Map<HTMLElement, number>();
+        // Attribute-only restrictions skip body collection. Still use each embed's
+        // own position rather than the first copied source ID's position.
+        const orderedElements = blockElements.length ? blockElements : collectScopedBlockElements(orderRoots, false);
+        orderedElements.forEach((element, index) => {
+            if (embedded.has(element)) ownerIndexes.set(element, index);
+        });
+        embedded.forEach((group, owner) => {
+            if (!skipEmbeddedOrder) recordEmbeddedOrder(owner, group);
+            const index = ownerIndexes.get(owner);
+            if (index !== undefined) group.forEach((block) => block.blockIndex = index);
+        });
+    }
+    return preserveEmbedSourceIds ? filtered : filtered.map((block) => {
+        const owner = owners.get(block);
+        return owner ? ownEmbeddedSearchUnit(block, owner.dataset.nodeId!) : block;
+    });
+}
+
+function copiedBlockKey(element: HTMLElement, blockId: string): string | HTMLElement {
+    const owner = embeddedOwner(element);
+    // Repeated scope roots still dedupe the same node. Distinct displayed source
+    // nodes must survive even when a query returns both a container and its child.
+    return owner && owner !== element ? element : blockId;
 }
 
 function filterFoldedSearchableBlocks(
@@ -682,6 +766,47 @@ type HeadingIncludeGates = Pick<
     | "includeHeadingH5"
     | "includeHeadingH6"
 >;
+
+/** Renderer coverage must use the same container/type gates as text collection. */
+export function createRendererElementFilter(
+    options: CollectSearchableBlocksOptions,
+): (element: HTMLElement) => boolean {
+    const gates: IncludeGates = {
+        includeAttributeView: options.includeAttributeView !== false,
+        includeTable: options.includeTable !== false,
+        includeBlockquote: options.includeBlockquote !== false,
+        includeCallout: options.includeCallout !== false,
+        includeSuperBlock: options.includeSuperBlock !== false,
+        includeListUnordered: options.includeListUnordered !== false,
+        includeListOrdered: options.includeListOrdered !== false,
+        includeListTask: options.includeListTask !== false,
+        includeParagraph: options.includeParagraph !== false,
+        includeHeadingH1: options.includeHeadingH1 !== false,
+        includeHeadingH2: options.includeHeadingH2 !== false,
+        includeHeadingH3: options.includeHeadingH3 !== false,
+        includeHeadingH4: options.includeHeadingH4 !== false,
+        includeHeadingH5: options.includeHeadingH5 !== false,
+        includeHeadingH6: options.includeHeadingH6 !== false,
+        includeMathBlock: options.includeMathBlock !== false,
+        includeEmbedBlock: options.includeEmbedBlock !== false,
+        includeCodeBlock: options.includeCodeBlock !== false,
+        includeMermaid: options.includeMermaid !== false,
+        includeFlowchart: options.includeFlowchart !== false,
+        includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeMindmap: options.includeMindmap !== false,
+    };
+    const body = shouldCollectBodyTextForRestrict(options.restrictInlineTypes);
+    const math = shouldCollectInlineMathUnits(options.restrictInlineTypes);
+    return (element) => {
+        const inlineMath = element.matches('span[data-type~="inline-math"]');
+        const kind = rendererAdapterKind(element);
+        return (inlineMath ? math : body && Boolean(kind && rendererEnabled(kind, gates))) &&
+            !shouldSkipAttributeUnitByIncludeGates(element, gates) &&
+            !(options.includeTabs === false && element.closest('[data-type="NodeTabs"]')) &&
+            !(options.includeFoldedBlocks === false && isUnderNonHeadingCssFold(element)) &&
+            !isAuthorCssHiddenElement(element);
+    };
+}
 
 /** 标题级别：与官方 subTypes h1–h6 / data-subtype 一致 */
 export type HeadingLevel = "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
@@ -854,7 +979,7 @@ function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeG
         return true;
     }
     // 挂件始终不搜（含其外壳上的行内备注 / 公式宿主）
-    if (Boolean(element.closest(`[data-type="${WIDGET_TYPE}"]`))) {
+    if (element.closest(`[data-type="${WIDGET_TYPE}"]`)) {
         return true;
     }
     if (
@@ -890,7 +1015,7 @@ function isInsideEmbedBlock(element: Element): boolean {
 
 /** 范围采集：计入根自身，再计入其中的子块。多个根的后代互不重叠。 */
 function collectScopedBlockElements(roots: HTMLElement[], excludeEmbed: boolean): HTMLElement[] {
-    const byId = new Map<string, HTMLElement>();
+    const byId = new Map<string | HTMLElement, HTMLElement>();
     const consider = (element: HTMLElement) => {
         const blockId = element.dataset.nodeId?.trim();
         if (!blockId || !element.dataset.type) {
@@ -899,9 +1024,10 @@ function collectScopedBlockElements(roots: HTMLElement[], excludeEmbed: boolean)
         if (excludeEmbed && isInsideEmbedBlock(element)) {
             return;
         }
-        const existing = byId.get(blockId);
+        const key = copiedBlockKey(element, blockId);
+        const existing = byId.get(key);
         if (!existing || shouldPreferBlockElement(element, existing)) {
-            byId.set(blockId, element);
+            byId.set(key, element);
         }
     };
     roots.forEach((root) => {
@@ -915,7 +1041,7 @@ function getUniqueBlockElements(
     root: ParentNode,
     options: {excludeEmbed?: boolean;} = {},
 ): HTMLElement[] {
-    const byId = new Map<string, HTMLElement>();
+    const byId = new Map<string | HTMLElement, HTMLElement>();
     const excludeEmbed = options.excludeEmbed === true;
 
     Array.from(root.querySelectorAll<HTMLElement>("[data-node-id][data-type]")).forEach((element) => {
@@ -927,9 +1053,10 @@ function getUniqueBlockElements(
             return;
         }
 
-        const existing = byId.get(blockId);
+        const key = copiedBlockKey(element, blockId);
+        const existing = byId.get(key);
         if (!existing || shouldPreferBlockElement(element, existing)) {
-            byId.set(blockId, element);
+            byId.set(key, element);
         }
     });
 
@@ -1264,7 +1391,8 @@ function tableCellTextRoot(cell: HTMLElement): HTMLElement {
 
 /** 与表格单元格搜索单元同一套正文节点，供划选偏移对齐。 */
 export function collectTableCellSearchTextNodes(cell: HTMLElement, includeImageTitle = true): Text[] {
-    return collectDescendantTextNodes(tableCellTextRoot(cell), includeImageTitle);
+    beginTextCollection(true);
+    return omitAuthorCssHiddenText(collectDescendantTextNodes(tableCellTextRoot(cell), includeImageTitle));
 }
 
 export function tableCellSearchRoot(cell: HTMLElement): HTMLElement {
@@ -1360,20 +1488,23 @@ function collectAttributeViewSearchUnits(
             includeImageTitle,
             headingGates,
         );
-        const text = textNodes.map((node) => node.nodeValue ?? "").join("");
-        if (!text) {
-            return;
-        }
+        const visible = omitAuthorCssHiddenText(textNodes);
+        const text = visible.map((node) => node.nodeValue ?? "").join("");
         seenUnitKeys.add(unitId);
-        units.push({
+        const base = {
             blockId,
             blockType: ATTRIBUTE_VIEW_TYPE,
             blockIndex,
             element: container,
-            text,
-            textNodes,
             unitId,
-        });
+        };
+        // Preserve mounted-cell coverage even when its text is empty or hidden.
+        // Otherwise API values would reintroduce the filtered text.
+        if (!text) {
+            units.push({...base, text: "", textNodes: []});
+            return;
+        }
+        units.push(...unitsFromTextNodes(base, visible));
     };
 
     const pushCellsInRoot = (root: ParentNode) => {
@@ -1710,14 +1841,12 @@ function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
                 return;
             }
             seenItems.add(tabId);
-            units.push({
+            units.push(...unitsFromTextNodes({
                 blockId,
                 blockType: blockEl?.getAttribute("data-type") || "NodeParagraph",
                 blockIndex: 0,
                 element: label,
-                text,
-                textNodes,
-            });
+            }, textNodes));
         });
     };
     for (const root of roots) {
@@ -1782,14 +1911,12 @@ export function collectMindmapPreviewUnits(roots: HTMLElement[]): SearchableBloc
                 return;
             }
             seen.add(blockId);
-            units.push({
+            units.push(...unitsFromTextNodes({
                 blockId,
                 blockType: preview.getAttribute("data-type") || "NodeParagraph",
                 blockIndex: 0,
                 element: preview,
-                text,
-                textNodes,
-            });
+            }, textNodes));
         });
     });
     return units;
@@ -2047,7 +2174,7 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
     let memoIndex = 0;
 
     for (const span of spans) {
-        if (span.closest(".protyle-attr, .fn__none")) {
+        if (span.closest(".protyle-attr, .fn__none") || isAuthorCssHiddenElement(span)) {
             continue;
         }
 
@@ -2103,7 +2230,7 @@ function memoHostSpansByOwner(
     const byOwner = new Map<HTMLElement, HTMLElement[]>();
     for (let index = 0; index < spans.length; index += 1) {
         const span = spans[index];
-        if (span.closest(".protyle-attr, .fn__none")) {
+        if (span.closest(".protyle-attr, .fn__none") || isAuthorCssHiddenElement(span)) {
             continue;
         }
         const owner = searchOwnerBlock(span);
@@ -2244,29 +2371,37 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
     });
     const slotCache = createTableSlotCache();
     const ordinals = new Map<HTMLElement, Map<string, number>>();
+    const embeddedOrdinals = new Map<HTMLElement, number>();
     let mathIndex = 0;
 
     for (const span of spans) {
-        if (span.closest(".protyle-attr, .fn__none")) {
+        const owner = searchOwnerBlock(span);
+        let embeddedOrdinal: number | undefined;
+        if (owner && span.closest('[data-type="NodeBlockQueryEmbed"]')) {
+            // Include pending/hidden spans in copied formula identity. Completing
+            // an earlier formula must not give it the same ID as a live sibling.
+            embeddedOrdinal = embeddedOrdinals.get(owner) ?? 0;
+            embeddedOrdinals.set(owner, embeddedOrdinal + 1);
+        }
+        if (span.closest(".protyle-attr, .fn__none") || isAuthorCssHiddenElement(span)) {
             continue;
         }
 
-        const textNodes = collectKatexGlyphTextNodes(span);
+        const textNodes = omitAuthorCssHiddenText(collectKatexGlyphTextNodes(span));
         const text = textNodes.map((node) => node.nodeValue ?? "").join("");
         // 仅零宽占位则跳过（思源在公式旁插入 ZWSP）
         if (!text.replace(ZERO_WIDTH_RE, "").length) {
             continue;
         }
 
-        const owner = searchOwnerBlock(span);
         const blockId = owner?.dataset.nodeId?.trim() ||
             `${PREVIEW_BLOCK_ID}-math-${mathIndex}`;
         const blockType = owner?.dataset.type?.trim() || INLINE_MATH_BLOCK_TYPE;
         const blockIndex = owner?.dataset.nodeId ?
             (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? mathIndex) :
             mathIndex;
-        let mathOrdinal: number | undefined;
-        if (owner) {
+        let mathOrdinal = embeddedOrdinal;
+        if (owner && embeddedOrdinal === undefined) {
             let seen = ordinals.get(owner);
             if (!seen) {
                 seen = new Map<string, number>();

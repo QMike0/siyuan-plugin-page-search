@@ -5,7 +5,9 @@ const LIST_SNIPPET_MATCH_CAP = 48;
 
 export interface ListSnippet {
     listText: string;
-    listMark?: {start: number; end: number};
+    listMark?: {start: number; end: number;};
+    /** 1: 前文省略；2: 后文省略；4: 命中本身截短。复用摘要作导航锚点，不另存整块文本。 */
+    listContextClipped?: number;
 }
 
 /**
@@ -19,6 +21,7 @@ export function buildListSnippet(content: string, start: number, end: number, fa
             return {
                 listText: made.text,
                 listMark: {start: made.markStart, end: made.markEnd},
+                listContextClipped: made.clipped,
             };
         }
         return {listText: made.text};
@@ -27,9 +30,9 @@ export function buildListSnippet(content: string, start: number, end: number, fa
     if (!plain) {
         return {listText: ""};
     }
-    const visible = plain.length > LIST_SNIPPET_MATCH_CAP
-        ? `${plain.slice(0, LIST_SNIPPET_MATCH_CAP)}…`
-        : plain;
+    const visible = plain.length > LIST_SNIPPET_MATCH_CAP ?
+        `${plain.slice(0, LIST_SNIPPET_MATCH_CAP)}…` :
+        plain;
     return {
         listText: visible,
         listMark: {start: 0, end: Math.min(LIST_SNIPPET_MATCH_CAP, plain.length)},
@@ -40,7 +43,7 @@ function isListSpace(char: string): boolean {
     return char === " " || char === "\n" || char === "\r" || char === "\t" || char === "\f" || char === "\v";
 }
 
-function collapseWs(raw: string): {text: string; map: number[]} {
+function collapseWs(raw: string): {text: string; map: number[];} {
     const map = new Array<number>(raw.length + 1);
     let text = "";
     let lastWasSpace = false;
@@ -61,7 +64,11 @@ function collapseWs(raw: string): {text: string; map: number[]} {
     return {text, map};
 }
 
-function sliceListSnippet(content: string, start: number, end: number): {text: string; markStart: number; markEnd: number} {
+function sliceListSnippet(
+    content: string,
+    start: number,
+    end: number,
+): {text: string; markStart: number; markEnd: number; clipped: number;} {
     const length = content.length;
     const safeStart = Math.max(0, Math.min(Number.isFinite(start) ? start : 0, length));
     const safeEnd = Math.max(safeStart, Math.min(Number.isFinite(end) ? end : safeStart, length));
@@ -93,5 +100,11 @@ function sliceListSnippet(content: string, start: number, end: number): {text: s
     if (text.length > 0 && (sliceEnd < length || shownEnd < safeEnd)) {
         text = `${text}…`;
     }
-    return {text, markStart, markEnd};
+    return {
+        text,
+        markStart,
+        markEnd,
+        clipped: (sliceStart > 0 ? 1 : 0) | ((sliceEnd < length || shownEnd < safeEnd) ? 2 : 0) |
+            (shownEnd < safeEnd ? 4 : 0),
+    };
 }

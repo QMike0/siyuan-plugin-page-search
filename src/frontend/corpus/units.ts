@@ -13,6 +13,7 @@ import {
 } from "../blocks";
 import type {
     SearchableBlock,
+    EmbeddedOrderSegment,
     SearchMatch,
     TableReplaceLock,
     TableSlot,
@@ -29,6 +30,9 @@ export interface CachedUnit {
     blockIndex: number;
     text: string;
     unitId?: string;
+    embeddedOrder?: readonly EmbeddedOrderSegment[];
+    /** Mounted recovery cache: embeddedOrder is relative to this renderer's current anchor. */
+    embeddedRecoveryKey?: string;
     segmentLengths?: number[];
     highlightKind: NonNullable<SearchMatch["highlightKind"]>;
     /** 行内类型宿主在单元文本中的覆盖区间。限制查找不再依赖已卸载的节点。 */
@@ -169,6 +173,7 @@ export function freezeBlock(
         blockIndex,
         text: block.text,
         unitId: block.unitId,
+        embeddedOrder: block.embeddedOrder,
         segmentLengths: lengths?.some((length) => length > 0) ? lengths : undefined,
         highlightKind,
         restrictSpans: includeRestrict ? collectRestrictSpans(block) : [],
@@ -189,9 +194,38 @@ export function restrictSpanCovers(
     if (!types?.length) {
         return true;
     }
-    return types.some((type) =>
-        spans.some((span) => {
-            return span.type === type && span.start <= start && end <= span.end;
-        })
-    );
+    let index = restrictIndexes.get(spans);
+    if (!index) {
+        index = new Map();
+        for (const span of spans) {
+            const list = index.get(span.type) ?? [];
+            list.push({start: span.start, end: span.end});
+            index.set(span.type, list);
+        }
+        for (const list of index.values()) {
+            list.sort((a, b) => a.start - b.start);
+            // 保留累计最大终点，只判断是否有单个宿主覆盖，不把相邻格式拼成一个宿主。
+            let maxEnd = -1;
+            for (const span of list) {
+                maxEnd = Math.max(maxEnd, span.end);
+                span.end = maxEnd;
+            }
+        }
+        restrictIndexes.set(spans, index);
+    }
+    return types.some((type) => {
+        const list = index.get(type);
+        if (!list?.length) return false;
+        let low = 0;
+        let high = list.length;
+        while (low < high) {
+            const mid = (low + high) >>> 1;
+            if (list[mid].start <= start) low = mid + 1;
+            else high = mid;
+        }
+        return low > 0 && list[low - 1].end >= end;
+    });
 }
+
+/** CachedUnit 的跨度是冻结快照；WeakMap 不额外保留已淘汰的文档。 */
+const restrictIndexes = new WeakMap<CachedUnit["restrictSpans"], Map<string, Array<{start: number; end: number;}>>>();

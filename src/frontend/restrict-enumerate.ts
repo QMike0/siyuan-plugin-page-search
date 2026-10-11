@@ -13,7 +13,6 @@ import {
     shouldCollectInlineMemoUnits,
     type RestrictInlineType,
 } from "../shared";
-import {buildListSnippet} from "./list-snippet";
 import {
     collectSearchableBlocks,
     isInsideMindmapBlock,
@@ -25,7 +24,11 @@ import {
     shouldSkipElementByListInclude,
     type CollectSearchableBlocksOptions,
 } from "./blocks";
-import type {SearchableBlock, SearchMatch} from "./dom-types";
+import type {
+    SearchableBlock,
+    SearchMatch,
+} from "./dom-types";
+import {buildListSnippet} from "./list-snippet";
 import {
     cloneSelectionScope,
     getSelectionScope,
@@ -53,6 +56,7 @@ export interface RestrictEnumerateOptions extends CollectSearchableBlocksOptions
     selectionOnly?: boolean;
     selectionScope?: SelectionScope;
     includeFoldedBlocks?: boolean;
+    onLiveUnitsCollected?: (blocks: SearchableBlock[]) => void;
 }
 
 interface EnumerateHostCandidate {
@@ -142,6 +146,7 @@ export function enumerateRestrictInlineMatches(
         includeInlineMemo,
         restrictInlineTypes: [],
     });
+    options.onLiveUnitsCollected?.(scopeBlocks);
     const selectionScope = resolveEnumerateSelectionScope(edit, scopeBlocks, options);
     if (selectionOnly && selectionScope.size === 0) {
         return [];
@@ -178,31 +183,33 @@ export function enumerateRestrictInlineMatches(
                 if (span.closest(HOST_EXCLUDED_CLOSEST)) {
                     continue;
                 }
-                if (shouldSkipHostByIncludeGates(span, {
-                    includeAttributeView,
-                    includeTable,
-                    includeBlockquote,
-                    includeCallout,
-                    includeSuperBlock,
-                    includeTabs,
-                    includeMindmap,
-                    includeListUnordered,
-                    includeListOrdered,
-                    includeListTask,
-                    includeParagraph,
-                    includeHeadingH1,
-                    includeHeadingH2,
-                    includeHeadingH3,
-                    includeHeadingH4,
-                    includeHeadingH5,
-                    includeHeadingH6,
-                    includeMathBlock,
-                    includeEmbedBlock,
-                    includeCodeBlock,
-                    includeMermaid,
-                    includeFlowchart,
-                    includeHtmlBlock,
-                })) {
+                if (
+                    shouldSkipHostByIncludeGates(span, {
+                        includeAttributeView,
+                        includeTable,
+                        includeBlockquote,
+                        includeCallout,
+                        includeSuperBlock,
+                        includeTabs,
+                        includeMindmap,
+                        includeListUnordered,
+                        includeListOrdered,
+                        includeListTask,
+                        includeParagraph,
+                        includeHeadingH1,
+                        includeHeadingH2,
+                        includeHeadingH3,
+                        includeHeadingH4,
+                        includeHeadingH5,
+                        includeHeadingH6,
+                        includeMathBlock,
+                        includeEmbedBlock,
+                        includeCodeBlock,
+                        includeMermaid,
+                        includeFlowchart,
+                        includeHtmlBlock,
+                    })
+                ) {
                     continue;
                 }
                 if (!isElementVisible(span, {allowFoldedHidden})) {
@@ -215,11 +222,11 @@ export function enumerateRestrictInlineMatches(
 
                 const owner = searchOwnerBlock(span);
                 // 取包含宿主的最深 SearchableBlock（表格单元格 / Callout unit 等带 unitId）
-                const ownerBlock = findDeepestOwningBlock(scopeBlocks, span)
-                    ?? (titleBlock && titleBlock.element.contains(span) ? titleBlock : undefined);
-                let offsets = ownerBlock
-                    ? getHostOffsetsInBlock(ownerBlock, span)
-                    : {start: 0, end: visible.length};
+                const ownerBlock = findDeepestOwningBlock(scopeBlocks, span) ??
+                    (titleBlock && titleBlock.element.contains(span) ? titleBlock : undefined);
+                let offsets = ownerBlock ?
+                    getHostOffsetsInBlock(ownerBlock, span) :
+                    {start: 0, end: visible.length};
                 if (!offsets) {
                     // 选区内依赖块内偏移；无法定位时跳过，避免错滤
                     if (selectionOnly) {
@@ -228,19 +235,19 @@ export function enumerateRestrictInlineMatches(
                     offsets = {start: 0, end: visible.length};
                 }
 
-                const blockId = ownerBlock?.blockId
-                    || owner?.dataset.nodeId?.trim()
-                    || `__restrict-host-${hostSerial}`;
-                const blockType = ownerBlock?.blockType
-                    || owner?.dataset.type?.trim()
-                    || "unknown";
-                const blockIndex = ownerBlock?.blockIndex
-                    ?? (owner?.dataset.nodeId
-                        ? (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? hostSerial)
-                        : hostSerial);
-                const scopeKey = ownerBlock
-                    ? unitKeyOf(ownerBlock)
-                    : unitKey(blockId);
+                const blockId = ownerBlock?.blockId ||
+                    owner?.dataset.nodeId?.trim() ||
+                    `__restrict-host-${hostSerial}`;
+                const blockType = ownerBlock?.blockType ||
+                    owner?.dataset.type?.trim() ||
+                    "unknown";
+                const blockIndex = ownerBlock?.blockIndex ??
+                    (owner?.dataset.nodeId ?
+                        (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? hostSerial) :
+                        hostSerial);
+                const scopeKey = ownerBlock ?
+                    unitKeyOf(ownerBlock) :
+                    unitKey(blockId);
 
                 seenHosts.add(span);
                 candidates.push({
@@ -360,9 +367,9 @@ export function enumerateRestrictInlineMatches(
             matchedText: candidate.text,
             replaceable: false,
             range,
-            highlightKind: candidate.matchSource === "inline-memo"
-                ? "inline-memo"
-                : (candidate.matchSource === "inline-math" ? "inline-math" : "text"),
+            highlightKind: candidate.matchSource === "inline-memo" ?
+                "inline-memo" :
+                (candidate.matchSource === "inline-math" ? "inline-math" : "text"),
             ...buildListSnippet(candidate.text, candidate.start, candidate.end, candidate.text),
         });
     }
@@ -386,9 +393,9 @@ function resolveEnumerateSelectionScope(
     if (live.size > 0) {
         return live;
     }
-    return options.selectionScope
-        ? cloneSelectionScope(options.selectionScope)
-        : new Map();
+    return options.selectionScope ?
+        cloneSelectionScope(options.selectionScope) :
+        new Map();
 }
 
 function collectEnumerateRoots(edit: Element): HTMLElement[] {
@@ -450,28 +457,28 @@ function shouldSkipHostByIncludeGates(
         return true;
     }
     if (
-        !options.includeTable
-        && (blockType === TABLE_TYPE
-            || owner.classList.contains("table")
-            || Boolean(host.closest(`[data-type="${TABLE_TYPE}"], .table`)))
+        !options.includeTable &&
+        (blockType === TABLE_TYPE ||
+            owner.classList.contains("table") ||
+            Boolean(host.closest(`[data-type="${TABLE_TYPE}"], .table`)))
     ) {
         return true;
     }
     if (
-        !options.includeBlockquote
-        && Boolean(host.closest(`[data-type="${BLOCKQUOTE_TYPE}"], .bq`))
+        !options.includeBlockquote &&
+        Boolean(host.closest(`[data-type="${BLOCKQUOTE_TYPE}"], .bq`))
     ) {
         return true;
     }
     if (
-        !options.includeCallout
-        && Boolean(host.closest(`[data-type="${CALLOUT_TYPE}"], .callout`))
+        !options.includeCallout &&
+        Boolean(host.closest(`[data-type="${CALLOUT_TYPE}"], .callout`))
     ) {
         return true;
     }
     if (
-        !options.includeSuperBlock
-        && Boolean(host.closest(`[data-type="${SUPER_BLOCK_TYPE}"], .sb`))
+        !options.includeSuperBlock &&
+        Boolean(host.closest(`[data-type="${SUPER_BLOCK_TYPE}"], .sb`))
     ) {
         return true;
     }
@@ -481,37 +488,41 @@ function shouldSkipHostByIncludeGates(
     if (!options.includeMindmap && isInsideMindmapBlock(host)) {
         return true;
     }
-    if (shouldSkipElementByListInclude(host, {
-        includeListUnordered: options.includeListUnordered,
-        includeListOrdered: options.includeListOrdered,
-        includeListTask: options.includeListTask,
-    })) {
+    if (
+        shouldSkipElementByListInclude(host, {
+            includeListUnordered: options.includeListUnordered,
+            includeListOrdered: options.includeListOrdered,
+            includeListTask: options.includeListTask,
+        })
+    ) {
         return true;
     }
     if (!options.includeParagraph && isInsideParagraphBlock(host)) {
         return true;
     }
     // 标题级别与容器门闩 AND：宿主在已关级别的 NodeHeading DOM 内则跳过
-    if (shouldSkipElementByHeadingInclude(host, {
-        includeHeadingH1: options.includeHeadingH1,
-        includeHeadingH2: options.includeHeadingH2,
-        includeHeadingH3: options.includeHeadingH3,
-        includeHeadingH4: options.includeHeadingH4,
-        includeHeadingH5: options.includeHeadingH5,
-        includeHeadingH6: options.includeHeadingH6,
-    })) {
+    if (
+        shouldSkipElementByHeadingInclude(host, {
+            includeHeadingH1: options.includeHeadingH1,
+            includeHeadingH2: options.includeHeadingH2,
+            includeHeadingH3: options.includeHeadingH3,
+            includeHeadingH4: options.includeHeadingH4,
+            includeHeadingH5: options.includeHeadingH5,
+            includeHeadingH6: options.includeHeadingH6,
+        })
+    ) {
         return true;
     }
     // 仅公式块；勿用 data-subtype="math"（行内公式亦有该属性）
     if (
-        !options.includeMathBlock
-        && Boolean(host.closest(`[data-type="${MATH_BLOCK_TYPE}"]`))
+        !options.includeMathBlock &&
+        Boolean(host.closest(`[data-type="${MATH_BLOCK_TYPE}"]`))
     ) {
         return true;
     }
     if (
-        !options.includeEmbedBlock
-        && Boolean(host.closest(`[data-type="${EMBED_BLOCK_TYPE}"]`))
+        !options.includeEmbedBlock &&
+        Boolean(host.closest(`[data-type="${EMBED_BLOCK_TYPE}"]`))
     ) {
         return true;
     }
@@ -520,8 +531,8 @@ function shouldSkipHostByIncludeGates(
         return true;
     }
     if (
-        !options.includeHtmlBlock
-        && Boolean(host.closest(`[data-type="${HTML_BLOCK_TYPE}"]`))
+        !options.includeHtmlBlock &&
+        Boolean(host.closest(`[data-type="${HTML_BLOCK_TYPE}"]`))
     ) {
         return true;
     }
@@ -537,12 +548,16 @@ function shouldSkipHostByIncludeGates(
             return true;
         }
     }
-    if (host.closest(`[data-type="${CODE_BLOCK_TYPE}"][data-subtype="${MERMAID_SUBTYPE}"]`)
-        && !options.includeMermaid) {
+    if (
+        host.closest(`[data-type="${CODE_BLOCK_TYPE}"][data-subtype="${MERMAID_SUBTYPE}"]`) &&
+        !options.includeMermaid
+    ) {
         return true;
     }
-    if (host.closest('[data-type="NodeCodeBlock"][data-subtype="flowchart"]')
-        && !options.includeFlowchart) {
+    if (
+        host.closest('[data-type="NodeCodeBlock"][data-subtype="flowchart"]') &&
+        !options.includeFlowchart
+    ) {
         return true;
     }
     return false;
@@ -578,7 +593,7 @@ function findDeepestOwningBlock(
 function getHostOffsetsInBlock(
     block: SearchableBlock,
     host: Element,
-): {start: number; end: number} | null {
+): {start: number; end: number;} | null {
     let cursor = 0;
     let start = -1;
     let end = -1;

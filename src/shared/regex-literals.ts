@@ -9,28 +9,35 @@ const MAX_REPEAT = 8;
 const MAX_LITERAL = 64;
 
 export type RegexPrefilterAtom =
-    | {kind: "lit"; text: string}
-    | {kind: "digit"}
-    | {kind: "word"};
+    | {kind: "lit"; text: string;}
+    | {kind: "digit";}
+    | {kind: "word";};
 
 type Node =
-    | {kind: "lit"; text: string}
-    | {kind: "digit"}
-    | {kind: "word"}
-    | {kind: "eps"}
-    | {kind: "wild"}
-    | {kind: "seq"; items: Node[]}
-    | {kind: "alt"; items: Node[]}
-    | {kind: "rep"; node: Node; min: number};
+    | {kind: "lit"; text: string;}
+    | {kind: "digit";}
+    | {kind: "word";}
+    | {kind: "eps";}
+    | {kind: "wild";}
+    | {kind: "seq"; items: Node[];}
+    | {kind: "alt"; items: Node[];}
+    | {kind: "rep"; node: Node; min: number; exact: boolean;};
 
 /** 空 alts 表示这一支提不出必现条件。 */
-type Requirement = {alts: RegexPrefilterAtom[][]};
+type Requirement = {alts: RegexPrefilterAtom[][];};
 
 function noConstraint(): Requirement {
     return {alts: []};
 }
 
 function usableLiteral(text: string): boolean {
+    // Non-u atoms/classes may refer to half a surrogate pair. SQL/Go strings
+    // cannot preserve that UTF-16 predicate, so retain only other safe atoms.
+    for (const char of text) {
+        if (char.length === 1 && /[\uD800-\uDFFF]/.test(char)) {
+            return false;
+        }
+    }
     if (text.length >= 2) {
         return true;
     }
@@ -39,7 +46,7 @@ function usableLiteral(text: string): boolean {
 
 const FINAL_SIGMA = "\u03C2";
 const CAPITAL_I_WITH_DOT = "\u0130";
-const LATIN_I_WITH_COMBINING_DOT = "i\u0307";
+const COMBINING_DOT = "\u0307";
 
 /**
  * 不区分大小写的字面量预筛使用思源 search_normalize，也就是 Go strings.ToLower
@@ -53,7 +60,7 @@ export function searchNormalizeFoldIsSuperset(needle: string): boolean {
     if (
         needle.includes(CAPITAL_I_WITH_DOT) ||
         folded.includes(FINAL_SIGMA) ||
-        folded.includes(LATIN_I_WITH_COMBINING_DOT)
+        folded.includes(COMBINING_DOT)
     ) {
         return false;
     }
@@ -119,6 +126,7 @@ function intersectRequirements(left: Requirement, right: Requirement): Requireme
     return {alts};
 }
 
+/** Only complete, fixed strings may be joined to their neighbours. */
 function pureLiteral(node: Node): string | null {
     if (node.kind === "lit") {
         return node.text;
@@ -132,18 +140,20 @@ function pureLiteral(node: Node): string | null {
             }
             text += part;
             if (text.length > MAX_LITERAL) {
-                return text.slice(0, MAX_LITERAL);
+                return null;
             }
         }
         return text;
     }
-    if (node.kind === "rep" && node.min >= 1) {
+    if (node.kind === "rep" && node.exact && node.min >= 1 && node.min <= MAX_REPEAT) {
         const inner = pureLiteral(node.node);
         if (inner === null || !inner) {
             return null;
         }
-        const times = Math.min(node.min, MAX_REPEAT);
-        return inner.repeat(times).slice(0, MAX_LITERAL);
+        if (inner.length * node.min > MAX_LITERAL) {
+            return null;
+        }
+        return inner.repeat(node.min);
     }
     return null;
 }
@@ -273,7 +283,7 @@ class PatternParser {
     private index = 0;
     private depth = 0;
 
-    constructor(private readonly source: string) {}
+    constructor(private readonly source: string, private readonly unicode: boolean) {}
 
     parse(): Node | null {
         const node = this.parseAlt();
@@ -285,6 +295,13 @@ class PatternParser {
 
     private peek(offset = 0): string {
         return this.source.charAt(this.index + offset);
+    }
+
+    private readLiteral(): string {
+        const code = this.source.codePointAt(this.index);
+        const text = this.unicode && code !== undefined ? String.fromCodePoint(code) : this.peek();
+        this.index += text.length;
+        return text;
     }
 
     private parseAlt(): Node | null {
@@ -348,8 +365,7 @@ class PatternParser {
             this.index += 1;
             return {kind: "eps"};
         }
-        this.index += 1;
-        return {kind: "lit", text: current};
+        return {kind: "lit", text: this.readLiteral()};
     }
 
     private parseGroup(): Node | null {
@@ -358,7 +374,6 @@ class PatternParser {
         if (this.depth > 40) {
             return null;
         }
-        let inner: Node | null;
         let ignore = false;
         if (this.peek() === "?") {
             this.index += 1;
@@ -380,7 +395,7 @@ class PatternParser {
                 return null;
             }
         }
-        inner = this.parseAlt();
+        const inner = this.parseAlt();
         this.depth -= 1;
         if (!inner || this.peek() !== ")") {
             return null;
@@ -400,6 +415,7 @@ class PatternParser {
         let sawDigit = false;
         let wordOnly = !negated;
         let sawWord = false;
+        let hasOtherAlternative = false;
         let first = true;
         const noteOther = () => {
             digitOnly = false;
@@ -420,6 +436,7 @@ class PatternParser {
                     digitOnly = false;
                 } else if (escaped === "wild") {
                     noteOther();
+                    hasOtherAlternative = true;
                 } else if (isDigitChar(escaped)) {
                     sawDigit = true;
                     chars.push(escaped);
@@ -429,8 +446,7 @@ class PatternParser {
                 }
                 continue;
             }
-            const start = this.peek();
-            this.index += 1;
+            const start = this.readLiteral();
             if (this.peek() === "-" && this.peek(1) && this.peek(1) !== "]") {
                 this.index += 1;
                 let end = "";
@@ -446,14 +462,14 @@ class PatternParser {
                         end = escaped;
                     }
                 } else if (this.peek() && this.peek() !== "]") {
-                    end = this.peek();
-                    this.index += 1;
+                    end = this.readLiteral();
                 }
                 if (!endClass && isDigitChar(start) && isDigitChar(end) && start <= end) {
                     sawDigit = true;
                     wordOnly = false;
                 } else {
                     noteOther();
+                    hasOtherAlternative = true;
                 }
                 continue;
             }
@@ -478,8 +494,8 @@ class PatternParser {
         if (wordOnly && sawWord && chars.length === 0) {
             return {kind: "word"};
         }
-        // 数字区间再混一个别的字符时，不能收成那一个字符，否则只有数字的块会被漏掉。
-        if (chars.length === 1 && !sawDigit && !sawWord) {
+        // 只有整个字符类可证明为单一字面量时才能预筛；范围和字符类转义也是备选项。
+        if (chars.length === 1 && !sawDigit && !sawWord && !hasOtherAlternative) {
             return {kind: "lit", text: chars[0]};
         }
         return {kind: "wild"};
@@ -503,6 +519,15 @@ class PatternParser {
         }
         if (current === "b") {
             return "\u0008";
+        }
+        if (current >= "1" && current <= "9") {
+            // In a non-u class these can be legacy octal escapes, not digits.
+            // Treat the entire numeric escape as unconstrained; consuming any
+            // following class digits only weakens the necessary conditions.
+            while (this.peek() >= "0" && this.peek() <= "9") {
+                this.index += 1;
+            }
+            return "wild";
         }
         return this.finishEscape(current);
     }
@@ -582,6 +607,9 @@ class PatternParser {
         }
         if (current === "u") {
             if (this.peek() === "{") {
+                if (!this.unicode) {
+                    return null;
+                }
                 this.index += 1;
                 const close = this.source.indexOf("}", this.index);
                 if (close < 0) {
@@ -598,11 +626,19 @@ class PatternParser {
                 }
                 return String.fromCodePoint(code);
             }
-            return this.readHex(4);
+            const text = this.readHex(4);
+            // Adjacent surrogate escapes become one u-mode atom. Do not infer
+            // requirements from separate code units when that grammar is ambiguous.
+            if (this.unicode && text && /[\uD800-\uDFFF]/.test(text)) {
+                return null;
+            }
+            return text;
         }
         if (current === "c") {
             const letter = this.peek();
-            if (!letter) {
+            // Only ASCII letters have the same control-escape meaning in and
+            // outside classes. Annex B forms such as \c0 are context dependent.
+            if (!/^[A-Za-z]$/.test(letter)) {
                 return null;
             }
             this.index += 1;
@@ -627,7 +663,7 @@ class PatternParser {
             if (this.peek() === "?") {
                 this.index += 1;
             }
-            return {kind: "rep", node: atom, min: current === "+" ? 1 : 0};
+            return {kind: "rep", node: atom, min: current === "+" ? 1 : 0, exact: false};
         }
         if (current !== "{") {
             return atom;
@@ -641,10 +677,10 @@ class PatternParser {
         if (brace === "bad") {
             return null;
         }
-        return {kind: "rep", node: atom, min: brace.min};
+        return {kind: "rep", node: atom, min: brace.min, exact: brace.exact};
     }
 
-    private tryBrace(): {min: number} | "bad" | null {
+    private tryBrace(): {min: number; exact: boolean;} | "bad" | null {
         const matched = /^\{(\d+)(,(\d+)?)?\}/.exec(this.source.slice(this.index));
         if (!matched) {
             return null;
@@ -660,7 +696,8 @@ class PatternParser {
         if (this.peek() === "?") {
             this.index += 1;
         }
-        return {min};
+        const exact = !matched[2] || (matched[3] !== undefined && parseInt(matched[3], 10) === min);
+        return {min, exact};
     }
 }
 
@@ -726,7 +763,7 @@ export function extractRegexLiteralGroups(
     } catch {
         return null;
     }
-    const node = new PatternParser(pattern).parse();
+    const node = new PatternParser(pattern, unicode).parse();
     if (!node) {
         return null;
     }
@@ -734,7 +771,10 @@ export function extractRegexLiteralGroups(
     if (!groups) {
         return null;
     }
-    if (!caseSensitive && groups.some((group) => group.some((atom) => atom.kind === "lit" && needsUnicodeCaseFold(atom.text)))) {
+    if (
+        !caseSensitive &&
+        groups.some((group) => group.some((atom) => atom.kind === "lit" && needsUnicodeCaseFold(atom.text)))
+    ) {
         return null;
     }
     if (unicode && !caseSensitive) {

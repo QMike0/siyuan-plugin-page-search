@@ -29,6 +29,11 @@ export function isDiagramCodeLanguage(language: string): boolean {
     return DIAGRAM_CODE_LANGUAGE_SET.has(language);
 }
 
+/** 冷态/折叠的这两种图表直接搜索源码，不调用离屏图表渲染器。 */
+export function supportsDiagramSourceSearch(language: string): boolean {
+    return language === "mermaid" || language === "flowchart";
+}
+
 export function isCodeBlockLanguageEnabled(language: string, options: CodeBlockLanguageFlags): boolean {
     if (language === "mermaid") {
         return options.includeMermaid !== false;

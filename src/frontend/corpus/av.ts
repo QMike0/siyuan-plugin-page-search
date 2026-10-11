@@ -20,11 +20,19 @@ class AttributeViewPageError extends Error {
     }
 }
 
+/** 保留成功载体的缓存，只把失败载体与截断状态传给搜索覆盖检查。 */
+export class AttributeViewLoadError extends Error {
+    constructor(readonly failedBlockIds: string[], readonly truncatedBlockIds: string[]) {
+        super("attribute view loading is incomplete");
+        this.name = "AttributeViewLoadError";
+    }
+}
+
 export interface AvBlockRef {
     blockId: string;
     avId: string;
     updated: string;
-    /** 载体块 IAL 持久化的当前视图；空值才允许兼容性全视图回退。 */
+    /** 载体块 IAL 持久化的当前视图；空值使用默认首个可用视图。 */
     carrierViewId: string;
 }
 
@@ -40,57 +48,159 @@ interface AvUnitDraft {
 }
 
 const cache = new Map<string, SearchableUnit[]>();
+const cachedBytes = new Map<string, number>();
+const cacheKeysByCarrier = new Map<string, Set<string>>();
+const pinnedAvKeys = new Set<string>();
+const unpinnedAvKeys = new Map<string, true>();
+let retainedBytes = 0;
+
+function dropAvCache(key: string): void {
+    retainedBytes -= cachedBytes.get(key) ?? 0;
+    cachedBytes.delete(key);
+    cache.delete(key);
+    unpinnedAvKeys.delete(key);
+    const prefix = key.split(":").slice(0, 2).join(":") + ":";
+    const keys = cacheKeysByCarrier.get(prefix);
+    keys?.delete(key);
+    if (keys?.size === 0) cacheKeysByCarrier.delete(prefix);
+}
 const AV_CACHE_LIMIT = 32;
 const AV_CACHE_BYTE_LIMIT = 4 * 1024 * 1024;
+const activeKeysByRoot = new Map<string, Set<string>>();
+const activeOwnersByRoot = new Map<string, Map<object | string, Set<string>>>();
+let cacheRevision = 0;
+const activeLoads = new Set<{refs: AvBlockRef[]; invalidated: boolean;}>();
+interface CarrierFlight {
+    ref: AvBlockRef;
+    controller: AbortController;
+    consumers: Set<() => boolean>;
+    task: Promise<SearchableUnit[] | null>;
+}
+const carrierFlights = new Map<string, CarrierFlight>();
+
+function abortCarrierFlights(matches: (ref: AvBlockRef) => boolean): void {
+    for (const [key, flight] of carrierFlights) {
+        if (matches(flight.ref)) {
+            carrierFlights.delete(key);
+            flight.controller.abort();
+        }
+    }
+}
+
+/** 只在工作集变更时重算所有权；写入时不重复扫描整篇文档的锁定缓存。 */
+function syncAvCacheOwnership(): void {
+    pinnedAvKeys.clear();
+    for (const keys of activeKeysByRoot.values()) for (const key of keys) pinnedAvKeys.add(key);
+    unpinnedAvKeys.clear();
+    for (const key of cache.keys()) if (!pinnedAvKeys.has(key)) unpinnedAvKeys.set(key, true);
+    trimAvCache();
+}
+
+/** 活动搜索的完整工作集允许暂时超过预算，否则 33 个载体会在 32 项缓存中循环补全。 */
+export function pinAvCache(
+    rootId: string,
+    refs: AvBlockRef[],
+    viewIds: ReadonlyMap<string, string>,
+    owner: object | string = rootId,
+): void {
+    const owners = activeOwnersByRoot.get(rootId) ?? new Map<object | string, Set<string>>();
+    owners.set(owner, new Set(refs.map((ref) => cacheKey(ref, selectedViewId(ref, viewIds)))));
+    activeOwnersByRoot.set(rootId, owners);
+    const owned = new Set<string>();
+    for (const keys of owners.values()) for (const key of keys) owned.add(key);
+    activeKeysByRoot.set(rootId, owned);
+    syncAvCacheOwnership();
+}
+
+export function releaseAvCache(rootId: string): void {
+    activeKeysByRoot.delete(rootId);
+    activeOwnersByRoot.delete(rootId);
+    syncAvCacheOwnership();
+}
+
+export function releaseAvCacheOwner(rootId: string, owner: object): void {
+    const owners = activeOwnersByRoot.get(rootId);
+    if (!owners?.delete(owner)) return;
+    if (!owners.size) {
+        releaseAvCache(rootId);
+        return;
+    }
+    const keys = new Set<string>();
+    for (const owned of owners.values()) for (const key of owned) keys.add(key);
+    activeKeysByRoot.set(rootId, keys);
+    syncAvCacheOwnership();
+}
+
+export function invalidateAvCacheForIds(avIds: readonly string[]): void {
+    const ids = new Set(avIds);
+    abortCarrierFlights((ref) => ids.has(ref.avId));
+    for (const load of activeLoads) {
+        if (load.refs.some((ref) => ids.has(ref.avId))) load.invalidated = true;
+    }
+    for (const key of cache.keys()) {
+        if (ids.has(key.split(":")[1])) {
+            dropAvCache(key);
+        }
+    }
+}
+
+export function rootUsesAttributeViews(rootId: string, avIds: readonly string[]): boolean {
+    const ids = new Set(avIds);
+    for (const key of activeKeysByRoot.get(rootId) ?? []) {
+        if (ids.has(key.split(":")[1])) return true;
+    }
+    return false;
+}
+
+export function invalidateAvCacheForRoot(rootId: string): void {
+    const keys = activeKeysByRoot.get(rootId) ?? new Set<string>();
+    const blockIds = new Set(Array.from(keys, (key) => key.split(":")[0]));
+    invalidateAvCacheForBlocks(Array.from(blockIds));
+}
 
 export function invalidateAvCacheForBlocks(blockIds: readonly string[]): void {
     if (blockIds.length === 0) {
         return;
     }
-    const prefixes = blockIds.map((blockId) => `${blockId}:`);
-    const doomed: string[] = [];
-    for (const key of cache.keys()) {
-        if (prefixes.some((prefix) => key.startsWith(prefix))) {
-            doomed.push(key);
-        }
+    const ids = new Set(blockIds);
+    abortCarrierFlights((ref) => ids.has(ref.blockId));
+    for (const load of activeLoads) {
+        if (load.refs.some((ref) => ids.has(ref.blockId))) load.invalidated = true;
     }
-    for (const key of doomed) {
-        cache.delete(key);
+    for (const key of cache.keys()) {
+        if (ids.has(key.split(":")[0])) dropAvCache(key);
     }
 }
 
 export function invalidateAvCache(): void {
+    cacheRevision += 1;
+    abortCarrierFlights(() => true);
     cache.clear();
+    cachedBytes.clear();
+    cacheKeysByCarrier.clear();
+    pinnedAvKeys.clear();
+    unpinnedAvKeys.clear();
+    retainedBytes = 0;
+    activeKeysByRoot.clear();
+    activeOwnersByRoot.clear();
 }
 
 function avUnitsBytes(units: readonly SearchableUnit[]): number {
     let bytes = 64;
     for (const unit of units) {
-        bytes += 48 + unit.text.length * 2 + (unit.unitId?.length ?? 0) * 2;
+        bytes += 48 + unit.text.length * 2 + (unit.unitId?.length ?? 0) * 2 +
+            ((unit as SearchableUnit & {snippet?: string;}).snippet?.length ?? 0) * 2;
     }
     return bytes;
 }
 
 function trimAvCache(): void {
-    while (cache.size > AV_CACHE_LIMIT) {
-        const oldest = cache.keys().next().value as string | undefined;
-        if (!oldest) {
+    if (cache.size <= AV_CACHE_LIMIT && retainedBytes <= AV_CACHE_BYTE_LIMIT) return;
+    for (const key of unpinnedAvKeys.keys()) {
+        if (cache.size <= AV_CACHE_LIMIT && retainedBytes <= AV_CACHE_BYTE_LIMIT) {
             return;
         }
-        cache.delete(oldest);
-    }
-    let bytes = 0;
-    for (const units of cache.values()) {
-        bytes += avUnitsBytes(units);
-    }
-    while (cache.size > 1 && bytes > AV_CACHE_BYTE_LIMIT) {
-        const oldest = cache.keys().next().value as string | undefined;
-        if (!oldest) {
-            return;
-        }
-        const removed = cache.get(oldest);
-        cache.delete(oldest);
-        bytes -= removed ? avUnitsBytes(removed) : 0;
+        dropAvCache(key);
     }
 }
 
@@ -101,6 +211,7 @@ function touchAvCache(key: string): void {
     }
     cache.delete(key);
     cache.set(key, units);
+    if (unpinnedAvKeys.delete(key)) unpinnedAvKeys.set(key, true);
 }
 
 export function readAvId(...sources: string[]): string {
@@ -150,6 +261,12 @@ function textOf(value: unknown): string {
     }
     if (typeof record.content === "string" && record.content) {
         return record.content;
+    }
+    const text = asRecord(record.text);
+    if (typeof text?.content === "string") {
+        // 思源普通文本单元格直接渲染 text.content，不裁剪/压缩字段值。
+        // 多选、关联等复合值继续使用下面的历史分隔规则。
+        return text.content;
     }
     const parts: string[] = [];
     for (
@@ -279,107 +396,51 @@ function absorbRows(
     }
 }
 
-function groupSnapshots(view: Record<string, unknown>): Array<{id: string; rows: number; total: number;}> {
+function groupSnapshots(view: Record<string, unknown>): Array<{id: string; view: Record<string, unknown>;}> {
     if (!Array.isArray(view.groups)) {
         return [];
     }
-    const snapshots: Array<{id: string; rows: number; total: number;}> = [];
+    const snapshots: Array<{id: string; view: Record<string, unknown>;}> = [];
     for (const group of view.groups) {
         const record = asRecord(group);
         if (!record) {
             continue;
         }
         const id = String(record.id ?? record.groupID ?? "");
-        snapshots.push({
-            id,
-            rows: rowList(record).length,
-            total: Number(record.rowCount ?? record.cardCount ?? 0) || 0,
-        });
+        snapshots.push({id, view: record});
     }
     return snapshots;
 }
 
-function pageDone(shown: number, total: number, accumulated: number): boolean {
-    // 这一页或累计行数已经盖住声明的总数时结束。
-    // 短页只有在内核没给总数时才表示末页，避免总数还没到就当成读完。
-    if (total > 0 && (accumulated >= total || shown >= total)) {
-        return true;
-    }
-    if (total > 0) {
-        return false;
-    }
-    return shown < PAGE_SIZE;
+interface PageProgress {
+    page: number;
+    seen: Set<string>;
+    total?: number;
+    done: boolean;
 }
 
-function subtreeRowIds(view: Record<string, unknown>): string[] {
-    const ids: string[] = [];
-    for (const row of rowList(view)) {
+function observePage(view: Record<string, unknown>, progress: PageProgress): void {
+    const value = view.rowCount ?? view.cardCount;
+    const total = value === undefined ? undefined : Number(value);
+    if (total !== undefined && (!Number.isSafeInteger(total) || total < 0)) throw new AttributeViewPageError();
+    if (progress.total !== undefined && total !== progress.total) throw new AttributeViewPageError();
+    progress.total = total;
+    const rows = rowList(view);
+    for (const row of rows) {
         const id = String(asRecord(row)?.id ?? "");
-        if (id) {
-            ids.push(id);
-        }
+        // 一页内和同一组跨页都不应重复。跨组的合法重复由各组独立 seen 接受。
+        if (!id || progress.seen.has(id)) throw new AttributeViewPageError();
+        progress.seen.add(id);
     }
-    if (!Array.isArray(view.groups)) {
-        return ids;
-    }
-    for (const group of view.groups) {
-        const record = asRecord(group);
-        if (record) {
-            ids.push(...subtreeRowIds(record));
-        }
-    }
-    return ids;
+    if (total !== undefined && progress.seen.size > total) throw new AttributeViewPageError();
+    progress.done = total === undefined ? rows.length < PAGE_SIZE : progress.seen.size === total;
+    if (!progress.done && rows.length < PAGE_SIZE) throw new AttributeViewPageError();
 }
 
-function groupSubtreeIds(view: Record<string, unknown>, groupIds: ReadonlySet<string>): string[] {
-    const ids: string[] = [];
-    if (!Array.isArray(view.groups)) {
-        return ids;
-    }
-    for (const group of view.groups) {
-        const record = asRecord(group);
-        if (!record) {
-            continue;
-        }
-        const id = String(record.id ?? record.groupID ?? "");
-        if (!groupIds.has(id)) {
-            continue;
-        }
-        ids.push(...subtreeRowIds(record));
-    }
-    return ids;
-}
-
-/** 同一页里重复的行号只计一次。跨页又出现，说明翻页窗口变了。 */
-function observeRowIds(ids: readonly string[], seen: Set<string>): {fresh: number; duplicate: number;} {
-    const local = new Set<string>();
-    let fresh = 0;
-    let duplicate = 0;
-    for (const id of ids) {
-        if (!id || local.has(id)) {
-            continue;
-        }
-        local.add(id);
-        if (seen.has(id)) {
-            duplicate += 1;
-            continue;
-        }
-        seen.add(id);
-        fresh += 1;
-    }
-    return {fresh, duplicate};
-}
-
-function assertFreshPage(stats: {fresh: number; duplicate: number;}): void {
-    if (stats.fresh === 0 || stats.duplicate > 0) {
-        throw new AttributeViewPageError();
-    }
-}
-
-function assertSameTotal(previous: number, next: number): void {
-    if (previous > 0 && next > 0 && previous !== next) {
-        throw new AttributeViewPageError();
-    }
+function firstProgress(view: Record<string, unknown>): PageProgress {
+    const progress: PageProgress = {page: 1, seen: new Set(), done: false};
+    observePage(view, progress);
+    return progress;
 }
 
 async function renderView(
@@ -412,54 +473,31 @@ async function renderView(
     }
     const firstView = asRecord(first?.view);
     if (!firstView) {
-        return true;
+        throw new AttributeViewPageError();
     }
-    const seenRows = new Set<string>();
-    observeRowIds(subtreeRowIds(firstView), seenRows);
     absorbRows(target, firstView, viewName, true);
     const groups = groupSnapshots(firstView);
     if (groups.length > 0) {
-        const pages = new Map<string, number>();
-        const seenInGroup = new Map<string, number>();
+        const progressByGroup = new Map<string, PageProgress>();
         for (const group of groups) {
-            if (group.id) {
-                pages.set(group.id, 1);
-                seenInGroup.set(group.id, group.rows);
-            }
+            if (!group.id || progressByGroup.has(group.id)) throw new AttributeViewPageError();
+            progressByGroup.set(group.id, firstProgress(group.view));
         }
         for (let round = 0; round < MAX_PAGES; round += 1) {
             const groupPaging: Record<string, {page: number; pageSize: number;}> = {};
             const requested = new Set<string>();
-            let pending = false;
-            for (const group of groups) {
-                if (!group.id) {
-                    continue;
-                }
-                const seen = seenInGroup.get(group.id) ?? group.rows;
-                if (!pageDone(group.rows, group.total, seen) && group.rows > 0) {
-                    const page = pages.get(group.id) ?? 1;
-                    pages.set(group.id, page + 1);
-                    groupPaging[group.id] = {page: page + 1, pageSize: PAGE_SIZE};
-                    requested.add(group.id);
-                    pending = true;
+            for (const [id, progress] of progressByGroup) {
+                if (!progress.done) {
+                    if (progress.page >= MAX_PAGES) throw new AttributeViewTruncatedError();
+                    progress.page += 1;
+                    groupPaging[id] = {page: progress.page, pageSize: PAGE_SIZE};
+                    requested.add(id);
                 }
             }
-            if (!pending) {
-                for (const group of groups) {
-                    if (!group.id) {
-                        continue;
-                    }
-                    const seen = seenInGroup.get(group.id) ?? group.rows;
-                    if (!pageDone(group.rows, group.total, seen)) {
-                        throw new AttributeViewPageError();
-                    }
-                }
-                return true;
-            }
+            if (!requested.size) return true;
             if (!shouldContinue()) {
                 return false;
             }
-            const previousTotals = new Map(groups.map((group) => [group.id, group.total]));
             const data = await postJson<Record<string, unknown>>("/api/av/renderAttributeView", {
                 id: avId,
                 blockID: blockId,
@@ -480,43 +518,38 @@ async function renderView(
             if (!view) {
                 throw new AttributeViewPageError();
             }
-            const scoped = groupSubtreeIds(view, requested);
-            const stats = observeRowIds(scoped.length > 0 ? scoped : subtreeRowIds(view), seenRows);
-            if (scoped.length > 0) {
-                assertFreshPage(stats);
-            } else if (stats.fresh === 0) {
-                throw new AttributeViewPageError();
-            }
             const next = groupSnapshots(view);
+            const returned = new Set<string>();
             for (const group of next) {
-                assertSameTotal(previousTotals.get(group.id) ?? 0, group.total);
-                if (group.id && requested.has(group.id)) {
-                    seenInGroup.set(group.id, (seenInGroup.get(group.id) ?? 0) + group.rows);
+                const progress = progressByGroup.get(group.id);
+                if (!progress || returned.has(group.id)) throw new AttributeViewPageError();
+                returned.add(group.id);
+                const value = group.view.rowCount ?? group.view.cardCount;
+                if (progress.total !== undefined && Number(value) !== progress.total) {
+                    throw new AttributeViewPageError();
                 }
+                if (requested.has(group.id)) observePage(group.view, progress);
             }
+            if (returned.size !== progressByGroup.size) throw new AttributeViewPageError();
             absorbRows(target, view, viewName, true);
-            groups.splice(0, groups.length, ...next.filter((group) => pages.has(group.id)));
-            if (!groups.length) {
-                throw new AttributeViewPageError();
-            }
         }
         throw new AttributeViewTruncatedError();
     }
 
-    let page = 1;
-    let rows = rowList(firstView).length;
-    let total = Number(firstView.rowCount ?? firstView.cardCount ?? 0) || 0;
+    const progress = firstProgress(firstView);
     const pageCount = Number(firstView.pageCount ?? 0) || 0;
-    while (!pageDone(rows, total, seenRows.size) && (pageCount === 0 || page < pageCount) && page < MAX_PAGES) {
+    while (!progress.done) {
+        if (progress.page >= MAX_PAGES) throw new AttributeViewTruncatedError();
+        if (pageCount > 0 && progress.page >= pageCount) throw new AttributeViewPageError();
         if (!shouldContinue()) {
             return false;
         }
-        page += 1;
+        progress.page += 1;
         const data = await postJson<Record<string, unknown>>("/api/av/renderAttributeView", {
             id: avId,
             blockID: blockId,
             viewID: viewId,
-            page,
+            page: progress.page,
             pageSize: PAGE_SIZE,
             query: "",
             groupPaging: {},
@@ -532,20 +565,8 @@ async function renderView(
         if (!view) {
             throw new AttributeViewPageError();
         }
-        const nextTotal = Number(view.rowCount ?? view.cardCount ?? 0) || 0;
-        assertSameTotal(total, nextTotal);
-        if (nextTotal > 0) {
-            total = nextTotal;
-        }
-        assertFreshPage(observeRowIds(subtreeRowIds(view), seenRows));
+        observePage(view, progress);
         absorbRows(target, view, viewName, true);
-        rows = rowList(view).length;
-    }
-    if (!pageDone(rows, total, seenRows.size)) {
-        if (page >= MAX_PAGES) {
-            throw new AttributeViewTruncatedError();
-        }
-        throw new AttributeViewPageError();
     }
     return true;
 }
@@ -623,12 +644,21 @@ function selectedViewId(ref: AvBlockRef, viewIds: ReadonlyMap<string, string>): 
 function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUnit[]): void {
     // updated 变了也要清掉同一数据库的旧视图，避免长会话留下过期单元格文字。
     const prefix = `${ref.blockId}:${ref.avId}:`;
-    for (const key of Array.from(cache.keys())) {
-        if (key.startsWith(prefix)) {
-            cache.delete(key);
+    for (const key of cacheKeysByCarrier.get(prefix) ?? []) {
+        if (!key.startsWith(`${prefix}${ref.updated}:`)) {
+            dropAvCache(key);
         }
     }
-    cache.set(cacheKey(ref, viewId), units);
+    const key = cacheKey(ref, viewId);
+    dropAvCache(key);
+    cache.set(key, units);
+    const keys = cacheKeysByCarrier.get(prefix) ?? new Set<string>();
+    keys.add(key);
+    cacheKeysByCarrier.set(prefix, keys);
+    if (!pinnedAvKeys.has(key)) unpinnedAvKeys.set(key, true);
+    const bytes = avUnitsBytes(units);
+    cachedBytes.set(key, bytes);
+    retainedBytes += bytes;
     trimAvCache();
 }
 
@@ -642,7 +672,7 @@ export function peekAvUnits(
         const cached = cache.get(cacheKey(ref, selectedViewId(ref, viewIds)));
         if (cached) {
             touchAvCache(cacheKey(ref, selectedViewId(ref, viewIds)));
-            units.push(...cached);
+            for (const unit of cached) units.push(unit);
         } else {
             missing.push(ref);
         }
@@ -656,65 +686,135 @@ export async function loadAvUnits(
     viewIds: ReadonlyMap<string, string> = new Map(),
     signal?: AbortSignal,
 ): Promise<Array<SearchableUnit & {snippet?: string;}>> {
+    const revision = cacheRevision;
+    const load = {refs, invalidated: false};
+    activeLoads.add(load);
+    const canContinue = () =>
+        shouldContinue() && signal?.aborted !== true && revision === cacheRevision && !load.invalidated;
     const units: Array<SearchableUnit & {snippet?: string;}> = [];
-    for (const ref of refs) {
-        if (!shouldContinue()) {
-            return units;
-        }
-        const viewId = selectedViewId(ref, viewIds);
-        const key = cacheKey(ref, viewId);
-        const cached = cache.get(key);
-        if (cached) {
-            touchAvCache(key);
-            units.push(...cached);
-            continue;
-        }
-        const cells = new Map<string, AvCell>();
-        const raw = await postJson<unknown>("/api/av/getAttributeView", {id: ref.avId}, signal);
-        if (!shouldContinue()) {
-            return units;
-        }
-        if (raw === null) {
-            throw new Error("getAttributeView failed");
-        }
-        const info = absorbRaw(new Map(), raw);
-        const drafts: AvUnitDraft[] = [];
-        if (info.name) {
-            drafts.push({unitId: "av-title", text: info.name, snippet: info.name});
-        }
-        const views = viewId ?
-            info.views.filter((view) => view.id === viewId) :
-            info.views.slice(0, 1);
-        // 载体写入过期 viewID 时，内核会退回该数据库的首个可用视图。这里采用相同
-        // 的单视图回退，不能退化成全库并把隐藏列/筛选外行重新纳入搜索。
-        if (viewId && views.length === 0) {
-            const fallback = info.views[0];
-            if (fallback) {
-                views.push(fallback);
+    const failedBlockIds: string[] = [];
+    const truncatedBlockIds: string[] = [];
+    try {
+        for (const ref of refs) {
+            try {
+                if (!canContinue()) {
+                    return units;
+                }
+                const viewId = selectedViewId(ref, viewIds);
+                const key = cacheKey(ref, viewId);
+                const cached = cache.get(key);
+                if (cached) {
+                    touchAvCache(key);
+                    for (const unit of cached) units.push(unit);
+                    continue;
+                }
+                const built = await consumeAvCarrier(ref, viewId, canContinue, signal);
+                if (!canContinue()) {
+                    return units;
+                }
+                if (!built) return units;
+                for (const unit of built) units.push(unit);
+            } catch (error) {
+                if (!canContinue()) return units;
+                // 一个失败数据库不能阻止其后的独立载体完成；成功缓存仍可供重试复用。
+                failedBlockIds.push(ref.blockId);
+                if (error instanceof AttributeViewTruncatedError) truncatedBlockIds.push(ref.blockId);
             }
         }
-        for (const view of views) {
-            if (view.name) {
-                drafts.push({unitId: `av-view:${view.id}`, text: view.name, snippet: view.name});
-            }
-            if (!await renderView(ref.avId, ref.blockId, view.id, view.name, cells, shouldContinue, signal)) {
-                // 取消时分页还没结束。不写入这一库，避免把半截单元格当成完整缓存。
-                return units;
-            }
-        }
-        if (views.length === 0) {
-            if (!await renderView(ref.avId, ref.blockId, "", info.name, cells, shouldContinue, signal)) {
-                return units;
-            }
-        }
-        for (const [key, cell] of cells) {
-            drafts.push({unitId: `av:${key}`, text: cell.text, snippet: cell.snippet});
-        }
-        const built = toUnits(ref.blockId, drafts);
-        replaceCachedUnits(ref, viewId, built);
-        units.push(...built);
+        if (failedBlockIds.length) throw new AttributeViewLoadError(failedBlockIds, truncatedBlockIds);
+        return units;
+    } finally {
+        activeLoads.delete(load);
     }
-    return units;
+}
+
+/** 工作集可不同，但同载体、同版本、同视图的分页只执行一次。 */
+async function consumeAvCarrier(
+    ref: AvBlockRef,
+    viewId: string,
+    current: () => boolean,
+    signal?: AbortSignal,
+): Promise<SearchableUnit[] | null> {
+    const key = cacheKey(ref, viewId);
+    let flight = carrierFlights.get(key);
+    if (flight && !Array.from(flight.consumers).some((consumer) => consumer())) {
+        carrierFlights.delete(key);
+        flight.controller.abort();
+        flight = undefined;
+    }
+    if (!flight) {
+        const revision = cacheRevision;
+        flight = {ref: {...ref}, controller: new AbortController(), consumers: new Set(), task: Promise.resolve(null)};
+        const created = flight;
+        const canContinue = () =>
+            !created.controller.signal.aborted && revision === cacheRevision &&
+            carrierFlights.get(key) === created && Array.from(created.consumers).some((consumer) => consumer());
+        carrierFlights.set(key, created);
+        // 微任务启动，让首个消费者先登记，避免尚无人认领时误判为取消。
+        created.task = Promise.resolve().then(() =>
+            loadAvCarrier(created.ref, viewId, canContinue, created.controller.signal)
+        )
+            .finally(() => {
+                if (carrierFlights.get(key) === created) carrierFlights.delete(key);
+            });
+    }
+    const owned = flight;
+    // 每次调用拥有独立身份，即使调用方传入了同一个回调，也不能互相释放。
+    const consumer = () => current();
+    owned.consumers.add(consumer);
+    let cancel: (() => void) | undefined;
+    const release = () => {
+        owned.consumers.delete(consumer);
+        if (!Array.from(owned.consumers).some((item) => item())) {
+            if (carrierFlights.get(key) === owned) carrierFlights.delete(key);
+            owned.controller.abort();
+        }
+    };
+    const cancelled = new Promise<null>((resolve) => {
+        cancel = () => {
+            release();
+            resolve(null);
+        };
+        signal?.addEventListener("abort", cancel, {once: true});
+        if (signal?.aborted) cancel();
+    });
+    try {
+        return await Promise.race([owned.task, cancelled]);
+    } finally {
+        if (cancel) signal?.removeEventListener("abort", cancel);
+        release();
+    }
+}
+
+async function loadAvCarrier(
+    ref: AvBlockRef,
+    viewId: string,
+    canContinue: () => boolean,
+    signal: AbortSignal,
+): Promise<SearchableUnit[] | null> {
+    if (!canContinue()) return null;
+    const cells = new Map<string, AvCell>();
+    const raw = await postJson<unknown>("/api/av/getAttributeView", {id: ref.avId}, signal);
+    if (!canContinue()) return null;
+    if (raw === null) throw new Error("getAttributeView failed");
+    const info = absorbRaw(new Map(), raw);
+    const drafts: AvUnitDraft[] = [];
+    if (info.name) drafts.push({unitId: "av-title", text: info.name, snippet: info.name});
+    const views = viewId ? info.views.filter((view) => view.id === viewId) : info.views.slice(0, 1);
+    // 与内核一致：过期 viewID 回退首个视图，不能把全部视图重新纳入搜索。
+    if (viewId && !views.length && info.views[0]) views.push(info.views[0]);
+    for (const view of views) {
+        if (view.name) drafts.push({unitId: `av-view:${view.id}`, text: view.name, snippet: view.name});
+        if (!await renderView(ref.avId, ref.blockId, view.id, view.name, cells, canContinue, signal)) return null;
+    }
+    if (!views.length && !await renderView(ref.avId, ref.blockId, "", info.name, cells, canContinue, signal)) {
+        return null;
+    }
+    for (const [key, cell] of cells) drafts.push({unitId: `av:${key}`, text: cell.text, snippet: cell.snippet});
+    const built = toUnits(ref.blockId, drafts);
+    if (!canContinue()) return null;
+    replaceCachedUnits(ref, viewId, built);
+    return built;
 }
 
 export async function resolveMissingAvIds(
@@ -748,12 +848,15 @@ export async function resolveMissingAvIds(
             // 这一轮仍用已经解析出的引用；补全失败的结果不能写入缓存。
             return {refs, cacheable: false};
         }
+        let complete = true;
+        const rowsById = new Map(rows.map((row) => [row.id, row]));
         for (const id of missing) {
             const avId = readAvId(String(doms[id] ?? ""));
             if (!avId) {
+                complete = false;
                 continue;
             }
-            const row = rows.find((item) => item.id === id);
+            const row = rowsById.get(id);
             refs.push({
                 blockId: id,
                 avId,
@@ -765,8 +868,8 @@ export async function resolveMissingAvIds(
                 ),
             });
         }
+        return {refs, cacheable: complete};
     } catch {
         return {refs, cacheable: false};
     }
-    return {refs, cacheable: true};
 }

@@ -1,5 +1,6 @@
 import {
     generateSearchVariants,
+    effectiveSearchQuery,
     searchNormalizeFoldIsSuperset,
     ZERO_WIDTH_GLOBAL_RE,
 } from "../../shared";
@@ -31,8 +32,12 @@ function hasMarkerSql(column: string): string {
  * search_normalize 是思源 v3.8.6 原生搜索注册的 SQLite 函数；hanSensitive=1
  * 只折叠大小写，不在候选阶段额外扩大简繁语义。
  */
-function literalCandidatePredicate(column: string, needle: string, caseSensitive: boolean): string {
-    const variants = generateSearchVariants(needle, true);
+function literalCandidatePredicate(
+    column: string,
+    needle: string,
+    caseSensitive: boolean,
+): string {
+    const variants = generateSearchVariants(effectiveSearchQuery(needle), true);
     if (variants.length === 0) {
         return "0";
     }
@@ -119,12 +124,28 @@ export async function fetchContentCandidateIds(
 }
 
 export async function fetchMemoCandidateIds(rootId: string, signal?: AbortSignal): Promise<string[] | null> {
-    // 最终匹配使用去除 HTML 标签后的 data-inline-memo-content 可见文本。
-    // 原始 markdown 中的标签会把可见关键词拆开，因此这里只按 Memo 宿主筛选，
-    // 再交给统一文本提取和匹配，避免 SQL 阶段产生假阴性。
+    // 思源 buildBlockFromNode 用 ExportNodeStdMd 入库：备注变成 <sup>…</sup>，
+    // 不保留 data-inline-memo-content。spans.type 才保留 inline-memo 类型，
+    // 用同文档的行级索引找宿主，不能按备注关键词或 DOM 属性缩窄候选。
+    // IN 子查询只按有索引的 root_id 扫一次行级索引；分页和去重仍由 blocks.id 控制。
+    const root = escSql(rootId);
+    const leafScope = `AND type NOT IN (${CONTAINER_SQL}) `;
+    const ids = await queryScopedCandidates(
+        rootId,
+        "AND (type = 'query_embed' OR " +
+            `id IN (SELECT block_id FROM spans WHERE root_id = '${root}' ` +
+            "AND (type LIKE '% inline-memo' OR type LIKE '% inline-memo %')) OR " +
+            "instr(markdown, 'data-inline-memo-content') > 0) ",
+        signal,
+    );
+    if (ids !== null) return ids;
+    // 行级索引查询不可用时兼容标准导出和旧 DOM Markdown；sup 仅扩大候选，
+    // 最终仍从块 DOM 的真实备注属性提取，不把普通上标当成备注。
+    // 嵌入宿主的 Markdown 只有查询语句，备注来自查询结果，始终保留为候选。
     return queryScopedCandidates(
         rootId,
-        "AND instr(markdown, 'data-inline-memo-content') > 0 ",
+        leafScope + "AND (type = 'query_embed' OR instr(markdown, '<sup>') > 0 OR " +
+            "instr(markdown, 'data-inline-memo-content') > 0) ",
         signal,
     );
 }
@@ -178,11 +199,7 @@ export async function fetchLiteralGroupCandidateIds(
 ): Promise<string[] | null> {
     if (kind === "memo") {
         // 正则的必现字面量同样不能安全地在带 HTML 的 Memo 原文上预筛。
-        return queryScopedCandidates(
-            rootId,
-            "AND instr(markdown, 'data-inline-memo-content') > 0 ",
-            signal,
-        );
+        return fetchMemoCandidateIds(rootId, signal);
     }
     if (groups.length === 0) {
         return [];

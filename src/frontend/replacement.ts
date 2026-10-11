@@ -36,9 +36,6 @@ export interface ApplyReplacementOptions {
     /** 与查找相同的正则源（普通查询会 trim，纯空白查询保留原值） */
     searchQuery?: string;
     caseSensitive?: boolean;
-    regexUnicode?: boolean;
-    regexMultiline?: boolean;
-    regexDotAll?: boolean;
     /** Worker 已准备的正则展开结果；有值时绝不在主线程重新执行 RegExp。 */
     regexPlan?: RegexReplacementPlan;
 }
@@ -107,7 +104,9 @@ export function createReplacementUnitLookup(unitsByKey: Map<string, SearchableBl
 
 export function collectRegexReplacementRequests(
     unitsByKey: Map<string, SearchableBlock>,
-    matches: Array<Pick<SearchMatch, "id" | "blockId" | "unitId" | "start" | "end" | "matchedText"> & ReplacementUnitMatch>,
+    matches: Array<
+        Pick<SearchMatch, "id" | "blockId" | "unitId" | "start" | "end" | "matchedText"> & ReplacementUnitMatch
+    >,
 ): RegexReplacementUnitRequest[] {
     const lookup = createReplacementUnitLookup(unitsByKey);
     const grouped = new Map<string, {
@@ -202,9 +201,6 @@ function resolveReplacementText(
             end: spec.end,
             patternSource,
             caseSensitive: options.caseSensitive === true,
-            regexUnicode: options.regexUnicode === true,
-            regexMultiline: options.regexMultiline === true,
-            regexDotAll: options.regexDotAll === true,
             template: replacementText,
         });
     }
@@ -551,7 +547,9 @@ export function applyMatchesToSubmitClone(
     liveSubmit: HTMLElement,
     cloneSubmit: HTMLElement,
     unitsByKey: Map<string, SearchableBlock>,
-    matches: Array<Pick<SearchMatch, "id" | "start" | "end" | "matchedText" | "unitId" | "blockId"> & ReplacementUnitMatch>,
+    matches: Array<
+        Pick<SearchMatch, "id" | "start" | "end" | "matchedText" | "unitId" | "blockId"> & ReplacementUnitMatch
+    >,
     replacementText: string,
     options: ApplyReplacementOptions = {},
 ): ApplyReplacementOutcome {
@@ -619,7 +617,9 @@ export function applyMatchesToSubmitClone(
  */
 export function applyMatchesToLiveUnits(
     unitsByKey: Map<string, SearchableBlock>,
-    matches: Array<Pick<SearchMatch, "id" | "start" | "end" | "matchedText" | "unitId" | "blockId"> & ReplacementUnitMatch>,
+    matches: Array<
+        Pick<SearchMatch, "id" | "start" | "end" | "matchedText" | "unitId" | "blockId"> & ReplacementUnitMatch
+    >,
     replacementText: string,
     options: ApplyReplacementOptions = {},
 ): ApplyReplacementOutcome {

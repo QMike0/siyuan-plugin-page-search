@@ -7,6 +7,10 @@ export interface SearchableBlock {
     text: string;
     textNodes: Text[];
     unitId?: string;
+    /** Copied source instance within an embed; retained until ownership is rewritten. */
+    embeddedSourceId?: string;
+    /** 嵌入内的文字偏移到紧凑 DOM 顺序序号的快照，不保留节点。 */
+    embeddedOrder?: readonly EmbeddedOrderSegment[];
     /**
      * 匹配源：
      * - inline-memo：text 来自 data-inline-memo-content
@@ -25,6 +29,11 @@ export interface SearchableBlock {
     tableSlot?: TableSlot;
     /** 同一宿主块里同样内容的第几个行内公式。块的重复副本序号相同，去重只去掉副本。 */
     mathOrdinal?: number;
+}
+
+export interface EmbeddedOrderSegment {
+    start: number;
+    path: readonly number[];
 }
 
 export interface TableSlot {
@@ -49,6 +58,8 @@ export interface SearchMatch {
     unitId?: string;
     /** 同一块内的跳转顺序。表格先按格子再按格内位置，数据库先行后列。 */
     unitSeq?: number;
+    /** 嵌入宿主内部的结构位置；优先于不同子单元各自从零起算的偏移。 */
+    embeddedPosition?: readonly number[];
     start: number;
     end: number;
     matchedText: string;
@@ -74,5 +85,7 @@ export interface SearchMatch {
     /** 结果列表的单行摘要。与 snippet 分开，避免每次跳转都弹提示。 */
     listText?: string;
     /** listText 里需要标出的命中区间。 */
-    listMark?: {start: number; end: number};
+    listMark?: {start: number; end: number;};
+    /** 摘要裁剪标志，供唯一前后文锚定；不用于替换的安全验证。 */
+    listContextClipped?: number;
 }

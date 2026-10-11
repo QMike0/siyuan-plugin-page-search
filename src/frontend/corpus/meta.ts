@@ -3,11 +3,20 @@ import {
     codeBlockLanguagesNeeded as codeBlockLanguagesNeededFor,
     effectiveCodeBlockLanguage,
     isCodeBlockLanguageEnabled,
+    isDiagramCodeLanguage,
 } from "../../shared/code-block-language";
 import {
     escSql,
     querySqlAll,
 } from "./api";
+import {
+    forgetCacheBudget,
+    adjustCacheBudgetBytes,
+    rememberCacheBudget,
+    touchCacheBudget,
+    stringListBytes,
+} from "./cache-budget";
+import {CacheReadGuards} from "./cache-read-guard";
 
 /** 与搜索面板的块类型开关对齐，避免 corpus 反向依赖 pipeline。 */
 export interface BlockIncludeFlags extends BlockAncestorIncludeFlags {
@@ -49,6 +58,8 @@ export interface BlockMeta {
      * 复用到下一轮元数据；卸载后应重新从 blocks.markdown 读取。
      */
     codeLanguageFromLive?: boolean;
+    /** Current mounted diagram source, including edits not yet represented by SQL hash. */
+    codeContentFromLive?: string;
     ial: string;
     hash: string;
     updated: string;
@@ -77,19 +88,53 @@ export interface DocMeta {
 }
 
 const metaCache = new Map<string, {at: number; meta: DocMeta;}>();
+const metaReads = new CacheReadGuards();
 const META_TTL_MS = 1500;
 /** 长会话切换大量文档时，结构信息不能无限留下。当前文档刚写入，淘汰的是更早的文档。 */
 const META_CACHE_LIMIT = 16;
+const codeBudgetOwners = new WeakMap<BlockMeta, {key: string; bytes: number; rootId: string; meta: DocMeta;}>();
+
+function codeMetaBytes(item: BlockMeta): number {
+    return ((item.codeLanguage?.length ?? 0) + (item.codeContentFromLive?.length ?? 0)) * 2;
+}
+
+function syncCodeMetaBudget(item: BlockMeta): void {
+    const owner = codeBudgetOwners.get(item);
+    if (!owner || metaCache.get(owner.rootId)?.meta !== owner.meta) return;
+    const bytes = codeMetaBytes(item);
+    adjustCacheBudgetBytes(owner.key, bytes - owner.bytes);
+    owner.bytes = bytes;
+}
 
 function rememberMeta(rootId: string, entry: {at: number; meta: DocMeta;}): void {
+    const existing = metaCache.get(rootId) === entry;
     metaCache.delete(rootId);
     metaCache.set(rootId, entry);
+    const key = `meta:${rootId}`;
+    if (existing) touchCacheBudget(key);
+    else {
+        let bytes = stringListBytes(entry.meta.fallbackOrder);
+        for (const [id, link] of entry.meta.links) {
+            bytes += 192 +
+                (id.length + link.parentId.length + link.type.length + link.subtype.length + link.ial.length +
+                        link.hash.length) * 2;
+        }
+        bytes += entry.meta.byId.size * 160;
+        for (const item of entry.meta.byId.values()) {
+            if (item.type !== "c") continue;
+            const ownedBytes = codeMetaBytes(item);
+            codeBudgetOwners.set(item, {key, bytes: ownedBytes, rootId, meta: entry.meta});
+            bytes += ownedBytes;
+        }
+        rememberCacheBudget(key, bytes, () => metaCache.delete(rootId));
+    }
     while (metaCache.size > META_CACHE_LIMIT) {
         const oldest = metaCache.keys().next().value as string | undefined;
         if (!oldest) {
             break;
         }
         metaCache.delete(oldest);
+        forgetCacheBudget(`meta:${oldest}`);
     }
 }
 
@@ -99,10 +144,13 @@ export function peekDocMeta(rootId: string): DocMeta | null {
 }
 
 export function invalidateDocMeta(rootId?: string): void {
+    metaReads.invalidate(rootId);
     if (rootId) {
         metaCache.delete(rootId);
+        forgetCacheBudget(`meta:${rootId}`);
         return;
     }
+    for (const id of metaCache.keys()) forgetCacheBudget(`meta:${id}`);
     metaCache.clear();
 }
 
@@ -115,98 +163,103 @@ export async function loadDocMeta(rootId: string, signal?: AbortSignal): Promise
         rememberMeta(rootId, cached);
         return cached.meta;
     }
-    const root = escSql(rootId);
-    const rows = await querySqlAll<{
-        id: string;
-        parent_id?: string;
-        type?: string;
-        subtype?: string;
-        ial?: string;
-        hash?: string;
-        updated?: string;
-    }>((afterId, limit) => {
-        const after = afterId ? ` AND id > '${escSql(afterId)}'` : "";
-        return `SELECT id, parent_id, type, subtype, ial, hash, updated FROM blocks WHERE root_id = '${root}'${after} ` +
-            `ORDER BY id LIMIT ${limit}`;
-    }, signal);
-    if (!rows) {
-        return null;
-    }
+    const read = metaReads.begin(rootId);
+    try {
+        const root = escSql(rootId);
+        const rows = await querySqlAll<{
+            id: string;
+            parent_id?: string;
+            type?: string;
+            subtype?: string;
+            ial?: string;
+            hash?: string;
+            updated?: string;
+        }>((afterId, limit) => {
+            const after = afterId ? ` AND id > '${escSql(afterId)}'` : "";
+            return `SELECT id, parent_id, type, subtype, ial, hash, updated FROM blocks WHERE root_id = '${root}'${after} ` +
+                `ORDER BY id LIMIT ${limit}`;
+        }, signal);
+        if (!rows || signal?.aborted || !read.current()) {
+            return null;
+        }
 
-    const byId = new Map<string, BlockMeta>();
-    const parentById = new Map<string, {
-        parentId: string;
-        type: string;
-        subtype: string;
-        ial: string;
-        hash: string;
-    }>();
-    let maxUpdated = "";
-    let codeLanguagesComplete = true;
-    for (const row of rows) {
-        if (!row.id) {
-            continue;
-        }
-        const updated = String(row.updated ?? "");
-        if (updated > maxUpdated) {
-            maxUpdated = updated;
-        }
-        const type = String(row.type ?? "");
-        const meta: BlockMeta = {
-            id: row.id,
-            parentId: String(row.parent_id ?? ""),
-            type,
-            subtype: String(row.subtype ?? ""),
-            ial: String(row.ial ?? ""),
-            hash: String(row.hash ?? ""),
-            updated,
-        };
-        // 元数据 1.5 秒过期后仍可复用未改代码块的围栏语言，避免连续输入反复扫描整篇文档。
-        // hash 为空时不猜；围栏或内容变更后 hash 变化，下一次会重新读取 markdown。
-        const previous = cached?.meta.byId.get(meta.id);
-        if (
-            type === "c" &&
-            meta.hash &&
-            previous?.hash === meta.hash &&
-            previous.codeLanguage !== undefined &&
-            !previous.codeLanguageFromLive
-        ) {
-            meta.codeLanguage = previous.codeLanguage;
-        }
-        if (type === "c" && meta.codeLanguage === undefined) {
-            codeLanguagesComplete = false;
-        }
-        parentById.set(row.id, {
-            parentId: meta.parentId,
-            type: meta.type,
-            subtype: meta.subtype,
-            ial: meta.ial,
-            hash: meta.hash,
-        });
-        if (!isContainerType(type)) {
-            byId.set(row.id, meta);
-        }
-    }
-
-    const meta: DocMeta = {
-        byId,
-        links: parentById,
-        signature: `${rows.length}:${maxUpdated}`,
-        fallbackOrder: buildFallbackOrder(
-            rootId,
-            rows.map((row) => ({
+        const byId = new Map<string, BlockMeta>();
+        const parentById = new Map<string, {
+            parentId: string;
+            type: string;
+            subtype: string;
+            ial: string;
+            hash: string;
+        }>();
+        let maxUpdated = "";
+        let codeLanguagesComplete = true;
+        for (const row of rows) {
+            if (!row.id) {
+                continue;
+            }
+            const updated = String(row.updated ?? "");
+            if (updated > maxUpdated) {
+                maxUpdated = updated;
+            }
+            const type = String(row.type ?? "");
+            const meta: BlockMeta = {
                 id: row.id,
                 parentId: String(row.parent_id ?? ""),
-                type: String(row.type ?? ""),
-            })),
-        ),
-    };
-    if (codeLanguagesComplete) {
-        meta.codeLanguagesLoaded = true;
+                type,
+                subtype: String(row.subtype ?? ""),
+                ial: String(row.ial ?? ""),
+                hash: String(row.hash ?? ""),
+                updated,
+            };
+            // 元数据 1.5 秒过期后仍可复用未改代码块的围栏语言，避免连续输入反复扫描整篇文档。
+            // hash 为空时不猜；围栏或内容变更后 hash 变化，下一次会重新读取 markdown。
+            const previous = cached?.meta.byId.get(meta.id);
+            if (
+                type === "c" &&
+                meta.hash &&
+                previous?.hash === meta.hash &&
+                previous.codeLanguage !== undefined &&
+                !previous.codeLanguageFromLive
+            ) {
+                meta.codeLanguage = previous.codeLanguage;
+            }
+            if (type === "c" && meta.codeLanguage === undefined) {
+                codeLanguagesComplete = false;
+            }
+            parentById.set(row.id, {
+                parentId: meta.parentId,
+                type: meta.type,
+                subtype: meta.subtype,
+                ial: meta.ial,
+                hash: meta.hash,
+            });
+            if (!isContainerType(type)) {
+                byId.set(row.id, meta);
+            }
+        }
+
+        const meta: DocMeta = {
+            byId,
+            links: parentById,
+            signature: `${rows.length}:${maxUpdated}`,
+            fallbackOrder: buildFallbackOrder(
+                rootId,
+                rows.map((row) => ({
+                    id: row.id,
+                    parentId: String(row.parent_id ?? ""),
+                    type: String(row.type ?? ""),
+                })),
+            ),
+        };
+        if (codeLanguagesComplete) {
+            meta.codeLanguagesLoaded = true;
+        }
+        const cachedAt = Date.now();
+        rememberMeta(rootId, {at: cachedAt, meta});
+        return meta;
+    } finally {
+        read.release();
     }
-    const cachedAt = Date.now();
-    rememberMeta(rootId, {at: cachedAt, meta});
-    return meta;
 }
 
 function buildFallbackOrder(
@@ -305,6 +358,7 @@ export async function ensureCodeBlockLanguages(
         if (item && item.codeLanguage === undefined) {
             item.codeLanguage = codeFenceLanguage(String(row.fence ?? ""));
             item.codeLanguageFromLive = false;
+            syncCodeMetaBudget(item);
         }
     }
     meta.codeLanguagesLoaded = true;
@@ -347,11 +401,16 @@ export function noteLiveCodeLanguage(meta: BlockMeta, element: HTMLElement): boo
     }
     const language = host.getAttribute("data-subtype") ?? "";
     const changed = meta.codeLanguage !== language;
+    meta.codeContentFromLive = isDiagramCodeLanguage(language) ?
+        host.getAttribute("data-content") ?? undefined :
+        undefined;
     if (!changed && meta.codeLanguageFromLive) {
+        syncCodeMetaBudget(meta);
         return false;
     }
     meta.codeLanguage = language;
     meta.codeLanguageFromLive = true;
+    syncCodeMetaBudget(meta);
     return changed;
 }
 

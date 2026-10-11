@@ -11,7 +11,6 @@ import {
     collectAvDomCoverage,
     collectHeadingFoldedIds,
     isBlockTreeEnabled,
-    isHitReplaceableByUnit,
     isRendererUnitId,
     rendererUnitSource,
     isSelfFoldedIal,
@@ -31,8 +30,10 @@ import {
     shouldCollectInlineMemoUnits,
     type SearchableUnit,
 } from "../../shared";
+import {supportsDiagramSourceSearch} from "../../shared/code-block-language";
 import {
     collectSearchableBlocks,
+    createRendererElementFilter,
     directTableCellColumn,
     isDirectTableCell,
     inlineMathIdentityText,
@@ -44,29 +45,62 @@ import type {
     SearchMatch,
     TableReplaceLock,
 } from "../dom-types";
+import {
+    compareEmbeddedPositions,
+    createEmbeddedSourceReader,
+    embeddedPositionAt,
+    orderEmbeddedVisualMatches,
+    recordEmbeddedOrder,
+    relativeEmbeddedOrder,
+    rebaseEmbeddedOrder,
+} from "../embedded-order";
 import {isUnderNonHeadingCssFold} from "../fold-dom";
 import {buildListSnippet} from "../list-snippet";
 import type {
     SearchPipelineOptions,
     SearchPipelineResult,
 } from "../pipeline";
-import {diagramSourceText} from "../renderer-adapters";
+import {
+    DIAGRAM_SUBTYPE_SET,
+    collectRendererSearchUnits,
+    diagramOutputFailed,
+    rendererAdapterKind,
+} from "../renderer-adapters";
+import {
+    collectAuthorHiddenBlockIds,
+    isAuthorCssHiddenElement,
+    isAuthorCssHiddenText,
+} from "../visibility";
 import {
     escSql,
     querySqlAll,
 } from "./api";
 import {
     AttributeViewTruncatedError,
+    AttributeViewLoadError,
     invalidateAvCache,
     invalidateAvCacheForBlocks,
+    invalidateAvCacheForIds,
+    invalidateAvCacheForRoot,
     loadAvUnits,
     peekAvUnits,
+    pinAvCache,
+    releaseAvCache,
+    releaseAvCacheOwner,
     resolveMissingAvIds,
     type AvBlockRef,
 } from "./av";
 import {
+    forgetCacheBudget,
+    rememberCacheBudget,
+    touchCacheBudget,
+} from "./cache-budget";
+import {CacheReadGuards} from "./cache-read-guard";
+import {
     extractDiagramUnitsFromLive,
+    extractUnitsFromDoms,
     fetchAndExtractUnits,
+    rendererOutputCompleted,
 } from "./extract";
 import {
     collectFocusScope,
@@ -90,7 +124,7 @@ import {
     fetchHeadingChildrenIds,
     invalidateDocOrder,
 } from "./order";
-import {projectRanges} from "./project";
+import {projectRangesWithBudget} from "./project";
 import {
     isAttributeViewType,
     isDiagramBlock,
@@ -112,6 +146,8 @@ import {
 
 interface TextCacheEntry {
     hash: string;
+    codeLanguage?: string;
+    liveCodeContent?: string;
     units: CachedUnit[];
     /** 近似保留大小；用于跨文档的全局缓存预算。 */
     bytes: number;
@@ -123,8 +159,11 @@ const textCache = new Map<string, TextCacheEntry>();
 /** 所有文本缓存共用的 LRU。Map 的插入顺序就是从最久未使用到最新。 */
 const textCacheLru = new Map<string, true>();
 const embedCacheKeys = new Set<string>();
+/** 嵌入来源可以跨文档；保存后全局作废在途嵌入快照，不影响其它文本缓存。 */
+let embedCacheEpoch = 0;
 let renderSettingsStamp = "";
 let textCacheBytes = 0;
+let textCacheTrimBlocked = false;
 /** 缓存内容主要是 UTF-16 字符串；12 MiB 让频繁切页仍有命中，同时封顶长会话内存。 */
 const TEXT_CACHE_LIMIT_BYTES = 12 * 1024 * 1024;
 const SPECIAL_FAILURE_RETRY_MS = 5000;
@@ -133,7 +172,8 @@ const SPECIAL_CACHE_LIMIT = 2000;
 const specialCacheKeys = new Map<string, true>();
 /** 当前搜索涉及的特殊块不能在补全过程中互相淘汰；超出预算时暂时允许软溢出。 */
 const activeSpecialCacheKeys = new Set<string>();
-const activeSpecialCacheKeysByRoot = new Map<string, Set<string>>();
+const activeSpecialCacheKeysByRoot = new Map<string, Map<object, Set<string>>>();
+const specialCacheConsumers = new Map<string, number>();
 let specialCacheTrimBlocked = false;
 /** 普通正文缓存也使用跨文档全局 LRU，避免每篇文档各存一份而无限增长。 */
 const PLAIN_CACHE_LIMIT = 2000;
@@ -150,14 +190,22 @@ const corpusEpochs = new Map<string, number>();
 const backgroundRootUsers = new Map<string, number>();
 const JOB_FAILURE_RETRY_MS = 5000;
 const JOB_FAILURE_LIMIT = 100;
-const jobFailures = new Map<string, {rootId: string; retryAfter: number; truncated?: boolean;}>();
+const jobFailures = new Map<string, {
+    rootId: string;
+    retryAfter: number;
+    truncated?: boolean;
+    failedBlockIds?: string[];
+    truncatedBlockIds?: string[];
+}>();
 
 /**
  * 思源数据库的代码块 subtype 不含围栏语言；这里必须和开关判断使用同一有效语言。
- * 否则未挂载 Mermaid 会被当成普通代码块，错过 diagram 渲染和特殊缓存。
+ * 其它图表仍需要渲染文字与特殊缓存；Mermaid / flowchart 冷态只读源码。
  */
 function isSpecialRenderMeta(meta: BlockMeta): boolean {
-    return isSpecialRenderType(meta.type, effectiveCodeLanguage(meta));
+    const language = effectiveCodeLanguage(meta);
+    // 未加载 Mermaid / flowchart 的源码可由 content 预筛，沿用正文批量读取与哈希缓存。
+    return !(meta.type === "c" && supportsDiagramSourceSearch(language)) && isSpecialRenderType(meta.type, language);
 }
 
 function isDiagramMeta(meta: BlockMeta): boolean {
@@ -169,12 +217,15 @@ function currentCorpusEpoch(rootId: string): number {
 }
 
 export function invalidateTextCache(): void {
+    embedCacheEpoch += 1;
     textCache.clear();
     textCacheLru.clear();
     textCacheBytes = 0;
+    textCacheTrimBlocked = false;
     specialCacheKeys.clear();
     activeSpecialCacheKeys.clear();
     activeSpecialCacheKeysByRoot.clear();
+    specialCacheConsumers.clear();
     specialCacheTrimBlocked = false;
     plainCacheKeys.clear();
     embedCacheKeys.clear();
@@ -273,6 +324,7 @@ function collectionScope(options: SearchPipelineOptions): string {
         options.includeTabs !== false,
         options.includeMindmap !== false,
         options.includeInlineMemo === true,
+        options.includeFoldedBlocks === true,
     ].map((flag) => flag ? "1" : "0").join("");
     const restrict = normalizeRestrictInlineTypes(options.restrictInlineTypes, {
         includeInlineMemo: options.includeInlineMemo === true,
@@ -301,9 +353,11 @@ function estimateCacheEntryBytes(hash: string, units: readonly CachedUnit[]): nu
             textBytes(unit.text) +
             textBytes(unit.unitId) +
             textBytes(unit.highlightKind) +
-            textBytes(unit.snippet);
+            textBytes(unit.snippet) +
+            textBytes(unit.embeddedRecoveryKey);
         bytes += (unit.segmentLengths?.length ?? 0) * 8;
         bytes += (unit.restrictSpans?.length ?? 0) * 40;
+        for (const segment of unit.embeddedOrder ?? []) bytes += 40 + segment.path.length * 8;
     }
     return bytes;
 }
@@ -329,10 +383,23 @@ function dropTextCache(key: string): void {
 
 function currentRenderSettingsStamp(): string {
     const config = (window as Window & {
-        siyuan?: {config?: {appearance?: {mode?: unknown; theme?: unknown; themeDark?: unknown;};};};
+        siyuan?: {
+            config?: {
+                appearance?: {mode?: unknown; theme?: unknown; themeDark?: unknown;};
+                editor?: {katexMacros?: string; headingEmbedMode?: number;};
+                search?: {limit?: number;};
+            };
+        };
     }).siyuan?.config;
     const appearance = config?.appearance;
-    return `${appearance?.mode ?? ""}|${appearance?.theme ?? ""}|${appearance?.themeDark ?? ""}`;
+    return JSON.stringify([
+        appearance?.mode,
+        appearance?.theme,
+        appearance?.themeDark,
+        config?.editor?.katexMacros,
+        config?.editor?.headingEmbedMode,
+        config?.search?.limit,
+    ]);
 }
 
 /** 主题或明暗模式变化后，图表和 HTML 的可见字可能不同，不能沿用上一套渲染结果。 */
@@ -352,12 +419,15 @@ function syncRenderSettingsCache(): void {
 }
 
 function dropEmbedRenderCaches(): void {
+    // Clearing entries alone cannot stop an older query/recovery from writing them back.
+    embedCacheEpoch += 1;
     for (const key of Array.from(embedCacheKeys)) {
         dropTextCache(key);
     }
 }
 
 const queryMemo = new Map<string, {signature: string; value: unknown;}>();
+const queryReads = new CacheReadGuards();
 const QUERY_MEMO_LIMIT = 24;
 /** 数据库引用查询的代数。变更前已发出的请求完成后不能再写回缓存。 */
 const avRefEpoch = new Map<string, number>();
@@ -392,28 +462,43 @@ function readQueryMemo<T>(key: string, signature: string): T | undefined {
     if (!hit || hit.signature !== signature) {
         if (hit) {
             queryMemo.delete(key);
+            forgetCacheBudget(`query:${key}`);
         }
         return undefined;
     }
     queryMemo.delete(key);
     queryMemo.set(key, hit);
+    touchCacheBudget(`query:${key}`);
     return hit.value as T;
 }
 
-function writeQueryMemo<T>(key: string, signature: string, value: T): void {
+function writeQueryMemo(key: string, signature: string, value: string[] | AvBlockRef[]): void {
     queryMemo.delete(key);
     queryMemo.set(key, {signature, value});
+    let bytes = 64;
+    for (const item of value) {
+        bytes += typeof item === "string" ?
+            24 + item.length * 2 :
+            96 + (item.blockId.length + item.avId.length + item.updated.length + item.carrierViewId.length) * 2;
+    }
+    rememberCacheBudget(`query:${key}`, bytes, () => queryMemo.delete(key));
     while (queryMemo.size > QUERY_MEMO_LIMIT) {
         const oldest = queryMemo.keys().next().value as string | undefined;
         if (!oldest) {
             break;
         }
         queryMemo.delete(oldest);
+        forgetCacheBudget(`query:${oldest}`);
     }
 }
 
-/** 数据库事务或结构性重绘后只丢掉引用列表，正文候选和块文本缓存继续复用。 */
-export function invalidateAttributeViewSearch(rootId: string): void {
+/** 单元格事务不一定改变载体 updated，必须同时作废其显示值；正文缓存继续复用。 */
+export function invalidateAttributeViewSearch(rootId: string, avIds?: readonly string[]): void {
+    if (avIds?.length) {
+        invalidateAvCacheForIds(avIds);
+    } else {
+        invalidateAvCacheForRoot(rootId);
+    }
     if (!rootId) {
         return;
     }
@@ -431,12 +516,19 @@ export function invalidateAttributeViewSearch(rootId: string): void {
         jobs.delete(key);
         jobFailures.delete(key);
     }
-    queryMemo.delete(queryMemoKey(rootId, "avrefs"));
+    const key = queryMemoKey(rootId, "avrefs");
+    for (const failureKey of jobFailures.keys()) {
+        if (failureKey.startsWith(prefix)) jobFailures.delete(failureKey);
+    }
+    queryMemo.delete(key);
+    forgetCacheBudget(`query:${key}`);
 }
 
 function dropQueryMemo(rootId?: string): void {
+    queryReads.invalidate(rootId);
     if (!rootId) {
         bumpAllAvRefEpochs();
+        for (const key of queryMemo.keys()) forgetCacheBudget(`query:${key}`);
         queryMemo.clear();
         return;
     }
@@ -446,11 +538,13 @@ function dropQueryMemo(rootId?: string): void {
     for (const key of queryMemo.keys()) {
         if (key.startsWith(prefix)) {
             queryMemo.delete(key);
+            forgetCacheBudget(`query:${key}`);
         }
     }
 }
 
 async function memoizedIds(
+    rootId: string,
     key: string,
     signature: string,
     load: () => Promise<string[] | null>,
@@ -459,15 +553,22 @@ async function memoizedIds(
     if (cached !== undefined) {
         return cached;
     }
-    const ids = await load();
-    // 失败和取消都是 null，不能记成“没有候选”，否则下一轮会漏召回。
-    if (ids !== null) {
-        writeQueryMemo(key, signature, ids);
+    const read = queryReads.begin(rootId);
+    try {
+        const ids = await load();
+        if (!read.current()) return null;
+        // 失败和取消都是 null，不能记成“没有候选”，否则下一轮会漏召回。
+        if (ids !== null) {
+            writeQueryMemo(key, signature, ids);
+        }
+        return ids;
+    } finally {
+        read.release();
     }
-    return ids;
 }
 
 function trimTextCacheBudget(): void {
+    if (textCacheTrimBlocked) return;
     if (textCacheBytes <= TEXT_CACHE_LIMIT_BYTES) {
         return;
     }
@@ -481,13 +582,16 @@ function trimTextCacheBudget(): void {
         }
         dropTextCache(key);
     }
+    textCacheTrimBlocked = textCacheBytes > TEXT_CACHE_LIMIT_BYTES;
 }
 
 function writeTextCache(key: string, entry: Omit<TextCacheEntry, "bytes">): void {
+    if (!activeSpecialCacheKeys.has(key)) textCacheTrimBlocked = false;
     dropTextCache(key);
     const cached: TextCacheEntry = {
         ...entry,
-        bytes: estimateCacheEntryBytes(entry.hash, entry.units),
+        bytes: estimateCacheEntryBytes(entry.hash, entry.units) + textBytes(entry.codeLanguage) +
+            textBytes(entry.liveCodeContent),
     };
     textCache.set(key, cached);
     textCacheBytes += cached.bytes;
@@ -501,30 +605,46 @@ function touchSpecialCache(key: string): void {
     specialCacheKeys.set(key, true);
 }
 
-function pinSpecialCacheKeys(rootId: string, keys: string[]): void {
-    let owned = activeSpecialCacheKeysByRoot.get(rootId);
-    if (!owned) {
-        owned = new Set<string>();
-        activeSpecialCacheKeysByRoot.set(rootId, owned);
+function pinSpecialCacheKeys(rootId: string, owner: object, keys: string[]): void {
+    const owners = activeSpecialCacheKeysByRoot.get(rootId) ?? new Map<object, Set<string>>();
+    const previous = owners.get(owner) ?? new Set<string>();
+    const next = new Set(keys);
+    let unpinned = false;
+    for (const key of previous) {
+        if (next.has(key)) continue;
+        const users = (specialCacheConsumers.get(key) ?? 1) - 1;
+        if (users > 0) specialCacheConsumers.set(key, users);
+        else {
+            specialCacheConsumers.delete(key);
+            activeSpecialCacheKeys.delete(key);
+            unpinned = true;
+        }
     }
-    for (const key of keys) {
-        owned.add(key);
+    for (const key of next) {
+        if (!previous.has(key)) specialCacheConsumers.set(key, (specialCacheConsumers.get(key) ?? 0) + 1);
         activeSpecialCacheKeys.add(key);
+    }
+    if (next.size) owners.set(owner, next);
+    else owners.delete(owner);
+    if (owners.size) activeSpecialCacheKeysByRoot.set(rootId, owners);
+    else activeSpecialCacheKeysByRoot.delete(rootId);
+    if (unpinned) {
+        specialCacheTrimBlocked = false;
+        textCacheTrimBlocked = false;
+        trimSpecialCache();
+        trimTextCacheBudget();
     }
 }
 
 function releaseSpecialCacheKeys(rootId: string): void {
-    const owned = activeSpecialCacheKeysByRoot.get(rootId);
-    if (owned) {
-        for (const key of owned) {
-            activeSpecialCacheKeys.delete(key);
-        }
-        activeSpecialCacheKeysByRoot.delete(rootId);
+    for (const owner of Array.from(activeSpecialCacheKeysByRoot.get(rootId)?.keys() ?? [])) {
+        pinSpecialCacheKeys(rootId, owner, []);
     }
-    // 工作集已释放后立即回到全局预算；仍被其他文档使用的键会由 trimSpecialCache 跳过。
-    specialCacheTrimBlocked = false;
-    trimSpecialCache();
-    trimTextCacheBudget();
+}
+
+/** 同文档的其他窗格和在途渲染仍可保留各自的工作集。 */
+export function releaseSpecialCacheOwner(rootId: string, owner: object): void {
+    if (activeSpecialCacheKeysByRoot.get(rootId)?.has(owner)) pinSpecialCacheKeys(rootId, owner, []);
 }
 
 function trimSpecialCache(): void {
@@ -629,7 +749,7 @@ function collectOptions(options: SearchPipelineOptions) {
 function extractionCollectOptions(options: SearchPipelineOptions) {
     return {
         ...collectOptions(options),
-        includeFoldedBlocks: true,
+        includeFoldedBlocks: options.includeFoldedBlocks === true,
     };
 }
 
@@ -802,21 +922,179 @@ function passesRestrict(unit: CachedUnit, start: number, end: number, options: S
 function remember(rootId: string, meta: BlockMeta, units: CachedUnit[], scope: string): void {
     // 成功但没有可见文字也是稳定结果；缓存空数组可避免无限重渲染。
     const key = cacheKey(rootId, meta.id, scope);
-    writeSpecialCache(key, {hash: meta.hash, units});
+    writeSpecialCache(key, {...specialMetaVersion(meta), units});
     if (isEmbedType(meta.type)) {
         embedCacheKeys.add(key);
     }
 }
 
-function rememberUnrendered(rootId: string, meta: BlockMeta, scope: string): void {
+function rememberUnrendered(rootId: string, meta: BlockMeta, scope: string, units: CachedUnit[] = []): void {
     const key = cacheKey(rootId, meta.id, scope);
     writeSpecialCache(key, {
-        hash: meta.hash,
-        units: [],
+        ...specialMetaVersion(meta),
+        units,
         retryAfter: Date.now() + SPECIAL_FAILURE_RETRY_MS,
     });
     if (isEmbedType(meta.type)) {
         embedCacheKeys.add(key);
+    }
+}
+
+function specialMetaVersion(meta: BlockMeta): Pick<TextCacheEntry, "hash" | "codeLanguage" | "liveCodeContent"> {
+    return {
+        hash: meta.hash,
+        codeLanguage: meta.type === "c" ? effectiveCodeLanguage(meta) : undefined,
+        liveCodeContent: meta.codeContentFromLive,
+    };
+}
+
+function specialCacheMatches(
+    cached: Pick<TextCacheEntry, "hash" | "codeLanguage" | "liveCodeContent">,
+    meta: BlockMeta,
+): boolean {
+    return cached.hash === meta.hash &&
+        cached.codeLanguage === (meta.type === "c" ? effectiveCodeLanguage(meta) : undefined) &&
+        cached.liveCodeContent === meta.codeContentFromLive;
+}
+
+type DiagramExtraction = Awaited<ReturnType<typeof fetchAndExtractUnits>>;
+interface DiagramConsumer {
+    current: () => boolean;
+}
+interface DiagramBatch {
+    controller: AbortController;
+    entries: DiagramFlight[];
+}
+interface DiagramFlight {
+    version: ReturnType<typeof specialMetaVersion>;
+    task: Promise<DiagramExtraction>;
+    consumers: Set<DiagramConsumer>;
+    batch: DiagramBatch;
+}
+const diagramFlights = new Map<string, DiagramFlight>();
+
+/** Share kernel-DOM work across foreground searches and background warmups, per block/version/scope. */
+async function extractSharedDiagrams(
+    rootId: string,
+    notebookId: string,
+    metas: BlockMeta[],
+    options: SearchPipelineOptions,
+    shouldContinue: () => boolean,
+    signal?: AbortSignal,
+): Promise<DiagramExtraction> {
+    const epoch = currentCorpusEpoch(rootId);
+    const renderStamp = currentRenderSettingsStamp();
+    const consumer = {
+        current: () =>
+            shouldContinue() && !signal?.aborted && epoch === currentCorpusEpoch(rootId) &&
+            renderStamp === currentRenderSettingsStamp(),
+    };
+    const scope = collectionScope(options);
+    const pending: Array<{meta: BlockMeta; key: string; flight: DiagramFlight;}> = [];
+    const selected: Array<{id: string; flight: DiagramFlight;}> = [];
+    const batches = new Set<DiagramBatch>();
+    for (const meta of metas) {
+        const key = `${cacheKey(rootId, meta.id, scope)}:${epoch}:${renderStamp}`;
+        let flight = diagramFlights.get(key);
+        if (
+            !flight || flight.batch.controller.signal.aborted || !specialCacheMatches(flight.version, meta) ||
+            (!meta.hash && meta.codeContentFromLive === undefined)
+        ) {
+            const batch = {controller: new AbortController(), entries: [] as DiagramFlight[]};
+            flight = {version: specialMetaVersion(meta), task: Promise.resolve(null), consumers: new Set(), batch};
+            diagramFlights.set(key, flight);
+            pending.push({meta, key, flight});
+        }
+        flight.consumers.add(consumer);
+        selected.push({id: meta.id, flight});
+    }
+    // New blocks keep the existing two-block DOM/API batch size; overlapping blocks reuse their own task.
+    let previous: Promise<DiagramExtraction> = Promise.resolve(null);
+    for (let index = 0; index < pending.length; index += 2) {
+        const pair = pending.slice(index, index + 2);
+        const batch = pair[0].flight.batch;
+        batch.entries = pair.map(({flight}) => flight);
+        pair.forEach(({flight}) => {
+            flight.batch = batch;
+        });
+        const current = () =>
+            !batch.controller.signal.aborted &&
+            batch.entries.some((entry) => Array.from(entry.consumers).some((owner) => owner.current()));
+        const task = previous.then(() =>
+            fetchAndExtractUnits(
+                pair.map(({meta}) => meta.id),
+                notebookId,
+                extractionCollectOptions(options),
+                new Set(),
+                "diagram",
+                current,
+                batch.controller.signal,
+                new Map(pair.map(({meta}) => [meta.id, effectiveCodeLanguage(meta)])),
+            )
+        ).catch((): DiagramExtraction => null).finally(() => {
+            for (const {key, flight} of pair) {
+                if (diagramFlights.get(key) === flight) {
+                    diagramFlights.delete(key);
+                }
+            }
+        });
+        pair.forEach(({flight}) => {
+            flight.task = task;
+        });
+        previous = task;
+    }
+    selected.forEach(({flight}) => batches.add(flight.batch));
+    const abortUnused = () => {
+        for (const batch of batches) {
+            if (!batch.entries.some((entry) => Array.from(entry.consumers).some((owner) => owner.current()))) {
+                batch.controller.abort();
+            }
+        }
+    };
+    let onAbort: (() => void) | undefined;
+    const abandoned = new Promise<null>((resolve) => {
+        onAbort = () => {
+            abortUnused();
+            if (selected.every(({flight}) => flight.batch.controller.signal.aborted)) {
+                // The last owner waits for disposal; other owners keep their render and host alive.
+                void Promise.all(selected.map(({flight}) => flight.task)).then(() => resolve(null));
+            } else {
+                resolve(null);
+            }
+        };
+        signal?.addEventListener("abort", onAbort, {once: true});
+        if (!consumer.current()) {
+            onAbort();
+        }
+    });
+    try {
+        const completed = await Promise.race([
+            Promise.all(selected.map(async ({id, flight}) => {
+                const result = await flight.task;
+                return result ?
+                    {
+                        units: result.units.filter((unit) => unit.blockId === id),
+                        unrenderedIds: result.unrenderedIds.filter((blockId) => blockId === id),
+                        missingIds: result.missingIds.filter((blockId) => blockId === id),
+                    } :
+                    {units: [], unrenderedIds: [id], missingIds: [id]};
+            })),
+            abandoned,
+        ]);
+        if (!completed || !consumer.current()) {
+            return null;
+        }
+        return {
+            units: completed.flatMap((result) => result.units),
+            unrenderedIds: completed.flatMap((result) => result.unrenderedIds),
+            missingIds: completed.flatMap((result) => result.missingIds),
+        };
+    } finally {
+        if (onAbort) {
+            signal?.removeEventListener("abort", onAbort);
+        }
+        selected.forEach(({flight}) => flight.consumers.delete(consumer));
+        abortUnused();
     }
 }
 
@@ -830,15 +1108,15 @@ function cachedUnits(
     let unrendered = 0;
     const now = Date.now();
     syncRenderSettingsCache();
-    pinSpecialCacheKeys(rootId, metas.map((meta) => cacheKey(rootId, meta.id, scope)));
     for (const meta of metas) {
         const key = cacheKey(rootId, meta.id, scope);
         const cached = textCache.get(key);
-        if (cached && cached.hash === meta.hash) {
+        if (cached && specialCacheMatches(cached, meta)) {
             touchSpecialCache(key);
             touchTextCache(key);
             if (cached.retryAfter !== undefined) {
                 if (cached.retryAfter > now) {
+                    ready.push(...cached.units);
                     unrendered += 1;
                     continue;
                 }
@@ -862,10 +1140,33 @@ async function extractMetas(
     shouldContinue: () => boolean = () => true,
     signal?: AbortSignal,
 ): Promise<{units: CachedUnit[]; unrendered: number; unrenderedIds: string[]; failed: boolean;}> {
+    const consumer = {};
+    pinSpecialCacheKeys(rootId, consumer, metas.map((meta) => cacheKey(rootId, meta.id, collectionScope(options))));
+    try {
+        return await extractMetasImpl(rootId, notebookId, metas, options, mode, shouldContinue, signal);
+    } finally {
+        releaseSpecialCacheOwner(rootId, consumer);
+    }
+}
+
+async function extractMetasImpl(
+    rootId: string,
+    notebookId: string,
+    metas: BlockMeta[],
+    options: SearchPipelineOptions,
+    mode: OffscreenRenderMode,
+    shouldContinue: () => boolean = () => true,
+    signal?: AbortSignal,
+): Promise<{units: CachedUnit[]; unrendered: number; unrenderedIds: string[]; failed: boolean;}> {
     if (metas.length === 0) {
         return {units: [], unrendered: 0, unrenderedIds: [], failed: false};
     }
+    // Shared metadata can be updated by a concurrent search while rendering awaits.
+    metas = metas.map((meta) => ({...meta}));
     const epoch = currentCorpusEpoch(rootId);
+    const embedEpoch = embedCacheEpoch;
+    const embedCurrent = (meta: BlockMeta) => !isEmbedType(meta.type) || embedEpoch === embedCacheEpoch;
+    const renderStamp = currentRenderSettingsStamp();
     const canContinue = () => shouldContinue() && !signal?.aborted;
     const scope = collectionScope(options);
     const embedIds = new Set(metas.filter((meta) => isEmbedType(meta.type)).map((meta) => meta.id));
@@ -878,27 +1179,30 @@ async function extractMetas(
     }
     let extracted: Awaited<ReturnType<typeof fetchAndExtractUnits>>;
     try {
-        extracted = await fetchAndExtractUnits(
-            metas.map((meta) => meta.id),
-            notebookId,
-            extractionCollectOptions(options),
-            embedIds,
-            mode,
-            canContinue,
-            signal,
-            codeLanguages,
-        );
+        extracted = mode === "diagram" && metas.every(isDiagramMeta) ?
+            await extractSharedDiagrams(rootId, notebookId, metas, options, canContinue, signal) :
+            await fetchAndExtractUnits(
+                metas.map((meta) => meta.id),
+                notebookId,
+                extractionCollectOptions(options),
+                embedIds,
+                mode,
+                canContinue,
+                signal,
+                codeLanguages,
+                rootId,
+            );
     } catch {
         // 渲染器异常与接口失败使用同一条有限重试路径，不能让后台任务永久停在 partial。
         extracted = null;
     }
     if (!extracted) {
         const failedIds = metas
-            .filter(isSpecialRenderMeta)
+            .filter((meta) => isSpecialRenderMeta(meta) || isEmbedType(meta.type))
             .map((meta) => meta.id);
-        if (epoch === currentCorpusEpoch(rootId)) {
+        if (canContinue() && epoch === currentCorpusEpoch(rootId) && renderStamp === currentRenderSettingsStamp()) {
             for (const meta of metas) {
-                if (isSpecialRenderMeta(meta)) {
+                if (embedCurrent(meta) && (isSpecialRenderMeta(meta) || isEmbedType(meta.type))) {
                     rememberUnrendered(rootId, meta, scope);
                 }
             }
@@ -917,14 +1221,19 @@ async function extractMetas(
         byId.set(unit.blockId, list);
     }
     const units: CachedUnit[] = [];
-    const keep = canContinue() && epoch === currentCorpusEpoch(rootId);
+    const keep = canContinue() && epoch === currentCorpusEpoch(rootId) && renderStamp === currentRenderSettingsStamp();
     const unrenderedIds = new Set(extracted.unrenderedIds);
     for (const meta of metas) {
+        if (!embedCurrent(meta)) {
+            // A discarded snapshot is incomplete, not a renderer failure to cache/back off.
+            unrenderedIds.add(meta.id);
+            continue;
+        }
         const list = byId.get(meta.id) ?? [];
-        const cacheSpecial = mode !== "light" || isSpecialRenderMeta(meta);
+        const cacheSpecial = mode !== "light" || isSpecialRenderMeta(meta) || isEmbedType(meta.type);
         if (keep && cacheSpecial) {
             if (unrenderedIds.has(meta.id)) {
-                rememberUnrendered(rootId, meta, scope);
+                rememberUnrendered(rootId, meta, scope, list);
             } else {
                 remember(rootId, meta, list, scope);
             }
@@ -933,9 +1242,9 @@ async function extractMetas(
     }
     return {
         units,
-        unrendered: extracted.unrenderedIds.length,
-        unrenderedIds: extracted.unrenderedIds,
-        failed: false,
+        unrendered: unrenderedIds.size,
+        unrenderedIds: Array.from(unrenderedIds),
+        failed: extracted.missingIds.length > 0,
     };
 }
 
@@ -948,7 +1257,7 @@ function readPlainCache(rootId: string, blockId: string, scope: string, hash: st
         return null;
     }
     const cached = textCache.get(cacheKey(rootId, blockId, scope));
-    if (!cached || cached.hash !== hash || !cached.units.some((unit) => unit.text.trim())) {
+    if (!cached || cached.hash !== hash || !cached.units.some((unit) => unit.text.length > 0)) {
         return null;
     }
     const key = cacheKey(rootId, blockId, scope);
@@ -967,7 +1276,7 @@ function rememberPlain(
     hash: string,
     units: CachedUnit[],
 ): void {
-    if (!hash || !units.some((unit) => unit.text.trim())) {
+    if (!hash || !units.some((unit) => unit.text.length > 0)) {
         return;
     }
     const key = cacheKey(rootId, blockId, scope);
@@ -986,7 +1295,8 @@ function rememberPlain(
 
 /**
  * 未加载普通正文：哈希未变则复用上次抽出的文字。
- * 嵌入块、公式、图表和 HTML 不进这份缓存。哈希查询失败时全部重抽且不写入。
+ * Mermaid / flowchart 冷态源码也用此缓存；其它图表、嵌入、公式和 HTML 除外。
+ * 嵌入单独复用查询结果缓存；普通正文的哈希查询失败时重抽且不写入普通缓存。
  */
 async function loadPlainUnits(
     rootId: string,
@@ -1003,10 +1313,18 @@ async function loadPlainUnits(
         return {units: [], unrendered: 0, failed: false};
     }
     const hashes = await fetchBlockHashes(metas.filter(canCachePlainText).map((meta) => meta.id), signal);
-    const ready: CachedUnit[] = [];
+    // Embed SQL is independent of the search keyword. Reuse its versioned
+    // result (including empty/failure results), while ordinary text keeps its
+    // separate hash checks and cache policy.
+    const embeds = cachedUnits(rootId, metas.filter((meta) => isEmbedType(meta.type)), scope);
+    const missingEmbeds = new Set(embeds.missing.map((meta) => meta.id));
+    const ready: CachedUnit[] = embeds.ready.slice();
     const missing: BlockMeta[] = [];
     const hashAtFetch = new Map<string, string>();
     for (const meta of metas) {
+        if (isEmbedType(meta.type) && !missingEmbeds.has(meta.id)) {
+            continue;
+        }
         const hash = hashes?.get(meta.id) ?? "";
         const cached = hashes && canCachePlainText(meta) ?
             readPlainCache(rootId, meta.id, scope, hash) :
@@ -1021,7 +1339,7 @@ async function loadPlainUnits(
         }
     }
     if (missing.length === 0) {
-        return {units: ready, unrendered: 0, failed: false};
+        return {units: ready, unrendered: embeds.unrendered, failed: false};
     }
     const epoch = currentCorpusEpoch(rootId);
     const extracted = await extractMetas(rootId, notebookId, missing, options, mode, shouldContinue, signal);
@@ -1045,7 +1363,7 @@ async function loadPlainUnits(
     }
     return {
         units: ready.concat(extracted.units),
-        unrendered: extracted.unrendered,
+        unrendered: embeds.unrendered + extracted.unrendered,
         failed: extracted.failed,
     };
 }
@@ -1107,6 +1425,12 @@ function startJob(
                 rootId,
                 retryAfter: Date.now() + JOB_FAILURE_RETRY_MS,
                 truncated: error instanceof AttributeViewTruncatedError,
+                ...(error instanceof AttributeViewLoadError ?
+                    {
+                        failedBlockIds: error.failedBlockIds,
+                        truncatedBlockIds: error.truncatedBlockIds,
+                    } :
+                    {}),
             });
             pruneJobFailures(Date.now());
             // 只通知一次；退避期内不会再次启动同一失败任务，避免监听器形成快速重试环。
@@ -1135,6 +1459,7 @@ function cancelRootBackgroundCorpusJobs(rootId: string): void {
         warmupTimers.delete(rootId);
     }
     releaseSpecialCacheKeys(rootId);
+    releaseAvCache(rootId);
 }
 
 /**
@@ -1189,6 +1514,16 @@ export function subscribeIndexSettled(listener: (rootId: string) => void): () =>
     };
 }
 
+/** 用户主动重试仅清除该文档的失败退避，成功正文/图表/数据库缓存继续复用。 */
+export function retryIncompleteCorpus(rootId: string): void {
+    for (const [key, failure] of jobFailures) {
+        if (failure.rootId === rootId) jobFailures.delete(key);
+    }
+    for (const [key, entry] of textCache) {
+        if (key.startsWith(`${rootId}:`) && entry.retryAfter !== undefined) dropTextCache(key);
+    }
+}
+
 function notifyIndexSettled(rootId: string): void {
     for (const listener of listeners) {
         try {
@@ -1214,9 +1549,8 @@ function scheduleSpecialWarmup(
     if (initial.missing.length === 0) {
         return {units: initial.ready, unrendered: initial.unrendered};
     }
-    const previous = warmupTimers.get(rootId);
-    if (previous != null) {
-        window.clearTimeout(previous);
+    if (warmupTimers.has(rootId) || jobRunning(`special-rest:${rootId}`)) {
+        return {units: initial.ready, unrendered: initial.unrendered};
     }
     const timer = window.setTimeout(() => {
         warmupTimers.delete(rootId);
@@ -1253,28 +1587,6 @@ function jobRunning(prefix: string): boolean {
     return false;
 }
 
-function jobFailed(prefix: string): boolean {
-    const now = Date.now();
-    pruneJobFailures(now);
-    for (const [key, failure] of jobFailures) {
-        if (failure.retryAfter > now && key.startsWith(prefix)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-function jobTruncated(prefix: string): boolean {
-    const now = Date.now();
-    pruneJobFailures(now);
-    for (const [key, failure] of jobFailures) {
-        if (failure.truncated && failure.retryAfter > now && key.startsWith(prefix)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 type CandidateTriple = [string[] | null, string[] | null, string[] | null];
 
 interface CandidateQuery {
@@ -1295,7 +1607,6 @@ function beginCandidateQuery(input: {
     keyword: string;
     caseSensitive: boolean;
     regex: boolean;
-    regexUnicode: boolean;
     needContentCandidates: boolean;
     collectMemo: boolean;
     needImageTitleCandidates: boolean;
@@ -1304,14 +1615,13 @@ function beginCandidateQuery(input: {
 }): CandidateQuery {
     const memoHosts = () =>
         memoizedIds(
+            input.rootId,
             queryMemoKey(input.rootId, "memo-hosts"),
             input.signature,
             () => fetchMemoCandidateIds(input.rootId, input.signal),
         );
     if (input.regex) {
-        const groups = extractRegexLiteralGroups(input.keyword, input.caseSensitive, {
-            unicode: input.regexUnicode,
-        });
+        const groups = extractRegexLiteralGroups(input.keyword, input.caseSensitive);
         if (!groups) {
             return {
                 regexGroups: null,
@@ -1325,6 +1635,7 @@ function beginCandidateQuery(input: {
             triple: Promise.all([
                 input.needContentCandidates ?
                     memoizedIds(
+                        input.rootId,
                         queryMemoKey(input.rootId, "rg-content", `${input.caseSensitive}:${detail}`),
                         input.signature,
                         () =>
@@ -1340,6 +1651,7 @@ function beginCandidateQuery(input: {
                 input.collectMemo ? memoHosts() : Promise.resolve([] as string[]),
                 input.needImageTitleCandidates ?
                     memoizedIds(
+                        input.rootId,
                         queryMemoKey(input.rootId, "rg-title", `${input.caseSensitive}:${detail}`),
                         input.signature,
                         () =>
@@ -1356,22 +1668,37 @@ function beginCandidateQuery(input: {
             memoHosts: null,
         };
     }
+    // 关键词统一沿用宽松规则；含文字的首尾空白查询共用候选。
+    const candidateKeyword = effectiveSearchQuery(input.keyword);
     return {
         regexGroups: null,
         triple: Promise.all([
             input.needContentCandidates ?
                 memoizedIds(
-                    queryMemoKey(input.rootId, "content", `${input.caseSensitive}:${input.keyword}`),
+                    input.rootId,
+                    queryMemoKey(
+                        input.rootId,
+                        "content",
+                        `${input.caseSensitive}:${candidateKeyword}`,
+                    ),
                     input.signature,
-                    () => fetchContentCandidateIds(input.rootId, input.keyword, input.caseSensitive, input.signal),
+                    () =>
+                        fetchContentCandidateIds(
+                            input.rootId,
+                            candidateKeyword,
+                            input.caseSensitive,
+                            input.signal,
+                        ),
                 ) :
                 Promise.resolve([] as string[]),
             input.collectMemo ? memoHosts() : Promise.resolve([] as string[]),
             input.needImageTitleCandidates ?
                 memoizedIds(
-                    queryMemoKey(input.rootId, "title", `${input.caseSensitive}:${input.keyword}`),
+                    input.rootId,
+                    queryMemoKey(input.rootId, "title", `${input.caseSensitive}:${candidateKeyword}`),
                     input.signature,
-                    () => fetchImageTitleCandidateIds(input.rootId, input.keyword, input.caseSensitive, input.signal),
+                    () =>
+                        fetchImageTitleCandidateIds(input.rootId, candidateKeyword, input.caseSensitive, input.signal),
                 ) :
                 Promise.resolve([] as string[]),
         ]).catch((): null => null),
@@ -1416,7 +1743,7 @@ async function loadMemoizedAvRefs(
     if (loaded.cacheable && signal?.aborted !== true && epoch === currentAvRefEpoch(rootId)) {
         writeQueryMemo(key, signature, loaded.refs);
     }
-    return {refs: loaded.refs, failed: false};
+    return {refs: loaded.refs, failed: !loaded.cacheable};
 }
 
 /**
@@ -1517,10 +1844,26 @@ function orderIndexOf(order: string[]): Map<string, number> {
  * 正文先返回；图表和数据库在后台补进缓存，下一轮搜索再并入。
  */
 export async function searchCurrentDocument(
+    plugin: Plugin,
+    edit: Element,
+    value: string,
+    options: SearchPipelineOptions,
+): Promise<SearchPipelineResult | null> {
+    const consumer = {};
+    const rootId = editorRootId(edit);
+    try {
+        return await searchCurrentDocumentImpl(plugin, edit, value, options, consumer);
+    } finally {
+        releaseSpecialCacheOwner(rootId, consumer);
+    }
+}
+
+async function searchCurrentDocumentImpl(
     _plugin: Plugin,
     edit: Element,
     value: string,
     options: SearchPipelineOptions,
+    consumer: object,
 ): Promise<SearchPipelineResult | null> {
     const cancelled = () => options.signal?.aborted === true;
     if (cancelled()) {
@@ -1542,9 +1885,6 @@ export async function searchCurrentDocument(
             createSearchPattern(keyword, {
                 regex: true,
                 caseSensitive: options.caseSensitive === true,
-                regexUnicode: options.regexUnicode === true,
-                regexMultiline: options.regexMultiline === true,
-                regexDotAll: options.regexDotAll === true,
             });
         } catch (error) {
             return {
@@ -1570,8 +1910,8 @@ export async function searchCurrentDocument(
     const caseSensitive = options.caseSensitive === true;
     const keepRestrict = isRestrictInlineActive(options.restrictInlineTypes);
     // 限制只含备注时，正文、图片标题和行内公式都不会进入最终结果。
-    // 不能仍按正文关键词把大量无关块取回并离屏渲染；Memo 自身的 SQL 候选
-    // 已是完整超集（富文本属性可能把关键词拆开，故不能再按关键词缩窄）。
+    // 不能仍按正文关键词把大量无关块取回并离屏渲染；备注宿主与嵌入宿主构成
+    // 候选超集（富文本属性或嵌入查询不能按正文关键词安全缩窄）。
     const collectBodyText = shouldCollectBodyTextForRestrict(options.restrictInlineTypes);
     const collectMemo = shouldCollectInlineMemoUnits({
         includeInlineMemo: options.includeInlineMemo === true,
@@ -1592,7 +1932,6 @@ export async function searchCurrentDocument(
         keyword,
         caseSensitive,
         regex: options.regex === true,
-        regexUnicode: options.regexUnicode === true,
         needContentCandidates,
         collectMemo,
         needImageTitleCandidates,
@@ -1652,30 +1991,72 @@ export async function searchCurrentDocument(
     }
     // 折叠范围已经确定后再读编辑器。语言、候选 SQL 和数据库引用在这之前已经发出，
     // 扫描期间可以继续返回。
+    const languagesReady = await languagesPromise;
+    if (cancelled()) {
+        return {matches: [], error: "", cancelled: true};
+    }
     const liveAll = collectSearchableBlocks(edit, {
         ...collectOptions(options),
         includeDocTitle: options.includeDocTitle !== false && !focusId,
         includeAttributeView: options.includeAttributeView !== false,
     });
-    const languagesReady = await languagesPromise;
-    if (cancelled()) {
-        return {matches: [], error: "", cancelled: true};
-    }
+    options.onLiveUnitsCollected?.(liveAll);
     // 失败时仍按普通代码块继续，但不能把这次结果说成覆盖完整。
     const languageQueryFailed = codeBlockLanguagesNeeded(options) && !languagesReady;
+    const mountedCodeBlocks = new Map<string, HTMLElement>();
+    (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>('[data-type="NodeCodeBlock"][data-node-id]').forEach(
+        (element) => {
+            if (element.closest('[data-type="NodeBlockQueryEmbed"]')) {
+                return;
+            }
+            const id = element.dataset.nodeId;
+            const item = id ? meta.byId.get(id) : undefined;
+            if (item) {
+                // No rendered Text yet is still a mounted code block, possibly unsaved.
+                noteLiveCodeLanguage(item, element);
+                mountedCodeBlocks.set(item.id, element);
+            }
+        },
+    );
     const focusScope = focusId ? collectFocusScope(focusId, meta, orders) : null;
     // 聚焦但关系表里还没有这个块时，不把文档其余未加载块算进来。
     const inFocus = (id: string) => !focusId || Boolean(focusScope?.has(id));
     const orderIndex = orderIndexOf(orders);
     const scope = collectionScope(options);
     const enabledCache = new Map<string, boolean>();
+    const authorHiddenIds = collectAuthorHiddenBlockIds(resolveDocRoot(edit) ?? edit);
+    const surfacedIds = new Set(
+        liveAll.filter((unit) =>
+            unit.text && (unit.textNodes.length ?
+                unit.textNodes.some((node) => !isAuthorCssHiddenText(node, options.includeFoldedBlocks === true)) :
+                !isAuthorCssHiddenElement(unit.element))
+        ).map((unit) => unit.blockId),
+    );
+    const authorHiddenCache = new Map<string, boolean>();
+    const authorHidden = (id: string): boolean => {
+        // Tabs/mindmap labels can legitimately surface text whose source shell is hidden.
+        if (surfacedIds.has(id)) {
+            return false;
+        }
+        const path: string[] = [];
+        const seen = new Set<string>();
+        let current = id;
+        while (current && !seen.has(current) && !authorHiddenIds.has(current) && !authorHiddenCache.has(current)) {
+            seen.add(current);
+            path.push(current);
+            current = meta.links.get(current)?.parentId ?? "";
+        }
+        const hidden = authorHiddenIds.has(current) || authorHiddenCache.get(current) === true;
+        path.forEach((part) => authorHiddenCache.set(part, hidden));
+        return hidden;
+    };
     const nonHeadingFoldedCache = new Map<string, boolean>();
     const enabled = (item: BlockMeta) => {
         const known = enabledCache.get(item.id);
         if (known !== undefined) {
             return known;
         }
-        const value = isBlockTreeEnabled(item.id, meta.links, options) &&
+        const value = !authorHidden(item.id) && isBlockTreeEnabled(item.id, meta.links, options) &&
             !(options.includeTabs === false && isInTabsBlock(item.id, meta.links)) &&
             !(options.includeMindmap === false && isInMindmapBlock(item.id, meta.links)) &&
             isBlockTypeEnabled(item, options) &&
@@ -1686,6 +2067,15 @@ export async function searchCurrentDocument(
         return value;
     };
 
+    syncRenderSettingsCache();
+    const specialKeys = Array.from(meta.byId.values())
+        .filter((item) => enabled(item) && inFocus(item.id) && isSpecialRenderMeta(item))
+        .map((item) => cacheKey(context.rootId, item.id, scope));
+    // 本轮消费保留至结果返回；查找框仅保留最新范围，旧范围恢复为普通 LRU。
+    pinSpecialCacheKeys(context.rootId, consumer, specialKeys);
+    if (hasBackgroundCorpusUser(context.rootId)) pinSpecialCacheKeys(context.rootId, edit, specialKeys);
+    else releaseSpecialCacheOwner(context.rootId, edit);
+
     // 数据库单元格跟 highlight-search 一样走当前编辑器里的可见文字。
     // 离屏抽取仍关掉整块拼接，避免相邻单元格粘成一次误匹配。
     // 整张表都挂在画面里时直接用这些格子，未落库的修改不必再等 getBlockDOM。
@@ -1694,6 +2084,9 @@ export async function searchCurrentDocument(
     let units: CachedUnit[] = [];
     const foldedLiveDiagramBlocks = new Map<string, SearchableBlock>();
     const foldedLiveDiagramFallback = new Map<string, CachedUnit[]>();
+    const usedFoldedDiagramCache = new Set<string>();
+    const mountedAvIds = new Set<string>();
+    let unrendered = 0;
     // 预筛选若执行正则，灾难性回溯仍会卡住主线程。正则模式宁可多传几个表格单元给 Worker，
     // 也不能在此处调用 RegExp.test；最终匹配仍由 Worker 给出精确结果。
     const cellMayMatch = options.regex ?
@@ -1771,7 +2164,213 @@ export async function searchCurrentDocument(
     // folded live diagrams may consult the special cache before cachedUnits(); keep
     // theme changes from reusing SVG text generated under the previous appearance.
     syncRenderSettingsCache();
+    const refreshedEmbedIds = new Set<string>();
+    const recoveredEmbedElements = new Set<HTMLElement>();
+    const liveEmbedBlocks = new Map<string, SearchableBlock[]>();
     for (const block of liveAll) {
+        if (block.blockType !== "NodeBlockQueryEmbed") continue;
+        const owned = liveEmbedBlocks.get(block.blockId) ?? [];
+        owned.push(block);
+        liveEmbedBlocks.set(block.blockId, owned);
+    }
+    const recoverySelector = '[data-node-id][data-type], span[data-type~="inline-math"][data-content]';
+    const recoveryAttribute = "data-page-search-recovery";
+    const acceptsRenderer = createRendererElementFilter(extractionCollectOptions(options));
+    const mountedEmbeds = (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>(
+        '[data-type="NodeBlockQueryEmbed"][data-node-id]',
+    );
+    for (const owner of mountedEmbeds) {
+        const item = meta.byId.get(owner.dataset.nodeId ?? "");
+        if (
+            !item || !enabled(item) || !inFocus(item.id) ||
+            owner.parentElement?.closest('[data-type="NodeBlockQueryEmbed"]')
+        ) {
+            continue;
+        }
+        const inlineOrdinals = new Map<string, number>();
+        const sourceOf = createEmbeddedSourceReader();
+        const originalElements = Array.from(owner.querySelectorAll<HTMLElement>(recoverySelector));
+        const targets = originalElements
+            .map((element, index) => {
+                const sourceId = sourceOf(element) ?? "";
+                const inline = element.matches('span[data-type~="inline-math"]');
+                const ordinal = inline ? inlineOrdinals.get(sourceId) ?? 0 : 0;
+                if (inline) inlineOrdinals.set(sourceId, ordinal + 1);
+                return {element, index, key: JSON.stringify([sourceId, inline ? "inline-math" : "block", ordinal])};
+            })
+            .filter(({element}) =>
+                acceptsRenderer(element) && (
+                    element.matches('span[data-type~="inline-math"]') ?
+                        Boolean(element.getAttribute("data-content")) && !element.querySelector(".katex-html") :
+                        Boolean(rendererAdapterKind(element)) &&
+                        !supportsDiagramSourceSearch(element.dataset.subtype ?? "") && (
+                            !rendererOutputCompleted(element) ||
+                            (DIAGRAM_SUBTYPE_SET.has(element.dataset.subtype ?? "") &&
+                                isUnderNonHeadingCssFold(element))
+                        )
+                )
+            );
+        if (targets.length === 0) {
+            if (owner.querySelector("[data-node-id][data-type], .protyle-wysiwyg__embed")) {
+                // Mounted children remain authoritative when all their text
+                // was filtered by visibility or type gates.
+                liveIds.add(item.id);
+            }
+            continue;
+        }
+        // Cache only the recovered renderers. Current ordinary text and completed
+        // siblings retain their live visibility, run barriers and unsaved edits.
+        // Position is independent of render validity. Share one rank frame with
+        // live text, then reattach cached internal ranks to current anchors.
+        const positionOf = recordEmbeddedOrder(
+            owner,
+            liveEmbedBlocks.get(item.id) ?? [],
+            targets.map(({element}) => element),
+        );
+        const originalPositions = new Map(targets.map(({element, key}) => [key, positionOf(element)]));
+        const placeRecovered = (recovered: readonly CachedUnit[]): CachedUnit[] =>
+            recovered.map((unit) => ({
+                ...unit,
+                blockIndex: orderIndex.get(item.id) ?? unit.blockIndex,
+                embeddedOrder: rebaseEmbeddedOrder(
+                    unit.embeddedOrder,
+                    originalPositions.get(unit.embeddedRecoveryKey ?? ""),
+                ),
+            }));
+        const liveMeta = {
+            ...item,
+            codeContentFromLive: JSON.stringify(
+                targets.map(({element, key}) => [
+                    key,
+                    Array.from(element.attributes, ({name, value}) => [name, value]),
+                    isUnderNonHeadingCssFold(element),
+                    // Error SVGs can replace incomplete output without changing
+                    // source attributes. Such a failure cannot reuse successful text.
+                    diagramOutputFailed(element),
+                ]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+            ),
+        };
+        targets.forEach(({element}) => recoveredEmbedElements.add(element));
+        refreshedEmbedIds.add(item.id);
+        liveIds.add(item.id);
+        const cached = cachedUnits(context.rootId, [liveMeta], scope);
+        if (cached.missing.length === 0) {
+            units.push(...placeRecovered(cached.ready));
+            unrendered += cached.unrendered;
+            continue;
+        }
+        const epoch = currentCorpusEpoch(context.rootId);
+        const embedEpoch = embedCacheEpoch;
+        const version = liveMeta;
+        const renderStamp = currentRenderSettingsStamp();
+        let extracted: Awaited<ReturnType<typeof extractUnitsFromDoms>>;
+        try {
+            // Parse inertly, so healthy HTML custom elements are not upgraded or
+            // replayed merely because a different child needs recovery.
+            const template = document.createElement("template");
+            template.innerHTML = owner.outerHTML;
+            const copy = template.content.firstElementChild as HTMLElement;
+            const copiedElements = copy.querySelectorAll<HTMLElement>(recoverySelector);
+            copiedElements.forEach((element, index) => {
+                if (element.matches("[data-node-id][data-type]")) {
+                    const identity = sourceOf(originalElements[index]);
+                    if (identity) element.setAttribute("data-page-search-embedded-source", identity);
+                }
+            });
+            targets.forEach(({index, key}) => copiedElements[index].setAttribute(recoveryAttribute, key));
+            copiedElements.forEach((element) => {
+                if (rendererAdapterKind(element) && !element.hasAttribute(recoveryAttribute)) {
+                    element.remove();
+                }
+            });
+            extracted = await extractUnitsFromDoms(
+                [item.id],
+                {[item.id]: copy.outerHTML},
+                extractionCollectOptions(options),
+                new Set([item.id]),
+                "light",
+                () => !cancelled(),
+                options.signal,
+                undefined,
+                true,
+                recoveryAttribute,
+            );
+            if (embedEpoch !== embedCacheEpoch) {
+                unrendered += 1;
+                continue;
+            }
+            const recoveredBlocks = extracted.blocks.filter((block) => block.element.hasAttribute(recoveryAttribute));
+            const copiedOwner = recoveredBlocks[0]?.element.closest<HTMLElement>('[data-type="NodeBlockQueryEmbed"]');
+            const copiedPositionOf = copiedOwner && recordEmbeddedOrder(copiedOwner, extracted.blocks);
+            const frozen = recoveredBlocks.map((block) => ({
+                ...freezeLive(block, orderIndex.get(item.id) ?? block.blockIndex),
+                embeddedRecoveryKey: block.element.getAttribute(recoveryAttribute) ?? undefined,
+                embeddedOrder: relativeEmbeddedOrder(block.embeddedOrder, copiedPositionOf?.(block.element)),
+            }));
+            units.push(...placeRecovered(frozen));
+            const failed = extracted.unrenderedIds.length > 0;
+            unrendered += failed ? 1 : 0;
+            if (
+                !cancelled() && epoch === currentCorpusEpoch(context.rootId) &&
+                renderStamp === currentRenderSettingsStamp()
+            ) {
+                if (failed) {
+                    rememberUnrendered(context.rootId, version, scope, frozen);
+                } else {
+                    remember(context.rootId, version, frozen, scope);
+                }
+            }
+        } catch {
+            unrendered += 1;
+            if (
+                !cancelled() && epoch === currentCorpusEpoch(context.rootId) &&
+                embedEpoch === embedCacheEpoch &&
+                renderStamp === currentRenderSettingsStamp()
+            ) {
+                rememberUnrendered(context.rootId, version, scope);
+            }
+        } finally {
+            extracted?.dispose();
+        }
+        if (cancelled()) {
+            return {matches: [], error: "", cancelled: true};
+        }
+    }
+    const failedLiveDiagramIds = new Set<string>();
+    if (!memoOnlyRestriction) {
+        for (const [id, element] of mountedCodeBlocks) {
+            const item = meta.byId.get(id)!;
+            if (
+                !enabled(item) || !inFocus(id) || !isDiagramMeta(item) ||
+                supportsDiagramSourceSearch(effectiveCodeLanguage(item)) ||
+                !acceptsRenderer(element) || !diagramOutputFailed(element)
+            ) {
+                continue;
+            }
+            // A mounted renderer has already reported failure. Do not count its
+            // error SVG, reuse older successful labels, or rerender on each query.
+            failedLiveDiagramIds.add(id);
+            liveIds.add(id);
+            unrendered += 1;
+            const key = cacheKey(context.rootId, id, scope);
+            const cached = textCache.get(key);
+            if (
+                !cached || !specialCacheMatches(cached, item) || cached.retryAfter === undefined ||
+                cached.retryAfter <= Date.now() || cached.units.length > 0
+            ) {
+                rememberUnrendered(context.rootId, item, scope);
+            } else {
+                touchTextCache(key);
+            }
+        }
+    }
+    for (const block of liveAll) {
+        if (failedLiveDiagramIds.has(block.blockId) && isRendererUnitId(block.unitId)) {
+            continue;
+        }
+        if (refreshedEmbedIds.has(block.blockId) && recoveredEmbedElements.has(block.element)) {
+            continue;
+        }
         if (block.blockId === "__doc-title__") {
             if (focusId) {
                 continue;
@@ -1850,13 +2449,27 @@ export async function searchCurrentDocument(
         if (
             item &&
             isDiagramMeta(item) &&
+            !supportsDiagramSourceSearch(effectiveCodeLanguage(item)) &&
             !memoOnlyRestriction &&
             isUnderNonHeadingCssFold(block.element)
         ) {
             const cached = textCache.get(cacheKey(context.rootId, item.id, scope));
-            if (cached && cached.hash === item.hash && cached.retryAfter === undefined) {
+            if (
+                cached && specialCacheMatches(cached, item) &&
+                (cached.retryAfter === undefined || cached.retryAfter > Date.now())
+            ) {
                 touchTextCache(cacheKey(context.rootId, item.id, scope));
-                units.push(...cached.units);
+                if (!usedFoldedDiagramCache.has(item.id)) {
+                    usedFoldedDiagramCache.add(item.id);
+                    if (cached.retryAfter !== undefined) {
+                        unrendered += 1;
+                    } else {
+                        units.push(...cached.units);
+                    }
+                }
+                if (cached.retryAfter !== undefined) {
+                    units.push(frozen);
+                }
                 continue;
             }
             foldedLiveDiagramBlocks.set(block.blockId, block);
@@ -1869,17 +2482,104 @@ export async function searchCurrentDocument(
             continue;
         }
         units.push(frozen);
-        noteLiveUnit(block, item, frozen);
+        if (!refreshedEmbedIds.has(block.blockId)) {
+            noteLiveUnit(block, item, frozen);
+        }
     }
+    if (!memoOnlyRestriction) {
+        for (const [id, element] of mountedCodeBlocks) {
+            const item = meta.byId.get(id)!;
+            if (liveIds.has(id) || !enabled(item) || !inFocus(id) || !isDiagramMeta(item)) {
+                continue;
+            }
+            if (supportsDiagramSourceSearch(effectiveCodeLanguage(item))) {
+                // 包括空源码和尚未绘制的图；当前挂载属性是权威来源，不再读内核旧快照。
+                liveIds.add(id);
+                if (!acceptsRenderer(element)) {
+                    continue;
+                }
+                units.push(
+                    ...collectRendererSearchUnits(element, {
+                        blockId: id,
+                        blockType: "NodeCodeBlock",
+                        blockIndex: orderIndex.get(id) ?? 0,
+                    }).map((block) => freezeLive(block)),
+                );
+                if (!element.hasAttribute("data-content") && !rendererOutputCompleted(element)) unrendered += 1;
+                continue;
+            }
+            // Render from live source rather than kernel DOM when the initial SVG is absent.
+            // Author-hidden blocks have already been excluded by enabled().
+            liveIds.add(id);
+            const state = cachedUnits(context.rootId, [item], scope);
+            units.push(...state.ready);
+            unrendered += state.unrendered;
+            if (state.missing.length > 0) {
+                foldedLiveDiagramBlocks.set(id, {
+                    blockId: id,
+                    blockType: "NodeCodeBlock",
+                    blockIndex: orderIndex.get(id) ?? 0,
+                    element,
+                    text: "",
+                    textNodes: [],
+                });
+            }
+        }
+    }
+    (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>("[data-node-id][data-type]").forEach((element) => {
+        const item = meta.byId.get(element.dataset.nodeId ?? "");
+        if (
+            !item || liveIds.has(item.id) || item.type === "t" || isAttributeViewType(item.type) ||
+            isSpecialRenderMeta(item) ||
+            element.closest('[data-type="NodeBlockQueryEmbed"], [data-type="NodeTable"]') ||
+            !enabled(item) || !inFocus(item.id)
+        ) {
+            return;
+        }
+        if (
+            isVisuallyInEditor(element) || (options.includeFoldedBlocks === true && isUnderNonHeadingCssFold(element))
+        ) {
+            // A mounted empty/fully filtered body is authoritative; SQL may still contain old text.
+            liveIds.add(item.id);
+        }
+    });
     for (const tableId of visibleMountedTables) {
         if (!hiddenMountedTables.has(tableId)) {
             liveIds.add(tableId);
         }
     }
+    if (options.includeAttributeView !== false) {
+        (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]')
+            .forEach((element) => {
+                if (element.closest('[data-type="NodeBlockQueryEmbed"]')) {
+                    return;
+                }
+                const item = meta.byId.get(element.dataset.nodeId ?? "");
+                if (item && enabled(item) && inFocus(item.id)) {
+                    mountedAvIds.add(item.id);
+                    liveIds.add(item.id);
+                }
+            });
+    }
     for (const unit of mountedTableUnits) {
         if (liveIds.has(unit.blockId)) {
             units.push(unit);
         }
+    }
+    const incompleteLive = new Set<string>();
+    if (collectInlineMath) {
+        (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>('span[data-type~="inline-math"][data-content]')
+            .forEach((span) => {
+                const id = (span.closest<HTMLElement>('[data-type="NodeBlockQueryEmbed"][data-node-id]') ??
+                    span.closest<HTMLElement>("[data-node-id][data-type]"))?.dataset.nodeId;
+                if (
+                    id && !refreshedEmbedIds.has(id) && liveIds.has(id) && span.getAttribute("data-content") &&
+                    !span.querySelector(".katex-html") && acceptsRenderer(span)
+                ) {
+                    incompleteLive.add(id);
+                }
+            });
+        unrendered += incompleteLive.size;
     }
 
     // 标题折叠会直接卸载其后代 DOM。若该后代刚刚显示过，就把已经得到的“可见文字”
@@ -1887,6 +2587,13 @@ export async function searchCurrentDocument(
     for (const [blockId, liveUnits] of liveUnitsByBlockId) {
         const item = meta.byId.get(blockId);
         if (!item) {
+            continue;
+        }
+        if (failedLiveDiagramIds.has(blockId)) {
+            continue;
+        }
+        if (incompleteLive.has(blockId)) {
+            dropTextCache(cacheKey(context.rootId, blockId, scope));
             continue;
         }
         if (isSpecialRenderMeta(item)) {
@@ -1897,7 +2604,6 @@ export async function searchCurrentDocument(
             rememberPlain(context.rootId, blockId, scope, item.hash, liveUnits);
         }
     }
-    let unrendered = 0;
     let truncated = 0;
     let degraded = languageQueryFailed;
     const plainTargets: BlockMeta[] = [];
@@ -1925,7 +2631,7 @@ export async function searchCurrentDocument(
             plainTargets.push(item);
         }
     };
-    const queueRemainingSpecials = (includeDiagrams = true) => {
+    const queueRemainingSpecials = () => {
         const queued = new Set(specialTargets.map((item) => item.id));
         for (const item of meta.byId.values()) {
             if (!enabled(item) || liveIds.has(item.id) || queued.has(item.id) || !inFocus(item.id)) {
@@ -1934,12 +2640,7 @@ export async function searchCurrentDocument(
             if (!isSpecialRenderMeta(item)) {
                 continue;
             }
-            // blocks.content 包含并反转义 NodeCodeBlockCode；图表的可见标签
-            // 来自这段源码，所以候选 SQL 已经是安全超集。只有公式/HTML
-            // 仍可能在源码与 renderer 文字之间发生不可下推的变化。
-            // 无关图表交给后台缓存会触发 Mermaid/flowchart 的异步 renderer，
-            // 让每次普通搜索都长时间停在索引中；SQL 失败时走下方全量回退。
-            if (!includeDiagrams && isDiagramMeta(item)) {
+            if (isDiagramMeta(item)) {
                 continue;
             }
             specialTargets.push(item);
@@ -1957,7 +2658,6 @@ export async function searchCurrentDocument(
 
     let prefiltered = false;
     let storePlainCache = !options.regex;
-    let contentCandidateIds: Set<string> | null = null;
     if (options.regex) {
         const groups = candidateQuery.regexGroups;
         if (groups && candidateQuery.triple) {
@@ -1971,24 +2671,23 @@ export async function searchCurrentDocument(
             // 空数组是“查到了但没有候选”，不能当成查询失败。
             if (contentIds !== null && memoIds !== null && titleIds !== null) {
                 prefiltered = true;
-                contentCandidateIds = new Set(contentIds);
                 storePlainCache = regexPrefilterStoresPlainCache(groups);
                 for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
                     queueUnloaded(id);
                 }
                 // 公式和 HTML 的可见文字可能不在 content 里，不能靠字面量丢掉。
-                // 图表源码由 blocks.content 提供安全候选，只有命中的图表进入前台
-                // 渲染；仅备注时 memoIds 已覆盖全部备注宿主，额外预热无备注的特殊
+                // 图表源码只决定解析优先级，其余图表仍需后台补全。
+                // 仅备注时 memoIds 已覆盖全部备注宿主，额外预热无备注的特殊
                 // 块只会争用前台请求。
                 if (!memoOnlyRestriction) {
-                    queueRemainingSpecials(false);
+                    queueRemainingSpecials();
                 }
             }
         }
         if (!prefiltered) {
             // 没有可用于正则预筛的字面量时，普通正文仍只能全量抽取。
-            // 但“仅备注”已知所有候选都带 data-inline-memo-content，可保持完整召回
-            // 的同时避开与备注无关的块。
+            // “仅备注”只取备注宿主和可能含备注的嵌入宿主，保持完整召回，
+            // 同时避开与备注无关的普通正文和渲染器。
             if (memoOnlyRestriction) {
                 const memoIds = candidateQuery.memoHosts ?
                     await candidateQuery.memoHosts :
@@ -2017,35 +2716,32 @@ export async function searchCurrentDocument(
             // SQL 不可用时由文档元数据扩大到全部未加载叶子，保持结果完整性。
             queueEveryUnloaded();
         } else {
-            contentCandidateIds = new Set(contentIds);
             for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
                 queueUnloaded(id);
             }
         }
-        if (!memoOnlyRestriction) {
-            const queuedSpecials = new Set(specialTargets.map((item) => item.id));
-            const restSpecials: BlockMeta[] = [];
-            for (const item of meta.byId.values()) {
-                if (!enabled(item) || liveIds.has(item.id) || queuedSpecials.has(item.id) || !inFocus(item.id)) {
-                    continue;
-                }
-                if (!isSpecialRenderMeta(item)) {
-                    continue;
-                }
-                // 图表只在当前查询确实需要时离屏渲染。无关图表的后台预热会
-                // 触发 Mermaid/flowchart 的异步脚本和布局等待，导致搜索计数
-                // 长时间处于索引状态，却不会增加本次查询的召回。
-                const language = effectiveCodeLanguage(item);
-                if (language === "mermaid" || language === "flowchart") {
-                    continue;
-                }
-                restSpecials.push(item);
-            }
-            if (restSpecials.length > 0 && allowBackgroundJobs) {
-                const warmup = scheduleSpecialWarmup(context.rootId, context.notebookId, restSpecials, options);
-                units.push(...warmup.units);
-                unrendered += warmup.unrendered;
-            }
+    }
+
+    // Renderer text may decode HTML labels or generate numbers absent from source.
+    // SQL is a priority hint for diagrams, never proof that an unrendered block cannot match.
+    const queuedSpecials = new Set(specialTargets.map((item) => item.id));
+    const restSpecials = !memoOnlyRestriction ?
+        Array.from(meta.byId.values()).filter((item) =>
+            enabled(item) && !liveIds.has(item.id) && !queuedSpecials.has(item.id) &&
+            inFocus(item.id) && isSpecialRenderMeta(item)
+        ) :
+        [];
+    let pendingSpecialCoverage = false;
+    if (restSpecials.length > 0) {
+        if (allowBackgroundJobs) {
+            const warmup = scheduleSpecialWarmup(context.rootId, context.notebookId, restSpecials, options);
+            units.push(...warmup.units);
+            unrendered += warmup.unrendered;
+        } else {
+            const state = cachedUnits(context.rootId, restSpecials, scope);
+            units.push(...state.ready);
+            unrendered += state.unrendered;
+            pendingSpecialCoverage = state.missing.length > 0;
         }
     }
 
@@ -2073,11 +2769,8 @@ export async function searchCurrentDocument(
     const specialState = cachedUnits(context.rootId, specialTargets, scope);
     units.push(...specialState.ready);
     unrendered += specialState.unrendered;
-    // Mermaid / flowchart 的可搜索文字只存在 renderer 生成的 SVG/foreignObject 中。
-    // 折叠标题、折叠列表和未加载区域没有 live SVG；如果把它们全部交给后台任务，
-    // 首轮搜索只能等缓存完成后再命中。候选图块在当前搜索中同步离屏渲染，保证
-    // 首次搜索的召回；普通公式/HTML 及未被候选命中的特殊块仍走后台补全，避免把
-    // 大量无关图表的渲染成本放到每次输入的前台路径。
+    // 其余图表仍需 renderer 生成 SVG/foreignObject；候选图块在前台有界渲染。
+    // Mermaid / flowchart 已在 plainTargets 按源码提取，不进入此渲染或后台补全路径。
     const missingDiagrams = specialState.missing.filter(isDiagramMeta);
     const specialMissing = specialState.missing.filter((item) => !isDiagramMeta(item));
     if (missingDiagrams.length > 0) {
@@ -2101,6 +2794,8 @@ export async function searchCurrentDocument(
         startJob(`special:${context.rootId}`, context.rootId, async (isCurrent, signal) => {
             await extractMetas(context.rootId, context.notebookId, specialMissing, options, "light", isCurrent, signal);
         });
+    } else if (specialMissing.length > 0) {
+        pendingSpecialCoverage = true;
     }
 
     if (foldedLiveDiagramBlocks.size > 0) {
@@ -2112,34 +2807,15 @@ export async function searchCurrentDocument(
                 languages.set(id, language);
             }
         }
-        const sourceProbe = !options.regex ?
-            createTextMatchProbe(keyword, {
-                caseSensitive: options.caseSensitive === true,
-                wholeWord: options.wholeWord === true,
-            }) :
-            null;
-        const selected = Array.from(foldedLiveDiagramBlocks.entries()).filter(([id, block]) => {
-            if (contentCandidateIds === null || contentCandidateIds.has(id)) {
-                return true;
-            }
-            if (options.regex) {
-                // 没有必现字面量时无法安全地用 SQL 缩小范围；有字面量时
-                // content 候选是安全超集，继续保留轻量路径。
-                return candidateQuery.regexGroups === null;
-            }
-            // SQL 只看 blocks.content。图表源码可能含 HTML 实体或其它内核
-            // 规范化差异，直接检查 data-content 可把这类折叠图表重新纳入，
-            // 同时避免无关图表全部离屏渲染。
-            const source = diagramSourceText(block.element);
-            return source.length === 0 || Boolean(sourceProbe?.(source));
-        });
-        if (selected.length === 0) {
-            for (const fallback of foldedLiveDiagramFallback.values()) {
-                units.push(...fallback);
-            }
-        } else {
-            const selectedIds = new Set(selected.map(([id]) => id));
-            const selectedBlocks = selected.map(([, block]) => block);
+        const selected = Array.from(foldedLiveDiagramBlocks.values());
+        const epoch = currentCorpusEpoch(context.rootId);
+        const versions = new Map(selected.map((block) => {
+            const item = meta.byId.get(block.blockId);
+            return [block.blockId, item ? specialMetaVersion(item) : undefined];
+        }));
+        // Keep the same two-diagram budget as kernel-DOM extraction.
+        for (let index = 0; index < selected.length; index += 2) {
+            const selectedBlocks = selected.slice(index, index + 2);
             const selectedLanguages = new Map(
                 selectedBlocks.map((block) => [block.blockId, languages.get(block.blockId) ?? ""]),
             );
@@ -2154,6 +2830,7 @@ export async function searchCurrentDocument(
                 );
             } catch {
                 // 保留当前 live 文字；一次 renderer 异常不能让整个搜索链路失败。
+                degraded = true;
             }
             if (cancelled()) {
                 refreshed?.dispose();
@@ -2166,34 +2843,38 @@ export async function searchCurrentDocument(
                     list.push(unit);
                     refreshedById.set(unit.blockId, list);
                 }
-                for (const id of foldedLiveDiagramBlocks.keys()) {
-                    const full = refreshedById.get(id);
-                    const fallback = foldedLiveDiagramFallback.get(id);
-                    if (!selectedIds.has(id)) {
-                        units.push(...(fallback ?? []));
-                        continue;
-                    }
-                    const chosen = full && full.length > 0 ? full : (fallback ?? []);
+                const failedIds = new Set(refreshed?.unrenderedIds);
+                for (const block of selectedBlocks) {
+                    const id = block.blockId;
+                    const rendererFailed = !refreshed || failedIds.has(id);
+                    const chosen = rendererFailed ?
+                        (foldedLiveDiagramFallback.get(id) ?? []) :
+                        (refreshedById.get(id) ?? []);
                     units.push(...chosen);
                     const item = meta.byId.get(id);
-                    const rendererFailed = refreshed?.unrenderedIds.includes(id) === true;
-                    if (item && full && full.length > 0) {
-                        remember(context.rootId, item, chosen, scope);
-                    } else if (item && rendererFailed) {
-                        rememberUnrendered(context.rootId, item, scope);
-                    } else if (item && chosen.length > 0 && refreshed) {
-                        // A successful fallback remains usable; exceptions are retried
-                        // on the next search instead of being cached as complete output.
-                        remember(context.rootId, item, chosen, scope);
+                    if (rendererFailed) {
+                        unrendered += 1;
+                    }
+                    if (
+                        item && epoch === currentCorpusEpoch(context.rootId) &&
+                        versions.get(id) && specialCacheMatches(versions.get(id)!, item)
+                    ) {
+                        if (rendererFailed) {
+                            rememberUnrendered(context.rootId, item, scope);
+                        } else {
+                            // Successful SVG/canvas/img output can legitimately have no Text.
+                            remember(context.rootId, item, chosen, scope);
+                        }
                     }
                 }
-                unrendered += refreshed?.unrenderedIds.length ?? 0;
             } finally {
                 refreshed?.dispose();
             }
         }
     }
 
+    const incompleteBlockIds: string[] = [];
+    let avIndexing = false;
     if (options.includeAttributeView !== false) {
         const loadedRefs = await avRefsPromise;
         if (cancelled()) {
@@ -2206,7 +2887,7 @@ export async function searchCurrentDocument(
             const item = meta.byId.get(ref.blockId);
             return (!item || enabled(item)) && inFocus(ref.blockId);
         });
-        const avDom = collectAvDomCoverage(units);
+        const avDom = collectAvDomCoverage(liveAll.filter((unit) => mountedAvIds.has(unit.blockId)));
         const usedRowLabels = new Map<string, Set<string>>();
         const avViewTypes = new Map<string, string>();
         const avViewIds = new Map<string, string>();
@@ -2219,6 +2900,8 @@ export async function searchCurrentDocument(
                 avViewIds.set(ref.blockId, viewId);
             }
         }
+        if (hasBackgroundCorpusUser(context.rootId)) pinAvCache(context.rootId, refs, avViewIds, edit);
+        else releaseAvCacheOwner(context.rootId, edit);
         const peeked = peekAvUnits(refs, avViewIds);
         for (const unit of peeked.units) {
             if (liveIds.has(unit.blockId)) {
@@ -2244,20 +2927,36 @@ export async function searchCurrentDocument(
         }
         if (peeked.missing.length > 0 && allowBackgroundJobs) {
             const missing = peeked.missing;
-            const avJobPrefix = `av:${context.rootId}`;
-            startJob(`${avJobPrefix}:${meta.signature}`, context.rootId, async (isCurrent, signal) => {
+            // 不同窗格可使用同一数据库的不同视图，任务/失败退避不能互相挡住。
+            const workset = JSON.stringify(refs.map((ref) => [
+                ref.blockId,
+                ref.avId,
+                ref.updated,
+                avViewIds.get(ref.blockId) ?? ref.carrierViewId,
+            ]));
+            const avJobKey = `av:${context.rootId}:${meta.signature}:${workset}`;
+            startJob(avJobKey, context.rootId, async (isCurrent, signal) => {
                 await loadAvUnits(missing, isCurrent, avViewIds, signal);
             });
-            if (jobFailed(avJobPrefix)) {
-                const unavailable = new Set(missing.map((ref) => ref.blockId)).size;
+            avIndexing = jobs.has(avJobKey);
+            const failure = jobFailures.get(avJobKey);
+            if (failure && failure.retryAfter > Date.now()) {
+                const failedIds = failure.failedBlockIds ? new Set(failure.failedBlockIds) : undefined;
+                const failed = missing.filter((ref) => !failedIds || failedIds.has(ref.blockId));
+                incompleteBlockIds.push(...failed.map((ref) => ref.blockId));
+                const unavailable = new Set(failed.map((ref) => ref.blockId)).size;
                 unrendered += unavailable;
-                if (jobTruncated(avJobPrefix)) {
-                    truncated += unavailable;
-                }
+                const truncatedIds = new Set(failure.truncatedBlockIds ?? []);
+                truncated += failure.truncated ?
+                    unavailable :
+                    failed.filter((ref) => truncatedIds.has(ref.blockId)).length;
             }
+        } else if (peeked.missing.length > 0) {
+            pendingSpecialCoverage = true;
         }
     }
 
+    if (options.includeAttributeView === false) releaseAvCacheOwner(context.rootId, edit);
     let tableStale = new Set<string>();
     if (virtualTables.size > 0) {
         const merged = mergeVirtualTableUnits(units, virtualTables);
@@ -2277,9 +2976,6 @@ export async function searchCurrentDocument(
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
         regex: options.regex,
-        regexUnicode: options.regexUnicode,
-        regexMultiline: options.regexMultiline,
-        regexDotAll: options.regexDotAll,
         dedupeOverlaps: false,
     };
     const matched = options.regexMatcher ?
@@ -2303,7 +2999,14 @@ export async function searchCurrentDocument(
         byKey.set(`${unit.blockId}\u0000${unit.unitId ?? ""}`, unit);
     }
     const matches: SearchMatch[] = [];
-    for (const hit of matched.hits) {
+    let phaseStarted = performance.now();
+    for (let hitIndex = 0; hitIndex < matched.hits.length; hitIndex += 1) {
+        if ((hitIndex & 255) === 255 && performance.now() - phaseStarted >= 8) {
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+            if (cancelled()) return {matches: [], error: "", cancelled: true};
+            phaseStarted = performance.now();
+        }
+        const hit = matched.hits[hitIndex];
         const unit = byKey.get(`${hit.blockId}\u0000${hit.unitId ?? ""}`);
         if (!unit || !passesRestrict(unit, hit.start, hit.end, options)) {
             continue;
@@ -2328,13 +3031,14 @@ export async function searchCurrentDocument(
             blockIndex: orderIndex.get(hit.blockId) ?? (hit.blockId === "__doc-title__" ? -1 : hit.blockIndex),
             unitId: hit.unitId,
             unitSeq: navSeq(unit, hit.start),
+            embeddedPosition: embeddedPositionAt(unit.embeddedOrder, hit.start),
             start: hit.start,
             end: hit.end,
             matchedText: hit.matchedText,
             replaceable:
                 (nonReplaceable || Boolean(replaceLock) || tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`)) ?
                     false :
-                    isHitReplaceableByUnit(unit, hit.start, hit.end),
+                    hit.replaceable,
             replaceLock,
             highlightKind: unit.highlightKind,
             ...(unit.highlightKind === "inline-math" && unit.mathOrdinal !== undefined ?
@@ -2350,18 +3054,22 @@ export async function searchCurrentDocument(
         });
     }
     matches.sort(compareMatchOrder);
+    orderEmbeddedVisualMatches(matches, liveAll);
+    const projected = await projectRangesWithBudget(edit, matches, options, liveAll);
+    if (cancelled()) return {matches: [], error: "", cancelled: true};
 
-    const partial = jobRunning(`special:${context.rootId}`) ||
+    const partial = pendingSpecialCoverage || jobRunning(`special:${context.rootId}`) ||
         jobRunning(`special-rest:${context.rootId}`) ||
         warmupTimers.has(context.rootId) ||
-        jobRunning(`av:${context.rootId}`);
+        avIndexing;
     return {
-        matches: projectRanges(edit, matches, options, liveAll),
+        matches: projected,
         error: "",
         degraded,
         partial,
         unrendered,
         truncated,
+        incompleteBlockIds,
     };
 }
 
@@ -2391,6 +3099,8 @@ function compareMatchOrder(left: SearchMatch, right: SearchMatch): number {
     if (left.blockIndex !== right.blockIndex) {
         return left.blockIndex - right.blockIndex;
     }
+    const embedded = compareEmbeddedPositions(left, right);
+    if (embedded !== undefined && embedded !== 0) return embedded;
     if (
         sameStructuralBlock(left, right) &&
         left.unitSeq !== undefined &&
@@ -2582,6 +3292,7 @@ function avMatchPosition(unitId: string | undefined): {row: string; col: string;
     if (!unitId) {
         return null;
     }
+    unitId = unitId.replace(/#run-\d+$/, "");
     if (unitId.startsWith("cell:")) {
         const parts = unitId.split(":");
         if (parts.length < 4 || !parts[2]) {
@@ -2677,7 +3388,9 @@ function dedupeMathUnits(units: CachedUnit[]): CachedUnit[] {
             continue;
         }
         const text = unit.text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");
-        const key = `${unit.blockId}\0${text}\0${unit.mathOrdinal ?? ""}`;
+        const key = unit.unitId?.startsWith("embed:") ?
+            `${unit.blockId}\0${unit.unitId}` :
+            `${unit.blockId}\0${text}\0${unit.mathOrdinal ?? ""}`;
         if (seen.has(key)) {
             continue;
         }
@@ -2705,7 +3418,7 @@ function dedupeCorpusUnits(units: CachedUnit[]): CachedUnit[] {
             unit.blockType === "NodeCodeBlock" &&
             !source
         ) {
-            // renderer 单元（包括 source-fallback）已经代表了整个图表块。
+            // renderer 单元已经代表了整个图表块。
             // 异常 DOM 同时留下的普通代码文本不能再参与计数，否则同一
             // 个可见标签会在 renderer 与代码文本两条路径各命中一次。
             continue;

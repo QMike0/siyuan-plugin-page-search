@@ -5,6 +5,14 @@ import {
     Plugin,
 } from "siyuan";
 import "./index.scss";
+import {
+    attributeViewTransactionIds,
+    isAttrViewWsTransaction,
+} from "./frontend/av-watch";
+import {
+    invalidateAvCache,
+    invalidateAvCacheForIds,
+} from "./frontend/corpus/av";
 import {isEditorReplaceModeBlocked} from "./frontend/editor-mode";
 import {
     createClientId,
@@ -19,14 +27,14 @@ import {
     type HeadingIncludeLevel,
 } from "./frontend/search-bar";
 import {
-    scrubSelectionScopePollution,
-    clearAllSelectionScopeSessionOverlays,
-} from "./frontend/selection-scope-visual";
-import {
     bindSearchHistoryIo,
     SEARCH_HISTORY_STORAGE_KEY,
     searchHistory,
 } from "./frontend/search-history";
+import {
+    scrubSelectionScopePollution,
+    clearAllSelectionScopeSessionOverlays,
+} from "./frontend/selection-scope-visual";
 import {
     PREFS_STORAGE_PATH,
     type RestrictInlineType,
@@ -204,6 +212,14 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     }
 
     private readonly onSearchHistoryBroadcast = (event: CustomEvent) => {
+        // 搜索窗关闭后仍接收 AV 事务，不能在下次打开时复用未更新载体 hash 的旧单元格。
+        if (isAttrViewWsTransaction(event.detail)) {
+            const avIds = attributeViewTransactionIds(event.detail);
+            // 某些内核事务只标记 AttrView action 而不带 avID；此时精确失效不可用，
+            // 保守清空 AV 显示值缓存，避免下次冷搜索复用旧字段文字。
+            if (avIds.length) invalidateAvCacheForIds(avIds);
+            else invalidateAvCache();
+        }
         searchHistory.acceptBroadcast(event.detail);
     };
 
@@ -338,12 +354,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             wholeWord: t.wholeWord || "Whole word",
             searchMethodKeyword: t.searchMethodKeyword || "Keyword",
             searchMethodRegex: t.searchMethodRegex || "Regular expression",
-            regexOptions: t.regexOptions || "Regular expression options",
-            regexUnicode: t.regexUnicode || "Unicode (u)",
-            regexMultiline: t.regexMultiline || "Multiline anchors (m)",
-            regexDotAll: t.regexDotAll || "Dot matches newline (s)",
-            regexBoundaryHint: t.regexBoundaryHint ||
-                "Zero-length matches are skipped; matches do not cross text units",
             preserveCase: t.preserveCase || "Preserve case",
             preserveCaseDisabledByRegex: t.preserveCaseDisabledByRegex ||
                 "Unavailable with regex (replace uses $1 templates)",
@@ -388,6 +398,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             searchDegradedLoadedOnly: t.searchDegradedLoadedOnly ||
                 "This environment cannot query unloaded content. Results include only what is already loaded.",
             searchIndexingBadge: t.searchIndexingBadge || "Indexing",
+            searchRetryIncomplete: t.searchRetryIncomplete || "{count} incomplete databases (click to retry)",
+            replaceStaleTarget: t.replaceStaleTarget ||
+                "The target changed. Replacement was cancelled and results refreshed. Review them and try again.",
             searchUnrendered: t.searchUnrendered ||
                 "{count} blocks failed to render and were not counted",
             resultsPanelToggle: t.resultsPanelToggle || "Search results",
@@ -701,20 +714,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         });
     }
 
-    /** 将正则 flags 同步到其它已打开面板 */
-    syncRegexOptions(value: {
-        regexUnicode: boolean;
-        regexMultiline: boolean;
-        regexDotAll: boolean;
-    }, source?: SearchBar) {
-        this.searchBars.forEach((bar) => {
-            if (bar === source) {
-                return;
-            }
-            bar.applyRegexOptions(value);
-        });
-    }
-
     private readonly onKernelPluginStateChange = ({detail}: CustomEvent<IKernelPluginState>) => {
         this.kernelReady = detail?.code === 2;
     };
@@ -737,7 +736,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             if (bar) {
                 this.rememberSessionInputs(bar);
                 try {
-                    bar.destroy();
+                    bar.destroy(false);
                 } catch (error) {
                     console.error("[page-search] destroy invalid bar failed", error);
                     this.activeSearchComponentsCount = Math.max(0, this.activeSearchComponentsCount - 1);
@@ -801,15 +800,26 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         }
     }
 
-    onSearchComponentUnmounted(callback?: (event: CustomEvent) => void) {
+    onSearchComponentUnmounted(callback?: (event: CustomEvent) => void, root?: Element) {
         if (callback) {
             this.searchComponentCallbacks.delete(callback);
         }
         this.activeSearchComponentsCount--;
+        if (root === this.lastHighlightComponent) this.lastHighlightComponent = null;
         if (this.activeSearchComponentsCount === 0) {
+            this.lastHighlightComponent = null;
             this.eventBusOff();
             this.stopCleanupTimer();
         }
+    }
+
+    /** 宿主移除窗格时立即释放组件；不写配置，也不恢复焦点到被搬走的正文。 */
+    onSearchComponentDetached(root: Element) {
+        const bar = this.searchBars.get(root);
+        if (!bar) return;
+        this.searchBars.delete(root);
+        this.rememberSessionInputs(bar);
+        bar.destroy(false);
     }
 
     closeSearchDialog() {
@@ -974,9 +984,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeFoldedBlocks: prefs.includeFoldedBlocks === true,
                     includeInlineMemo: prefs.includeInlineMemo === true,
                     useRegex: prefs.useRegex === true,
-                    regexUnicode: prefs.regexUnicode === true,
-                    regexMultiline: prefs.regexMultiline === true,
-                    regexDotAll: prefs.regexDotAll === true,
                     // 限制查找仅会话内有效，打开时始终不限制
                     restrictInlineTypes: [],
                 });

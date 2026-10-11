@@ -30,6 +30,12 @@ export function isRendererUnitId(unitId: string | null | undefined): boolean {
     return rendererUnitSource(unitId) !== null;
 }
 
+/** 嵌入结果归属于宿主块，但仍保留原 renderer 单元身份。 */
+export function isRendererSourceFallbackUnitId(unitId: string | null | undefined): boolean {
+    const sourceUnitId = unitId?.startsWith("embed:") ? unitId.replace(/^embed:[^:]+:/, "") : unitId;
+    return rendererUnitSource(sourceUnitId) === "source-fallback";
+}
+
 export function isRendererUnitFor(
     unitId: string | null | undefined,
     renderer: string,

@@ -1,119 +1,94 @@
-/**
- * 连续可见文字。strong / em / a / code 这类行内格式不是阻隔。
- * br、图片、行内公式，以及换了块级容器（p、div、标题、单元格）的文字不能拼成一次匹配。
- */
-
-import {isCssHideBoundary} from "./visibility";
+import {
+    isCssHideBoundary,
+    textDisplay,
+} from "./visibility";
 
 const FLOW_SELECTOR = "p,div,h1,h2,h3,h4,h5,h6,li,pre,blockquote,td,th,figcaption,section,article";
 const GAP_SELECTOR = "br,hr,img,.img,span[data-type~='inline-math']";
-const FOLLOWING = 4;
 
+interface TextContext {
+    flow: Element | null;
+    gap: Element | null;
+}
+
+/** Walk only the DOM interval covered by these nodes, once. Ordinary inline formatting is continuous. */
 export function splitTextNodesAtBarriers(nodes: readonly Text[]): Text[][] {
     if (nodes.length === 0) {
         return [];
     }
-    const runs: Text[][] = [[nodes[0]]];
-    for (let index = 1; index < nodes.length; index += 1) {
-        const previous = nodes[index - 1];
-        const current = nodes[index];
-        if (visualBarrierBetween(previous, current)) {
-            runs.push([current]);
-        } else {
-            runs[runs.length - 1].push(current);
+    const contexts = new Map<Element, TextContext>();
+    const flows = new Map<Element, boolean>();
+    const isFlow = (element: Element): boolean => {
+        const cached = flows.get(element);
+        if (cached !== undefined) {
+            return cached;
         }
+        // SVG tspan belongs to its text label, regardless of SVG's display value.
+        const display = element instanceof HTMLElement ? textDisplay(element) : "";
+        const flow = display ?
+            display === "block" || display === "flow-root" || display === "flex" || display === "grid" ||
+            display === "list-item" || display.startsWith("table") || display.startsWith("block ") :
+            element.matches(FLOW_SELECTOR);
+        flows.set(element, flow);
+        return flow;
+    };
+    const contextOf = (node: Text): TextContext => {
+        let element = node.parentElement;
+        const path: Element[] = [];
+        while (element && !contexts.has(element)) {
+            path.push(element);
+            element = element.parentElement;
+        }
+        let context = element ? contexts.get(element)! : {flow: null, gap: null};
+        for (let index = path.length - 1; index >= 0; index -= 1) {
+            const parent = path[index];
+            context = {
+                flow: isFlow(parent) ? parent : context.flow,
+                gap: parent.matches(GAP_SELECTOR) ? parent : context.gap,
+            };
+            contexts.set(parent, context);
+        }
+        return context;
+    };
+    let root = nodes[0].getRootNode();
+    let walker = nodes[0].ownerDocument.createTreeWalker(root, NodeFilter.SHOW_ALL);
+    walker.currentNode = nodes[0];
+    let previous = nodes[0];
+    let previousContext = contextOf(previous);
+    const runs: Text[][] = [[previous]];
+    for (let index = 1; index < nodes.length; index += 1) {
+        const target = nodes[index];
+        const targetRoot = target.getRootNode();
+        const context = contextOf(target);
+        let barrier = previousContext.flow !== context.flow || previousContext.gap !== context.gap;
+        if (targetRoot !== root || !(previous.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+            barrier = true;
+            root = targetRoot;
+            walker = target.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_ALL);
+        } else {
+            let current = walker.nextNode();
+            while (current && current !== target) {
+                if (
+                    current instanceof Element && (
+                        current.matches(GAP_SELECTOR) || isFlow(current) || isCssHideBoundary(current)
+                    )
+                ) {
+                    barrier = true;
+                }
+                current = walker.nextNode();
+            }
+            if (!current) {
+                barrier = true;
+            }
+        }
+        if (barrier) {
+            runs.push([target]);
+        } else {
+            runs[runs.length - 1].push(target);
+        }
+        walker.currentNode = target;
+        previous = target;
+        previousContext = context;
     }
     return runs;
-}
-
-function visualBarrierBetween(left: Text, right: Text): boolean {
-    if (left.getRootNode() !== right.getRootNode()) {
-        return true;
-    }
-    if (flowAncestor(left) !== flowAncestor(right)) {
-        return true;
-    }
-    if (gapAncestor(left) !== gapAncestor(right)) {
-        return true;
-    }
-    return gapElementBetween(left, right);
-}
-
-function flowAncestor(node: Text): Element | null {
-    return node.parentElement?.closest(FLOW_SELECTOR) ?? null;
-}
-
-function gapAncestor(node: Text): Element | null {
-    return node.parentElement?.closest(GAP_SELECTOR) ?? null;
-}
-
-function gapElementBetween(left: Text, right: Text): boolean {
-    if (left.parentNode && left.parentNode === right.parentNode) {
-        let sibling = left.nextSibling;
-        while (sibling && sibling !== right) {
-            if (sibling.nodeType === 1 && subtreeHasGap(sibling as Element)) {
-                return true;
-            }
-            sibling = sibling.nextSibling;
-        }
-        return false;
-    }
-    const root = commonAncestorElement(left, right);
-    if (!root) {
-        return true;
-    }
-    const walker = left.ownerDocument.createTreeWalker(root, 1);
-    let seen = 0;
-    let current = walker.nextNode() as Element | null;
-    while (current && seen < 4000) {
-        seen += 1;
-        if (!current.contains(left) && !current.contains(right) && isGapElement(current)) {
-            const afterLeft = (left.compareDocumentPosition(current) & FOLLOWING) !== 0;
-            const beforeRight = (current.compareDocumentPosition(right) & FOLLOWING) !== 0;
-            if (afterLeft && beforeRight) {
-                return true;
-            }
-        }
-        if ((current.compareDocumentPosition(right) & 2) !== 0 && !current.contains(right)) {
-            break;
-        }
-        current = walker.nextNode() as Element | null;
-    }
-    return seen >= 4000;
-}
-
-function subtreeHasGap(element: Element): boolean {
-    return isGapElement(element) || Boolean(element.querySelector(GAP_SELECTOR));
-}
-
-function isGapElement(element: Element): boolean {
-    return element.matches(GAP_SELECTOR) || isCssHideBoundary(element);
-}
-
-function commonAncestorElement(left: Node, right: Node): Element | null {
-    const leftElement = left.parentElement;
-    const rightElement = right.parentElement;
-    if (!leftElement || !rightElement) {
-        return null;
-    }
-    if (leftElement === rightElement || leftElement.contains(rightElement)) {
-        return leftElement;
-    }
-    if (rightElement.contains(leftElement)) {
-        return rightElement;
-    }
-    const seen = new Set<Element>();
-    let cursor: Element | null = leftElement;
-    while (cursor) {
-        seen.add(cursor);
-        cursor = cursor.parentElement;
-    }
-    cursor = rightElement;
-    while (cursor) {
-        if (seen.has(cursor)) {
-            return cursor;
-        }
-        cursor = cursor.parentElement;
-    }
-    return null;
 }

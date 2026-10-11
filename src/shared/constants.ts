@@ -18,7 +18,6 @@ export function effectiveSearchQuery(value: string): string {
     if (!value || value.replace(ZERO_WIDTH_GLOBAL_RE, "").length === 0) {
         return "";
     }
-
     const trimmed = value.trim();
     if (trimmed.replace(ZERO_WIDTH_GLOBAL_RE, "").length > 0) {
         return trimmed;

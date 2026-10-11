@@ -14,6 +14,11 @@
     "all"
   ],
   "disabledInPublish": false,
+  "publish": {
+    "resources": [
+      "page-search-regex-worker.js"
+    ]
+  },
   "displayName": {
     "default": "In-Page Search & Replace",
     "zh-CN": "页内搜索替换"

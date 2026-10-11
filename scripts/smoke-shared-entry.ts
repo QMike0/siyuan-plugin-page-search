@@ -440,6 +440,18 @@ assert(cjkOpen.length === 2, `wholeWord off keeps both 中, got ${cjkOpen.length
 const cjkWhole = matchTextUnits(cjkUnits, "中", {wholeWord: true});
 assert(cjkWhole.length === 1 && cjkWhole[0].start === 3, `wholeWord CJK boundary, got ${cjkWhole.length}`);
 
+for (const regex of [false, true]) {
+    const punctuationWhole = matchTextUnits(
+        [{blockId: "cjk-punctuation", blockType: "p", blockIndex: 0, text: "（你好），你好世界", segmentLengths: [10]}],
+        "你好",
+        {wholeWord: true, regex},
+    );
+    assert(
+        punctuationWhole.length === 1 && punctuationWhole[0].start === 1,
+        "Chinese punctuation is a built-in boundary without splitting continuous Chinese text",
+    );
+}
+
 const accentWhole = matchTextUnits(
     [{blockId: "w3", blockType: "p", blockIndex: 0, text: "café caf", segmentLengths: [8]}],
     "caf",
@@ -494,23 +506,24 @@ const regexHits = matchTextUnits(
 );
 assert(regexHits.length === 3, `regex \\d+: expected 3, got ${regexHits.length}`);
 
+const removedRegexFlags = {regexUnicode: true, regexMultiline: true, regexDotAll: true};
 const regexUnicodeHits = matchTextUnits(
     [{blockId: "ru", blockType: "p", blockIndex: 0, text: "中文 123", segmentLengths: [6]}],
     "\\p{L}+",
-    {regex: true, regexUnicode: true, caseSensitive: true},
+    {regex: true, ...removedRegexFlags, caseSensitive: true},
 );
 assert(
-    regexUnicodeHits.length === 1 && regexUnicodeHits[0].matchedText === "中文",
-    "Unicode regex flag enables property escapes",
+    regexUnicodeHits.length === 0,
+    "removed Unicode flag cannot enable property escapes",
 );
 const regexMultilineHits = matchTextUnits(
     [{blockId: "rm", blockType: "p", blockIndex: 0, text: "a\nb", segmentLengths: [3]}],
     "^b",
-    {regex: true, regexMultiline: true, caseSensitive: true},
+    {regex: true, ...removedRegexFlags, caseSensitive: true},
 );
 assert(
-    regexMultilineHits.length === 1 && regexMultilineHits[0].start === 2,
-    "multiline regex flag changes anchors only when selected",
+    regexMultilineHits.length === 0,
+    "removed multiline flag cannot change anchors",
 );
 assert(
     matchTextUnits([{blockId: "rm0", blockType: "p", blockIndex: 0, text: "a\nb", segmentLengths: [3]}], "^b", {
@@ -522,9 +535,9 @@ assert(
 const regexDotAllHits = matchTextUnits(
     [{blockId: "rs", blockType: "p", blockIndex: 0, text: "a\nb", segmentLengths: [3]}],
     "a.b",
-    {regex: true, regexDotAll: true, caseSensitive: true},
+    {regex: true, ...removedRegexFlags, caseSensitive: true},
 );
-assert(regexDotAllHits.length === 1 && regexDotAllHits[0].matchedText === "a\nb", "dotAll matches newline");
+assert(regexDotAllHits.length === 0, "removed dotAll flag cannot make dot match newline");
 assert(
     matchTextUnits([{blockId: "rs0", blockType: "p", blockIndex: 0, text: "a\nb", segmentLengths: [3]}], "a.b", {
         regex: true,
@@ -535,11 +548,12 @@ assert(
 const unicodeDotHits = matchTextUnits(
     [{blockId: "emoji", blockType: "p", blockIndex: 0, text: "😀", segmentLengths: [2]}],
     ".",
-    {regex: true, regexUnicode: true, caseSensitive: true},
+    {regex: true, ...removedRegexFlags, caseSensitive: true},
 );
 assert(
-    unicodeDotHits.length === 1 && unicodeDotHits[0].start === 0 && unicodeDotHits[0].end === 2,
-    "Unicode dot keeps a surrogate pair as one match while retaining DOM UTF-16 offsets",
+    unicodeDotHits.length === 2 && unicodeDotHits[0].start === 0 && unicodeDotHits[0].end === 1 &&
+        unicodeDotHits[1].start === 1 && unicodeDotHits[1].end === 2,
+    "disabled Unicode flag retains UTF-16 code-unit matches and DOM offsets",
 );
 const emojiHaystack = "😀a";
 for (const unicode of [false, true]) {
@@ -547,16 +561,22 @@ for (const unicode of [false, true]) {
     const zeroLengthPatterns = ["^", "(?=a)", "(?=😀)"];
     for (const pattern of zeroLengthPatterns) {
         const skipped = matchTextUnits(
-            [{blockId: "zw", blockType: "p", blockIndex: 0, text: emojiHaystack, segmentLengths: [emojiHaystack.length]}],
+            [{
+                blockId: "zw",
+                blockType: "p",
+                blockIndex: 0,
+                text: emojiHaystack,
+                segmentLengths: [emojiHaystack.length],
+            }],
             pattern,
-            {regex: true, regexUnicode: unicode, caseSensitive: true},
+            {regex: true, ...{regexUnicode: unicode}, caseSensitive: true},
         );
         assert(skipped.length === 0, `${flags} ${pattern} keeps the zero-length policy on emoji text`);
     }
     const alternation = matchTextUnits(
         [{blockId: "alt", blockType: "p", blockIndex: 0, text: emojiHaystack, segmentLengths: [emojiHaystack.length]}],
         "^|a",
-        {regex: true, regexUnicode: unicode, caseSensitive: true},
+        {regex: true, ...{regexUnicode: unicode}, caseSensitive: true},
     );
     assert(
         alternation.length === 1 && alternation[0].start === 2 && alternation[0].end === 3 &&
@@ -567,29 +587,29 @@ for (const unicode of [false, true]) {
 const starAfterEmoji = matchTextUnits(
     [{blockId: "star", blockType: "p", blockIndex: 0, text: emojiHaystack, segmentLengths: [emojiHaystack.length]}],
     "a*",
-    {regex: true, regexUnicode: true, caseSensitive: true},
+    {regex: true, ...removedRegexFlags, caseSensitive: true},
 );
 assert(
     starAfterEmoji.length === 1 && starAfterEmoji[0].start === 2 && starAfterEmoji[0].matchedText === "a",
-    "unicode a* skips the empty match on an emoji and still finds the following a",
+    "a* skips empty matches on an emoji and still finds the following a with old flags ignored",
 );
 const multilineAnchor = matchTextUnits(
     [{blockId: "ml", blockType: "p", blockIndex: 0, text: "😀\na", segmentLengths: [4]}],
     "^|a",
-    {regex: true, regexUnicode: true, regexMultiline: true, caseSensitive: true},
+    {regex: true, ...removedRegexFlags, caseSensitive: true},
 );
 assert(
-    multilineAnchor.length === 0,
-    "unicode multiline ^|a terminates; a zero-length ^ at the same index still hides that alternative",
+    multilineAnchor.length === 1 && multilineAnchor[0].start === 3,
+    "disabled multiline ^|a terminates and keeps the later non-empty match",
 );
 const multilineLetter = matchTextUnits(
     [{blockId: "ml2", blockType: "p", blockIndex: 0, text: "😀\na", segmentLengths: [4]}],
     "a|^",
-    {regex: true, regexUnicode: true, regexMultiline: true, caseSensitive: true},
+    {regex: true, ...removedRegexFlags, caseSensitive: true},
 );
 assert(
     multilineLetter.length === 1 && multilineLetter[0].start === 3 && multilineLetter[0].matchedText === "a",
-    "unicode multiline still reports a non-empty alternative after advancing past an emoji",
+    "a|^ still reports the later non-empty alternative with old flags ignored",
 );
 const reusedRegexHits = matchTextUnitsDetailed(
     [
@@ -654,6 +674,11 @@ assertLiterals("(?=foo)bar", [[lit("bar")]]);
 assertLiterals("[0-9]+", [[digit]]);
 assertLiterals("[0-9a]+", null);
 assertLiterals("[a0-9]", null);
+assertLiterals("[A-Za-z_]{2}", null);
+assertLiterals("[a-z中]{2}", null);
+assertLiterals("[\\s中]{2}", null);
+assertLiterals("[\\D中]{2}", null);
+assertLiterals("[a-z。]foo", [[lit("foo")]]);
 assertLiterals("[\\d.]", null);
 assertLiterals("[a]", null);
 assertLiterals("\\w+", [[word]]);
@@ -679,6 +704,7 @@ assert(searchNormalizeFoldIsSuperset("中文"), "unscoped Han text can stay on s
 assert(!searchNormalizeFoldIsSuperset("ος"), "final sigma is not a Go simple-lower superset");
 assert(!searchNormalizeFoldIsSuperset("i\u0307x"), "dotted i expansion is not a Go simple-lower superset");
 assert(!searchNormalizeFoldIsSuperset("İx"), "capital I with dot is not a Go simple-lower superset");
+assert(!searchNormalizeFoldIsSuperset("\u0307"), "a partial expanding-lower match also needs a superset fallback");
 
 function goSimpleLower(text: string): string {
     let lowered = "";
@@ -706,6 +732,8 @@ function modeledLiteralPrefilterKeeps(content: string, needle: string, caseSensi
 
 const literalSupersetCases = [
     ["İx", "i\u0307x"],
+    ["İx", "\u0307"],
+    ["İx", "\u0307x"],
     ["ΟΣ", "ος"],
     ["Hello", "hello"],
     ["École", "école"],
@@ -732,15 +760,17 @@ function modeledRegexPrefilterKeeps(
     }
     const fold = (value: string) => caseSensitive ? value : goSimpleLower(value);
     const haystack = fold(content);
-    return groups.some((group) => group.every((atom) => {
-        if (atom.kind === "digit") {
-            return /[0-9]/.test(content);
-        }
-        if (atom.kind === "word") {
-            return /[A-Za-z0-9_]/.test(content);
-        }
-        return haystack.includes(fold(atom.text));
-    }));
+    return groups.some((group) =>
+        group.every((atom) => {
+            if (atom.kind === "digit") {
+                return /[0-9]/.test(content);
+            }
+            if (atom.kind === "word") {
+                return /[A-Za-z0-9_]/.test(content);
+            }
+            return haystack.includes(fold(atom.text));
+        })
+    );
 }
 
 const regexSupersetCases: Array<[string, string, boolean, boolean]> = [
@@ -749,14 +779,17 @@ const regexSupersetCases: Array<[string, string, boolean, boolean]> = [
     ["中文ſ", "中文\\w+", false, true],
     ["12", "\\d+", false, true],
     ["Ab", "\\w+", true, true],
+    ["\u{1F600}\u{1F600}", "\u{1F600}{2}", true, true],
+    ["ab", "\u{1F600}?ab", true, true],
+    ["\u{1F600}\u{1F600}", "[\u{1F600}]{2}", true, true],
+    ["\u{1F600}\u{1F600}", "\\uD83D\\uDE00{2}", true, true],
+    ["\u{1F600}\u{1F600}", "\\u{1F600}{2}", true, true],
 ];
 for (const [content, pattern, caseSensitive, unicode] of regexSupersetCases) {
-    const hits = matchTextUnits(
-        [{blockId: "fold", blockType: "p", blockIndex: 0, text: content, segmentLengths: [content.length]}],
-        pattern,
-        {regex: true, caseSensitive, regexUnicode: unicode},
-    );
-    assert(hits.length > 0, `regex ${pattern} should match ${content}`);
+    // The standalone candidate parser still accepts an explicit semantic context;
+    // production search always calls it without Unicode mode.
+    const matches = new RegExp(pattern, (caseSensitive ? "" : "i") + (unicode ? "u" : "")).test(content);
+    assert(matches, `regex ${pattern} should match ${content}`);
     assert(
         modeledRegexPrefilterKeeps(content, pattern, caseSensitive, unicode),
         `SQL prefilter must not drop regex hit ${pattern} in ${content}`,
@@ -902,16 +935,18 @@ assert(
     "merge prefs useRegex",
 );
 assert(
-    !DEFAULT_PREFS.regexUnicode && !DEFAULT_PREFS.regexMultiline && !DEFAULT_PREFS.regexDotAll,
-    "regex flags default off to preserve legacy regex behavior",
+    ["regexUnicode", "regexMultiline", "regexDotAll"].every(key => !(key in DEFAULT_PREFS)),
+    "removed regex flags are absent from default preferences",
 );
 assert(
-    coercePluginPrefs({regexUnicode: true, regexMultiline: true, regexDotAll: true}).regexDotAll,
-    "coerce regex flags",
+    ["regexUnicode", "regexMultiline", "regexDotAll"].every(key => !(key in coercePluginPrefs({...removedRegexFlags}))),
+    "coerce discards old regex flags",
 );
 assert(
-    mergePrefs(DEFAULT_PREFS, {regexUnicode: true}).regexUnicode,
-    "merge regex Unicode flag",
+    ["regexUnicode", "regexMultiline", "regexDotAll"].every(key =>
+        !(key in mergePrefs(DEFAULT_PREFS, {...removedRegexFlags}))
+    ),
+    "merge discards old regex flags",
 );
 
 const named = normalizeMatchRequest([{
@@ -1215,10 +1250,10 @@ assert(
         end: 2,
         patternSource: "(.)",
         caseSensitive: true,
-        regexUnicode: true,
+        ...removedRegexFlags,
         template: "[$1]",
-    }) === "[😀]",
-    "regex replacement uses the same Unicode flag as search",
+    }) === null,
+    "regex replacement cannot reinterpret UTF-16 matches as a Unicode dot",
 );
 assert(
     expandRegexReplacement({
@@ -1256,7 +1291,7 @@ assert(
         start: 0,
         end: 7,
         patternSource: "foo",
-        regexMultiline: true,
+        ...removedRegexFlags,
         template: "changed",
     }) === null,
     "regex replacement rejects a multiline partial-slice fallback",

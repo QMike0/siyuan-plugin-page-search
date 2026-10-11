@@ -20,7 +20,7 @@ interface RegexExpandWorkerRequest {
     units: RegexReplacementUnitRequest[];
     patternSource: string;
     template: string;
-    options: Pick<MatchTextUnitsOptions, "caseSensitive" | "regexUnicode" | "regexMultiline" | "regexDotAll">;
+    options: Pick<MatchTextUnitsOptions, "caseSensitive">;
 }
 
 type RegexWorkerRequest = RegexMatchWorkerRequest | RegexExpandWorkerRequest;
@@ -44,3 +44,6 @@ self.addEventListener("message", (event: MessageEvent<RegexWorkerRequest>) => {
     );
     self.postMessage({id: request.id, kind: request.kind, result});
 });
+
+// 监听器安装后通知主线程，下载/初始化耗时不占匹配和替换的执行预算。
+self.postMessage({kind: "ready"});

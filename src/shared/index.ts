@@ -41,6 +41,7 @@ export type {
     RegexReplacementUnitRequest,
 } from "./regex-replace";
 export {
+    isRendererSourceFallbackUnitId,
     isRendererUnitFor,
     isRendererUnitId,
     RENDERER_UNIT_PREFIX,
@@ -90,8 +91,8 @@ export {
     TABLE_VIRTUAL_ROWS_ATTR,
     tableCellNodeId,
     tableCellPosition,
-    tableOverlayKey,
     tableHostOmitsRows,
+    tableOverlayKey,
 } from "./table-live";
 export type { LogicalTableLayout, LogicalTableRow } from "./table-live";
 export type {

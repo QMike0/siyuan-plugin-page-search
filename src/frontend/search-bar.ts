@@ -18,6 +18,7 @@ import {
     hasRestrictInlineType,
     isRestrictInlineActive,
     isRendererUnitFor,
+    isRendererSourceFallbackUnitId,
     normalizeRestrictInlineTypes,
     toggleRestrictInlineType,
     logicalRowOffset,
@@ -29,6 +30,7 @@ import {
 } from "../shared";
 import {
     AV_REFRESH_DEBOUNCE_MS,
+    attributeViewTransactionIds,
     isAttrViewRelevantToEdit,
     isAttrViewWsTransaction,
     watchAttributeViewDom,
@@ -40,13 +42,22 @@ import {
     TABLE_TYPE,
     type CollectSearchableBlocksOptions,
 } from "./blocks";
+import {ComponentHighlights} from "./component-highlights";
+import {watchComponentLifecycle} from "./component-lifecycle";
+import {
+    rootUsesAttributeViews,
+    releaseAvCacheOwner,
+} from "./corpus/av";
 import {
     blockIsInEditor,
     openBlockInEditor,
 } from "./corpus/locate";
 import {
     fillLiveRanges,
-    rebindChangedRanges,
+    clearViewportProjection,
+    prepareViewportRangesWithBudget,
+    prepareLiveRangesWithBudget,
+    rebindChangedRangesWithBudget,
     type RebindTarget,
 } from "./corpus/project";
 import {
@@ -55,14 +66,20 @@ import {
     invalidateAttributeViewSearch,
     invalidateDocumentStructureCaches,
     releaseBackgroundCorpusRoot,
+    releaseSpecialCacheOwner,
     retainBackgroundCorpusRoot,
     subscribeIndexSettled,
+    retryIncompleteCorpus,
 } from "./corpus/search";
+import {DiagramSearchState} from "./diagram-search-state";
 import {
     DocumentSearchIndexMemory,
     type DocumentSearchIndexSnapshot,
 } from "./document-search-index";
-import {parentElementCrossingShadow} from "./dom-parent";
+import {
+    containsNodeCrossingShadow,
+    parentElementCrossingShadow,
+} from "./dom-parent";
 import type {
     SearchableBlock,
     SearchMatch,
@@ -73,6 +90,7 @@ import {
     type EditorDomChange,
 } from "./editor-dom-watch";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
+import {EmbedSearchState} from "./embed-search-state";
 import {
     clearNonHeadingFoldLocally,
     collectNonHeadingFoldedAncestorIds,
@@ -83,7 +101,10 @@ import {
     waitForLayout,
 } from "./fold";
 import {rpcSetPrefs} from "./kernel-client";
-import {resolveInitialMatchIndex} from "./match-anchor";
+import {
+    resolveInitialMatchIndex,
+    resolveRetainedMatchIndexWithBudget,
+} from "./match-anchor";
 import {
     applyMemoUnderlineVisual,
     clearMemoUnderlineVisual,
@@ -169,18 +190,12 @@ const LOCATED_MATCH_BIND_FALLBACK_RETRY_MS = 120;
  * Range 还连在文档上、没有缩成空点。思源换掉节点时，旧 Range 会缩到父节点上。
  * 备注 Range 选的是宿主内容，宿主还在就算有效。
  */
-function rangeStillPainted(match: SearchMatch): boolean {
+function rangeStillPainted(match: SearchMatch, edit: Element): boolean {
     const range = match.range;
     if (!range) {
         return false;
     }
-    try {
-        if (!range.startContainer.isConnected || !range.endContainer.isConnected) {
-            return false;
-        }
-    } catch {
-        return false;
-    }
+    if (!rangeBelongsToEditor(range, edit)) return false;
     if (!range.collapsed || match.end <= match.start) {
         return true;
     }
@@ -192,12 +207,16 @@ function rangeStillPainted(match: SearchMatch): boolean {
         (host as Element).matches(`[data-type~="${INLINE_MEMO_TYPE}"]`);
 }
 
-/**
- * 与 highlight-search 的 search-results / search-focus 分开。
- * CSS 自定义高亮是整页一份注册表，同名 set/delete 会盖掉另一个插件。
- */
-const PAGE_SEARCH_RESULTS_HIGHLIGHT = "page-search-results";
-const PAGE_SEARCH_FOCUS_HIGHLIGHT = "page-search-focus";
+/** 页签可在窗格间移动；连接着的 Range 也不能画到另一个组件的正文上。 */
+function rangeBelongsToEditor(range: Range, edit: Element): boolean {
+    try {
+        return range.startContainer.isConnected && range.endContainer.isConnected &&
+            containsNodeCrossingShadow(edit, range.startContainer) &&
+            containsNodeCrossingShadow(edit, range.endContainer);
+    } catch {
+        return false;
+    }
+}
 
 /**
  * 命中很多时不能把全部 Range 一次传给构造函数，参数个数超过引擎上限会整轮高亮失败。
@@ -257,13 +276,6 @@ export interface SearchBarI18n {
     searchMethodKeyword: string;
     /** 查找方法：正则表达式 */
     searchMethodRegex: string;
-    /** 正则 flags 子菜单标题 */
-    regexOptions: string;
-    regexUnicode: string;
-    regexMultiline: string;
-    regexDotAll: string;
-    /** 正则匹配边界说明，避免把零长度/跨单元行为误解为漏召回。 */
-    regexBoundaryHint: string;
     preserveCase: string;
     /** 正则开启时 Aa* 的禁用说明 */
     preserveCaseDisabledByRegex: string;
@@ -272,6 +284,7 @@ export interface SearchBarI18n {
     replaceAllAction: string;
     replaceToggle: string;
     replaceCurrentUnsupported: string;
+    replaceStaleTarget?: string;
     /** 单次正则替换：模板展开失败并跳过 */
     replaceRegexExpandFailed: string;
     replaceAttributeViewUnsupported: string;
@@ -300,6 +313,7 @@ export interface SearchBarI18n {
     /** 正则或渲染缓存仍在补齐。仅给屏幕阅读器，界面上改为计数闪烁。 */
     searchPartialIndexing?: string;
     searchIndexingBadge?: string;
+    searchRetryIncomplete?: string;
     /** 结果列表按钮的悬浮说明 */
     resultsPanelToggle?: string;
     resultsPanelEmpty?: string;
@@ -374,7 +388,8 @@ export interface SearchBarHost {
     isLastHighlightComponent(element: Element): boolean;
     closeCurrentSearchDialog(element: Element): void;
     onSearchComponentMounted(callback: (event: CustomEvent) => void): void;
-    onSearchComponentUnmounted(callback?: (event: CustomEvent) => void): void;
+    onSearchComponentUnmounted(callback?: (event: CustomEvent) => void, root?: Element): void;
+    onSearchComponentDetached(root: Element): void;
     /** 将文档标题匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeDocTitle?(value: boolean, source?: SearchBar): void;
     /** 将图片标题匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -423,17 +438,9 @@ export interface SearchBarHost {
     syncRestrictInlineTypes?(value: RestrictInlineType[], source?: SearchBar): void;
     /** 将查找方法（关键字/正则）同步到其它已打开的搜索面板（不写 prefs） */
     syncUseRegex?(value: boolean, source?: SearchBar): void;
-    /** 将正则 flags 同步到其它已打开的搜索面板（不写 prefs） */
-    syncRegexOptions?(value: RegexOptions, source?: SearchBar): void;
 }
 
 type MatchOptionKey = "caseSensitive" | "wholeWord" | "preserveCase" | "selectionOnly";
-
-type RegexOptions = {
-    regexUnicode: boolean;
-    regexMultiline: boolean;
-    regexDotAll: boolean;
-};
 
 function avScopeRefKey(ref: AvScopeVisualRef): string {
     return `${ref.kind}\0${ref.avBlockId}\0${ref.groupId}\0${ref.rowId}\0${ref.colId ?? ""}`;
@@ -473,6 +480,14 @@ export class SearchBar {
     /** switch-protyle 后等待可见编辑器稳定的帧任务。 */
     private documentSwitchRaf = 0;
     private searchGeneration = 0;
+    /** 替换只能消费当前查询已提交的结果，不能借用防抖期的显示快照。 */
+    private resultSearchKey = "";
+    private resultSearchGeneration = 0;
+    private resultSelectionScope: SelectionScope | null = null;
+    /** 全部替换需要本轮采集开始后正文和内核通知都未变；单处仍逐目标验证。 */
+    private resultDomEpoch = 0;
+    private documentEpoch = 0;
+    private resultDocumentEpoch = 0;
     /** 只用于可中断的正则和后台匹配；generation 仍保护其它异步步骤。 */
     private searchAbortController: AbortController | null = null;
     /** 最近一次仍能从编辑器解析出的文档 ID，供 DOM 已卸载后的销毁清理使用。 */
@@ -498,16 +513,88 @@ export class SearchBar {
     private findComposing = false;
     /** 本查找框持有的后台补全根，根切换或销毁时释放。 */
     private backgroundCorpusRootId = "";
+    private incompleteBlockIds: string[] = [];
 
     private caseSensitive = false;
     private wholeWord = false;
     private regex = false;
-    /** 三个 flags 默认均关闭，以保持原有 g/gi 正则行为。 */
-    private regexUnicode = false;
-    private regexMultiline = false;
-    private regexDotAll = false;
     private preserveCase = false;
     private readonly regexMatcher = new RegexTextMatcher();
+    private viewportRangeRaf = 0;
+    private viewportRangeAbort: AbortController | null = null;
+    private repairRangeAbort: AbortController | null = null;
+    private repairRangeWork: {
+        generation: number;
+        added: ReadonlySet<string> | null;
+        restored: boolean;
+    } | null = null;
+    private resultHighlightPending = false;
+    private highlightPaintGeneration = 0;
+    private componentHighlights: ComponentHighlights | null = null;
+    private highlightEditorOwner: Element | null = null;
+    private stopComponentLifecycleWatch: (() => void) | null = null;
+    private destroyed = false;
+
+    private canPaintHighlights(): boolean {
+        return !this.destroyed && this.edit.isConnected && (this.root?.isConnected ?? true);
+    }
+
+    private getComponentHighlights(): ComponentHighlights {
+        this.highlightEditorOwner = this.edit.matches(".protyle") ?
+            this.edit :
+            resolveDocRoot(this.edit)?.closest(".protyle") ?? this.edit;
+        return this.componentHighlights ??= new ComponentHighlights((this.root ?? this.edit).ownerDocument);
+    }
+
+    private watchComponentMount() {
+        this.stopComponentLifecycleWatch = watchComponentLifecycle(this.edit, this.root, {
+            editorOwner: () => this.highlightEditorOwner,
+            detached: () => {
+                try {
+                    this.plugin.onSearchComponentDetached?.(this.root);
+                } finally {
+                    this.destroy(false);
+                }
+            },
+            editorMoved: () => {
+                this.domEpoch += 1;
+                this.viewportRangeAbort?.abort();
+                this.repairRangeAbort?.abort();
+                this.clearHighlight();
+            },
+        });
+    }
+    private onViewportRangeChange = (event: Event) => {
+        if (
+            this.viewportRangeRaf || !this.resultMatches.length || this.selectionOnly ||
+            !this.canPaintHighlights() ||
+            (event.type === "scroll" && event.target instanceof Element && !this.edit.contains(event.target))
+        ) return;
+        this.viewportRangeAbort?.abort();
+        this.viewportRangeRaf = window.requestAnimationFrame(async () => {
+            this.viewportRangeRaf = 0;
+            const controller = new AbortController();
+            this.viewportRangeAbort = controller;
+            const matches = this.resultMatches;
+            const generation = this.searchGeneration;
+            const epoch = this.domEpoch;
+            const current = () =>
+                !controller.signal.aborted && generation === this.searchGeneration &&
+                epoch === this.domEpoch && matches === this.resultMatches &&
+                this.canPaintHighlights();
+            const update = await prepareViewportRangesWithBudget(this.edit, matches, controller.signal, current);
+            if (current() && update?.commit()) {
+                this.resultMatches = update.matches;
+                if (update.matches !== matches || this.resultHighlightPending) {
+                    await this.applyResultHighlightsWithBudget(
+                        update.matches,
+                        () => this.canPaintHighlights(),
+                    );
+                }
+            }
+            if (this.viewportRangeAbort === controller) this.viewportRangeAbort = null;
+        });
+    };
     /** 选区内查找；打开预填关键词不会自动打开 */
     private selectionOnly = false;
     /** 是否匹配文档标题；全局 prefs，默认 true */
@@ -611,8 +698,11 @@ export class SearchBar {
     /** 还没核对过的插入节点所在块。null 表示变动太大，按整篇核对。 */
     private pendingAddedBlocks: Set<string> | null = new Set();
     /** 嵌入块一次渲染出太多子块，补 Range 盖不住，等停下来重搜一次。 */
-    private embedRefreshPending = false;
     private domRefreshTimer: number | undefined;
+    private readonly diagramSearchState = new DiagramSearchState();
+    private readonly embedSearchState = new EmbedSearchState();
+    private diagramRefreshPending = false;
+    private diagramRefreshTimer: number | undefined;
     /** fold 属性变更专用刷新：不等 savedoc，也不复用输入的 400ms 防抖。 */
     private foldRefreshTimer: number | undefined;
     /** 跳转滚动期间抑制 AV DOM 观察触发的重搜，避免把索引打回 1 */
@@ -729,10 +819,6 @@ export class SearchBar {
         restrictInlineTypes?: RestrictInlineType[];
         /** 查找方法是否为正则（来自全局 prefs；默认关键字） */
         useRegex?: boolean;
-        /** 正则 flags（来自全局 prefs；均默认关闭） */
-        regexUnicode?: boolean;
-        regexMultiline?: boolean;
-        regexDotAll?: boolean;
     }) {
         this.edit = options.edit;
         this.lastRootId = editorRootId(this.edit);
@@ -746,9 +832,6 @@ export class SearchBar {
         this.i18n = options.i18n;
         this.replaceVisible = Boolean(options.replaceVisible);
         this.regex = options.useRegex === true;
-        this.regexUnicode = options.regexUnicode === true;
-        this.regexMultiline = options.regexMultiline === true;
-        this.regexDotAll = options.regexDotAll === true;
         this.includeDocTitle = options.includeDocTitle !== false;
         this.includeImageTitle = options.includeImageTitle !== false;
         this.includeAttributeView = options.includeAttributeView !== false;
@@ -788,6 +871,16 @@ export class SearchBar {
         this.replaceInput = this.root.querySelector(".search-input-replace") as HTMLInputElement;
         this.countEl = this.root.querySelector(".search-count") as HTMLElement;
         this.indexStatusEl = this.root.querySelector(".search-index-status") as HTMLElement;
+        this.indexStatusEl.addEventListener("click", () => {
+            if (!this.incompleteBlockIds.length || this.backgroundIndexing) return;
+            retryIncompleteCorpus(this.rememberCurrentRootId());
+            void this.highlightHitResult(this.searchText, false);
+        });
+        this.indexStatusEl.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            this.indexStatusEl.click();
+        });
         this.resultsPanelEl = this.root.querySelector(".search-results-panel");
         this.resultsListEl = this.root.querySelector(".search-results-panel__list");
         this.replaceRow = this.root.querySelector(".search-row--replace");
@@ -836,22 +929,16 @@ export class SearchBar {
             this.scheduleAttrViewResearch();
         });
         this.stopEditorDomWatch = watchEditorDom(this.edit, {
+            knownDiagram: (element) => this.diagramSearchState.knows(element),
             onMutate: () => {
                 this.domEpoch += 1;
+                this.viewportRangeAbort?.abort();
+                this.repairRangeAbort?.abort();
             },
-            onSettled: (change) => {
-                this.noteAddedBlocks(change);
-                if (change.foldChanged && this.includeFoldedBlocks) {
-                    this.noteFoldContentStable(change);
-                    return;
-                }
-                this.repairHighlightRanges();
-                if (change.foldChanged) {
-                    this.scheduleFoldRefresh();
-                }
-            },
+            onSettled: (change) => this.onEditorDomSettled(change),
         });
         this.plugin.onSearchComponentMounted(this.eventBusHandle);
+        this.watchComponentMount();
         this.syncOptionButtons();
         this.syncReplaceVisibility();
         this.syncReplaceButtons();
@@ -915,6 +1002,8 @@ export class SearchBar {
         }
         const previousRootId = this.backgroundCorpusRootId;
         if (this.backgroundCorpusRootId) {
+            releaseAvCacheOwner(this.backgroundCorpusRootId, this.edit);
+            releaseSpecialCacheOwner(this.backgroundCorpusRootId, this.edit);
             releaseBackgroundCorpusRoot(this.backgroundCorpusRootId);
         }
         this.backgroundCorpusRootId = rootId;
@@ -946,13 +1035,16 @@ export class SearchBar {
         this.searchAbortController?.abort();
         this.searchAbortController = null;
         this.tableRevealSerial += 1;
+        this.clearDiagramSearchState();
         this.resultMatches = [];
+        this.incompleteBlockIds = [];
+        clearViewportProjection(this.edit);
         this.resultCount = 0;
         this.resultIndex = 0;
         this.pendingDocumentCountDisplay = this.documentSearchIndices.pendingSnapshot(rootId);
-        this.searchCoverageIncomplete = Boolean(effectiveSearchQuery(this.searchText));
+        this.searchCoverageIncomplete = Boolean(this.effectiveQuery());
         this.backgroundIndexing = false;
-        this.awaitingSearchResult = Boolean(effectiveSearchQuery(this.searchText));
+        this.awaitingSearchResult = Boolean(this.effectiveQuery());
         this.clearHighlight();
         this.updateCountLabel(false, false);
         this.syncIndexingIndicator();
@@ -1005,13 +1097,19 @@ export class SearchBar {
 
     private setSearchText(text: string): void {
         if (text !== this.searchText) {
+            this.viewportRangeAbort?.abort();
+            this.repairRangeAbort?.abort();
+            this.searchGeneration += 1;
+            this.resultSearchKey = "";
+            this.searchAbortController?.abort();
             this.clearDocumentSearchIndices();
             // 输入防抖期也属于“结果即将变化”：现有数字来自上一轮，提前闪烁避免误解为已稳定。
-            this.awaitingSearchResult = Boolean(effectiveSearchQuery(text)) ||
+            this.awaitingSearchResult = Boolean(this.effectiveQuery(text)) ||
                 isRestrictInlineActive(this.restrictInlineTypes);
             this.syncIndexingIndicator();
         }
         this.searchText = text;
+        this.syncReplaceButtons();
     }
 
     /** 打开时把当前输入框当作基线，会话恢复的词不会因此写入历史。 */
@@ -1117,7 +1215,16 @@ export class SearchBar {
         return true;
     }
 
-    destroy() {
+    destroy(restoreFocus = true) {
+        if (this.destroyed) return;
+        this.destroyed = true;
+        this.stopComponentLifecycleWatch?.();
+        this.stopComponentLifecycleWatch = null;
+        this.viewportRangeAbort?.abort();
+        this.repairRangeAbort?.abort();
+        clearViewportProjection(this.edit);
+        if (this.backgroundCorpusRootId) releaseAvCacheOwner(this.backgroundCorpusRootId, this.edit);
+        if (this.backgroundCorpusRootId) releaseSpecialCacheOwner(this.backgroundCorpusRootId, this.edit);
         // 关掉面板时作废还在等大表分段挂出的跳转，避免关闭后仍滚动正文。
         this.tableRevealSerial += 1;
         this.searchGeneration += 1;
@@ -1140,6 +1247,7 @@ export class SearchBar {
         }
         clearTimeout(this.avRefreshTimer);
         clearTimeout(this.domRefreshTimer);
+        this.clearDiagramSearchState();
         clearTimeout(this.foldRefreshTimer);
         this.stopEditorDomWatch?.();
         this.stopEditorDomWatch = null;
@@ -1154,16 +1262,21 @@ export class SearchBar {
         this.teardownSelectionScopeLayoutSync();
         this.teardownMemoUnderlineLayoutSync();
         this.clearSelectionScopeVisual();
-        this.restoreEditorFocus();
+        if (restoreFocus) this.restoreEditorFocus();
         this.clearHighlight();
+        this.componentHighlights?.dispose();
+        this.componentHighlights = null;
         this.closeResultsPanel();
         document.removeEventListener("pointerdown", this.onResultsPanelOutsidePointerDown, true);
         window.removeEventListener("pointerdown", this.onCaptureSelectionPointerDown, true);
+        document.removeEventListener("scroll", this.onViewportRangeChange, true);
+        window.removeEventListener("resize", this.onViewportRangeChange);
+        if (this.viewportRangeRaf) window.cancelAnimationFrame(this.viewportRangeRaf);
         this.stopAvDomWatch?.();
         this.stopAvDomWatch = null;
         this.panelFrame?.destroy();
         this.panelFrame = null;
-        this.plugin.onSearchComponentUnmounted(this.eventBusHandle);
+        this.plugin.onSearchComponentUnmounted(this.eventBusHandle, this.root);
         this.root.remove();
         this.restoreEditorRange = null;
     }
@@ -1244,6 +1357,10 @@ export class SearchBar {
     /** 仅清空高亮（跨窗口 clear） */
     clearHighlightsOnly() {
         this.clearHighlight();
+        clearViewportProjection(this.edit);
+        if (this.backgroundCorpusRootId) releaseAvCacheOwner(this.backgroundCorpusRootId, this.edit);
+        if (this.backgroundCorpusRootId) releaseSpecialCacheOwner(this.backgroundCorpusRootId, this.edit);
+        this.incompleteBlockIds = [];
         this.resultMatches = [];
         this.resultCount = 0;
         this.resultIndex = 0;
@@ -1347,6 +1464,10 @@ export class SearchBar {
     }
 
     private bindUi() {
+        // “最后活动组件”只控制主动导航，不再代表整页高亮的独占权。
+        const activate = () => this.plugin.updateLastHighlightComponent(this.root);
+        this.root.addEventListener("pointerdown", activate, true);
+        this.root.addEventListener("focusin", activate);
         this.input.addEventListener("compositionstart", () => {
             this.findComposing = true;
         });
@@ -1432,6 +1553,8 @@ export class SearchBar {
         this.resultsListEl?.addEventListener("scroll", this.onResultsListScroll);
         document.addEventListener("pointerdown", this.onResultsPanelOutsidePointerDown, true);
         window.addEventListener("pointerdown", this.onCaptureSelectionPointerDown, true);
+        document.addEventListener("scroll", this.onViewportRangeChange, true);
+        window.addEventListener("resize", this.onViewportRangeChange);
     }
 
     /**
@@ -1909,16 +2032,14 @@ export class SearchBar {
     }
 
     /**
-     * 触发器图标/文案随当前方法变化（关键字 = Exact，正则 = Regex），对齐官方搜索栏。
+     * 触发器图标/文案随当前方法变化；关键字使用官方 iconExact 图标，正则使用 iconRegex。
      */
     private syncSearchMethodTrigger() {
         const button = this.searchMethodBtn;
         if (!button) {
             return;
         }
-        const label = this.regex ?
-            this.i18n.searchMethodRegex :
-            this.i18n.searchMethodKeyword;
+        const label = this.regex ? this.i18n.searchMethodRegex : this.i18n.searchMethodKeyword;
         button.dataset.method = this.regex ? "regex" : "keyword";
         button.setAttribute("title", label);
         button.setAttribute("aria-label", label);
@@ -1951,14 +2072,15 @@ export class SearchBar {
     }
 
     private syncReplaceButtons() {
+        const currentResults = this.hasCurrentSearchResults();
         const enumerateMode = this.isRestrictEnumerateMode();
         const modeBlocked = isEditorReplaceModeBlocked(this.edit);
         const current = this.getCurrentMatch();
-        const canReplaceCurrent = !enumerateMode &&
+        const canReplaceCurrent = currentResults && !enumerateMode &&
             !modeBlocked &&
             Boolean(current && isMatchWritable(this.edit, current));
         // 覆盖未完成只禁止全部替换。单处替换只看当前这条是否可写。
-        const hasWritable = !enumerateMode &&
+        const hasWritable = currentResults && !enumerateMode &&
             !modeBlocked &&
             !this.searchCoverageIncomplete &&
             this.resultMatches.some((match) => isMatchWritable(this.edit, match));
@@ -2030,7 +2152,18 @@ export class SearchBar {
         this.countEl.classList.toggle("is-indexing", indexing);
         this.indexStatusEl.textContent = indexing ?
             (this.i18n.searchIndexingBadge ?? "索引中") :
-            "";
+            (this.incompleteBlockIds.length ?
+                (this.i18n.searchRetryIncomplete ?? "{count} 个数据库未完成（点击重试）").replace(
+                    "{count}",
+                    String(this.incompleteBlockIds.length),
+                ) :
+                "");
+        this.indexStatusEl.title = indexing ? "" : this.incompleteBlockIds.slice(0, 100).join("\n");
+        this.indexStatusEl.style.cursor = !indexing && this.incompleteBlockIds.length ? "pointer" : "";
+        const retryable = !indexing && this.incompleteBlockIds.length > 0;
+        this.indexStatusEl.tabIndex = retryable ? 0 : -1;
+        if (retryable) this.indexStatusEl.setAttribute("role", "button");
+        else this.indexStatusEl.removeAttribute("role");
     }
 
     private toggleResultsPanel() {
@@ -2185,16 +2318,31 @@ export class SearchBar {
         retainDisplayedResults = false,
     ): Promise<SearchMatch[]> {
         const rootId = this.syncBackgroundCorpusRoot();
+        this.viewportRangeAbort?.abort();
+        this.repairRangeAbort?.abort();
         this.searchAbortController?.abort();
         const abortController = new AbortController();
         this.searchAbortController = abortController;
         // 即使新查询为空，也必须作废旧的异步结果，避免它回来覆盖清空后的状态。
         const generation = ++this.searchGeneration;
+        this.resultSearchKey = "";
+        let searchKey = "";
+        let selectionScope: SelectionScope | null = null;
+        if (this.selectionOnly && rootId) {
+            releaseSpecialCacheOwner(rootId, this.edit);
+            releaseAvCacheOwner(rootId, this.edit);
+        }
+        this.syncReplaceButtons();
         if (change) {
             this.clearDocumentSearchIndices();
         }
-        const keyword = effectiveSearchQuery(value);
+        const keyword = this.effectiveQuery(value);
         if (!keyword && !isRestrictInlineActive(this.restrictInlineTypes)) {
+            this.clearDiagramSearchState();
+            if (rootId) releaseAvCacheOwner(rootId, this.edit);
+            if (rootId) releaseSpecialCacheOwner(rootId, this.edit);
+            clearViewportProjection(this.edit);
+            this.incompleteBlockIds = [];
             this.clearHighlight();
             this.resultMatches = [];
             this.resultCount = 0;
@@ -2227,107 +2375,172 @@ export class SearchBar {
         }
 
         this.searchEpoch = this.domEpoch;
+        const domEpoch = this.domEpoch;
+        const documentEpoch = this.documentEpoch;
         this.searchesInFlight += 1;
         this.syncIndexingIndicator();
         let result: SearchPipelineResult;
         try {
-            result = await this.runSearchPipeline(value, abortController.signal);
+            const pending = this.runSearchPipeline(value, abortController.signal);
+            // resolveScopeForSearch 会先同步更新冻结选区，快照必须在它之后记录。
+            searchKey = this.searchResultKey(value);
+            selectionScope = this.selectionOnly ? this.rememberedSelectionScope : null;
+            result = await pending;
+            const {matches, error, degraded, partial, unrendered, truncated} = result;
+            const isCurrent = () =>
+                !this.destroyed && !abortController.signal.aborted && generation === this.searchGeneration &&
+                searchKey === this.searchResultKey() &&
+                selectionScope === (this.selectionOnly ? this.rememberedSelectionScope : null) &&
+                rootId === this.documentSearchIndices.activeRoot && this.rememberCurrentRootId() === rootId;
+            if (result.cancelled || !isCurrent()) {
+                // 调用方若是高亮流程，不得拿另一篇文档的旧 Range 再次上屏。
+                this.syncIndexingIndicator();
+                return [];
+            }
+
+            if (error) {
+                clearViewportProjection(this.edit);
+                this.incompleteBlockIds = [];
+                this.clearHighlight();
+                this.resultMatches = [];
+                this.resultCount = 0;
+                this.resultIndex = 0;
+                this.pendingDocumentCountDisplay = null;
+                this.searchCoverageIncomplete = false;
+                this.backgroundIndexing = false;
+                this.awaitingSearchResult = false;
+                this.updateCountLabel();
+                this.syncIndexingIndicator();
+                this.syncReplaceButtons();
+                showMessage(this.i18n.invalidRegex.replace("{error}", error), 4000, "error");
+                return [];
+            }
+
+            const restoredSnapshot = change ? null : this.documentSearchIndices.consumePending(rootId);
+            let retainedIndex: number | undefined;
+            if (!change && restoredSnapshot === null) {
+                // 分片期间用户可继续导航，或滚动投影可替换旧数组。最多重试一次，
+                // 持续交互时保留用户最新序号，不让后台锚点计算抢回过时的当前项。
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    const previousMatches = this.resultMatches;
+                    const previousIndex = this.resultIndex;
+                    const previous = previousMatches[previousIndex - 1];
+                    if (!previous) break;
+                    const anchorEpoch = this.domEpoch;
+                    retainedIndex = await resolveRetainedMatchIndexWithBudget(
+                        matches,
+                        previous,
+                        previousIndex,
+                        {
+                            previousMatches,
+                            // 搜索期间换过 DOM 时，旧投影不能证明词级 Range 的身份。
+                            edit: anchorEpoch === domEpoch ? this.edit : undefined,
+                        },
+                        () =>
+                            isCurrent() && previousMatches === this.resultMatches &&
+                            previousIndex === this.resultIndex &&
+                            (anchorEpoch !== domEpoch || anchorEpoch === this.domEpoch),
+                    );
+                    if (!isCurrent()) return [];
+                    if (retainedIndex !== undefined) break;
+                }
+            }
+            if (!isCurrent()) return [];
+            this.resultMatches = matches;
+            this.resultSearchKey = searchKey;
+            this.resultSearchGeneration = generation;
+            this.resultSelectionScope = selectionScope;
+            this.resultDomEpoch = domEpoch;
+            this.resultDocumentEpoch = documentEpoch;
+            this.incompleteBlockIds = result.incompleteBlockIds ?? [];
+            this.resultCount = matches.length;
+            this.pendingDocumentCountDisplay = null;
+            this.awaitingSearchResult = false;
+            this.searchCoverageIncomplete = Boolean(
+                degraded || partial || (unrendered ?? 0) > 0 || (truncated ?? 0) > 0,
+            );
+            this.noteSearchCoverage(degraded, partial, unrendered, truncated);
+            if (restoredSnapshot !== null) {
+                this.resultIndex = Math.min(restoredSnapshot.index, matches.length);
+            } else if (change && matches.length > 0) {
+                // 仅 change=true 时按光标/选区锚定；失败回退第 1 项。替换后走 keepIndex，不走这里。
+                this.resultIndex = resolveInitialMatchIndex(matches, {
+                    anchorRange: this.getSearchAnchorRange(),
+                    modeBlocked: isEditorReplaceModeBlocked(this.edit),
+                });
+            } else if (retainedIndex !== undefined) {
+                this.resultIndex = retainedIndex;
+            } else if (this.resultIndex > matches.length) {
+                this.resultIndex = matches.length;
+            }
+            this.updateCountLabel(true);
+            this.syncReplaceButtons();
+            return matches;
         } finally {
             this.searchesInFlight -= 1;
             if (this.searchAbortController === abortController) {
                 this.searchAbortController = null;
             }
             this.syncIndexingIndicator();
+            this.scheduleDiagramRefresh();
         }
-        const {matches, error, degraded, partial, unrendered, truncated} = result;
-        if (
-            result.cancelled ||
-            generation !== this.searchGeneration ||
-            rootId !== this.documentSearchIndices.activeRoot ||
-            this.rememberCurrentRootId() !== rootId
-        ) {
-            // 调用方若是高亮流程，不得拿另一篇文档的旧 Range 再次上屏。
-            this.syncIndexingIndicator();
-            return [];
-        }
-
-        if (error) {
-            this.clearHighlight();
-            this.resultMatches = [];
-            this.resultCount = 0;
-            this.resultIndex = 0;
-            this.pendingDocumentCountDisplay = null;
-            this.searchCoverageIncomplete = false;
-            this.backgroundIndexing = false;
-            this.awaitingSearchResult = false;
-            this.updateCountLabel();
-            this.syncIndexingIndicator();
-            this.syncReplaceButtons();
-            showMessage(this.i18n.invalidRegex.replace("{error}", error), 4000, "error");
-            return [];
-        }
-
-        const restoredSnapshot = change ? null : this.documentSearchIndices.consumePending(rootId);
-        const previous = change || restoredSnapshot !== null ? undefined : this.resultMatches[this.resultIndex - 1];
-        this.resultMatches = matches;
-        this.resultCount = matches.length;
-        this.pendingDocumentCountDisplay = null;
-        this.awaitingSearchResult = false;
-        this.searchCoverageIncomplete = Boolean(
-            degraded || partial || (unrendered ?? 0) > 0 || (truncated ?? 0) > 0,
-        );
-        this.noteSearchCoverage(degraded, partial, unrendered, truncated);
-        if (restoredSnapshot !== null) {
-            this.resultIndex = Math.min(restoredSnapshot.index, matches.length);
-        } else if (change && matches.length > 0) {
-            // 仅 change=true 时按光标/选区锚定；失败回退第 1 项。替换后走 keepIndex，不走这里。
-            this.resultIndex = resolveInitialMatchIndex(matches, {
-                anchorRange: this.getSearchAnchorRange(),
-                modeBlocked: isEditorReplaceModeBlocked(this.edit),
-            });
-        } else if (previous) {
-            const kept = matches.findIndex((match) => {
-                return match.blockId === previous.blockId &&
-                    match.unitId === previous.unitId &&
-                    match.start === previous.start;
-            });
-            if (kept >= 0) {
-                this.resultIndex = kept + 1;
-            } else {
-                // 同一块在当前命中之前插入/删除文字时，偏移会整体移动。
-                // 仅在同一单元中同样文字唯一时才重锚；重复词不猜测，仍保留旧序号，
-                // 避免把用户从第一个 “foo” 跳到另一个 “foo”。
-                const sameText = matches.filter((match) => {
-                    return match.blockId === previous.blockId &&
-                        match.unitId === previous.unitId &&
-                        match.matchedText === previous.matchedText;
-                });
-                if (sameText.length === 1) {
-                    this.resultIndex = matches.indexOf(sameText[0]) + 1;
-                } else if (this.resultIndex > matches.length) {
-                    this.resultIndex = matches.length;
-                }
-            }
-        } else if (this.resultIndex > matches.length) {
-            this.resultIndex = matches.length;
-        }
-        this.updateCountLabel(true);
-        this.syncReplaceButtons();
-        return matches;
     }
 
     private runSearchPipeline(value: string, signal: AbortSignal): Promise<SearchPipelineResult> {
         return calculateSearchMatches(this.plugin, this.edit, value, {
+            ...this.searchOptions(),
+            regexMatcher: this.regexMatcher,
+            signal,
+            selectionScope: this.resolveScopeForSearch(),
+            onLiveUnitsCollected: (blocks) => {
+                if (signal.aborted || this.destroyed) return;
+                this.diagramSearchState.capture(
+                    blocks,
+                    this.selectionOnly ? this.rememberedSelectionScope ?? new Map() : undefined,
+                );
+                this.embedSearchState.capture(
+                    blocks,
+                    this.selectionOnly ? this.rememberedSelectionScope ?? new Map() : undefined,
+                    Boolean(this.restrictInlineTypes?.length),
+                );
+                // 采集前的变化已包含在新搜索中；采集后的变化仍由 settled 保留。
+                this.diagramRefreshPending = false;
+                window.clearTimeout(this.diagramRefreshTimer);
+                this.diagramRefreshTimer = undefined;
+            },
+        });
+    }
+
+    private searchResultKey(value = this.searchText): string {
+        return JSON.stringify([
+            editorRootId(this.edit),
+            value,
+            this.searchOptions(),
+        ]);
+    }
+
+    private effectiveQuery(value = this.searchText): string {
+        return effectiveSearchQuery(value);
+    }
+
+    private hasCurrentSearchResults(): boolean {
+        return Boolean(this.resultSearchKey) && this.resultSearchGeneration === this.searchGeneration &&
+            this.resultSearchKey === this.searchResultKey() &&
+            this.resultSelectionScope === (this.selectionOnly ? this.rememberedSelectionScope : null);
+    }
+
+    private hasStableReplaceAllSnapshot(): boolean {
+        return this.hasCurrentSearchResults() && !this.searchCoverageIncomplete &&
+            this.resultDomEpoch === this.domEpoch && this.resultDocumentEpoch === this.documentEpoch;
+    }
+
+    /** 搜索与替换快照共用这些选项，避免新增范围开关时漏掉写入保护。 */
+    private searchOptions() {
+        return {
             caseSensitive: this.caseSensitive,
             wholeWord: this.wholeWord,
             regex: this.regex,
-            regexUnicode: this.regexUnicode,
-            regexMultiline: this.regexMultiline,
-            regexDotAll: this.regexDotAll,
-            regexMatcher: this.regexMatcher,
-            signal,
             selectionOnly: this.selectionOnly,
-            selectionScope: this.resolveScopeForSearch(),
             includeDocTitle: this.includeDocTitle,
             includeImageTitle: this.includeImageTitle,
             includeAttributeView: this.includeAttributeView,
@@ -2356,7 +2569,7 @@ export class SearchBar {
             includeFoldedBlocks: this.includeFoldedBlocks,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
-        });
+        };
     }
 
     private noteSearchCoverage(degraded?: boolean, partial?: boolean, unrendered?: number, truncated?: number) {
@@ -2394,7 +2607,7 @@ export class SearchBar {
 
     /** 后台索引结束时合并成一次刷新，避免补图期间反复全量搜索。 */
     private scheduleIndexRefresh(rootId: string) {
-        if (!effectiveSearchQuery(this.searchText) || this.rememberCurrentRootId() !== rootId) {
+        if (!this.effectiveQuery() || this.rememberCurrentRootId() !== rootId) {
             return;
         }
         if (this.indexSettledTimer != null) {
@@ -2413,10 +2626,10 @@ export class SearchBar {
         if (matches !== this.resultMatches) {
             return;
         }
-        const keyword = effectiveSearchQuery(value);
+        const keyword = this.effectiveQuery(value);
 
         // 空查询且未限制：清空高亮（旧行为）。限制激活的空查询走下方枚举高亮。
-        // 保持原有高亮归属。清空时改归属的话，别的窗口之后只更新计数、不再重画。
+        // 清空仅作用于本组件，不改变主动导航的归属。
         if (!keyword && !shouldEnumerateRestrictInline(value, this.restrictInlineTypes)) {
             this.clearHighlight();
             return;
@@ -2425,35 +2638,19 @@ export class SearchBar {
         const hasAnyRange = matches.some((match) => Boolean(match.range));
         if (!hasAnyRange) {
             this.clearHighlight();
-            this.plugin.updateLastHighlightComponent(this.root);
             this.repairAfterSearchIfNeeded(epoch);
             return;
         }
 
         this.clearHighlight();
-        // 正文与行内公式统一黄/橙 CSS Highlight；备注仍用虚线下划线
-        const textRanges: Range[] = [];
-        for (const match of matches) {
-            if (!match.range || match.highlightKind === "inline-memo") {
-                continue;
-            }
-            textRanges.push(match.range);
-            const mirror = mirrorTabsTitleRange(match.range);
-            if (mirror) {
-                textRanges.push(mirror);
-            }
-        }
-        if (textRanges.length) {
-            const highlight = newHighlight(textRanges);
-            if (highlight) {
-                (CSS as any).highlights.set(PAGE_SEARCH_RESULTS_HIGHLIGHT, highlight);
-            } else {
-                console.warn("[page-search] CSS Custom Highlight API unavailable");
-            }
-        }
+        if (
+            !await this.applyResultHighlightsWithBudget(
+                matches,
+                () => this.canPaintHighlights(),
+            )
+        ) return;
 
         this.syncMemoUnderlineVisual();
-        this.plugin.updateLastHighlightComponent(this.root);
         this.repairAfterSearchIfNeeded(epoch);
 
         if (change && this.resultIndex >= 1) {
@@ -2469,17 +2666,10 @@ export class SearchBar {
     }
 
     private clearHighlight() {
-        const highlights = (CSS as any).highlights;
-        if (highlights) {
-            highlights.delete(PAGE_SEARCH_RESULTS_HIGHLIGHT);
-            highlights.delete(PAGE_SEARCH_FOCUS_HIGHLIGHT);
-            // 旧版曾用独立 math/memo Highlight 名；清理以免残留底色。
-            // 不删除 search-results / search-focus，那是 highlight-search 的键。
-            highlights.delete("search-math-results");
-            highlights.delete("search-math-focus");
-            highlights.delete("search-memo-results");
-            highlights.delete("search-memo-focus");
-        }
+        this.resultHighlightPending = false;
+        this.highlightPaintGeneration = (this.highlightPaintGeneration ?? 0) + 1;
+        this.componentHighlights?.clear();
+        this.highlightEditorOwner = null;
         this.teardownMemoUnderlineLayoutSync();
         clearMemoUnderlineVisual(this.edit);
     }
@@ -2488,7 +2678,7 @@ export class SearchBar {
     private syncMemoUnderlineVisual() {
         const memoRanges: Range[] = [];
         for (const match of this.resultMatches) {
-            if (match.highlightKind === "inline-memo" && match.range) {
+            if (match.highlightKind === "inline-memo" && match.range && rangeBelongsToEditor(match.range, this.edit)) {
                 memoRanges.push(match.range);
             }
         }
@@ -2498,7 +2688,8 @@ export class SearchBar {
             return;
         }
         const focusMatch = this.getCurrentMatch();
-        const focusRange = focusMatch?.highlightKind === "inline-memo" ?
+        const focusRange = focusMatch?.highlightKind === "inline-memo" && focusMatch.range &&
+                rangeBelongsToEditor(focusMatch.range, this.edit) ?
             (focusMatch.range ?? null) :
             null;
         try {
@@ -2582,13 +2773,16 @@ export class SearchBar {
         // 数据库事务：列改名 / 切视图 / 单元格等 → avRender 重建 DOM，需重搜
         if (
             isAttrViewWsTransaction(event.detail) &&
-            isAttrViewRelevantToEdit(this.edit, event.detail)
+            (isAttrViewRelevantToEdit(this.edit, event.detail) ||
+                rootUsesAttributeViews(this.rememberCurrentRootId(), attributeViewTransactionIds(event.detail)))
         ) {
-            this.scheduleAttrViewResearch();
+            this.documentEpoch += 1;
+            this.scheduleAttrViewResearch(attributeViewTransactionIds(event.detail));
             return;
         }
 
         if (["savedoc", "rename"].includes(event.detail?.cmd)) {
+            this.documentEpoch += 1;
             const rootId = this.rememberCurrentRootId();
             if (rootId) {
                 invalidateDocumentStructureCaches(rootId);
@@ -2603,7 +2797,7 @@ export class SearchBar {
                         }
                     });
                 } else {
-                    void this.calculateSearchResults(this.searchText, false);
+                    void this.highlightHitResult(this.searchText, false);
                 }
             }, DONE_TYPING_MS);
             return;
@@ -2650,11 +2844,7 @@ export class SearchBar {
                 if (this.locatePending) {
                     return;
                 }
-                if (this.plugin.isLastHighlightComponent(this.root)) {
-                    void this.highlightHitResult(this.searchText, false);
-                } else {
-                    void this.calculateSearchResults(this.searchText, false);
-                }
+                void this.highlightHitResult(this.searchText, false);
             }, DONE_TYPING_MS);
         }
     }
@@ -2663,14 +2853,14 @@ export class SearchBar {
      * 数据库结构性重建后重新匹配并画高亮。
      * 使用 change=false 保留当前跳转索引；跳转滚动期间不响应，避免误重置到第一项。
      */
-    private scheduleAttrViewResearch() {
+    private scheduleAttrViewResearch(avIds?: readonly string[]) {
         // 变更一到就丢掉引用缓存。跳转暂停或搜索框为空时不会重搜，
         // 但下一次手动搜索也不能继续用旧单元格。
-        invalidateAttributeViewSearch(this.rememberCurrentRootId());
+        invalidateAttributeViewSearch(this.rememberCurrentRootId(), avIds);
         if (!this.includeAttributeView) {
             return;
         }
-        if (!effectiveSearchQuery(this.searchText)) {
+        if (!this.effectiveQuery()) {
             return;
         }
         if (Date.now() < this.avWatchPausedUntil) {
@@ -2690,7 +2880,7 @@ export class SearchBar {
                     this.scrollIntoRanges(this.resultIndex - 1, false);
                 });
             } else {
-                void this.calculateSearchResults(this.searchText, false);
+                void this.highlightHitResult(this.searchText, false);
             }
         }, AV_REFRESH_DEBOUNCE_MS);
     }
@@ -2850,6 +3040,7 @@ export class SearchBar {
             ...this.searchCollectOptions(),
             includeDocTitle: false,
             scopeRoots: [host],
+            skipEmbeddedOrder: true,
         });
         const block = live.find((item) => item.blockId === match.blockId && item.unitId === match.unitId);
         if (!block || block.text.slice(match.start, match.end) !== match.matchedText) {
@@ -2928,11 +3119,8 @@ export class SearchBar {
             const release = () => {
                 this.locatePending = false;
                 this.pauseIndexReset(800);
-                // 大量块同时插入时观察器会以 null 表示“整篇变动”。本次只需要补当前
-                // 跳转目标，避免一次点击结果触发整篇 Range 重建。
-                if (this.pendingAddedBlocks === null) {
-                    this.pendingAddedBlocks = new Set([match.blockId]);
-                } else {
+                // 保留标题段落的待修复范围；大范围 Range 重建由分片任务执行。
+                if (this.pendingAddedBlocks !== null) {
                     this.pendingAddedBlocks.add(match.blockId);
                 }
                 // 定位期间的渲染突变不能丢掉。目标块若在超时后才填入正文，
@@ -2952,6 +3140,20 @@ export class SearchBar {
             this.resultIndex :
             keepIndex;
         const target = index >= 1 ? this.resultMatches[index - 1] : undefined;
+        if (target && isRendererSourceFallbackUnitId(target.unitId)) {
+            // 源码偏移与 SVG 标签无对应关系；定位到块即可，不等待永远不会出现的词级 Range。
+            consumeUnfoldedOuterHeadingId();
+            if (this.resultIndex < 1) {
+                this.resultIndex = index;
+                this.updateCountLabel();
+            }
+            this.clearSearchFocus();
+            if (scroll) {
+                this.edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(target.blockId)}"]`)
+                    ?.scrollIntoView({block: "center", inline: "nearest"});
+            }
+            return;
+        }
         if (target && await this.waitForLocatedMatchRange(index, target.id)) {
             if (this.resultIndex < 1) {
                 this.resultIndex = Math.min(index, this.resultMatches.length);
@@ -3135,7 +3337,15 @@ export class SearchBar {
         if (!units.length) {
             return false;
         }
-        this.resultMatches = fillLiveRanges(this.resultMatches, units, this.includeFoldedBlocks);
+        const rebound = fillLiveRanges([match], units, this.includeFoldedBlocks)[0];
+        if (rebound !== match) {
+            this.viewportRangeAbort?.abort();
+            this.repairRangeAbort?.abort();
+            this.highlightPaintGeneration = (this.highlightPaintGeneration ?? 0) + 1;
+            this.resultMatches[index] = rebound;
+            this.queueRangeRepairBlock(match.blockId);
+            void this.repairHighlightRanges();
+        }
         return Boolean(this.resultMatches[index]?.range);
     }
 
@@ -3161,14 +3371,16 @@ export class SearchBar {
             ...this.searchCollectOptions(),
             includeDocTitle: false,
             scopeRoots: [owner],
+            skipEmbeddedOrder: true,
         });
-        if (onlyCurrent) {
-            const rebound = fillLiveRanges([match], live, this.includeFoldedBlocks)[0];
-            if (rebound !== match) {
-                this.resultMatches[index - 1] = rebound;
-            }
-        } else {
-            this.resultMatches = fillLiveRanges(this.resultMatches, live, this.includeFoldedBlocks);
+        const rebound = fillLiveRanges([match], live, this.includeFoldedBlocks)[0];
+        if (rebound !== match) {
+            this.viewportRangeAbort?.abort();
+            this.repairRangeAbort?.abort();
+            this.highlightPaintGeneration = (this.highlightPaintGeneration ?? 0) + 1;
+            this.resultMatches[index - 1] = rebound;
+            this.queueRangeRepairBlock(match.blockId);
+            if (!onlyCurrent) void this.repairHighlightRanges();
         }
         let current = this.resultMatches[index - 1];
         if (!current?.range && this.bindMindmapPreview(index - 1)) {
@@ -3199,13 +3411,33 @@ export class SearchBar {
         if (!roots.length) {
             return;
         }
-        const live = collectSearchableBlocks(this.edit, {
-            ...this.searchCollectOptions(),
-            includeDocTitle: false,
-            scopeRoots: roots,
-        });
-        this.resultMatches = fillLiveRanges(this.resultMatches, live, this.includeFoldedBlocks);
-        this.applyResultHighlights();
+        // 定位释放后统一按预算补齐这一段；不在一次导航回调里同步生成所有 Range。
+        if (this.pendingAddedBlocks !== null) {
+            for (const root of roots) {
+                const id = root.dataset.nodeId;
+                if (id) this.pendingAddedBlocks.add(id);
+                if (this.pendingAddedBlocks.size > MAX_TOUCHED_BLOCKS) {
+                    this.pendingAddedBlocks = null;
+                    break;
+                }
+            }
+        }
+        this.repairHighlightRanges();
+    }
+
+    private queueRangeRepairBlock(blockId: string) {
+        if (this.pendingAddedBlocks === null) return;
+        this.pendingAddedBlocks.add(blockId);
+        if (this.pendingAddedBlocks.size > MAX_TOUCHED_BLOCKS) this.pendingAddedBlocks = null;
+    }
+
+    private restoreRangeRepairWork(work: NonNullable<SearchBar["repairRangeWork"]>) {
+        if (work.restored) return;
+        work.restored = true;
+        // 新查询（包括切文档）已重建完整结果，不接回旧查询的局部范围或嵌入刷新。
+        if (work.generation !== this.searchGeneration) return;
+        if (work.added === null || this.pendingAddedBlocks === null) this.pendingAddedBlocks = null;
+        else for (const id of work.added) this.queueRangeRepairBlock(id);
     }
 
     private searchCollectOptions(): CollectSearchableBlocksOptions {
@@ -3242,50 +3474,55 @@ export class SearchBar {
     }
 
     /** 用当前命中上的 Range 重画高亮，不清除还没补上的命中 */
-    private applyResultHighlights() {
-        const HighlightCtor = (window as any).Highlight as {
-            new(...ranges: Range[]): Highlight;
-        };
-        if (typeof HighlightCtor !== "function" || !(CSS as any).highlights) {
-            this.syncMemoUnderlineVisual();
-            return;
-        }
-        const textRanges: Range[] = [];
-        for (const match of this.resultMatches) {
-            if (!match.range || match.highlightKind === "inline-memo") {
-                continue;
-            }
-            try {
-                if (!match.range.startContainer.isConnected) {
-                    continue;
+    private async applyResultHighlightsWithBudget(
+        matches: SearchMatch[],
+        shouldContinue = () => true,
+    ): Promise<boolean> {
+        const generation = this.searchGeneration;
+        const epoch = this.domEpoch;
+        const paintGeneration = (this.highlightPaintGeneration ?? 0) + 1;
+        this.highlightPaintGeneration = paintGeneration;
+        this.resultHighlightPending = true;
+        const current = () =>
+            matches === this.resultMatches && generation === this.searchGeneration && epoch === this.domEpoch &&
+            paintGeneration === this.highlightPaintGeneration && this.canPaintHighlights() && shouldContinue();
+        if (!current()) return false;
+        const highlight = newHighlight([]);
+        const fallback: Range[] = [];
+        let count = 0;
+        let started = performance.now();
+        for (let index = 0; index < matches.length; index++) {
+            if (!current()) return false;
+            const match = matches[index];
+            if (match.range && rangeStillPainted(match, this.edit) && match.highlightKind !== "inline-memo") {
+                for (const range of [match.range, mirrorTabsTitleRange(match.range)]) {
+                    if (!range || (range !== match.range && !rangeBelongsToEditor(range, this.edit))) continue;
+                    count++;
+                    if (highlight && typeof highlight.add === "function") highlight.add(range);
+                    else if (fallback.length < 4096) fallback.push(range);
                 }
-            } catch {
-                continue;
             }
-            textRanges.push(match.range);
-            const mirror = mirrorTabsTitleRange(match.range);
-            if (mirror) {
-                textRanges.push(mirror);
+            if ((index & 63) === 63 && performance.now() - started >= 8) {
+                await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+                started = performance.now();
             }
         }
-        if (textRanges.length) {
-            const highlight = newHighlight(textRanges);
-            if (!highlight) {
-                this.syncMemoUnderlineVisual();
-                return;
-            }
-            (CSS as any).highlights.set(PAGE_SEARCH_RESULTS_HIGHLIGHT, highlight);
-        } else {
-            (CSS as any).highlights.delete(PAGE_SEARCH_RESULTS_HIGHLIGHT);
-        }
-        const current = this.getCurrentMatch();
-        if (current?.range && current.highlightKind !== "inline-memo") {
-            this.applyFocusHighlight(current.range);
-        } else if (current?.highlightKind === "inline-memo") {
-            this.clearSearchFocus();
-        }
+        if (!current()) return false;
+        const nextHighlight = highlight && typeof highlight.add === "function" ? highlight : newHighlight(fallback);
+        this.getComponentHighlights().setResults(nextHighlight && count ? nextHighlight : null);
+        this.resultHighlightPending = false;
+        const focused = this.getCurrentMatch();
+        if (focused?.range && focused.highlightKind !== "inline-memo") this.applyFocusHighlight(focused.range);
+        else this.clearSearchFocus();
         this.syncMemoUnderlineVisual();
-        this.plugin.updateLastHighlightComponent(this.root);
+        return true;
+    }
+
+    private applyResultHighlights() {
+        void this.applyResultHighlightsWithBudget(
+            this.resultMatches,
+            () => this.canPaintHighlights(),
+        ).catch((error) => console.warn("[page-search] highlight repair failed", error));
     }
 
     /**
@@ -3293,30 +3530,73 @@ export class SearchBar {
      * 不支持可变 Highlight 的运行时回退到 applyResultHighlights，保持旧兼容路径。
      */
     private appendResultHighlight(match: SearchMatch): boolean {
-        if (!match.range || match.highlightKind === "inline-memo") {
+        if (
+            !this.canPaintHighlights() || !match.range || !rangeStillPainted(match, this.edit) ||
+            match.highlightKind === "inline-memo"
+        ) {
             return false;
         }
-        const highlights = (CSS as any).highlights;
-        const resultHighlight = highlights?.get?.(PAGE_SEARCH_RESULTS_HIGHLIGHT);
-        if (!resultHighlight || typeof resultHighlight.add !== "function") {
-            return false;
-        }
-        try {
-            resultHighlight.add(match.range);
-            const mirror = mirrorTabsTitleRange(match.range);
-            if (mirror) {
-                resultHighlight.add(mirror);
+        const highlights = this.getComponentHighlights();
+        if (!highlights.appendResult(match.range)) return false;
+        const mirror = mirrorTabsTitleRange(match.range);
+        return !mirror || !rangeBelongsToEditor(mirror, this.edit) || highlights.appendResult(mirror);
+    }
+
+    private onEditorDomSettled(change: EditorDomChange) {
+        this.noteAddedBlocks(change);
+        if ((this.effectiveQuery() || this.isRestrictEnumerateMode()) && this.canPaintHighlights()) {
+            const options = this.isRestrictEnumerateMode() ?
+                {...this.searchCollectOptions(), restrictInlineTypes: []} :
+                this.searchCollectOptions();
+            const diagramChanged = this.diagramSearchState.changed(this.edit, change.diagramBlocks, options);
+            const embedChanged = this.embedSearchState.changed(this.edit, change.embedBlocks, options);
+            if (diagramChanged || embedChanged) {
+                this.diagramRefreshPending = true;
+                window.clearTimeout(this.diagramRefreshTimer);
+                this.diagramRefreshTimer = undefined;
             }
-            return true;
-        } catch {
-            return false;
+            this.scheduleDiagramRefresh();
         }
+        if (change.foldChanged && this.includeFoldedBlocks) {
+            this.noteFoldContentStable(change);
+            return;
+        }
+        void this.repairHighlightRanges();
+        if (change.foldChanged) this.scheduleFoldRefresh();
+    }
+
+    private clearDiagramSearchState() {
+        this.diagramSearchState?.clear();
+        this.embedSearchState?.clear();
+        this.diagramRefreshPending = false;
+        window.clearTimeout(this.diagramRefreshTimer);
+        this.diagramRefreshTimer = undefined;
+    }
+
+    /** 图表/嵌入异步渲染不发 savedoc。只在搜索文本改变时合并重搜，忙碌时保留请求。 */
+    private scheduleDiagramRefresh() {
+        if (
+            !this.diagramRefreshPending || (!this.effectiveQuery() && !this.isRestrictEnumerateMode()) ||
+            !this.canPaintHighlights()
+        ) return;
+        // 图表重搜也覆盖普通 Range 的文字变化，不能让两个计时器互相取消搜索。
+        window.clearTimeout(this.domRefreshTimer);
+        this.domRefreshTimer = undefined;
+        if (this.diagramRefreshTimer != null) return;
+        const key = this.searchResultKey();
+        this.diagramRefreshTimer = window.setTimeout(() => {
+            this.diagramRefreshTimer = undefined;
+            if (!this.diagramRefreshPending || key !== this.searchResultKey() || !this.canPaintHighlights()) return;
+            if (
+                this.searchesInFlight || this.replaceBusy || this.locatePending || this.findComposing ||
+                this.typingTimer != null
+            ) return;
+            void this.highlightHitResult(this.searchText, false);
+        }, DONE_TYPING_MS);
     }
 
     private noteAddedBlocks(change: EditorDomChange) {
-        if (change.embedOverflow) {
-            this.embedRefreshPending = true;
-        }
+        // 嵌入内容由语义快照核对；大批插入也走同一刷新队列，避免双重重搜。
         const pending = this.pendingAddedBlocks;
         if (!pending) {
             return;
@@ -3332,7 +3612,7 @@ export class SearchBar {
     }
 
     /**
-     * 开启“搜索折叠块内容”时，fold 只会改变 DOM 挂载与可见性，局部 Range 不必重建全文索引。
+     * 普通折叠只改变 DOM 挂载与可见性，不重建全文索引；图表搜索来源变化单独核对。
      * 收起标题没有新增节点：直接释放已断开的 Range，避免按所有命中重扫整篇文档；
      * 展开时保留既有的按新增块补 Range 路径，公式/图表完成渲染后会继续触发同一条路径。
      */
@@ -3344,25 +3624,42 @@ export class SearchBar {
         this.dropDetachedFoldRanges();
     }
 
-    private dropDetachedFoldRanges() {
+    private async dropDetachedFoldRanges() {
         if (
             this.locatePending ||
             this.replaceBusy ||
             this.searchesInFlight > 0 ||
-            !this.plugin.isLastHighlightComponent(this.root) ||
+            !this.canPaintHighlights() ||
             !this.resultMatches.length
         ) {
             return;
         }
+        const matches = this.resultMatches;
+        const generation = this.searchGeneration;
+        const epoch = this.domEpoch;
+        const current = () =>
+            matches === this.resultMatches && generation === this.searchGeneration &&
+            epoch === this.domEpoch && !this.replaceBusy && this.canPaintHighlights();
         let changed = false;
-        const next = this.resultMatches.map((match) => {
-            if (!match.range || rangeStillPainted(match)) {
-                return match;
+        const next: SearchMatch[] = [];
+        let started = performance.now();
+        for (let index = 0; index < matches.length; index++) {
+            const match = matches[index];
+            if (!match.range || rangeStillPainted(match, this.edit)) {
+                next.push(match);
+            } else {
+                changed = true;
+                next.push({...match, range: undefined});
             }
-            changed = true;
-            return {...match, range: undefined};
-        });
+            if ((index & 255) === 255 && performance.now() - started >= 8) {
+                await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+                if (!current()) return;
+                started = performance.now();
+            }
+        }
+        if (!current()) return;
         if (!changed) {
+            if (this.resultHighlightPending) this.applyResultHighlights();
             return;
         }
         this.resultMatches = next;
@@ -3387,140 +3684,168 @@ export class SearchBar {
      * 原来亮着、偏移处文字变了的不补，安排一次重搜。开关单元格编辑器不产生事务，收不到 savedoc。
      * 没有 Range 的命中，只在所在块插入了节点时核对：大表虚拟滚动挂出新行、嵌入块渲染完成等。
      */
-    private repairHighlightRanges() {
+    private repairHighlightRanges(): Promise<void> {
+        return this.repairHighlightRangesWithBudget().catch((error) =>
+            console.warn("[page-search] range repair failed", error)
+        );
+    }
+
+    private async repairHighlightRangesWithBudget() {
+        this.scheduleDiagramRefresh();
         // 定位时思源会在块壳出现后继续异步插入正文。保留这些块 id，等定位结束后
         // 立刻重用本函数补 Range；清空会导致首次跳转只能等下一次导航才有高亮。
         if (this.locatePending) {
             return;
         }
-        if (this.replaceBusy || !this.plugin.isLastHighlightComponent(this.root)) {
+        if (this.replaceBusy || !this.canPaintHighlights()) {
             this.pendingAddedBlocks = new Set();
-            this.embedRefreshPending = false;
             return;
         }
         if (this.searchesInFlight > 0) {
             this.repairAfterSearch = true;
             return;
         }
-        const embedRefresh = this.embedRefreshPending;
-        this.embedRefreshPending = false;
+        // 新 repair 接管仍在分片的旧任务时，先收回它的范围，避免旧 finally 太晚恢复。
+        this.repairRangeAbort?.abort();
+        if (this.repairRangeWork) this.restoreRangeRepairWork(this.repairRangeWork);
         if (!this.resultMatches.length) {
             this.pendingAddedBlocks = new Set();
-            this.scheduleEmbedRepair(embedRefresh);
             return;
         }
         const added = this.pendingAddedBlocks;
         this.pendingAddedBlocks = new Set();
-        const wholeDocument = added === null;
-        const targets = new Map<SearchMatch, RebindTarget>();
-        const blockIds = new Set<string>();
-        let brokenCount = 0;
-        for (const match of this.resultMatches) {
-            // 文档标题在正文外面，改名走 savedoc / rename 重搜
-            if (!wholeDocument && match.blockId === "__doc-title__") {
-                continue;
+        const controller = new AbortController();
+        this.repairRangeAbort = controller;
+        const work = {generation: this.searchGeneration, added, restored: false};
+        this.repairRangeWork = work;
+        const matches = this.resultMatches;
+        const epoch = this.domEpoch;
+        const generation = this.searchGeneration;
+        const current = () =>
+            !controller.signal.aborted && matches === this.resultMatches &&
+            epoch === this.domEpoch && generation === this.searchGeneration &&
+            !this.replaceBusy && !this.locatePending && !this.searchesInFlight &&
+            this.canPaintHighlights();
+        let consumed = false;
+        try {
+            const wholeDocument = added === null;
+            const targets = new Map<SearchMatch, RebindTarget>();
+            const blockIds = new Set<string>();
+            let brokenCount = 0;
+            let started = performance.now();
+            let steps = 0;
+            for (const match of matches) {
+                if ((++steps & 255) === 0 && performance.now() - started >= 8) {
+                    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+                    if (!current()) return;
+                    started = performance.now();
+                }
+                // 文档标题在正文外面，改名走 savedoc / rename 重搜
+                if (!wholeDocument && match.blockId === "__doc-title__") {
+                    continue;
+                }
+                const broken = Boolean(match.range) && !rangeStillPainted(match, this.edit);
+                if (broken) {
+                    brokenCount += 1;
+                } else if (match.range || !(added === null || added.has(match.blockId))) {
+                    continue;
+                }
+                targets.set(match, {broken, blockShown: false});
+                blockIds.add(match.blockId);
             }
-            const broken = Boolean(match.range) && !rangeStillPainted(match);
-            if (broken) {
-                brokenCount += 1;
-            } else if (match.range || !(added === null || added.has(match.blockId))) {
-                continue;
-            }
-            targets.set(match, {broken, blockShown: false});
-            blockIds.add(match.blockId);
-        }
-        // 只插入了大量块（滚动装载、文档重载）由 loaded-protyle 事件重搜。
-        // 嵌入块溢出不走那条事件，单独重搜一次。
-        if (!targets.size || (wholeDocument && brokenCount === 0)) {
-            this.scheduleEmbedRepair(embedRefresh);
-            return;
-        }
-        if (this.isRestrictEnumerateMode()) {
-            // 枚举结果的 unitId 按出现序号编，换过节点后对不回去，直接重新枚举。
-            // 嵌入溢出走保存刷新同一个计时器，避免和动态加载各搜一遍。
-            if (!this.scheduleEmbedRepair(embedRefresh) && brokenCount > 0) {
-                this.scheduleDomRefresh();
-            }
-            return;
-        }
-        const docRoot = resolveDocRoot(this.edit);
-        if (!docRoot) {
-            this.scheduleEmbedRepair(embedRefresh);
-            return;
-        }
-
-        const shown = new Set<string>();
-        let live: SearchableBlock[];
-        if (wholeDocument || blockIds.size > MAX_SCOPED_REPAIR_BLOCKS) {
-            live = collectSearchableBlocks(this.edit, this.searchCollectOptions());
-            if (brokenCount > 0) {
-                docRoot.querySelectorAll<HTMLElement>("[data-node-id]").forEach((element) => {
-                    const id = element.getAttribute("data-node-id");
-                    if (id && blockIds.has(id)) {
-                        shown.add(id);
-                    }
-                });
-            }
-        } else {
-            const roots: HTMLElement[] = [];
-            for (const id of blockIds) {
-                docRoot.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`).forEach((element) => {
-                    roots.push(element);
-                    shown.add(id);
-                });
-            }
-            live = roots.length ?
-                collectSearchableBlocks(this.edit, {
-                    ...this.searchCollectOptions(),
-                    includeDocTitle: false,
-                    scopeRoots: roots,
-                }) :
-                [];
-        }
-        for (const [match, target] of targets) {
-            target.blockShown = shown.has(match.blockId);
-        }
-
-        const rebound = rebindChangedRanges(this.resultMatches, live, targets, {
-            allowFoldedHidden: this.includeFoldedBlocks,
-            restrictInlineTypes: this.restrictInlineTypes,
-        });
-        if (rebound.changed) {
-            this.resultMatches = rebound.matches;
-            this.applyResultHighlights();
-            this.syncReplaceButtons();
-        }
-        if (!this.scheduleEmbedRepair(embedRefresh) && rebound.textChanged > 0) {
-            this.scheduleDomRefresh();
-        }
-    }
-
-    /**
-     * 嵌入块内部一次渲染出太多子块时，并进输入框 / 保存 / 动态加载共用的那次刷新。
-     * 已经排上了就不再另开计时器。返回 true 表示这次全文刷新已经覆盖嵌入。
-     */
-    private scheduleEmbedRepair(embedRefresh: boolean): boolean {
-        if (!embedRefresh) {
-            return false;
-        }
-        if (!effectiveSearchQuery(this.searchText) && !this.isRestrictEnumerateMode()) {
-            return false;
-        }
-        if (this.typingTimer != null) {
-            return true;
-        }
-        this.typingTimer = window.setTimeout(() => {
-            this.typingTimer = undefined;
-            if (this.replaceBusy || this.locatePending || !this.plugin.isLastHighlightComponent(this.root)) {
+            // 高亮构建被渲染突变取消时，即使 Range 仍有效也必须重画。
+            if (!targets.size) {
+                consumed = true;
+                if (this.resultHighlightPending) await this.applyResultHighlightsWithBudget(matches, current);
                 return;
             }
-            void this.highlightHitResult(this.searchText, false).then(() => {
-                if (this.resultIndex >= 1) {
-                    this.scrollIntoRanges(this.resultIndex - 1, false);
+            if (this.isRestrictEnumerateMode()) {
+                consumed = true;
+                // 枚举结果的 unitId 按出现序号编，换过节点后对不回去，直接重新枚举。
+                if (brokenCount > 0) {
+                    this.scheduleDomRefresh();
                 }
-            });
-        }, DONE_TYPING_MS);
-        return true;
+                return;
+            }
+            const docRoot = resolveDocRoot(this.edit);
+            if (!docRoot) {
+                consumed = true;
+                return;
+            }
+
+            const shown = new Set<string>();
+            let live: SearchableBlock[];
+            if (wholeDocument || blockIds.size > MAX_SCOPED_REPAIR_BLOCKS) {
+                live = collectSearchableBlocks(this.edit, {...this.searchCollectOptions(), skipEmbeddedOrder: true});
+                if (brokenCount > 0) {
+                    docRoot.querySelectorAll<HTMLElement>("[data-node-id]").forEach((element) => {
+                        const id = element.getAttribute("data-node-id");
+                        if (id && blockIds.has(id)) {
+                            shown.add(id);
+                        }
+                    });
+                }
+            } else {
+                const roots: HTMLElement[] = [];
+                for (const id of blockIds) {
+                    docRoot.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`).forEach((element) => {
+                        roots.push(element);
+                        shown.add(id);
+                    });
+                }
+                live = roots.length ?
+                    collectSearchableBlocks(this.edit, {
+                        ...this.searchCollectOptions(),
+                        includeDocTitle: false,
+                        scopeRoots: roots,
+                        skipEmbeddedOrder: true,
+                    }) :
+                    [];
+            }
+            for (const [match, target] of targets) {
+                target.blockShown = shown.has(match.blockId);
+            }
+
+            const rebound = await rebindChangedRangesWithBudget(matches, live, targets, {
+                allowFoldedHidden: this.includeFoldedBlocks,
+                restrictInlineTypes: this.restrictInlineTypes,
+            }, current);
+            if (!rebound || !current()) return;
+            const update = await prepareLiveRangesWithBudget(
+                this.edit,
+                rebound.matches,
+                live,
+                this.includeFoldedBlocks,
+                current,
+            );
+            if (!current() || !update?.commit()) return;
+            this.resultMatches = update.matches;
+            consumed = true;
+            if (rebound.changed || live.length || this.resultHighlightPending) {
+                await this.applyResultHighlightsWithBudget(
+                    update.matches,
+                    () => this.canPaintHighlights(),
+                );
+                this.syncReplaceButtons();
+            }
+            if (rebound.textChanged > 0) {
+                this.scheduleDomRefresh();
+            }
+        } finally {
+            if (this.repairRangeAbort === controller) this.repairRangeAbort = null;
+            if (this.repairRangeWork === work) this.repairRangeWork = null;
+            // 分片期间再次变动时，旧插入点仍需在下一次 settled 核对，不能丢掉无 Range 的目标。
+            if (!consumed && generation === this.searchGeneration) {
+                this.restoreRangeRepairWork(work);
+                // 滚动投影可能先提交一个新结果数组；此时没有新的 DOM settled 事件。
+                // 接回范围后立即重试，不能把补亮永久留到下一次编辑/导航才做。
+                if (
+                    !controller.signal.aborted && epoch === this.domEpoch && matches !== this.resultMatches &&
+                    !this.replaceBusy && !this.locatePending && !this.searchesInFlight &&
+                    this.canPaintHighlights()
+                ) void this.repairHighlightRanges();
+            }
+        }
     }
 
     /**
@@ -3528,13 +3853,17 @@ export class SearchBar {
      * 编辑会带来 savedoc 刷新；它先跑了就不再重复。撤销的 savedoc 早于本地回放，单元格编辑器开关没有 savedoc。
      */
     private scheduleDomRefresh() {
+        if (this.diagramRefreshPending) {
+            this.scheduleDiagramRefresh();
+            return;
+        }
         window.clearTimeout(this.domRefreshTimer);
         const generation = this.searchGeneration;
         this.domRefreshTimer = window.setTimeout(() => {
             if (this.searchGeneration !== generation) {
                 return;
             }
-            if (this.replaceBusy || this.locatePending || !this.plugin.isLastHighlightComponent(this.root)) {
+            if (this.replaceBusy || this.locatePending || !this.canPaintHighlights()) {
                 return;
             }
             void this.highlightHitResult(this.searchText, false).then(() => {
@@ -3552,13 +3881,13 @@ export class SearchBar {
     private scheduleFoldRefresh() {
         if (
             this.includeFoldedBlocks ||
-            (!effectiveSearchQuery(this.searchText) && !this.isRestrictEnumerateMode())
+            (!this.effectiveQuery() && !this.isRestrictEnumerateMode())
         ) {
             return;
         }
         window.clearTimeout(this.foldRefreshTimer);
         this.foldRefreshTimer = window.setTimeout(() => {
-            if (this.replaceBusy || this.locatePending || !this.plugin.isLastHighlightComponent(this.root)) {
+            if (this.replaceBusy || this.locatePending || !this.canPaintHighlights()) {
                 return;
             }
             this.searchCoverageIncomplete = true;
@@ -3580,6 +3909,7 @@ export class SearchBar {
      * 思源开关单元格编辑器会整格换掉子节点，Range 缩成格子开头的空点，也算失效。
      */
     private rangeStillInMatchBlock(range: Range, match: SearchMatch): boolean {
+        if (!rangeBelongsToEditor(range, this.edit)) return false;
         const blockId = match.blockId;
         let node: Node;
         try {
@@ -3637,6 +3967,10 @@ export class SearchBar {
 
     /** 当前命中立刻标成橙色。标题展开路径在滚动之前调用。 */
     private applyFocusHighlight(range: Range) {
+        if (!this.canPaintHighlights() || !rangeBelongsToEditor(range, this.edit)) {
+            this.clearSearchFocus();
+            return;
+        }
         const HighlightCtor = (window as any).Highlight as {
             new(...ranges: Range[]): Highlight;
         };
@@ -3645,28 +3979,19 @@ export class SearchBar {
         }
         const ranges = [range];
         const mirror = mirrorTabsTitleRange(range);
-        if (mirror) {
+        if (mirror && rangeBelongsToEditor(mirror, this.edit)) {
             ranges.push(mirror);
         }
         const highlight = newHighlight(ranges);
         if (!highlight) {
             return;
         }
-        const highlights = (CSS as any).highlights;
-        highlights.delete(PAGE_SEARCH_FOCUS_HIGHLIGHT);
-        highlights.delete("search-math-focus");
-        highlights.set(PAGE_SEARCH_FOCUS_HIGHLIGHT, highlight);
-        this.plugin.updateLastHighlightComponent(this.root);
+        this.getComponentHighlights().setFocus(highlight);
     }
 
     /** 当前项是备注虚线时，去掉正文上的橙色，让它回到页内查找的黄色。 */
     private clearSearchFocus() {
-        const highlights = (CSS as any).highlights;
-        if (!highlights) {
-            return;
-        }
-        highlights.delete(PAGE_SEARCH_FOCUS_HIGHLIGHT);
-        highlights.delete("search-math-focus");
+        this.componentHighlights?.setFocus(null);
     }
 
     /**
@@ -3987,7 +4312,10 @@ export class SearchBar {
      * 单处只验证这一条：只读、不可写和偏移处文字已经对不上的，写回会拒绝。
      */
     private async clickReplace() {
-        if (this.replaceBusy || this.resultCount === 0 || this.isRestrictEnumerateMode()) {
+        if (
+            this.replaceBusy || !this.hasCurrentSearchResults() || this.resultCount === 0 ||
+            this.isRestrictEnumerateMode()
+        ) {
             return;
         }
         if (isEditorReplaceModeBlocked(this.edit)) {
@@ -4013,6 +4341,8 @@ export class SearchBar {
         }
 
         const keepIndex = this.resultIndex;
+        const searchKey = this.resultSearchKey;
+        const selectionScope = this.resultSelectionScope;
         this.replaceBusy = true;
         try {
             let current = match;
@@ -4032,10 +4362,23 @@ export class SearchBar {
                         openBlockInEditor(app, current.blockId, done, this.edit);
                         window.setTimeout(done, 4500);
                     });
+                    if (this.searchResultKey() !== searchKey) return;
                     await this.highlightHitResult(this.searchText, false);
-                    current = this.getCurrentMatch() ?? current;
+                    const rebound = this.resultMatches.find((candidate) =>
+                        candidate.blockId === match.blockId && candidate.unitId === match.unitId &&
+                        candidate.start === match.start && candidate.end === match.end &&
+                        candidate.matchedText === match.matchedText
+                    );
+                    if (!rebound) return;
+                    current = rebound;
                 }
             }
+            if (
+                !this.hasCurrentSearchResults() || this.resultSearchKey !== searchKey ||
+                this.resultSelectionScope !== selectionScope
+            ) return;
+            const generation = this.searchGeneration;
+            const replacementText = this.replaceText;
             const result = await replaceCurrentMatchInEditor(
                 this.edit,
                 current,
@@ -4045,10 +4388,11 @@ export class SearchBar {
                     regex: this.regex,
                     searchQuery: this.searchText,
                     caseSensitive: this.caseSensitive,
-                    regexUnicode: this.regexUnicode,
-                    regexMultiline: this.regexMultiline,
-                    regexDotAll: this.regexDotAll,
                     regexMatcher: this.regexMatcher,
+                    isCurrent: () =>
+                        this.hasCurrentSearchResults() &&
+                        this.resultSearchKey === searchKey && this.searchGeneration === generation &&
+                        this.replaceText === replacementText,
                 },
             );
             if (result.error === "readonly-or-preview") {
@@ -4057,6 +4401,15 @@ export class SearchBar {
             }
             if (result.error === "protyle-missing") {
                 showMessage(this.i18n.replaceProtyleMissing, 4000, "error");
+                return;
+            }
+            if (result.error === "stale-target") {
+                showMessage(
+                    this.i18n.replaceStaleTarget ?? "目标内容已变化，已取消替换并刷新结果，请重新确认。",
+                    4000,
+                    "info",
+                );
+                await this.highlightHitResult(this.searchText, false);
                 return;
             }
             if (result.error === "regex-expand-failed") {
@@ -4098,16 +4451,26 @@ export class SearchBar {
             showMessage(this.i18n.replaceCurrentDone, 2000, "info");
         } finally {
             this.replaceBusy = false;
+            this.scheduleDiagramRefresh();
         }
     }
 
     private async clickReplaceAll() {
-        if (this.replaceBusy || this.resultCount === 0 || this.isRestrictEnumerateMode()) {
+        if (
+            this.replaceBusy || !this.hasCurrentSearchResults() || this.searchCoverageIncomplete ||
+            this.resultCount === 0 || this.isRestrictEnumerateMode()
+        ) {
             return;
         }
         if (isEditorReplaceModeBlocked(this.edit)) {
             showMessage(this.i18n.replaceModeUnsupported, 3000, "info");
             return;
+        }
+        // 渲染和折叠也会改变 domEpoch，不能永久禁用按钮。只在用户准备全部替换时
+        // 更新一次陈旧快照；确认框显示的数量必须来自此次稳定结果。
+        if (!this.hasStableReplaceAllSnapshot()) {
+            await this.highlightHitResult(this.searchText, false);
+            if (!this.hasStableReplaceAllSnapshot() || this.replaceBusy || this.resultCount === 0) return;
         }
         const searchGeneration = this.searchGeneration;
         const confirmText = this.i18n.replaceAllConfirm.replace(
@@ -4122,12 +4485,14 @@ export class SearchBar {
             return;
         }
         if (
-            this.searchCoverageIncomplete ||
+            this.replaceBusy ||
+            !this.hasStableReplaceAllSnapshot() ||
             searchGeneration !== this.searchGeneration ||
             this.resultCount === 0 ||
             this.isRestrictEnumerateMode()
         ) {
             showMessage(this.i18n.replaceAllIncomplete, 4000, "info");
+            if (!this.hasStableReplaceAllSnapshot()) await this.highlightHitResult(this.searchText, false);
             return;
         }
         if (isEditorReplaceModeBlocked(this.edit)) {
@@ -4137,6 +4502,8 @@ export class SearchBar {
 
         this.replaceBusy = true;
         try {
+            const searchKey = this.resultSearchKey;
+            const replacementText = this.replaceText;
             const result = await replaceAllMatchesInEditor(
                 this.edit,
                 this.resultMatches,
@@ -4146,10 +4513,11 @@ export class SearchBar {
                     regex: this.regex,
                     searchQuery: this.searchText,
                     caseSensitive: this.caseSensitive,
-                    regexUnicode: this.regexUnicode,
-                    regexMultiline: this.regexMultiline,
-                    regexDotAll: this.regexDotAll,
                     regexMatcher: this.regexMatcher,
+                    isCurrent: () =>
+                        this.hasStableReplaceAllSnapshot() &&
+                        this.resultSearchKey === searchKey && this.searchGeneration === searchGeneration &&
+                        this.replaceText === replacementText,
                 },
             );
             if (result.error === "readonly-or-preview") {
@@ -4166,6 +4534,15 @@ export class SearchBar {
             }
             if (result.replacedCount === 0 && result.error === "table-pending-edit") {
                 showMessage(this.i18n.replaceTablePendingEdit, 4000, "info");
+                return;
+            }
+            if (result.error === "stale-target") {
+                showMessage(
+                    this.i18n.replaceStaleTarget ?? "目标内容已变化，已取消替换并刷新结果，请重新确认。",
+                    4000,
+                    "info",
+                );
+                await this.highlightHitResult(this.searchText, false);
                 return;
             }
             if (
@@ -4198,6 +4575,7 @@ export class SearchBar {
             );
         } finally {
             this.replaceBusy = false;
+            this.scheduleDiagramRefresh();
         }
     }
 
@@ -4489,46 +4867,6 @@ export class SearchBar {
                 void this.setSearchMethod(true);
             },
         });
-        menu.addSeparator();
-        menu.addItem({
-            id: "page-search-method-regex-options",
-            type: "submenu",
-            label: this.i18n.regexOptions,
-            disabled: !this.regex,
-            submenu: [
-                {
-                    id: "page-search-regex-unicode",
-                    label: this.i18n.regexUnicode,
-                    checked: this.regexUnicode,
-                    click: () => {
-                        void this.setRegexOption("regexUnicode", !this.regexUnicode);
-                    },
-                },
-                {
-                    id: "page-search-regex-multiline",
-                    label: this.i18n.regexMultiline,
-                    checked: this.regexMultiline,
-                    click: () => {
-                        void this.setRegexOption("regexMultiline", !this.regexMultiline);
-                    },
-                },
-                {
-                    id: "page-search-regex-dotall",
-                    label: this.i18n.regexDotAll,
-                    checked: this.regexDotAll,
-                    click: () => {
-                        void this.setRegexOption("regexDotAll", !this.regexDotAll);
-                    },
-                },
-                {
-                    type: "separator",
-                },
-                {
-                    type: "readonly",
-                    label: this.i18n.regexBoundaryHint,
-                },
-            ],
-        });
         const rect = anchor.getBoundingClientRect();
         menu.open({
             x: rect.left,
@@ -4571,26 +4909,6 @@ export class SearchBar {
         this.syncOptionButtons();
         await rpcSetPrefs(this.plugin, {useRegex});
         this.plugin.syncUseRegex?.(useRegex, this);
-        void this.highlightHitResult(this.searchText, true);
-    }
-
-    private regexOptions(): RegexOptions {
-        return {
-            regexUnicode: this.regexUnicode,
-            regexMultiline: this.regexMultiline,
-            regexDotAll: this.regexDotAll,
-        };
-    }
-
-    /** 切换一个 flags；即使菜单已关闭，也先写入当前值再启动新搜索。 */
-    private async setRegexOption(key: keyof RegexOptions, value: boolean) {
-        if (this[key] === value) {
-            return;
-        }
-        this[key] = value;
-        const options = this.regexOptions();
-        await rpcSetPrefs(this.plugin, options);
-        this.plugin.syncRegexOptions?.(options, this);
         void this.highlightHitResult(this.searchText, true);
     }
 
@@ -5327,27 +5645,6 @@ export class SearchBar {
         this.regex = value;
         this.closeSearchMethodMenu();
         this.syncOptionButtons();
-        void this.highlightHitResult(this.searchText, true);
-    }
-
-    /** 其它面板同步过来的正则 flags（不再写存储）。 */
-    applyRegexOptions(value: RegexOptions) {
-        const next = {
-            regexUnicode: value.regexUnicode === true,
-            regexMultiline: value.regexMultiline === true,
-            regexDotAll: value.regexDotAll === true,
-        };
-        if (
-            this.regexUnicode === next.regexUnicode &&
-            this.regexMultiline === next.regexMultiline &&
-            this.regexDotAll === next.regexDotAll
-        ) {
-            return;
-        }
-        this.regexUnicode = next.regexUnicode;
-        this.regexMultiline = next.regexMultiline;
-        this.regexDotAll = next.regexDotAll;
-        this.closeSearchMethodMenu();
         void this.highlightHitResult(this.searchText, true);
     }
 }

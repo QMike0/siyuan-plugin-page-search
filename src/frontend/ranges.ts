@@ -147,6 +147,7 @@ export function createRangeFromBlockOffsets(
   start: number,
   end: number,
   visibility: ElementVisibilityOptions = {},
+  existingRange?: Range,
 ): Range | null {
   if (isInlineMemoSearchUnit(block)) {
     return createRangeFromInlineMemo(block, start, end, visibility)
@@ -166,12 +167,20 @@ export function createRangeFromBlockOffsets(
   }
 
   try {
-    const range = document.createRange()
-    range.setStart(startPoint.node, startPoint.offset)
-    range.setEnd(endPoint.node, endPoint.offset)
+    // 局部修复已经建好的 Range 只在端点完全一致时复用；仍执行下面的可见性检查。
+    const reusable = existingRange
+      && existingRange.startContainer === startPoint.node && existingRange.startOffset === startPoint.offset
+      && existingRange.endContainer === endPoint.node && existingRange.endOffset === endPoint.offset
+    const range = reusable ? existingRange : document.createRange()
+    if (!reusable) {
+      range.setStart(startPoint.node, startPoint.offset)
+      range.setEnd(endPoint.node, endPoint.offset)
+    }
 
     const startContainerElement = startPoint.node.parentElement
+      ?? (startPoint.node.parentNode instanceof ShadowRoot ? startPoint.node.parentNode.host : null)
     const endContainerElement = endPoint.node.parentElement
+      ?? (endPoint.node.parentNode instanceof ShadowRoot ? endPoint.node.parentNode.host : null)
     if (
       !startContainerElement
       || !endContainerElement

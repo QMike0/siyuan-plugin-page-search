@@ -1,12 +1,17 @@
 import {
     DIAGRAM_CODE_LANGUAGES,
     DIAGRAM_CODE_LANGUAGE_SET,
+    supportsDiagramSourceSearch,
 } from "../shared/code-block-language";
 import {ZERO_WIDTH_GLOBAL_RE} from "../shared/constants";
 import {rendererUnitId} from "../shared/renderer-units";
 import type {SearchableBlock} from "./dom-types";
+import {isUnderNonHeadingCssFold} from "./fold-dom";
 import {splitTextNodesAtBarriers} from "./text-runs";
-import {omitAuthorCssHiddenText} from "./visibility";
+import {
+    isAuthorCssHiddenElement,
+    omitAuthorCssHiddenText,
+} from "./visibility";
 
 const CODE_BLOCK_TYPE = "NodeCodeBlock";
 const MATH_BLOCK_TYPE = "NodeMathBlock";
@@ -41,10 +46,21 @@ export function rendererAdapterKind(element: HTMLElement): RendererAdapterKind |
     return null;
 }
 
+/** Mermaid can leave its error SVG next to, rather than inside, the error message. */
+export function diagramOutputFailed(element: Element): boolean {
+    return Boolean(element.querySelector(".ft__error"));
+}
+
+/** Only empty Mermaid completes synchronously after setting this marker, without an SVG. */
+export function isCompletedEmptyMermaid(element: Element): boolean {
+    return element.getAttribute("data-subtype") === "mermaid" &&
+        element.getAttribute("data-content") === "" && element.getAttribute("data-render") === "true";
+}
+
 /**
  * live DOM 与离屏 DOM 共用的 renderer 采集入口。
- * Mermaid / flowchart 没有 renderer 文本时会返回一个明确标记的源码兜底单元；
- * 其他 renderer 仍返回 []，不会把源码误当成公式或 HTML 的可见字。
+ * Mermaid / flowchart 在折叠、离屏或无正常输出时只返回源码单元。
+ * 源码单元没有 Text 节点，不能投影到 SVG 或参与替换；其余 renderer 保持可见文字语义。
  */
 export function collectRendererSearchUnits(
     element: HTMLElement,
@@ -69,9 +85,9 @@ function collectMathUnits(element: HTMLElement, context: RendererContext): Searc
     if (!katexHtml) {
         return [];
     }
-    const textNodes = collectTextNodes(katexHtml, (parent) => {
+    const textNodes = omitAuthorCssHiddenText(collectTextNodes(katexHtml, (parent) => {
         return !parent.closest(".katex-mathml, math, annotation, svg, style, script");
-    });
+    }));
     return singleRenderedUnit(element, context, "math", textNodes);
 }
 
@@ -107,12 +123,35 @@ function collectDiagramUnits(
     context: RendererContext,
     kind: DiagramSubtype,
 ): SearchableBlock[] {
+    if (
+        supportsDiagramSourceSearch(kind) && element.hasAttribute("data-content") &&
+        (element.closest("[data-page-search-offscreen]") || element.hasAttribute("parent-heading") ||
+            isUnderNonHeadingCssFold(element) || diagramOutputFailed(element) ||
+            !Array.from(element.querySelectorAll("svg, canvas, img")).some((output) =>
+                !output.closest(".protyle-icons, .protyle-attr")
+            ))
+    ) {
+        if (isAuthorCssHiddenElement(element)) return [];
+        const text = diagramSourceText(element);
+        return text.length ?
+            [{
+                ...context,
+                element,
+                text,
+                textNodes: [],
+                unitId: rendererUnitId("source-fallback", kind),
+            }] :
+            [];
+    }
+    if (diagramOutputFailed(element)) {
+        return [];
+    }
     // 一个 SVG text / foreignObject 是一个视觉标签；同一 text 内的 tspan 仍可跨样式匹配。
     // 这样既不会把相邻标签 foo + bar 拼成 foobar，也保留单个标签内部的精确 Range。
     const boundaries = Array.from(
         element.querySelectorAll<SVGTextElement | SVGForeignObjectElement>("svg text, svg foreignObject"),
     ).filter((boundary) => {
-        if (boundary.closest(".protyle-attr, .protyle-icons")) {
+        if (boundary.closest(".protyle-attr, .protyle-icons, .ft__error")) {
             return false;
         }
         if (boundary.localName === "text" && boundary.closest("foreignObject")) {
@@ -133,32 +172,17 @@ function collectDiagramUnits(
                 ".protyle-attr, .protyle-icons, style, script, textarea, noscript, title, desc, template, [hidden]",
             );
         }));
-        const text = textNodes.map((node) => node.nodeValue ?? "").join("");
-        if (!meaningful(text)) {
-            continue;
-        }
-        units.push({
-            ...context,
-            element,
-            text,
-            textNodes,
-            unitId: rendererUnitId("rendered-text", kind, units.length),
-        });
-    }
-    if (units.length === 0 && (kind === "mermaid" || kind === "flowchart")) {
-        // Mermaid / flowchart 的源码通常包含节点标签；当思源 renderer 尚未挂载
-        // SVG（例如首次打开的折叠块）时，保留一份不可定位的源码单元，避免整块
-        // 被误报为“未完成解析”。有 SVG 时仍只使用真正的可见文字，避免重复命中。
-        const source = diagramSourceText(element);
-        if (meaningful(source)) {
+        for (const run of splitTextNodesAtBarriers(textNodes)) {
+            const text = run.map((node) => node.nodeValue ?? "").join("");
+            if (!meaningful(text)) {
+                continue;
+            }
             units.push({
                 ...context,
                 element,
-                text: source,
-                textNodes: [],
-                // 源码只是召回兜底，不能按普通正文定位或替换；沿用统一
-                // renderer 单元标识也能让缓存、跳转和替换门闩保持一致。
-                unitId: rendererUnitId("source-fallback", kind),
+                text,
+                textNodes: run,
+                unitId: rendererUnitId("rendered-text", kind, units.length),
             });
         }
     }
@@ -195,7 +219,8 @@ function collectTextNodes(
             if (!(node instanceof Text) || !node.nodeValue?.length) {
                 return NodeFilter.FILTER_REJECT;
             }
-            const parent = node.parentElement;
+            const parent = node.parentElement ??
+                (node.parentNode instanceof ShadowRoot ? node.parentNode.host as HTMLElement : null);
             if (!parent || !acceptsParent(parent)) {
                 return NodeFilter.FILTER_REJECT;
             }
@@ -217,21 +242,20 @@ function meaningful(text: string): boolean {
     return Boolean(text.replace(ZERO_WIDTH_GLOBAL_RE, "").trim());
 }
 
-/** 返回图表块里的源码文本，用于 renderer 尚未完成时的召回候选判断。 */
+/** 与思源图表输入一致：只解码实体，保留 HTML 形式的源码标签。 */
 export function diagramSourceText(element: HTMLElement): string {
-    const raw = element.getAttribute("data-content");
-    if (!raw) {
-        return "";
-    }
+    const raw = element.getAttribute("data-content") ?? "";
+    if (!raw.includes("&")) return raw;
     const lute = (window as Window & {Lute?: {UnEscapeHTMLStr?: (value: string) => string;};}).Lute;
     if (typeof lute?.UnEscapeHTMLStr === "function") {
         try {
             return lute.UnEscapeHTMLStr(raw);
         } catch {
-            // DOM decoding below is sufficient for ordinary entities.
+            // 渲染库不可用时保留源码搜索，不让一次解码失败中断整条搜索链路。
         }
     }
-    const textarea = document.createElement("textarea");
-    textarea.innerHTML = raw;
-    return textarea.value;
+    // textarea 脱离文档；转义 '<' 后不会创建源码里的标签或加载资源。
+    const decoder = document.createElement("textarea");
+    decoder.innerHTML = raw.replace(/</g, "&lt;");
+    return decoder.value;
 }
