@@ -73,6 +73,27 @@ export function isAttrViewWsTransaction(detail: unknown): boolean {
     return false;
 }
 
+/** These native transactions change layout only. Mixed/unknown batches still
+ * invalidate values, including when an undo operation contains a real edit. */
+export function isAttrViewFoldOnlyTransaction(detail: unknown): boolean {
+    const payload = detail as {
+        cmd?: string;
+        data?: Array<{doOperations?: Array<{action?: string;}>; undoOperations?: Array<{action?: string;}>;}>;
+    } | null;
+    if (payload?.cmd !== "transactions" || !Array.isArray(payload.data)) return false;
+    let found = false;
+    for (const tx of payload.data) {
+        for (const op of [
+            ...(Array.isArray(tx?.doOperations) ? tx.doOperations : []),
+            ...(Array.isArray(tx?.undoOperations) ? tx.undoOperations : []),
+        ]) {
+            if (op?.action !== "foldAttrViewGroup" && op?.action !== "foldAttrViewGroups") return false;
+            found = true;
+        }
+    }
+    return found;
+}
+
 /**
  * 当前编辑区内是否存在（或事务涉及）可观察的数据库块。
  */

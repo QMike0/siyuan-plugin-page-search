@@ -15,7 +15,7 @@ import {
     type SelectionScope,
 } from "./selection";
 
-type UnitSnapshot = {unitId?: string; text: string; restrictions?: string;};
+type UnitSnapshot = {unitId?: string; text: string; restrictions?: string; avRow?: boolean;};
 
 function sourceDiagram(block: SearchableBlock): boolean {
     return block.element.dataset.type === "NodeCodeBlock" &&
@@ -44,6 +44,7 @@ export class EmbedSearchState {
         edit: Element,
         elements: ReadonlySet<HTMLElement> | null | undefined,
         options: CollectSearchableBlocksOptions,
+        virtualAvEmbeds?: ReadonlySet<HTMLElement>,
     ): boolean {
         if (options.includeEmbedBlock === false || elements === undefined || elements?.size === 0) return false;
         const root = resolveDocRoot(edit);
@@ -61,16 +62,28 @@ export class EmbedSearchState {
                 [],
             this.restricted,
         );
+        const virtualIds = new Set(Array.from(virtualAvEmbeds ?? [], element => element.dataset.nodeId ?? ""));
         let changed = false;
         const ids = new Set([...next.keys(), ...Array.from(elements, element => element.dataset.nodeId ?? "")]);
         for (const id of ids) {
             const before = this.units.get(id) ?? [];
             const after = next.get(id) ?? [];
+            const ignoreAvMounts = virtualIds.has(id);
+            const beforeIds = ignoreAvMounts ? new Set(before.map(unit => unit.unitId)) : undefined;
+            const afterIds = ignoreAvMounts ? new Set(after.map(unit => unit.unitId)) : undefined;
+            // Full search already owns these rows through the paged API. Compare
+            // retained row text, but do not treat mounting/unmounting as an edit.
+            const comparedBefore = ignoreAvMounts ?
+                before.filter(unit => !unit.avRow || afterIds!.has(unit.unitId)) :
+                before;
+            const comparedAfter = ignoreAvMounts ?
+                after.filter(unit => !unit.avRow || beforeIds!.has(unit.unitId)) :
+                after;
             if (
-                before.length !== after.length ||
-                before.some((unit, index) =>
-                    unit.unitId !== after[index].unitId || unit.text !== after[index].text ||
-                    unit.restrictions !== after[index].restrictions
+                comparedBefore.length !== comparedAfter.length ||
+                comparedBefore.some((unit, index) =>
+                    unit.unitId !== comparedAfter[index].unitId || unit.text !== comparedAfter[index].text ||
+                    unit.restrictions !== comparedAfter[index].restrictions
                 )
             ) changed = true;
             if (after.length) this.units.set(id, after);
@@ -112,6 +125,10 @@ export class EmbedSearchState {
                         {
                             unitId: block.unitId,
                             text: block.text,
+                            avRow: Boolean(
+                                block.element.closest('[data-type="NodeAttributeView"]') &&
+                                    block.element.closest(".av__row[data-id], .av__gallery-item[data-id]"),
+                            ),
                             restrictions: restricted ? JSON.stringify(freezeBlock(block).restrictSpans) : undefined,
                         }
                 ),

@@ -31,6 +31,7 @@ import {
 import {
     AV_REFRESH_DEBOUNCE_MS,
     attributeViewTransactionIds,
+    isAttrViewFoldOnlyTransaction,
     isAttrViewRelevantToEdit,
     isAttrViewWsTransaction,
     watchAttributeViewDom,
@@ -91,6 +92,7 @@ import {
 } from "./editor-dom-watch";
 import {isEditorReplaceModeBlocked} from "./editor-mode";
 import {EmbedSearchState} from "./embed-search-state";
+import {createEmbeddedSourceReader} from "./embedded-order";
 import {
     clearNonHeadingFoldLocally,
     collectNonHeadingFoldedAncestorIds,
@@ -2777,7 +2779,7 @@ export class SearchBar {
                 rootUsesAttributeViews(this.rememberCurrentRootId(), attributeViewTransactionIds(event.detail)))
         ) {
             this.documentEpoch += 1;
-            this.scheduleAttrViewResearch(attributeViewTransactionIds(event.detail));
+            this.scheduleAttrViewResearch(attributeViewTransactionIds(event.detail), !isAttrViewFoldOnlyTransaction(event.detail));
             return;
         }
 
@@ -2853,10 +2855,10 @@ export class SearchBar {
      * 数据库结构性重建后重新匹配并画高亮。
      * 使用 change=false 保留当前跳转索引；跳转滚动期间不响应，避免误重置到第一项。
      */
-    private scheduleAttrViewResearch(avIds?: readonly string[]) {
+    private scheduleAttrViewResearch(avIds?: readonly string[], invalidateValues = true) {
         // 变更一到就丢掉引用缓存。跳转暂停或搜索框为空时不会重搜，
         // 但下一次手动搜索也不能继续用旧单元格。
-        invalidateAttributeViewSearch(this.rememberCurrentRootId(), avIds);
+        if (invalidateValues) invalidateAttributeViewSearch(this.rememberCurrentRootId(), avIds);
         if (!this.includeAttributeView) {
             return;
         }
@@ -3100,8 +3102,10 @@ export class SearchBar {
             void this.revealVirtualTableMatch(index, match, existing, serial);
             return;
         }
-        if (shown || (match.blockType === ATTRIBUTE_VIEW_TYPE && existing)) {
-            existing?.scrollIntoView({block: "center", inline: "nearest"});
+        if (shown) {
+            const group = this.attributeViewGroupBody(match);
+            if (group) this.clearSearchFocus();
+            (group?.previousElementSibling ?? existing)?.scrollIntoView({block: "center", inline: "nearest"});
             return;
         }
         if (this.locatePending) {
@@ -3136,6 +3140,7 @@ export class SearchBar {
      * 先给当前命中补高亮并滚动；标题下其余命中下一帧再补，对不上才整篇重搜。
      */
     private async finishLocatedMatch(keepIndex: number, scroll: boolean) {
+        const generation = this.searchGeneration;
         const index = this.resultIndex >= 1 && this.resultIndex <= this.resultMatches.length ?
             this.resultIndex :
             keepIndex;
@@ -3154,7 +3159,11 @@ export class SearchBar {
             }
             return;
         }
-        if (target && await this.waitForLocatedMatchRange(index, target.id)) {
+        const bound = target && await this.waitForLocatedMatchRange(index, target.id, scroll);
+        // 加载期间新查询或导航已经接管，不展开旧目标，也不为旧目标重搜全文。
+        if (generation !== this.searchGeneration || (target && this.resultMatches[index - 1]?.id !== target.id) ||
+            (this.resultIndex >= 1 && this.resultIndex !== index)) return;
+        if (bound) {
             if (this.resultIndex < 1) {
                 this.resultIndex = Math.min(index, this.resultMatches.length);
                 this.updateCountLabel();
@@ -3165,6 +3174,18 @@ export class SearchBar {
             await new Promise<void>((resolve) => {
                 window.requestAnimationFrame(() => resolve());
             });
+            this.bindUnfoldedHeadingSection();
+            return;
+        }
+        const group = this.attributeViewGroupBody(target);
+        if (group) {
+            // 分组中的虚拟卡片未必已挂载，保留完整匹配，不用重搜反复等待不存在的 Range。
+            if (this.resultIndex < 1) {
+                this.resultIndex = index;
+                this.updateCountLabel();
+            }
+            this.clearSearchFocus();
+            if (scroll) (group.previousElementSibling ?? group).scrollIntoView({block: "center", inline: "nearest"});
             this.bindUnfoldedHeadingSection();
             return;
         }
@@ -3196,13 +3217,14 @@ export class SearchBar {
      * 在大块、嵌套容器或渲染器逐步挂载时会抢占主线程，反而拖慢思源把文本插进来。
      * 低频轮询只保留给观察不到的 shadow DOM / 外部渲染器路径。
      */
-    private async waitForLocatedMatchRange(index: number, matchId: string): Promise<boolean> {
+    private async waitForLocatedMatchRange(index: number, matchId: string, revealAvGroup = false): Promise<boolean> {
         const generation = this.searchGeneration;
         const canBindCurrent = (): boolean => {
             if (
                 generation !== this.searchGeneration ||
                 this.replaceBusy ||
-                !this.plugin.isLastHighlightComponent(this.root)
+                !this.plugin.isLastHighlightComponent(this.root) ||
+                (this.resultIndex >= 1 && this.resultIndex !== index)
             ) {
                 return false;
             }
@@ -3213,7 +3235,9 @@ export class SearchBar {
             return true;
         };
         const tryBind = (): boolean => {
-            if (!canBindCurrent() || !this.tryBindUnfoldedMatch(index, true)) {
+            if (!canBindCurrent()) return false;
+            if (revealAvGroup) this.unfoldAttributeViewGroup(this.resultMatches[index - 1]);
+            if (!this.tryBindUnfoldedMatch(index, true)) {
                 return false;
             }
             // 已有的结果 Highlight 是可变集合；只追加刚装载的这一条，避免在命中很多时
@@ -3549,7 +3573,16 @@ export class SearchBar {
                 {...this.searchCollectOptions(), restrictInlineTypes: []} :
                 this.searchCollectOptions();
             const diagramChanged = this.diagramSearchState.changed(this.edit, change.diagramBlocks, options);
-            const embedChanged = this.embedSearchState.changed(this.edit, change.embedBlocks, options);
+            const virtualEmbeds = change.virtualAvEmbeds;
+            const embedRoots = change.embedBlocks === null || virtualEmbeds === null ?
+                null :
+                new Set([...(change.embedBlocks ?? []), ...(virtualEmbeds ?? [])]);
+            const embedChanged = this.embedSearchState.changed(
+                this.edit,
+                embedRoots,
+                options,
+                !this.selectionOnly && !this.searchCoverageIncomplete ? virtualEmbeds ?? undefined : undefined,
+            );
             if (diagramChanged || embedChanged) {
                 this.diagramRefreshPending = true;
                 window.clearTimeout(this.diagramRefreshTimer);
@@ -3994,6 +4027,45 @@ export class SearchBar {
         this.componentHighlights?.setFocus(null);
     }
 
+    /** 按搜索宿主、源数据库和视图定位分组，避免操作同库的另一个嵌入副本。 */
+    private attributeViewGroupBody(match: SearchMatch | undefined): HTMLElement | null {
+        if (!match?.unitId) return null;
+        let sourceId = match.blockId;
+        let local = match.unitId.replace(/#run-\d+$/, "");
+        if (local.startsWith("embed:")) {
+            const end = local.indexOf(":", 6);
+            if (end < 0) return null;
+            sourceId = local.slice(6, end);
+            local = local.slice(end + 1);
+        } else if (match.blockType !== ATTRIBUTE_VIEW_TYPE) return null;
+        const group = local.startsWith("av-group:") || local.startsWith("cell:") ?
+            local.split(":")[1] : local.startsWith("group-title:") ? local.slice(12) :
+            local.startsWith("group-counter:") ? local.slice(14) : "";
+        if (!group || group === "nogroup" || group.startsWith("idx-")) return null;
+        const owner = this.edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(match.blockId)}"]`);
+        const readSource = createEmbeddedSourceReader();
+        const av = owner?.matches('[data-type="NodeAttributeView"]') ? owner :
+            Array.from(owner?.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]') ?? [])
+                .find(element => readSource(element) === sourceId);
+        if (!av) return null;
+        const view = av.getAttribute("custom-sy-av-view")?.trim() ||
+            av.querySelector<HTMLElement>(".av__views .item--focus")?.dataset.id?.trim();
+        if (match.embeddedAvViewId && view !== match.embeddedAvViewId) return null;
+        return av.querySelector<HTMLElement>(`.av__body[data-group-id="${CSS.escape(group)}"]`);
+    }
+
+    /** 仅展开目标分组；让原生事件处理初始化和折叠状态持久化。 */
+    private unfoldAttributeViewGroup(match: SearchMatch | undefined): boolean {
+        const body = this.attributeViewGroupBody(match);
+        const fold = body?.previousElementSibling?.querySelector<HTMLElement>('[data-type="av-group-fold"]');
+        if (!body?.classList.contains("fn__none") || fold?.dataset.id !== body.dataset.groupId ||
+            fold.firstElementChild?.classList.contains("av__group-arrow--open")) return false;
+        this.pauseAvWatch(800);
+        this.pauseIndexReset(800);
+        fold.click();
+        return true;
+    }
+
     /**
      * 跳转命中：已在编辑器里的折叠列表/提示先展开再滚动。
      * 折叠标题下的命中不在 DOM 里，展开后仍停在当前序号，不进入聚焦。
@@ -4014,8 +4086,21 @@ export class SearchBar {
         const match = this.resultMatches[index];
         if (scroll) {
             this.revealMatchTabs(match);
+            if (this.unfoldAttributeViewGroup(match)) {
+                const generation = this.searchGeneration;
+                await waitForLayout();
+                if (generation !== this.searchGeneration || this.getCurrentMatch()?.id !== match?.id) return;
+                if (!this.tryBindUnfoldedMatch(index + 1, true) && match &&
+                    ["table", "list"].includes(this.attributeViewGroupBody(match)?.closest<HTMLElement>(".av")?.dataset.avType ?? "") &&
+                    !this.attributeViewGroupBody(match)?.querySelector(".av__row--header, .av__row[data-id]")) {
+                    // Table/list bodies are mounted after the native fold click;
+                    // keep the existing bounded, cancellable wait for those rows.
+                    await this.waitForLocatedMatchRange(index + 1, match.id);
+                    if (generation !== this.searchGeneration || this.getCurrentMatch()?.id !== match.id) return;
+                }
+            }
         }
-        let range = match?.range;
+        let range = this.resultMatches[index]?.range;
         // 折叠标题会删掉后面的块，浏览器把旧 Range 缩到文首。跳转时不能再滚到那里。
         if (range && match && !this.rangeStillInMatchBlock(range, match)) {
             match.range = undefined;

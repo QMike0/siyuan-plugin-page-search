@@ -1,3 +1,5 @@
+import type {AvBlockRef} from "./corpus/av";
+
 /** 前端 DOM 搜索块（含 element / textNodes，仅浏览器侧使用） */
 export interface SearchableBlock {
     blockId: string;
@@ -11,6 +13,8 @@ export interface SearchableBlock {
     embeddedSourceId?: string;
     /** 嵌入内的文字偏移到紧凑 DOM 顺序序号的快照，不保留节点。 */
     embeddedOrder?: readonly EmbeddedOrderSegment[];
+    /** Cold embedded database carrier; values stay in the independently invalidated AV cache. */
+    embeddedAvRef?: AvBlockRef;
     /**
      * 匹配源：
      * - inline-memo：text 来自 data-inline-memo-content
@@ -60,6 +64,8 @@ export interface SearchMatch {
     unitSeq?: number;
     /** 嵌入宿主内部的结构位置；优先于不同子单元各自从零起算的偏移。 */
     embeddedPosition?: readonly number[];
+    /** View used by a cold embedded AV snapshot; prevents alias binding after a view switch. */
+    embeddedAvViewId?: string;
     start: number;
     end: number;
     matchedText: string;

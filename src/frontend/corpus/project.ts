@@ -1,4 +1,5 @@
 import type {RestrictInlineType} from "../../shared";
+import {avApiUnitId} from "../../shared/av-live";
 import {
     collectSearchableBlocks,
     inlineMathIdentityText,
@@ -229,12 +230,17 @@ function createRangeProjection(
         restrictInlineTypes: options.restrictInlineTypes,
     });
     const byKey = new Map<string, SearchableBlock>();
+    const embeddedAvByKey = new Map<string, SearchableBlock[]>();
     const mathByKey = new Map<string, SearchableBlock[]>();
     const memoByKey = new Map<string, SearchableBlock>();
     for (const block of live) {
         const key = unitKey(block.blockId, block.unitId);
         const existing = byKey.get(key);
         if (!existing || liveUnitRank(block) > liveUnitRank(existing)) byKey.set(key, block);
+        const avKey = avApiUnitId(block.unitId);
+        if (avKey && avKey !== block.unitId && block.element.closest('[data-type="NodeAttributeView"]')) {
+            pushLiveUnit(embeddedAvByKey, unitKey(block.blockId, avKey), block);
+        }
         if (isInlineMathSearchUnit(block) && block.mathOrdinal !== undefined) {
             const key = `${block.blockId}\0${block.mathOrdinal}\0${inlineMathIdentityText(block.text)}`;
             const candidates = mathByKey.get(key);
@@ -281,7 +287,13 @@ function createRangeProjection(
         if (!block) {
             block = byKey.get(unitKey(match.blockId, match.unitId));
         }
-        return block;
+        if (!block) {
+            const candidates = embeddedAvByKey.get(unitKey(match.blockId, match.unitId));
+            // Only a unique unsplit cell in the same group may borrow its Range;
+            // offset/text checks still happen below.
+            if (candidates?.length === 1 && embeddedAvViewMatches(match, candidates[0])) block = candidates[0];
+        }
+        return block && embeddedAvViewMatches(match, block) ? block : undefined;
     };
     const project = (match: SearchMatch): SearchMatch => {
         const block = resolve(match);
@@ -496,11 +508,16 @@ function* iterateChangedRanges(
         return {matches, changed: false, textChanged: 0};
     }
     const byKey = new Map<string, SearchableBlock[]>();
+    const embeddedAvByKey = new Map<string, SearchableBlock[]>();
     const mathByKey = new Map<string, SearchableBlock[]>();
     const memoByKey = new Map<string, SearchableBlock[]>();
     let steps = 0;
     for (const block of liveBlocks) {
         pushLiveUnit(byKey, unitKey(block.blockId, block.unitId), block);
+        const avKey = avApiUnitId(block.unitId);
+        if (avKey && avKey !== block.unitId && block.element.closest('[data-type="NodeAttributeView"]')) {
+            pushLiveUnit(embeddedAvByKey, unitKey(block.blockId, avKey), block);
+        }
         if (isInlineMathSearchUnit(block) && block.mathOrdinal !== undefined) {
             pushLiveUnit(
                 mathByKey,
@@ -524,9 +541,15 @@ function* iterateChangedRanges(
         if (!target) {
             return match;
         }
-        const candidates = rankedLiveUnits(match, byKey, mathByKey, memoByKey);
+        let candidates = rankedLiveUnits(match, byKey, mathByKey, memoByKey).filter(block =>
+            embeddedAvViewMatches(match, block)
+        );
         if (!candidates.length) {
-            if (target.broken && !target.blockShown) {
+            const aliases = embeddedAvByKey.get(unitKey(match.blockId, match.unitId));
+            if (aliases?.length === 1 && embeddedAvViewMatches(match, aliases[0])) candidates = aliases;
+        }
+        if (!candidates.length) {
+            if (target.broken && (!target.blockShown || avApiUnitId(match.unitId))) {
                 changed = true;
                 return {...match, range: undefined};
             }
@@ -586,6 +609,14 @@ function liveUnitRank(block: SearchableBlock): number {
         rank += 1;
     }
     return rank;
+}
+
+function embeddedAvViewMatches(match: SearchMatch, block: SearchableBlock): boolean {
+    if (!match.embeddedAvViewId) return true;
+    const av = block.element.closest('[data-type="NodeAttributeView"]');
+    const view = av?.getAttribute("custom-sy-av-view")?.trim() ||
+        av?.querySelector<HTMLElement>(".av__views .item--focus")?.dataset.id?.trim() || "";
+    return view === match.embeddedAvViewId;
 }
 
 function pushLiveUnit(into: Map<string, SearchableBlock[]>, key: string, block: SearchableBlock) {

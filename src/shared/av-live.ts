@@ -10,6 +10,7 @@ export interface AvDomCoverage {
     columns: Set<string>;
     title: boolean;
     viewIds: Set<string>;
+    groupTitles: Set<string>;
     /** 日历卡片上没有列 id 的标题文字，同一行只用来挡一次接口单元。 */
     rowLabelText: Map<string, string>;
 }
@@ -21,8 +22,46 @@ export function emptyAvDomCoverage(): AvDomCoverage {
         columns: new Set<string>(),
         title: false,
         viewIds: new Set<string>(),
+        groupTitles: new Set<string>(),
         rowLabelText: new Map<string, string>(),
     };
+}
+
+/** A row displayed in two groups owns two distinct cells. Keep ungrouped IDs compatible. */
+export function avCellUnitId(row: string, col: string, group = "nogroup"): string {
+    return group === "nogroup" ? `av:${row}:${col}` : `av-group:${group}:${row}:${col}`;
+}
+
+export function avApiCellPosition(unitId: string): {row: string; col: string;} | null {
+    if (unitId.startsWith("av-group:")) {
+        const parts = unitId.split(":");
+        if (parts.length < 4 || !parts[1] || !parts[2]) return null;
+        return {row: `group:${parts[1]}:${parts[2]}`, col: parts.slice(3).join(":")};
+    }
+    if (!unitId.startsWith("av:")) return null;
+    const rest = unitId.slice(3);
+    const splitAt = rest.indexOf(":");
+    return splitAt > 0 ? {row: rest.slice(0, splitAt), col: rest.slice(splitAt + 1)} : null;
+}
+
+/** API and DOM spell the same AV cell differently. Do not alias split
+ * text runs, unstable rows/columns, calendar labels or table headers. */
+export function avApiUnitId(unitId?: string): string | undefined {
+    if (!unitId || /#run-\d+$/.test(unitId)) return undefined;
+    const sourceEnd = unitId.startsWith("embed:") ? unitId.indexOf(":", 6) : -1;
+    if (unitId.startsWith("embed:") && sourceEnd < 0) return undefined;
+    const prefix = sourceEnd < 0 ? "" : unitId.slice(0, sourceEnd + 1);
+    const local = sourceEnd < 0 ? unitId : unitId.slice(sourceEnd + 1);
+    if (local === "title") return prefix + "av-title";
+    if (local.startsWith("view-name:")) return prefix + "av-view:" + local.slice(10);
+    if (local === "av-title" || local.startsWith("av-view:") || local.startsWith("group-title:") || avApiCellPosition(local)) return unitId;
+    const cell = parseShownCell(local);
+    if (!cell || cell.unstable || cell.label || cell.row.startsWith("header:")) return undefined;
+    return prefix + avCellUnitId(cell.row, cell.col, cell.group);
+}
+
+export function embeddedAvApiUnitId(unitId?: string): string | undefined {
+    return unitId?.startsWith("embed:") ? avApiUnitId(unitId) : undefined;
 }
 
 export function collectAvDomCoverage(
@@ -76,22 +115,19 @@ export function avApiUnitShown(
     if (unitId.startsWith("av-view:")) {
         return coverage.viewIds.has(unitId.slice("av-view:".length));
     }
-    if (!unitId.startsWith("av:")) {
+    if (unitId.startsWith("group-title:")) {
+        return coverage.groupTitles.has(unitId.slice("group-title:".length));
+    }
+    const cell = avApiCellPosition(unitId);
+    if (!cell) {
         return false;
     }
-    const rest = unitId.slice(3);
-    const splitAt = rest.indexOf(":");
-    if (splitAt <= 0) {
-        return false;
-    }
-    const row = rest.slice(0, splitAt);
-    const col = rest.slice(splitAt + 1);
-    if (coverage.cells.has(row + ":" + col)) {
+    const {row} = cell;
+    if (coverage.cells.has(unitId)) {
         return true;
     }
     const label = coverage.rowLabelText.get(row);
-    const folded = foldAvText(text);
-    if (label && label === folded && !usedRowLabels.has(row)) {
+    if (label && !usedRowLabels.has(row) && label === foldAvText(text)) {
         usedRowLabels.add(row);
         return true;
     }
@@ -108,19 +144,20 @@ export function avApiUnitInView(
     coverage: AvDomCoverage,
     viewType: string,
 ): boolean {
-    if (coverage.unstable || !unitId.startsWith("av:")) {
+    if (coverage.unstable) {
         return true;
     }
-    const rest = unitId.slice(3);
-    const splitAt = rest.indexOf(":");
-    if (splitAt <= 0) {
-        return false;
-    }
-    const col = rest.slice(splitAt + 1);
+    const cell = avApiCellPosition(unitId);
+    if (!cell) return true;
+    const {col} = cell;
     if (!col) {
         return false;
     }
     if (coverage.columns.size === 0) {
+        // Native folded list groups remove their whole row/header body. The
+        // selected-view API already filters hidden fields; no mounted column
+        // here must not suppress every row in an otherwise visible group.
+        if (viewType === "list" && coverage.groupTitles.size > 0) return true;
         return viewType !== "list" && viewType !== "calendar";
     }
     return coverage.columns.has(col);
@@ -137,6 +174,10 @@ function noteAvDomUnit(coverage: AvDomCoverage, unitId: string, text: string): v
         if (viewId) {
             coverage.viewIds.add(viewId);
         }
+        return;
+    }
+    if (unitId.startsWith("group-title:")) {
+        coverage.groupTitles.add(unitId.slice("group-title:".length));
         return;
     }
     const cell = parseShownCell(unitId);
@@ -159,36 +200,42 @@ function noteAvDomUnit(coverage: AvDomCoverage, unitId: string, text: string): v
     if (cell.row.startsWith("header:")) {
         return;
     }
-    coverage.cells.add(cell.row + ":" + cell.col);
+    coverage.cells.add(avCellUnitId(cell.row, cell.col, cell.group));
 }
 
-function parseShownCell(unitId: string): {row: string; col: string; unstable: boolean; label: boolean;} | null {
+function parseShownCell(
+    unitId: string,
+): {group: string; row: string; col: string; unstable: boolean; label: boolean;} | null {
+    let group = "nogroup";
     let row: string;
     let col: string;
     if (unitId.startsWith("cell:")) {
         const parts = unitId.split(":");
         if (parts.length < 4) {
-            return {row: "norow", col: "idx-", unstable: true, label: false};
+            return {group, row: "norow", col: "idx-", unstable: true, label: false};
         }
-        row = parts[2];
-        col = parts.slice(3).join(":");
+        group = parts[1];
+        // Header row IDs contain their group: `cell:g:header:g:column`.
+        const header = parts[2] === "header" && parts.length >= 5;
+        row = header ? "header:" + parts[3] : parts[2];
+        col = parts.slice(header ? 4 : 3).join(":");
     } else if (unitId.startsWith("calendar:")) {
         const parts = unitId.split(":");
         if (parts.length < 3) {
-            return {row: "norow", col: "idx-", unstable: true, label: false};
+            return {group, row: "norow", col: "idx-", unstable: true, label: false};
         }
         row = parts[1];
         col = parts.slice(2).join(":");
     } else {
         return null;
     }
-    if (row === "norow" || col.indexOf("idx-") === 0) {
-        return {row, col, unstable: true, label: false};
+    if (!group || group.indexOf("idx-") === 0 || row === "norow" || col.indexOf("idx-") === 0) {
+        return {group, row, col, unstable: true, label: false};
     }
     if (col === "title" || col === "undated") {
-        return {row, col, unstable: false, label: true};
+        return {group, row, col, unstable: false, label: true};
     }
-    return {row, col, unstable: false, label: false};
+    return {group, row, col, unstable: false, label: false};
 }
 
 function foldAvText(text: string): string {

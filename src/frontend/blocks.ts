@@ -19,7 +19,7 @@ import {
     embeddedOwner,
     recordEmbeddedOrder,
 } from "./embedded-order";
-import {isUnderNonHeadingCssFold} from "./fold-dom";
+import {foldedAttributeViewGroupBody, isUnderNonHeadingCssFold} from "./fold-dom";
 import {
     collectRendererSearchUnits,
     rendererAdapterKind,
@@ -124,7 +124,6 @@ const AV_EXCLUDED_CLOSEST = [
     ".protyle-attr",
     // 关闭「显示条目图标」时主键前的 .b3-menu__avemoji 带 fn__none，但仍含 emoji 文本节点；
     // 若采入会导致「test」命中落在图标/主键文本边界，Range 起点落在 fn__none 内被可见性丢弃。
-    ".fn__none",
     ".b3-menu__avemoji",
     "svg",
     "style",
@@ -767,7 +766,7 @@ type HeadingIncludeGates = Pick<
     | "includeHeadingH6"
 >;
 
-/** Renderer coverage must use the same container/type gates as text collection. */
+/** Runtime content coverage must use the same container/type gates as text collection. */
 export function createRendererElementFilter(
     options: CollectSearchableBlocksOptions,
 ): (element: HTMLElement) => boolean {
@@ -800,7 +799,10 @@ export function createRendererElementFilter(
     return (element) => {
         const inlineMath = element.matches('span[data-type~="inline-math"]');
         const kind = rendererAdapterKind(element);
-        return (inlineMath ? math : body && Boolean(kind && rendererEnabled(kind, gates))) &&
+        const runtime = kind ?
+            rendererEnabled(kind, gates) :
+            element.matches(`[data-type="${ATTRIBUTE_VIEW_TYPE}"]`) && gates.includeAttributeView;
+        return (inlineMath ? math : body && runtime) &&
             !shouldSkipAttributeUnitByIncludeGates(element, gates) &&
             !(options.includeTabs === false && element.closest('[data-type="NodeTabs"]')) &&
             !(options.includeFoldedBlocks === false && isUnderNonHeadingCssFold(element)) &&
@@ -1680,7 +1682,12 @@ function collectAttributeViewSearchUnits(
     for (let index = 0; index < groupTitles.length; index++) {
         const groupTitle = groupTitles[index];
         const groupId = resolveAvGroupId(groupTitle, index);
-        pushUnit(groupTitle, `group-title:${groupId}`);
+        const name = groupTitle.querySelector<HTMLElement>(".av__group-name");
+        pushUnit(name ?? groupTitle, `group-title:${groupId}`);
+        if (name) {
+            const counter = groupTitle.querySelector<HTMLElement>(".av__group-counter");
+            if (counter) pushUnit(counter, `group-counter:${groupId}`);
+        }
 
         const groupBody = resolveAvGroupBody(avBlock, groupTitle, groupId);
         if (groupBody && !processedBodies.has(groupBody)) {
@@ -1749,6 +1756,9 @@ function collectTextNodesInContainer(
     includeImageTitle = true,
     headingGates?: HeadingIncludeGates,
 ): Text[] {
+    // Native gallery folding retains card DOM. Keep its actual text (including
+    // pending edits) as cell coverage, while still excluding all other hidden UI.
+    const foldedBody = foldedAttributeViewGroupBody(container);
     const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
             if (!(node instanceof Text) || !node.nodeValue?.length) {
@@ -1759,6 +1769,9 @@ function collectTextNodesInContainer(
             if (!parentElement || parentElement.closest(AV_EXCLUDED_CLOSEST)) {
                 return NodeFilter.FILTER_REJECT;
             }
+            let hidden = parentElement.closest(".fn__none");
+            if (hidden && hidden === foldedBody) hidden = hidden.parentElement?.closest(".fn__none") ?? null;
+            if (hidden) return NodeFilter.FILTER_REJECT;
             if (!includeImageTitle && parentElement.closest(IMAGE_TITLE_TEXT_CLOSEST)) {
                 return NodeFilter.FILTER_REJECT;
             }

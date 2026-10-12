@@ -213,6 +213,7 @@ async function main() {
     let domResponder;
     let embedResponder;
     let embedRequests = [];
+    let avResponder;
     api = async (url, body, _headers, _process, signal) => {
         if (url === "/api/query/sql") {
             return failSql(body.stmt) ?
@@ -226,6 +227,7 @@ async function main() {
             };
         }
         if (url.includes("getHeadingChildren")) return {code: 0, data: ["b"]};
+        if (url.startsWith("/api/av/") && avResponder) return avResponder(url, body, signal);
         if (url === "/api/search/searchEmbedBlock") {
             embedRequests.push(body);
             if (embedResponder) return embedResponder(body, signal);
@@ -282,6 +284,7 @@ async function main() {
         domResponder = null;
         embedResponder = null;
         embedRequests = [];
+        avResponder = null;
         window.Protyle = {graphvizRender: renderer, mermaidRender: renderer, flowchartRender: renderer};
     };
     const search = (query, options = {}) =>
@@ -1861,6 +1864,1078 @@ async function main() {
             );
             assert.equal(renderCalls, 0, "copied Mermaid/flowchart never offscreen-render");
         }
+        // Concurrent panes share a native query, so a second failure cannot overwrite success.
+        reset();
+        add("b", "query_embed", "select * from blocks");
+        doms.b = '<div data-node-id="b" data-type="NodeBlockQueryEmbed" data-content="select * from blocks"></div>';
+        const secondEdit = edit.cloneNode(true);
+        document.body.appendChild(secondEdit);
+        editors.push({protyle: {element: secondEdit, notebookId: "", block: {id: "r", rootID: "r"}}});
+        let bothDomsRead;
+        const domBarrier = new Promise(resolve => bothDomsRead = resolve);
+        domResponder = async () => {
+            if (domCalls === 2) bothDomsRead();
+            await domBarrier;
+            return {code: 0, data: doms};
+        };
+        let finishSharedQuery;
+        let sharedQueryEntered;
+        const sharedQueryStarted = new Promise(resolve => sharedQueryEntered = resolve);
+        embedResponder = async () => {
+            if (embedRequests.length > 1) return {code: -1};
+            sharedQueryEntered();
+            return new Promise(resolve =>
+                finishSharedQuery = () =>
+                    resolve({
+                        code: 0,
+                        data: {
+                            blocks: [{
+                                block: {
+                                    id: "source",
+                                    content: '<div data-node-id="source" data-type="NodeParagraph">sharedKeyword</div>',
+                                },
+                            }],
+                        },
+                    })
+            );
+        };
+        try {
+            const first = search("sharedKeyword");
+            const second = corpus.searchCurrentDocument({}, secondEdit, "sharedKeyword", {
+                includeAttributeView: false,
+                includeFoldedBlocks: true,
+            });
+            await sharedQueryStarted;
+            finishSharedQuery();
+            const results = await Promise.all([first, second]);
+            for (const result of results) {
+                full(result);
+                assert.equal(result.matches.length, 1);
+            }
+            full(await search("sharedKeyword"));
+            assert.equal((await search("sharedKeyword")).matches.length, 1);
+            assert.equal(embedRequests.length, 1, "shared successful query stays cached in both panes");
+        } finally {
+            editors = editors.filter(editor => editor.protyle.element !== secondEdit);
+            secondEdit.remove();
+        }
+        // A later pane can miss the native flight while the first response is still rendering.
+        reset();
+        add("b", "query_embed", "select * from blocks");
+        doms.b = '<div data-node-id="b" data-type="NodeBlockQueryEmbed" data-content="select * from blocks"></div>';
+        const lateEdit = edit.cloneNode(true);
+        document.body.appendChild(lateEdit);
+        editors.push({protyle: {element: lateEdit, notebookId: "", block: {id: "r", rootID: "r"}}});
+        let rendererEntered;
+        let finishRenderer;
+        const rendererStarted = new Promise(resolve => rendererEntered = resolve);
+        window.Protyle.graphvizRender = async host => {
+            rendererEntered();
+            await new Promise(resolve => finishRenderer = resolve);
+            host.querySelectorAll('[data-subtype="graphviz"]').forEach(graph => {
+                graph.innerHTML = "<svg><text>lateKeyword</text></svg>";
+            });
+        };
+        let failureEntered;
+        let finishFailure;
+        const failureStarted = new Promise(resolve => failureEntered = resolve);
+        embedResponder = async () => {
+            if (embedRequests.length === 1) {
+                return {
+                    code: 0,
+                    data: {
+                        blocks: [{
+                            block: {
+                                id: "source",
+                                content:
+                                    '<div data-node-id="source" data-type="NodeCodeBlock" data-subtype="graphviz" data-content="graph"><div></div></div>',
+                            },
+                        }],
+                    },
+                };
+            }
+            failureEntered();
+            return new Promise(resolve => finishFailure = () => resolve({code: -1}));
+        };
+        try {
+            const first = search("lateKeyword");
+            await rendererStarted;
+            const late = corpus.searchCurrentDocument({}, lateEdit, "lateKeyword", {
+                includeAttributeView: false,
+                includeFoldedBlocks: true,
+            });
+            await failureStarted;
+            finishRenderer();
+            assert.equal((await first).matches.length, 1);
+            finishFailure();
+            assert.equal((await late).unrendered, 1);
+            const reused = await search("lateKeyword");
+            full(reused);
+            assert.equal(reused.matches.length, 1, "late failed extraction cannot overwrite complete embed cache");
+            assert.equal(embedRequests.length, 2);
+            assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
+        } finally {
+            editors = editors.filter(editor => editor.protyle.element !== lateEdit);
+            lateEdit.remove();
+        }
+        const {resolveEmbedQuery} = source("frontend/corpus/embed-query");
+        for (const cancelBoth of [false, true]) {
+            reset();
+            const html =
+                '<div data-node-id="b" data-type="NodeBlockQueryEmbed" data-content="select * from blocks"></div>';
+            let release;
+            let entered;
+            let nativeSignal;
+            const started = new Promise(resolve => entered = resolve);
+            embedResponder = async (_body, signal) => {
+                nativeSignal = signal;
+                entered();
+                return new Promise(resolve => release = () => resolve({code: 0, data: {blocks: []}}));
+            };
+            const firstController = new AbortController();
+            const secondController = new AbortController();
+            const first = resolveEmbedQuery("b", html, "r", "", () => true, firstController.signal);
+            const second = resolveEmbedQuery("b", html, "r", "", () => true, secondController.signal);
+            await started;
+            firstController.abort();
+            assert.equal(await first, null);
+            assert.equal(nativeSignal.aborted, false, "one pane cannot abort the other's native query");
+            if (cancelBoth) {
+                secondController.abort();
+                assert.equal(await second, null);
+                assert.equal(nativeSignal.aborted, true, "last consumer aborts the native query");
+            }
+            release();
+            if (!cancelBoth) assert.ok(await second);
+            assert.equal(embedRequests.length, 1);
+            embedResponder = async () => ({code: 0, data: {blocks: []}});
+            assert.ok(await resolveEmbedQuery("b", html, "r", "", () => true));
+            assert.equal(embedRequests.length, 2, "settled/cancelled flights retain no response cache");
+        }
+        reset();
+        embedResponder = async () => ({code: 0, data: {blocks: []}});
+        const queryHtml = (stmt, mode = "0") =>
+            '<div data-node-id="b" data-type="NodeBlockQueryEmbed" data-content="' +
+            stmt + '" custom-heading-mode="' + mode + '"></div>';
+        await Promise.all([
+            resolveEmbedQuery("b", queryHtml("select * from blocks"), "r", "", () => true),
+            resolveEmbedQuery("b", queryHtml("select * from blocks where type='p'"), "r", "", () => true),
+            resolveEmbedQuery("b", queryHtml("select * from blocks", "1"), "r", "", () => true),
+            resolveEmbedQuery("b", queryHtml("select * from blocks"), "other-root", "", () => true),
+            resolveEmbedQuery("b", queryHtml("select * from blocks"), "r", "encrypted-box", () => true),
+        ]);
+        assert.equal(embedRequests.length, 5, "SQL, heading mode, root and notebook isolate native flights");
+        console.log("embedded native query sharing, cancellation isolation and request identity OK");
+        // Cold embedded databases use AV pagination, without rendering or caching field values as embed text.
+        const avModule = source("frontend/corpus/av");
+        const avShell = (view = "v") =>
+            '<div data-node-id="source-av" data-type="NodeAttributeView" data-av-id="av-id" custom-sy-av-view="' +
+            view + '" data-av-type="table"><div></div></div>';
+        const embedShell = id =>
+            '<div data-node-id="' + id +
+            '" data-type="NodeBlockQueryEmbed" data-content="select * from blocks"></div>';
+        const avRaw = {name: "database", views: [{id: "v", name: "table"}, {id: "v2", name: "other"}]};
+        const avPage = (values) => ({
+            code: 0,
+            data: {
+                view: {
+                    type: "table",
+                    rowCount: values.length,
+                    columns: [{id: "col", name: "column", type: "text"}],
+                    rows: values.map((value, index) => ({
+                        id: "row" + index,
+                        cells: [{keyID: "col", value: {type: "text", text: {content: value}}}],
+                    })),
+                },
+            },
+        });
+        // The native render response includes hidden values; only its field metadata
+        // determines what the selected view actually displays, even before mounting.
+        for (const embedded of [false, true]) {
+            for (const layout of ["table", "list", "gallery", "kanban", "calendar"]) {
+                for (const foldedParent of ["none", "heading", "list", "callout"]) {
+                    reset();
+                    const parent = ["list", "callout"].includes(foldedParent) ? "container" : "r";
+                    if (foldedParent === "heading") add("a", "h", "title", "h1", "r", 'fold="1"');
+                    if (parent !== "r") {
+                        add("container", foldedParent === "list" ? "l" : "callout", "", "u", "r", 'fold="1"');
+                    }
+                    const shell = avShell().replace('data-node-id="source-av"', 'data-node-id="b"')
+                        .replace('data-av-type="table"', 'data-av-type="' + layout + '"');
+                    add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell, "", parent);
+                    doms.b = embedded ? embedShell("b") : shell;
+                    if (embedded) {
+                        embedResponder = async () => ({
+                            code: 0,
+                            data: {blocks: [{block: {id: "source-av", content: avShell()}}]},
+                        });
+                    }
+                    const columns = [
+                        {id: "primary", type: "block", name: "", hidden: false},
+                        {id: "visible", type: "text", name: "", hidden: false},
+                        {id: "hidden", type: "text", name: "", hidden: true},
+                    ];
+                    const cells = columns.map(column => ({
+                        keyID: column.id,
+                        value: {keyID: column.id, type: "text", text: {content: column.id + "Keyword"}},
+                    }));
+                    const cards = ["gallery", "kanban"].includes(layout);
+                    const page = {
+                        type: layout,
+                        [cards ? "fields" : "columns"]: columns,
+                        [cards ? "cardCount" : "rowCount"]: 1,
+                        [cards ? "cards" : "rows"]: [{id: "row0", [cards ? "values" : "cells"]: cells}],
+                    };
+                    let reads = 0;
+                    avResponder = async url => {
+                        reads++;
+                        return {code: 0, data: url.endsWith("getAttributeView") ? avRaw : {view: page}};
+                    };
+                    corpus.retainBackgroundCorpusRoot("r");
+                    try {
+                        const cold = await settle("Keyword", {includeAttributeView: true});
+                        full(cold);
+                        assert.equal(cold.matches.length, 2, embedded + "/" + layout + "/" + foldedParent);
+                        assert.equal((await search("hiddenKeyword", {includeAttributeView: true})).matches.length, 0);
+                        const beforeMount = reads;
+                        const live = (embedded ? avShell() : shell).replace(
+                            "<div></div>",
+                            '<div class="av__row" data-id="row0">' + ["primary", "visible"].map(id =>
+                                '<div class="av__cell" data-col-id="' + id + '">' + id + "Keyword</div>"
+                            ).join("") + "</div>",
+                        );
+                        wysiwyg.innerHTML = embedded ?
+                            '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' + live + "</div>" :
+                            live;
+                        const hot = await search("Keyword", {includeAttributeView: true});
+                        full(hot);
+                        assert.equal(hot.matches.length, 2, "mounted visible fields agree with cold values");
+                        wysiwyg.innerHTML = "";
+                        const unmounted = await search("Keyword", {includeAttributeView: true});
+                        full(unmounted);
+                        assert.equal(unmounted.matches.length, 2);
+                        assert.equal(
+                            reads,
+                            beforeMount,
+                            "mount transitions reuse filtered values without more requests",
+                        );
+                        assert.equal(renderCalls, 0);
+                        if (layout === "table" && foldedParent === "none") {
+                            columns[2].hidden = false;
+                            corpus.invalidateAttributeViewSearch("r", ["av-id"]);
+                            const revealed = await settle("hiddenKeyword", {includeAttributeView: true});
+                            full(revealed);
+                            assert.equal(
+                                revealed.matches.length,
+                                1,
+                                "field visibility changes invalidate cached filtering",
+                            );
+                            columns[2].hidden = true;
+                            corpus.invalidateAttributeViewSearch("r", ["av-id"]);
+                            const hiddenAgain = await settle("hiddenKeyword", {includeAttributeView: true});
+                            full(hiddenAgain);
+                            assert.equal(hiddenAgain.matches.length, 0);
+                        }
+                    } finally {
+                        avModule.releaseAvCacheOwner("r", edit);
+                        corpus.releaseBackgroundCorpusRoot("r");
+                    }
+                }
+            }
+        }
+        console.log("ordinary/embedded AV hidden fields: all layouts, cold/folded/mounted transitions OK");
+
+        // SiYuan returns hidden groups and a database name even when the selected
+        // view does not paint them. Ordinary and embedded carriers share these rules.
+        for (const embedded of [false, true]) {
+            for (const foldedParent of ["none", "heading", "list", "callout"]) {
+                reset();
+                const parent = ["list", "callout"].includes(foldedParent) ? "container" : "r";
+                if (foldedParent === "heading") add("a", "h", "title", "h1", "r", 'fold="1"');
+                if (parent !== "r") {
+                    add("container", foldedParent === "list" ? "l" : "callout", "", "u", "r", 'fold="1"');
+                }
+                const shell = embedded ? avShell() : avShell().replace('data-node-id="source-av"', 'data-node-id="b"');
+                add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell, "", parent);
+                doms.b = embedded ? embedShell("b") : shell;
+                if (embedded) {
+                    embedResponder = async () => ({
+                        code: 0,
+                        data: {blocks: [{block: {id: "source-av", content: shell}}]},
+                    });
+                }
+                const page = {
+                    type: "table",
+                    hideAttrViewName: true,
+                    columns: [{id: "col", hidden: false}],
+                    groups: [
+                        ...["visible", "folded", "hidden"].map(id => ({
+                            id,
+                            groupHidden: id === "hidden" ? 2 : 0,
+                            groupFolded: id === "folded",
+                            rowCount: 1,
+                            columns: null,
+                            rows: [{id: "row0", cells: [{value: {keyID: "col", text: {content: id + "Keyword"}}}]}],
+                        })),
+                        {id: "empty-hidden", groupHidden: 1, rowCount: 0, rows: []},
+                    ],
+                };
+                let reads = 0;
+                avResponder = async url => {
+                    reads++;
+                    return {
+                        code: 0,
+                        data: url.endsWith("getAttributeView") ? {...avRaw, name: "titleKeyword"} : {view: page},
+                    };
+                };
+                corpus.retainBackgroundCorpusRoot("r");
+                try {
+                    const coldTitle = await settle("titleKeyword", {includeAttributeView: true});
+                    full(coldTitle);
+                    assert.equal(
+                        coldTitle.matches.length,
+                        0,
+                        "hidden title must not match: " + embedded + "/" + foldedParent,
+                    );
+                    const cold = await search("Keyword", {includeAttributeView: true});
+                    full(cold);
+                    assert.deepEqual(cold.matches.map(match => match.matchedText), ["Keyword", "Keyword"]);
+                    assert.equal((await search("hiddenKeyword", {includeAttributeView: true})).matches.length, 0);
+                    assert.equal((await search("foldedKeyword", {includeAttributeView: true})).matches.length, 1);
+                    const beforeMount = reads;
+                    const live = shell.replace(
+                        "<div></div>",
+                        '<div class="av__title fn__none">titleKeyword</div>' +
+                            '<div class="av__body" data-group-id="visible"><div class="av__row" data-id="row0">' +
+                            '<div class="av__cell" data-col-id="col">visibleKeyword</div></div></div>' +
+                            '<div class="av__body fn__none" data-group-id="folded"></div>',
+                    );
+                    wysiwyg.innerHTML = embedded ?
+                        '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' + live + "</div>" :
+                        live;
+                    const hot = await search("Keyword", {includeAttributeView: true});
+                    full(hot);
+                    assert.equal(hot.matches.length, 2, "native mounted view agrees with cold visibility");
+                    assert.equal(
+                        hot.matches.filter(match => match.range).length,
+                        1,
+                        "only unfolded group binds a live Range",
+                    );
+                    wysiwyg.innerHTML = "";
+                    assert.equal((await search("Keyword", {includeAttributeView: true})).matches.length, 2);
+                    assert.equal(reads, beforeMount, "mount/unmount adds no API requests");
+                    assert.equal(renderCalls, 0, "database visibility requires no offscreen rendering");
+                    page.hideAttrViewName = false;
+                    page.groups[2].groupHidden = 0;
+                    corpus.invalidateAttributeViewSearch("r", ["av-id"]);
+                    const revealed = await settle("Keyword", {includeAttributeView: true});
+                    full(revealed);
+                    assert.equal(revealed.matches.length, 4, "visibility changes refresh title and group filtering");
+                    page.hideAttrViewName = true;
+                    page.groups[2].groupHidden = 2;
+                    corpus.invalidateAttributeViewSearch("r", ["av-id"]);
+                    const hiddenAgain = await settle("Keyword", {includeAttributeView: true});
+                    full(hiddenAgain);
+                    assert.equal(hiddenAgain.matches.length, 2);
+                } finally {
+                    avModule.releaseAvCacheOwner("r", edit);
+                    corpus.releaseBackgroundCorpusRoot("r");
+                }
+            }
+        }
+        console.log("ordinary/embedded AV hidden groups/title: cold, folded, mounted, cache transitions and ranges OK");
+
+        // Native folded galleries retain card DOM, while later cards are paged
+        // through the API. The same row in two groups remains two instances.
+        const galleryRects = Element.prototype.getClientRects;
+        Element.prototype.getClientRects = function() {
+            return this.closest('.av__body.fn__none') ? [] : galleryRects.call(this);
+        };
+        for (const embedded of [false, true]) {
+            reset();
+            const shell = (embedded ? avShell() : avShell().replace('data-node-id="source-av"', 'data-node-id="b"'))
+                .replace('data-av-type="table"', 'data-av-type="gallery"');
+            add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell);
+            doms.b = embedded ? embedShell("b") : shell;
+            if (embedded) embedResponder = async () => ({
+                code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]},
+            });
+            let reads = 0;
+            avResponder = async (url, data) => {
+                reads++;
+                if (url.endsWith("getAttributeView")) return {code: 0, data: avRaw};
+                const page = data.groupPaging.folded?.page ?? 1;
+                return {code: 0, data: {view: {
+                    type: "gallery",
+                    columns: [{id: "col"}, {id: "secret", hidden: true}],
+                    groups: ["folded", "visible", "hidden"].map(id => ({
+                        id, name: id + "NameKeyword", groupValue: {type: "text"},
+                        groupHidden: id === "hidden" ? 2 : 0, groupFolded: id === "folded",
+                        cardCount: id === "folded" ? 201 : 1,
+                        cards: Array.from({length: id === "folded" ? (page === 1 ? 200 : 1) : 1}, (_, index) => ({
+                            id: "row" + (id === "folded" ? (page - 1) * 200 + index : 0),
+                            values: [
+                                {keyID: "col", type: "text", text: {content: "galleryKeyword"}},
+                                {keyID: "secret", type: "text", text: {content: "secretKeyword"}},
+                            ],
+                        })),
+                    })),
+                }}};
+            };
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                const options = {includeAttributeView: true, includeFoldedBlocks: true};
+                const cold = await settle("galleryKeyword", options);
+                full(cold);
+                assert.equal(cold.matches.length, 202, "all pages of visible and folded groups are searched");
+                assert.equal((await search("secretKeyword", options)).matches.length, 0);
+                assert.equal((await search("NameKeyword", options)).matches.length, 2, "cold visible group names are searchable");
+                const beforeMount = reads;
+                const groupHTML = (id, folded) =>
+                    '<div class="av__group-title"><button data-type="av-group-fold" data-id="' + id +
+                    '"><svg class="' + (folded ? "" : "av__group-arrow--open") + '"></svg></button>' +
+                    '<span class="av__group-name">' + id + 'NameKeyword</span><span class="av__group-counter">1</span></div>' +
+                    '<div class="av__body' + (folded ? " fn__none" : "") + '" data-group-id="' + id + '">' +
+                    '<div class="av__gallery-item" data-id="row0"><div class="av__cell" data-field-id="col">' +
+                    'galleryKeyword<span class="fn__none">uiKeyword</span><span style="display:none">cssKeyword</span>' +
+                    '</div></div></div>';
+                wysiwyg.innerHTML = (embedded ? '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' : "") +
+                    shell.replace("<div></div>", groupHTML("folded", true) + groupHTML("visible", false)) +
+                    (embedded ? "</div>" : "");
+                const collect = () => source("frontend/blocks").collectSearchableBlocks(edit, options);
+                const projection = source("frontend/corpus/project");
+                const mounted = await search("galleryKeyword", options);
+                full(mounted);
+                assert.equal(mounted.matches.length, 202, "folded mounted cards must not erase API matches");
+                assert.equal(mounted.matches.filter(match => match.range).length, 1);
+                const ordered = await search("NameKeyword|galleryKeyword", {...options, regex: true});
+                assert.equal(ordered.matches.length, 204, "mounted names and cells do not duplicate API results");
+                assert.ok(ordered.matches[0].unitId.endsWith("group-title:folded"));
+                assert.ok(ordered.matches[202].unitId.endsWith("group-title:visible"), "folded rows precede the next group title");
+                assert.equal((await search("NameKeyword", options)).matches.filter(match => match.range).length, 2);
+                assert.equal((await search("uiKeyword|cssKeyword", {...options, regex: true})).matches.length, 0);
+                const foldedBody = wysiwyg.querySelector('.av__body[data-group-id="folded"]');
+                foldedBody.classList.remove("fn__none");
+                const rebound = projection.fillLiveRanges(cold.matches, collect(), true);
+                assert.equal(rebound.filter(match => match.range).length, 2, "ordinary and embedded cold IDs bind after unfolding");
+                assert.equal(rebound[0].range.toString(), "galleryKeyword");
+                assert.equal(rebound[0].range.startContainer.parentElement.closest("[data-group-id]").dataset.groupId, "folded");
+                assert.equal(rebound[201].range.startContainer.parentElement.closest("[data-group-id]").dataset.groupId, "visible");
+                assert.equal((await search("galleryKeyword", options)).matches.length, 202);
+                foldedBody.classList.add("fn__none");
+                const refolded = projection.rebindChangedRanges(rebound, collect(),
+                    new Map(rebound.map(match => [match, {broken: true, blockShown: true}])),
+                    {allowFoldedHidden: true});
+                assert.equal(refolded.matches[0].range, undefined, "refolding releases invisible Ranges");
+                assert.equal(refolded.matches.length, 202);
+                assert.equal((await search("galleryKeyword", options)).matches.length, 202);
+                const cell = foldedBody.querySelector(".av__cell");
+                cell.textContent = "localKeyword";
+                assert.equal((await search("galleryKeyword", options)).matches.length, 201, "folded pending edits win over API");
+                assert.equal((await search("localKeyword", options)).matches.length, 1);
+                cell.textContent = "";
+                assert.equal((await search("galleryKeyword", options)).matches.length, 201, "empty folded cells keep coverage");
+                wysiwyg.innerHTML = "";
+                assert.equal((await search("galleryKeyword", options)).matches.length, 202);
+                assert.equal(reads, beforeMount, "mount, fold, edit and unmount reuse current-view cache");
+                assert.equal(renderCalls, 0, "complete gallery search never renders offscreen cards");
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        console.log("ordinary/embedded folded gallery: full pagination, stable counts, aliases, hidden text and local edits OK");
+        Element.prototype.getClientRects = galleryRects;
+
+        for (const embedded of [false, true]) {
+            for (const layout of ["table", "list"]) {
+                reset();
+                const shell = (embedded ? avShell() : avShell().replace('data-node-id="source-av"', 'data-node-id="b"'))
+                    .replace('data-av-type="table"', 'data-av-type="' + layout + '"');
+                add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell);
+                doms.b = embedded ? embedShell("b") : shell;
+                if (embedded) embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]}});
+                let checkboxGroups = false;
+                avResponder = async url => ({code: 0, data: url.endsWith("getAttributeView") ? avRaw : {view: {
+                    type: layout, columns: [{id: "col"}, {id: "secret", hidden: true}],
+                    groups: ["g1", "g2"].map(id => ({
+                        id, name: id + "Keyword", groupValue: {type: checkboxGroups ? "checkbox" : "text"}, groupHidden: 0, groupFolded: true,
+                        rowCount: 1, rows: [{id: "row", cells: [
+                            {value: {keyID: "col", text: {content: id + "Keyword"}}},
+                            {value: {keyID: "secret", text: {content: "secretKeyword"}}},
+                        ]}],
+                    })),
+                }}});
+                corpus.retainBackgroundCorpusRoot("r");
+                try {
+                    const options = {includeAttributeView: true, includeFoldedBlocks: true};
+                    const cold = await settle("Keyword", options);
+                    assert.equal(cold.matches.length, 4);
+                    const groupHTML = id => '<div class="av__group-title"><button data-type="av-group-fold" data-id="' + id +
+                        '"><svg></svg></button><span class="av__group-name">' + id + 'Keyword</span></div>' +
+                        '<div class="av__body fn__none" data-group-id="' + id + '"></div>';
+                    wysiwyg.innerHTML = (embedded ? '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' : "") +
+                        shell.replace("<div></div>", groupHTML("g1") + groupHTML("g2")) + (embedded ? "</div>" : "");
+                    const folded = await search("Keyword", options);
+                    full(folded);
+                    assert.equal(folded.matches.length, 4, layout + " empty folded bodies retain all visible-field rows");
+                    assert.deepEqual(folded.matches.map(match => match.unitId.replace(/^embed:[^:]+:/, "")), [
+                        "group-title:g1", "av-group:g1:row:col", "group-title:g2", "av-group:g2:row:col",
+                    ], "a group title is immediately followed by its own entries");
+                    assert.equal(folded.matches.filter(match => match.range).length, 2);
+                    assert.equal((await search("secretKeyword", options)).matches.length, 0);
+                    checkboxGroups = true;
+                    wysiwyg.querySelectorAll(".av__group-name").forEach(name => name.replaceChildren());
+                    wysiwyg.querySelectorAll(".av__group-title").forEach(title =>
+                        title.insertAdjacentHTML("beforeend", '<span class="av__group-counter">1</span>')
+                    );
+                    corpus.invalidateAttributeViewSearch("r", ["av-id"]);
+                    const checkbox = await settle("^1$|Keyword", {...options, regex: true});
+                    full(checkbox);
+                    assert.deepEqual(checkbox.matches.map(match => match.unitId.replace(/^embed:[^:]+:/, "")), [
+                        "group-counter:g1", "av-group:g1:row:col", "group-counter:g2", "av-group:g2:row:col",
+                    ], "icon-only group titles/counters anchor their own unloaded entries");
+                } finally {
+                    avModule.releaseAvCacheOwner("r", edit);
+                    corpus.releaseBackgroundCorpusRoot("r");
+                }
+            }
+        }
+        console.log("ordinary/embedded folded table/list: group names, empty bodies, visibility and navigation order OK");
+
+        reset();
+        add("b", "query_embed", "select * from blocks");
+        doms.b = embedShell("b");
+        embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: avShell()}}]}});
+        avResponder = async url => ({
+            code: 0,
+            data: url.endsWith("getAttributeView") ? avRaw : {
+                view: {
+                    type: "table",
+                    columns: [{id: "col", hidden: false}, {id: "hidden", hidden: true}],
+                    groups: ["g1", "g2"].map(id => ({
+                        id,
+                        columns: null, // Kernel omits redundant per-group field metadata.
+                        rowCount: 1,
+                        rows: [{
+                            id: "row0",
+                            cells: [
+                                {value: {keyID: "col", text: {content: "groupKeyword"}}},
+                                {value: {keyID: "hidden", text: {content: "hiddenKeyword"}}},
+                            ],
+                        }],
+                    })),
+                },
+            },
+        });
+        corpus.retainBackgroundCorpusRoot("r");
+        try {
+            const cold = await settle("groupKeyword", {includeAttributeView: true});
+            full(cold);
+            assert.deepEqual(cold.matches.map(match => match.unitId), [
+                "embed:source-av:av-group:g1:row0:col",
+                "embed:source-av:av-group:g2:row0:col",
+            ], "same source row displayed in two groups has two search instances");
+            assert.equal((await search("hiddenKeyword", {includeAttributeView: true})).matches.length, 0);
+            const groupHTML = id =>
+                '<div class="av__body" data-group-id="' + id + '"><div class="av__row" data-id="row0">' +
+                '<div class="av__cell" data-col-id="col">groupKeyword</div></div></div>';
+            const mount = ids => {
+                wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' +
+                    avShell().replace("<div></div>", ids.map(groupHTML).join("")) + "</div>";
+                return source("frontend/blocks").collectSearchableBlocks(edit, {includeAttributeView: true});
+            };
+            const allLive = mount(["g1", "g2"]);
+            const hot = await search("groupKeyword", {includeAttributeView: true});
+            full(hot);
+            assert.equal(hot.matches.length, 2);
+            assert.ok(hot.matches.every(match => match.range));
+            const rebound = source("frontend/corpus/project").fillLiveRanges(cold.matches, allLive, true);
+            assert.deepEqual(
+                rebound.map(match =>
+                    match.range?.startContainer.parentElement.closest("[data-group-id]").dataset.groupId
+                ),
+                ["g1", "g2"],
+                "each cold group binds to its own mounted instance",
+            );
+            const state = new (source("frontend/embed-search-state").EmbedSearchState)();
+            state.capture(allLive);
+            for (const remaining of ["g1", "g2"]) {
+                mount([remaining]);
+                const partialMount = await search("groupKeyword", {includeAttributeView: true});
+                full(partialMount);
+                assert.equal(partialMount.matches.length, 2, "unmounted group is supplemented independently");
+                assert.equal(partialMount.matches.filter(match => match.range).length, 1);
+                assert.equal(partialMount.matches[0].unitId.includes("g1"), true, "group order remains stable");
+                const owner = wysiwyg.firstElementChild;
+                assert.equal(
+                    state.changed(edit, new Set([owner]), {includeAttributeView: true}, new Set([owner])),
+                    false,
+                );
+                const cell = owner.querySelector(".av__cell");
+                cell.textContent = "localKeyword";
+                const edited = await search("groupKeyword", {includeAttributeView: true});
+                assert.equal(edited.matches.length, 1, "local edit suppresses only its own group API instance");
+                assert.equal((await search("localKeyword", {includeAttributeView: true})).matches.length, 1);
+                state.capture(mount(["g1", "g2"]));
+            }
+            wysiwyg.innerHTML = "";
+            assert.equal((await search("groupKeyword", {includeAttributeView: true})).matches.length, 2);
+        } finally {
+            avModule.releaseAvCacheOwner("r", edit);
+            corpus.releaseBackgroundCorpusRoot("r");
+        }
+        console.log("embedded AV group identity, visibility, order, range repair and virtual mounting OK");
+        for (const foldedParent of ["none", "heading", "list", "callout"]) {
+            reset();
+            const parent = foldedParent === "list" || foldedParent === "callout" ? "container" : "r";
+            if (foldedParent === "heading") add("a", "h", "title", "h1", "r", 'fold="1"');
+            if (parent !== "r") {
+                add("container", foldedParent === "list" ? "l" : "callout", "", "u", "r", 'fold="1"');
+            }
+            add("b", "query_embed", "select * from blocks", "", parent);
+            doms.b = embedShell("b");
+            const body = '<div data-node-id="before" data-type="NodeParagraph">beforeKeyword</div>' + avShell() +
+                '<div data-node-id="after" data-type="NodeParagraph">afterKeyword</div>';
+            embedResponder = async () => ({
+                code: 0,
+                data: {
+                    blocks: [{
+                        block: {
+                            id: "source-container",
+                            rootID: "source-root",
+                            content: body,
+                        },
+                    }],
+                },
+            });
+            let value = "embeddedKeyword";
+            let avReads = 0;
+            avResponder = async (url, request) => {
+                avReads++;
+                if (url === "/api/av/getAttributeView") return {code: 0, data: avRaw};
+                assert.equal(request.blockID, "source-av", "AV API uses the source carrier, not its embed host");
+                assert.equal(request.viewID, "v");
+                assert.equal(request.createIfNotExist, false);
+                return avPage([value, value]);
+            };
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                // Switching from AV-disabled cache must still discover the carrier.
+                full(await search("embeddedKeyword", {includeAttributeView: false}));
+                assert.equal(avReads, 0);
+                const initial = await search("embeddedKeyword", {includeAttributeView: true});
+                assert.equal(initial.partial, true, "unloaded AV values cannot report complete coverage");
+                const cold = await settle("Keyword", {includeAttributeView: true});
+                full(cold);
+                assert.deepEqual(cold.matches.map(match => match.matchedText), [
+                    "Keyword",
+                    "Keyword",
+                    "Keyword",
+                    "Keyword",
+                ]);
+                assert.deepEqual(cold.matches.map(match => match.unitId.includes("source-av")), [
+                    false,
+                    true,
+                    true,
+                    false,
+                ]);
+                assert.ok(cold.matches.every(match => match.blockId === "b" && !match.replaceable && !match.range));
+                const reads = avReads;
+                full(await search("absent", {includeAttributeView: true}));
+                assert.equal(avReads, reads, "keyword changes reuse the AV cache");
+                assert.equal(renderCalls, 0, "embedded AV never invokes an offscreen renderer");
+                assert.equal(
+                    avModule.rootUsesAttributeViews("r", ["av-id"]),
+                    true,
+                    "cold carrier receives AV transactions",
+                );
+                value = "changedKeyword";
+                corpus.invalidateAttributeViewSearch("r", ["av-id"]);
+                const changed = await settle("changedKeyword", {includeAttributeView: true});
+                full(changed);
+                assert.equal(changed.matches.length, 2);
+                const metadataCold = await search("database|table", {includeAttributeView: true, regex: true});
+                assert.equal(metadataCold.matches.length, 2);
+                assert.equal((await search("embeddedKeyword", {includeAttributeView: true})).matches.length, 0);
+                assert.equal(
+                    embedRequests.length,
+                    2,
+                    "AV transactions refresh values without re-running native embed SQL",
+                );
+                full(await search("changedKeyword", {includeAttributeView: false}));
+                assert.equal((await search("changedKeyword", {includeAttributeView: false})).matches.length, 0);
+                if (foldedParent !== "none") {
+                    assert.equal(
+                        (await search("changedKeyword", {
+                            includeAttributeView: true,
+                            includeFoldedBlocks: false,
+                        })).matches.length,
+                        0,
+                    );
+                }
+                const beforeRestriction = avReads;
+                const restricted = await search("changedKeyword", {
+                    includeAttributeView: true,
+                    includeInlineMemo: true,
+                    restrictInlineTypes: ["inline-memo"],
+                });
+                full(restricted);
+                assert.equal(restricted.matches.length, 0);
+                assert.equal(avReads, beforeRestriction, "memo-only search cannot load embedded AV values");
+                // Healthy text and recovered renderers must share the AV shell's rank frame.
+                const pendingGraph =
+                    '<div data-node-id="graph" data-type="NodeCodeBlock" data-subtype="graphviz" data-content="graph"><div></div></div>';
+                wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' +
+                    '<div data-node-id="before" data-type="NodeParagraph">beforeKeyword</div>' + avShell() +
+                    pendingGraph + '<div data-node-id="after" data-type="NodeParagraph">afterKeyword</div></div>';
+                window.Protyle.graphvizRender = host =>
+                    host.querySelectorAll('[data-subtype="graphviz"]').forEach(graph => {
+                        graph.innerHTML = "<svg><text>graphKeyword</text></svg>";
+                    });
+                const mixed = await settle("Keyword", {includeAttributeView: true});
+                full(mixed);
+                assert.deepEqual(
+                    mixed.matches.map(match =>
+                        match.unitId.includes("source-av") ?
+                            "av" :
+                            match.unitId.includes("graph") ?
+                            "graph" :
+                            match.unitId.includes("before") ?
+                            "before" :
+                            "after"
+                    ),
+                    ["before", "av", "av", "graph", "after"],
+                );
+                assert.deepEqual(
+                    (await search("Keyword", {includeAttributeView: true})).matches.map(match => match.unitId),
+                    mixed.matches.map(match => match.unitId),
+                    "cached renderer and AV shell retain shared order",
+                );
+                const live = avShell().replace(
+                    "<div></div>",
+                    '<div class="av__row" data-id="row0"><div class="av__cell" data-col-id="col">changedKeyword</div></div>' +
+                        '<div class="av__row" data-id="row1"><div class="av__cell" data-col-id="col">changedKeyword</div></div>',
+                );
+                wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' + body + "</div>";
+                const pendingMounted = await settle("changedKeyword", {includeAttributeView: true});
+                full(pendingMounted);
+                assert.equal(
+                    pendingMounted.matches.length,
+                    2,
+                    "mounted AV shell beside healthy text still loads values",
+                );
+                wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' + live + "</div>";
+                const mounted = await search("changedKeyword", {includeAttributeView: true});
+                full(mounted);
+                assert.equal(mounted.matches.length, 2, "mounted and cold cell counts agree");
+                assert.ok(mounted.matches.every(match => match.range && match.blockId === "b" && !match.replaceable));
+                const liveUnits = source("frontend/blocks").collectSearchableBlocks(edit, {includeAttributeView: true});
+                const projection = source("frontend/corpus/project");
+                const rebound = projection.fillLiveRanges(changed.matches, liveUnits, true);
+                assert.ok(rebound.every(match => match.range), "cold API cells rebind to mounted DOM identities");
+                const avElement = wysiwyg.querySelector('[data-type="NodeAttributeView"]');
+                avElement.setAttribute("custom-sy-av-view", "v2");
+                assert.ok(
+                    projection.fillLiveRanges(changed.matches, liveUnits, true).every(match => !match.range),
+                    "cold view cannot bind to the same row/column in a different view",
+                );
+                assert.ok(
+                    projection.fillLiveRanges(
+                        mounted.matches.map(match => ({...match, range: undefined})),
+                        liveUnits,
+                        true,
+                    )
+                        .every(match => !match.range),
+                    "hot unit IDs must also verify their original view",
+                );
+                avElement.setAttribute("custom-sy-av-view", "v");
+                avElement.insertAdjacentHTML(
+                    "afterbegin",
+                    '<div class="av__title">database</div><div class="av__views"><div class="layout-tab-bar">' +
+                        '<div class="item" data-id="v"><span class="item__text">table</span></div></div></div>',
+                );
+                assert.ok(
+                    projection.fillLiveRanges(
+                        metadataCold.matches,
+                        source("frontend/blocks").collectSearchableBlocks(edit),
+                        true,
+                    ).every(match => match.range),
+                    "cold database title and view names rebind independently of cells",
+                );
+                assert.ok(
+                    projection.projectLiveRanges(edit, changed.matches, liveUnits, true).every(match => match.range),
+                );
+                const repaired = projection.rebindChangedRanges(
+                    changed.matches,
+                    liveUnits,
+                    new Map(changed.matches.map(match => [match, {broken: false, blockShown: true}])),
+                    {allowFoldedHidden: true},
+                );
+                assert.ok(repaired.matches.every(match => match.range), "observer repair uses the same safe aliases");
+                assert.equal(
+                    source("frontend/match-anchor").resolveRetainedMatchIndex(mounted.matches, changed.matches[1], 1, {
+                        previousMatches: changed.matches,
+                    }),
+                    2,
+                    "cold-to-live identity retains the second row",
+                );
+                const wrongCopy = liveUnits.map(block => ({
+                    ...block,
+                    unitId: block.unitId.replace("source-av:", "source-av@1:"),
+                }));
+                assert.ok(projection.fillLiveRanges(changed.matches, wrongCopy, true).every(match => !match.range));
+                const groupedCopies = ["g1", "g2"].flatMap(group =>
+                    liveUnits.map(block => ({
+                        ...block,
+                        unitId: block.unitId.replace("cell:nogroup:", "cell:" + group + ":"),
+                    }))
+                );
+                assert.ok(
+                    projection.fillLiveRanges(changed.matches, groupedCopies, true).every(match => !match.range),
+                    "ambiguous group copies cannot borrow another cell's Range",
+                );
+                assert.ok(
+                    projection.fillLiveRanges(
+                        changed.matches,
+                        liveUnits.map(block => ({...block, unitId: block.unitId + "#run-0"})),
+                        true,
+                    )
+                        .every(match => !match.range),
+                    "split text runs cannot reuse whole-cell offsets",
+                );
+                for (const mountedPart of ["title", "header", "row0", "row1", "hidden", "empty", "unsaved"]) {
+                    const content = mountedPart === "title" ?
+                        '<div class="av__title">database</div>' :
+                        mountedPart === "header" ?
+                        '<div class="av__row av__row--header"><div class="av__cell av__cell--header" data-col-id="col">column</div></div>' :
+                        '<div class="av__row" data-id="' + (mountedPart === "row1" ? "row1" : "row0") +
+                        '"><div class="av__cell" data-col-id="col"' +
+                        (mountedPart === "hidden" ? ' style="display:none"' : "") + ">" +
+                        (mountedPart === "empty" ? "" : mountedPart === "unsaved" ? "localKeyword" : "changedKeyword") +
+                        "</div></div>";
+                    wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' +
+                        avShell().replace("<div></div>", content) + "</div>";
+                    const partialMounted = await search("changedKeyword", {includeAttributeView: true});
+                    full(partialMounted);
+                    assert.equal(
+                        partialMounted.matches.length,
+                        ["title", "header", "row0", "row1"].includes(mountedPart) ? 2 : 1,
+                        mountedPart + " supplements only unmounted cells",
+                    );
+                    if (mountedPart === "row0" || mountedPart === "row1") {
+                        assert.equal(partialMounted.matches.filter(match => match.range).length, 1);
+                        assert.equal(
+                            partialMounted.matches[0].unitId.includes("row0"),
+                            true,
+                            "API row order is preserved",
+                        );
+                    }
+                    if (mountedPart === "unsaved") {
+                        assert.equal((await search("localKeyword", {includeAttributeView: true})).matches.length, 1);
+                    }
+                }
+                assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        for (const viewIdentity of ["default", "stale", "unnamed"]) {
+            reset();
+            add("b", "query_embed", "select * from blocks");
+            doms.b = embedShell("b");
+            const shell = viewIdentity === "default" ?
+                avShell().replace('custom-sy-av-view="v"', "") :
+                avShell(viewIdentity === "stale" ? "deleted-view" : "v");
+            embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]}});
+            avResponder = async url =>
+                url === "/api/av/getAttributeView" ?
+                    {
+                        code: 0,
+                        data: {name: "database", views: [{id: "v", name: viewIdentity === "unnamed" ? "" : "table"}]},
+                    } :
+                    avPage(["viewKeyword"]);
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                const cold = await settle("viewKeyword", {includeAttributeView: true});
+                full(cold);
+                assert.equal(cold.matches[0].embeddedAvViewId, "v", "actual resolved view survives " + viewIdentity);
+                const live = avShell("v2").replace(
+                    "<div></div>",
+                    '<div class="av__row" data-id="row0"><div class="av__cell" data-col-id="col">viewKeyword</div></div>',
+                );
+                wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' + live + "</div>";
+                const units = source("frontend/blocks").collectSearchableBlocks(edit);
+                assert.ok(
+                    source("frontend/corpus/project").fillLiveRanges(cold.matches, units, true).every(match =>
+                        !match.range
+                    ),
+                );
+                wysiwyg.querySelector('[data-type="NodeAttributeView"]').setAttribute("custom-sy-av-view", "v");
+                assert.ok(
+                    source("frontend/corpus/project").fillLiveRanges(cold.matches, units, true).every(match =>
+                        match.range
+                    ),
+                );
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        for (const differentViews of [false, true]) {
+            reset();
+            add("a", "query_embed", "select * from blocks");
+            add("b", "query_embed", "select * from blocks");
+            doms.a = embedShell("a");
+            doms.b = embedShell("b");
+            embedResponder = async request => ({
+                code: 0,
+                data: {
+                    blocks: [
+                        {
+                            block: {
+                                id: "source-av",
+                                content: avShell(),
+                            },
+                        },
+                        ...(request.embedBlockID === "b" ?
+                            [{
+                                block: {
+                                    id: "source-av",
+                                    content: avShell(differentViews ? "v2" : "v"),
+                                },
+                            }] :
+                            []),
+                    ],
+                },
+            });
+            let renderReads = 0;
+            avResponder = async (url, request) => {
+                if (url === "/api/av/getAttributeView") return {code: 0, data: avRaw};
+                renderReads++;
+                return avPage([request.viewID === "v2" ? "otherKeyword" : "sharedKeyword"]);
+            };
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                const copies = await settle("Keyword", {includeAttributeView: true});
+                full(copies);
+                assert.equal(copies.matches.length, 3, "same source retains all three displayed copies");
+                assert.deepEqual(copies.matches.map(match => match.blockId), ["a", "b", "b"]);
+                assert.equal(new Set(copies.matches.map(match => match.blockId + ":" + match.unitId)).size, 3);
+                assert.equal(renderReads, differentViews ? 2 : 1, "only identical carrier views share pagination");
+                assert.equal(
+                    (await search("sharedKeyword", {includeAttributeView: true})).matches.length,
+                    differentViews ? 2 : 3,
+                );
+                assert.equal(
+                    (await search("otherKeyword", {includeAttributeView: true})).matches.length,
+                    differentViews ? 1 : 0,
+                );
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        for (const failure of ["api", "page", "truncated", "hidden", "disabled-container", "missing-id"]) {
+            reset();
+            add("b", "query_embed", "select * from blocks");
+            doms.b = embedShell("b");
+            let carrier = avShell();
+            if (failure === "hidden") carrier = carrier.replace('data-av-type="table"', 'style="display:none"');
+            if (failure === "missing-id") carrier = carrier.replace('data-av-id="av-id"', "");
+            if (failure === "disabled-container") {
+                carrier = '<div data-node-id="list" data-type="NodeList" data-subtype="u">' + carrier + "</div>";
+            }
+            embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: carrier}}]}});
+            let avReads = 0;
+            avResponder = async (url, request) => {
+                avReads++;
+                if (failure === "api") return {code: -1};
+                if (url === "/api/av/getAttributeView") return {code: 0, data: avRaw};
+                if (failure === "truncated") {
+                    return {
+                        code: 0,
+                        data: {
+                            view: {
+                                type: "table",
+                                rowCount: 100001,
+                                rows: Array.from({length: request.pageSize}, (_item, index) => ({
+                                    id: "row-" + request.page + "-" + index,
+                                    cells: [],
+                                })),
+                            },
+                        },
+                    };
+                }
+                return {code: 0, data: {view: {type: "table", rowCount: 2, rows: []}}};
+            };
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                const options = {includeAttributeView: true, includeListUnordered: failure !== "disabled-container"};
+                const result = await settle("Keyword", options);
+                assert.equal(result.matches.length, 0);
+                assert.equal(result.unrendered, ["api", "page", "truncated", "missing-id"].includes(failure) ? 1 : 0);
+                assert.equal(result.truncated, failure === "truncated" ? 1 : 0);
+                if (["api", "page", "truncated"].includes(failure)) {
+                    assert.deepEqual(result.incompleteBlockIds, ["b"], "failure coverage belongs to the embed host");
+                    const before = avReads;
+                    await search("otherKeyword", options);
+                    assert.equal(avReads, before, "embedded AV failures use the existing finite backoff");
+                } else {
+                    assert.equal(avReads, 0, "filtered/malformed carriers cannot issue AV requests");
+                }
+                assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        console.log(
+            "embedded AV cold/folded/live counts, view/copy isolation, cache/transaction/gates/failure coverage OK",
+        );
+        reset();
+        add("b", "query_embed", "select * from blocks");
+        doms.b = embedShell("b");
+        const manyCarriers = Array.from(
+            {length: 40},
+            (_item, index) =>
+                avShell().replace("source-av", "source-av-" + index).replace('av-id"', "av-id-" + index + '"'),
+        );
+        embedResponder = async () => ({
+            code: 0,
+            data: {
+                blocks: [{
+                    block: {
+                        id: "source-container",
+                        content: manyCarriers.join(""),
+                    },
+                }],
+            },
+        });
+        let manyReads = 0;
+        avResponder = async url => {
+            manyReads++;
+            return url === "/api/av/getAttributeView" ? {code: 0, data: avRaw} : avPage(["manyKeyword"]);
+        };
+        corpus.retainBackgroundCorpusRoot("r");
+        try {
+            const many = await settle("manyKeyword", {includeAttributeView: true});
+            full(many);
+            assert.equal(many.matches.length, 40, "embedded AV workset can exceed the 32-carrier cache limit");
+            assert.equal(manyReads, 80);
+            full(await search("manyKeyword", {includeAttributeView: true}));
+            assert.equal(manyReads, 80, "pinned embedded workset cannot evict itself into endless indexing");
+        } finally {
+            avModule.releaseAvCacheOwner("r", edit);
+            corpus.releaseBackgroundCorpusRoot("r");
+        }
+        assert.equal(
+            avModule.rootUsesAttributeViews("r", ["av-id-0"]),
+            false,
+            "closing search releases embedded AV ownership",
+        );
+        console.log("embedded AV oversized workset completes once and releases its cache pins OK");
         // Native API honors effective heading mode, order and root/self exclusions.
         for (const mode of [0, 1, 2]) {
             reset();

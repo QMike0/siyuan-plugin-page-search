@@ -30,6 +30,11 @@ import {
     shouldCollectInlineMemoUnits,
     type SearchableUnit,
 } from "../../shared";
+import {
+    avApiCellPosition,
+    avApiUnitId,
+    embeddedAvApiUnitId,
+} from "../../shared/av-live";
 import {supportsDiagramSourceSearch} from "../../shared/code-block-language";
 import {
     collectSearchableBlocks,
@@ -38,6 +43,7 @@ import {
     isDirectTableCell,
     inlineMathIdentityText,
     isInlineMathSearchUnit,
+    ownEmbeddedSearchUnit,
     resolveDocRoot,
 } from "../blocks";
 import type {
@@ -54,7 +60,7 @@ import {
     relativeEmbeddedOrder,
     rebaseEmbeddedOrder,
 } from "../embedded-order";
-import {isUnderNonHeadingCssFold} from "../fold-dom";
+import {foldedAttributeViewGroupBody, isUnderNonHeadingCssFold} from "../fold-dom";
 import {buildListSnippet} from "../list-snippet";
 import type {
     SearchPipelineOptions,
@@ -96,7 +102,9 @@ import {
     touchCacheBudget,
 } from "./cache-budget";
 import {CacheReadGuards} from "./cache-read-guard";
+import {invalidateEmbedQueries} from "./embed-query";
 import {
+    collectEmbeddedAvCarriers,
     extractDiagramUnitsFromLive,
     extractUnitsFromDoms,
     fetchAndExtractUnits,
@@ -218,6 +226,7 @@ function currentCorpusEpoch(rootId: string): number {
 
 export function invalidateTextCache(): void {
     embedCacheEpoch += 1;
+    invalidateEmbedQueries();
     textCache.clear();
     textCacheLru.clear();
     textCacheBytes = 0;
@@ -301,6 +310,7 @@ export function invalidateDocumentStructureCaches(rootId?: string): void {
 function collectionScope(options: SearchPipelineOptions): string {
     const include = [
         options.includeImageTitle !== false,
+        options.includeAttributeView !== false,
         options.includeTable !== false,
         options.includeBlockquote !== false,
         options.includeCallout !== false,
@@ -355,6 +365,11 @@ function estimateCacheEntryBytes(hash: string, units: readonly CachedUnit[]): nu
             textBytes(unit.highlightKind) +
             textBytes(unit.snippet) +
             textBytes(unit.embeddedRecoveryKey);
+        if (unit.embeddedAvRef) {
+            const ref = unit.embeddedAvRef;
+            bytes += 64 + textBytes(ref.blockId) + textBytes(ref.avId) + textBytes(ref.updated) +
+                textBytes(ref.carrierViewId);
+        }
         bytes += (unit.segmentLengths?.length ?? 0) * 8;
         bytes += (unit.restrictSpans?.length ?? 0) * 40;
         for (const segment of unit.embeddedOrder ?? []) bytes += 40 + segment.path.length * 8;
@@ -413,6 +428,7 @@ function syncRenderSettingsCache(): void {
         return;
     }
     renderSettingsStamp = next;
+    invalidateEmbedQueries();
     for (const key of Array.from(specialCacheKeys.keys())) {
         dropTextCache(key);
     }
@@ -421,6 +437,7 @@ function syncRenderSettingsCache(): void {
 function dropEmbedRenderCaches(): void {
     // Clearing entries alone cannot stop an older query/recovery from writing them back.
     embedCacheEpoch += 1;
+    invalidateEmbedQueries();
     for (const key of Array.from(embedCacheKeys)) {
         dropTextCache(key);
     }
@@ -749,6 +766,7 @@ function collectOptions(options: SearchPipelineOptions) {
 function extractionCollectOptions(options: SearchPipelineOptions) {
     return {
         ...collectOptions(options),
+        includeAttributeView: options.includeAttributeView !== false,
         includeFoldedBlocks: options.includeFoldedBlocks === true,
     };
 }
@@ -930,6 +948,14 @@ function remember(rootId: string, meta: BlockMeta, units: CachedUnit[], scope: s
 
 function rememberUnrendered(rootId: string, meta: BlockMeta, scope: string, units: CachedUnit[] = []): void {
     const key = cacheKey(rootId, meta.id, scope);
+    const existing = textCache.get(key);
+    // A pane may enter after the shared SQL response, while another still extracts it.
+    // Its later transient failure must not replace a complete snapshot of the same version.
+    if (
+        existing && isEmbedType(meta.type) && existing.retryAfter === undefined && specialCacheMatches(existing, meta)
+    ) {
+        return;
+    }
     writeSpecialCache(key, {
         ...specialMetaVersion(meta),
         units,
@@ -2082,6 +2108,7 @@ async function searchCurrentDocumentImpl(
     // 虚拟大表只替换已经挂出来的格子，屏外行仍用完整表。
     const liveIds = new Set<string>();
     let units: CachedUnit[] = [];
+    const embeddedAvViews = new Map<string, string>();
     const foldedLiveDiagramBlocks = new Map<string, SearchableBlock>();
     const foldedLiveDiagramFallback = new Map<string, CachedUnit[]>();
     const usedFoldedDiagramCache = new Set<string>();
@@ -2187,6 +2214,20 @@ async function searchCurrentDocumentImpl(
         ) {
             continue;
         }
+        const ownedBlocks = liveEmbedBlocks.get(item.id) ?? [];
+        const carriers = collectEmbeddedAvCarriers(owner, extractionCollectOptions(options));
+        if (carriers.incomplete) unrendered += 1;
+        if (carriers.blocks.length) {
+            ownedBlocks.push(...carriers.blocks);
+            liveIds.add(item.id);
+        }
+        const noteCarriers = () => {
+            units.push(
+                ...carriers.blocks.map((block) =>
+                    freezeLive(ownEmbeddedSearchUnit(block, item.id), orderIndex.get(item.id) ?? 0)
+                ),
+            );
+        };
         const inlineOrdinals = new Map<string, number>();
         const sourceOf = createEmbeddedSourceReader();
         const originalElements = Array.from(owner.querySelectorAll<HTMLElement>(recoverySelector));
@@ -2211,6 +2252,8 @@ async function searchCurrentDocumentImpl(
                 )
             );
         if (targets.length === 0) {
+            if (carriers.blocks.length) recordEmbeddedOrder(owner, ownedBlocks);
+            noteCarriers();
             if (owner.querySelector("[data-node-id][data-type], .protyle-wysiwyg__embed")) {
                 // Mounted children remain authoritative when all their text
                 // was filtered by visibility or type gates.
@@ -2224,9 +2267,10 @@ async function searchCurrentDocumentImpl(
         // live text, then reattach cached internal ranks to current anchors.
         const positionOf = recordEmbeddedOrder(
             owner,
-            liveEmbedBlocks.get(item.id) ?? [],
+            ownedBlocks,
             targets.map(({element}) => element),
         );
+        noteCarriers();
         const originalPositions = new Map(targets.map(({element, key}) => [key, positionOf(element)]));
         const placeRecovered = (recovered: readonly CachedUnit[]): CachedUnit[] =>
             recovered.map((unit) => ({
@@ -2440,7 +2484,7 @@ async function searchCurrentDocumentImpl(
         // 这里不能再以几何可见性丢掉这些已有文字，否则会先少计、再离屏重抽一次。
         const reusableFoldedLiveText = options.includeFoldedBlocks === true &&
             Boolean(block.text.trim()) &&
-            isUnderNonHeadingCssFold(block.element);
+            (isUnderNonHeadingCssFold(block.element) || foldedAttributeViewGroupBody(block.element));
         if (!isVisuallyInEditor(block.element) && !reusableFoldedLiveText) {
             continue;
         }
@@ -2874,6 +2918,7 @@ async function searchCurrentDocumentImpl(
     }
 
     const incompleteBlockIds: string[] = [];
+    const avNavigationOrder = new Map<string, number>();
     let avIndexing = false;
     if (options.includeAttributeView !== false) {
         const loadedRefs = await avRefsPromise;
@@ -2900,9 +2945,97 @@ async function searchCurrentDocumentImpl(
                 avViewIds.set(ref.blockId, viewId);
             }
         }
-        if (hasBackgroundCorpusUser(context.rootId)) pinAvCache(context.rootId, refs, avViewIds, edit);
+        const embeddedCarriers = units.filter((unit) => unit.embeddedAvRef);
+        // Coverage is scoped to the displayed source copy, not merely the source
+        // block ID: another embed (or another view) may mount different rows.
+        const embeddedAvLive = new Map<string, SearchableBlock[]>();
+        for (const block of liveAll) {
+            if (!block.embeddedSourceId || !block.element.closest('[data-type="NodeAttributeView"]')) continue;
+            const prefix = `embed:${block.embeddedSourceId}:`;
+            if (!block.unitId?.startsWith(prefix)) continue;
+            const key = `${block.blockId}\0${prefix}`;
+            const list = embeddedAvLive.get(key) ?? [];
+            list.push({...block, blockType: "NodeAttributeView", unitId: block.unitId.slice(prefix.length)});
+            embeddedAvLive.set(key, list);
+        }
+        const workRefs = new Map<string, AvBlockRef>();
+        const ownersByRef = new Map<string, Set<string>>();
+        const refKey = (ref: AvBlockRef) =>
+            JSON.stringify([
+                ref.blockId,
+                ref.avId,
+                ref.updated,
+                ref.carrierViewId,
+            ]);
+        const addRef = (ref: AvBlockRef, ownerId: string) => {
+            const key = refKey(ref);
+            workRefs.set(key, ref);
+            const owners = ownersByRef.get(key) ?? new Set<string>();
+            owners.add(ownerId);
+            ownersByRef.set(key, owners);
+        };
+        for (const ref of refs) {
+            addRef({...ref, carrierViewId: avViewIds.get(ref.blockId) ?? ref.carrierViewId}, ref.blockId);
+        }
+        for (const carrier of embeddedCarriers) addRef(carrier.embeddedAvRef!, carrier.blockId);
+        const worksetRefs = Array.from(workRefs.values());
+        if (hasBackgroundCorpusUser(context.rootId)) pinAvCache(context.rootId, worksetRefs, new Map(), edit);
         else releaseAvCacheOwner(context.rootId, edit);
         const peeked = peekAvUnits(refs, avViewIds);
+        // DOM supplies headers/chrome and pending edits; API supplies all rows.
+        // Put missing rows between their mounted neighbours, rather than after
+        // every group title. Split runs keep their exact DOM order.
+        const avBounds = new Map<string, Map<string, {first: number; last: number;}>>();
+        const avLiveRanks = new Map<string, number>();
+        for (const block of liveAll) {
+            if (block.blockType !== "NodeAttributeView" || block.embeddedSourceId) continue;
+            const rank = avLiveRanks.get(block.blockId) ?? 0;
+            avLiveRanks.set(block.blockId, rank + 1);
+            avNavigationOrder.set(`${block.blockId}\0${block.unitId ?? ""}`, rank);
+            const id = avApiUnitId(block.unitId?.replace(/#run-\d+$/, "").replace(/^group-counter:/, "group-title:"));
+            if (!id) continue;
+            const bounds = avBounds.get(block.blockId) ?? new Map();
+            const old = bounds.get(id);
+            bounds.set(id, {first: old?.first ?? rank, last: rank});
+            avBounds.set(block.blockId, bounds);
+        }
+        const apiByBlock = new Map<string, typeof peeked.units>();
+        for (const unit of peeked.units) {
+            // Entirely cold carriers already use complete native row order;
+            // only mixed DOM/API carriers need the additional rank snapshot.
+            if (!avBounds.has(unit.blockId)) continue;
+            const list = apiByBlock.get(unit.blockId) ?? [];
+            list.push(unit);
+            apiByBlock.set(unit.blockId, list);
+        }
+        for (const [blockId, api] of apiByBlock) {
+            const bounds = avBounds.get(blockId);
+            const following: Array<number | undefined> = [];
+            let next: number | undefined;
+            for (let index = api.length - 1; index >= 0; index--) {
+                following[index] = next;
+                const bound = bounds?.get(api[index].unitId ?? "");
+                if (bound) next = bound.first;
+            }
+            let previous: number | undefined;
+            api.forEach((unit, index) => {
+                const bound = bounds?.get(unit.unitId ?? "");
+                if (bound) previous = bound.last;
+                // Checkbox/empty group names have no API text unit, but their
+                // mounted title/counter still precedes the group's rows.
+                const groupTitle = unit.unitId?.startsWith("av-group:") ?
+                    bounds?.get(`group-title:${unit.unitId.split(":")[1]}`) : undefined;
+                if (groupTitle) previous = Math.max(previous ?? groupTitle.last, groupTitle.last);
+                const rank = bound?.first ?? (following[index] !== undefined ? following[index]! - 0.5 :
+                    previous !== undefined ? previous + 0.5 : index);
+                avNavigationOrder.set(`${blockId}\0${unit.unitId ?? ""}`, rank + (bound ? 0 : index / (api.length + 1) * 0.25));
+            });
+        }
+        const missingByKey = new Map<string, AvBlockRef>();
+        for (const ref of peeked.missing) {
+            const selected = {...ref, carrierViewId: avViewIds.get(ref.blockId) ?? ref.carrierViewId};
+            missingByKey.set(refKey(selected), selected);
+        }
         for (const unit of peeked.units) {
             if (liveIds.has(unit.blockId)) {
                 const coverage = avDom.get(unit.blockId);
@@ -2925,33 +3058,105 @@ async function searchCurrentDocumentImpl(
             }
             units.push(avToCached(unit, orderIndex));
         }
-        if (peeked.missing.length > 0 && allowBackgroundJobs) {
-            const missing = peeked.missing;
+        const embeddedValues = new Map<string, ReturnType<typeof peekAvUnits>>();
+        for (const carrier of embeddedCarriers) {
+            const ref = carrier.embeddedAvRef!;
+            const key = refKey(ref);
+            let cached = embeddedValues.get(key);
+            if (!cached) {
+                cached = peekAvUnits([ref]);
+                embeddedValues.set(key, cached);
+                if (cached.missing.length) missingByKey.set(key, ref);
+            }
+            const prefix = carrier.unitId!.slice(0, -"av-carrier".length);
+            embeddedAvViews.set(
+                `${carrier.blockId}\0${prefix}`,
+                cached.resolvedViewIds.get(ref.blockId) ?? ref.carrierViewId,
+            );
+            const anchor = carrier.embeddedOrder?.[0]?.path;
+            const shown = embeddedAvLive.get(`${carrier.blockId}\0${prefix}`) ?? [];
+            const coverage = collectAvDomCoverage(shown).get(carrier.blockId);
+            const labels = new Set<string>();
+            const carrierElement = shown[0]?.element.closest<HTMLElement>('[data-type="NodeAttributeView"]');
+            const viewType = carrierElement?.dataset.avType ?? "";
+            // Place unloaded rows between their mounted neighbours. The shell's
+            // rank alone would put every API row before every painted row.
+            const bounds = new Map<string, {first: number; last: number;}>();
+            for (const block of shown) {
+                const id = embeddedAvApiUnitId(prefix + block.unitId?.replace(/#run-\d+$/, "").replace(/^group-counter:/, "group-title:"));
+                const paths = block.embeddedOrder;
+                if (!id || !paths?.length) continue;
+                const first = paths[0].path[0];
+                const last = paths[paths.length - 1].path[0];
+                const old = bounds.get(id);
+                bounds.set(id, {first: Math.min(first, old?.first ?? first), last: Math.max(last, old?.last ?? last)});
+            }
+            const following: Array<number | undefined> = [];
+            let next: number | undefined;
+            for (let index = cached.units.length - 1; index >= 0; index--) {
+                following[index] = next;
+                const bound = bounds.get(prefix + cached.units[index].unitId);
+                if (bound) next = bound.first;
+            }
+            let previous: number | undefined;
+            cached.units.forEach((unit, index) => {
+                const bound = bounds.get(prefix + unit.unitId);
+                if (bound) previous = bound.last;
+                const groupTitle = unit.unitId?.startsWith("av-group:") ?
+                    bounds.get(`${prefix}group-title:${unit.unitId.split(":")[1]}`) : undefined;
+                if (groupTitle) previous = Math.max(previous ?? groupTitle.last, groupTitle.last);
+                if (
+                    coverage && (
+                        !avApiUnitInView(unit.unitId ?? "", coverage, viewType) ||
+                        avApiUnitShown(unit.unitId ?? "", unit.text, coverage, labels)
+                    )
+                ) return;
+                const rank = following[index] !== undefined ?
+                    following[index]! - 0.5 :
+                    previous !== undefined ?
+                    previous + 0.5 :
+                    undefined;
+                units.push({
+                    ...avToCached(unit, orderIndex),
+                    blockId: carrier.blockId,
+                    blockType: "NodeBlockQueryEmbed",
+                    blockIndex: carrier.blockIndex,
+                    unitId: prefix + unit.unitId,
+                    embeddedOrder: rank !== undefined ?
+                        [{start: 0, path: [rank, index]}] :
+                        anchor ?
+                        [{start: 0, path: [...anchor, index]}] :
+                        undefined,
+                });
+            });
+        }
+        const missing = Array.from(missingByKey.values());
+        if (missing.length > 0 && allowBackgroundJobs) {
             // 不同窗格可使用同一数据库的不同视图，任务/失败退避不能互相挡住。
-            const workset = JSON.stringify(refs.map((ref) => [
-                ref.blockId,
-                ref.avId,
-                ref.updated,
-                avViewIds.get(ref.blockId) ?? ref.carrierViewId,
-            ]));
+            const workset = JSON.stringify(Array.from(workRefs.keys()));
             const avJobKey = `av:${context.rootId}:${meta.signature}:${workset}`;
             startJob(avJobKey, context.rootId, async (isCurrent, signal) => {
-                await loadAvUnits(missing, isCurrent, avViewIds, signal);
+                await loadAvUnits(missing, isCurrent, new Map(), signal);
             });
             avIndexing = jobs.has(avJobKey);
             const failure = jobFailures.get(avJobKey);
             if (failure && failure.retryAfter > Date.now()) {
                 const failedIds = failure.failedBlockIds ? new Set(failure.failedBlockIds) : undefined;
                 const failed = missing.filter((ref) => !failedIds || failedIds.has(ref.blockId));
-                incompleteBlockIds.push(...failed.map((ref) => ref.blockId));
-                const unavailable = new Set(failed.map((ref) => ref.blockId)).size;
+                const failedOwners = new Set(failed.flatMap((ref) => Array.from(ownersByRef.get(refKey(ref)) ?? [])));
+                incompleteBlockIds.push(...failedOwners);
+                const unavailable = failedOwners.size;
                 unrendered += unavailable;
                 const truncatedIds = new Set(failure.truncatedBlockIds ?? []);
                 truncated += failure.truncated ?
                     unavailable :
-                    failed.filter((ref) => truncatedIds.has(ref.blockId)).length;
+                    new Set(
+                        failed.filter((ref) => truncatedIds.has(ref.blockId)).flatMap((ref) =>
+                            Array.from(ownersByRef.get(refKey(ref)) ?? [])
+                        ),
+                    ).size;
             }
-        } else if (peeked.missing.length > 0) {
+        } else if (missing.length > 0) {
             pendingSpecialCoverage = true;
         }
     }
@@ -2970,7 +3175,7 @@ async function searchCurrentDocumentImpl(
     // 图表中不同标签即使文字相同，unitId 也不同，仍然保留各自的可见命中。
     // 若同一图表同时出现 renderer 文字和普通代码/源码兜底，只保留 renderer
     // 文字，避免异常 DOM 或重复提取把同一可见词计两次。
-    units = dedupeCorpusUnits(units);
+    units = dedupeCorpusUnits(units.filter((unit) => !unit.embeddedAvRef));
 
     const matchOptions = {
         caseSensitive: options.caseSensitive,
@@ -2994,7 +3199,7 @@ async function searchCurrentDocumentImpl(
     }
 
     const byKey = new Map<string, CachedUnit>();
-    const navSeq = structuralNavSeq(units, new Set(virtualTables.keys()));
+    const navSeq = structuralNavSeq(units, new Set(virtualTables.keys()), avNavigationOrder);
     for (const unit of units) {
         byKey.set(`${unit.blockId}\u0000${unit.unitId ?? ""}`, unit);
     }
@@ -3032,6 +3237,9 @@ async function searchCurrentDocumentImpl(
             unitId: hit.unitId,
             unitSeq: navSeq(unit, hit.start),
             embeddedPosition: embeddedPositionAt(unit.embeddedOrder, hit.start),
+            embeddedAvViewId: hit.unitId?.startsWith("embed:") ?
+                embeddedAvViews.get(`${hit.blockId}\0${hit.unitId.slice(0, hit.unitId.indexOf(":", 6) + 1)}`) :
+                undefined,
             start: hit.start,
             end: hit.end,
             matchedText: hit.matchedText,
@@ -3170,6 +3378,7 @@ const TABLE_CELL_SLOT = 3;
 function structuralNavSeq(
     units: CachedUnit[],
     indexRankedTables: ReadonlySet<string>,
+    avNavigationOrder: ReadonlyMap<string, number>,
 ): (unit: CachedUnit, start: number) => number | undefined {
     const seq = new Map<string, number>();
     const rowRank = new Map<string, number>();
@@ -3211,6 +3420,7 @@ function structuralNavSeq(
         if (unit.blockType !== "NodeAttributeView") {
             return;
         }
+        if (avNavigationOrder.has(key)) return;
         const pos = avMatchPosition(unit.unitId);
         if (!pos) {
             const cursor = nextRow.get(unit.blockId) ?? 0;
@@ -3252,7 +3462,7 @@ function structuralNavSeq(
     return (unit, start) => {
         const key = `${unit.blockId}\u0000${unit.unitId ?? ""}`;
         if (unit.blockType !== "NodeTable") {
-            return seq.get(key);
+            return (unit.blockType === "NodeAttributeView" ? avNavigationOrder.get(key) : undefined) ?? seq.get(key);
         }
         const rank = tableRank.get(key);
         if (rank === undefined) {
@@ -3298,7 +3508,12 @@ function avMatchPosition(unitId: string | undefined): {row: string; col: string;
         if (parts.length < 4 || !parts[2]) {
             return null;
         }
-        return {row: parts[2], col: parts.slice(3).join(":")};
+        const header = parts[2] === "header" && parts.length >= 5;
+        const row = header ? "header:" + parts[3] : parts[2];
+        return {
+            row: parts[1] === "nogroup" ? row : `group:${parts[1]}:${row}`,
+            col: parts.slice(header ? 4 : 3).join(":"),
+        };
     }
     if (unitId.startsWith("calendar:")) {
         const parts = unitId.split(":");
@@ -3307,15 +3522,7 @@ function avMatchPosition(unitId: string | undefined): {row: string; col: string;
         }
         return {row: parts[1], col: parts.slice(2).join(":")};
     }
-    if (unitId.startsWith("av:")) {
-        const rest = unitId.slice(3);
-        const splitAt = rest.indexOf(":");
-        if (splitAt <= 0) {
-            return null;
-        }
-        return {row: rest.slice(0, splitAt), col: rest.slice(splitAt + 1)};
-    }
-    return null;
+    return avApiCellPosition(unitId);
 }
 
 function sameStructuralBlock(left: SearchMatch, right: SearchMatch): boolean {

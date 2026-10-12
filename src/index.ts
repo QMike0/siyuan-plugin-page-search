@@ -7,6 +7,7 @@ import {
 import "./index.scss";
 import {
     attributeViewTransactionIds,
+    isAttrViewFoldOnlyTransaction,
     isAttrViewWsTransaction,
 } from "./frontend/av-watch";
 import {
@@ -213,7 +214,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
 
     private readonly onSearchHistoryBroadcast = (event: CustomEvent) => {
         // 搜索窗关闭后仍接收 AV 事务，不能在下次打开时复用未更新载体 hash 的旧单元格。
-        if (isAttrViewWsTransaction(event.detail)) {
+        if (isAttrViewWsTransaction(event.detail) && !isAttrViewFoldOnlyTransaction(event.detail)) {
             const avIds = attributeViewTransactionIds(event.detail);
             // 某些内核事务只标记 AttrView action 而不带 avID；此时精确失效不可用，
             // 保守清空 AV 显示值缓存，避免下次冷搜索复用旧字段文字。

@@ -1,3 +1,4 @@
+import {avApiUnitId} from "../shared/av-live";
 import {containsNodeCrossingShadow} from "./dom-parent";
 import type {SearchMatch} from "./dom-types";
 
@@ -56,18 +57,35 @@ function* retainedMatchIndex(
     let unchangedIndex = 0;
     let oldCursor = 0;
     let steps = 0;
+    const avId = previous.blockType === "NodeAttributeView" || previous.unitId?.startsWith("embed:") ?
+        avApiUnitId(previous.unitId) : undefined;
+    let avAlias: string | undefined;
+    if (avId) {
+        const identities = new Set<string>();
+        for (const match of matches) {
+            if (
+                match.blockId === previous.blockId && match.embeddedAvViewId === previous.embeddedAvViewId &&
+                avApiUnitId(match.unitId) === avId
+            ) {
+                identities.add(match.unitId!);
+            }
+            if ((++steps & 255) === 0) yield;
+        }
+        // Repeated hits in one cell are safe; multiple group instances are not.
+        if (identities.size === 1) avAlias = avId;
+    }
     const old = options.previousMatches;
     let unchanged = Boolean(old);
     for (let index = 0; index < matches.length; index++) {
         if ((++steps & 255) === 0) yield;
         const match = matches[index];
-        if (!sameAnchorUnit(match, previous)) continue;
+        if (!sameAnchorUnit(match, previous, avAlias)) continue;
         // 词级 Range 已证明身份时，不再遍历旧快照。备注枚举 Range 无法区分宿主内命中。
         if (match.matchedText === previous.matchedText && sameLiveTextRange(match, previous, options.edit)) {
             return index + 1;
         }
         if (unchanged && old) {
-            while (oldCursor < old.length && !sameAnchorUnit(old[oldCursor], previous)) {
+            while (oldCursor < old.length && !sameAnchorUnit(old[oldCursor], previous, avAlias)) {
                 oldCursor++;
                 if ((++steps & 255) === 0) yield;
             }
@@ -88,7 +106,7 @@ function* retainedMatchIndex(
     if (unchanged && unchangedIndex && old) {
         while (oldCursor < old.length) {
             if ((++steps & 255) === 0) yield;
-            if (sameAnchorUnit(old[oldCursor++], previous)) {
+            if (sameAnchorUnit(old[oldCursor++], previous, avAlias)) {
                 unchanged = false;
                 break;
             }
@@ -125,8 +143,9 @@ function sameLiveTextRange(match: SearchMatch, previous: SearchMatch, edit?: Ele
     }
 }
 
-function sameAnchorUnit(match: SearchMatch, previous: SearchMatch): boolean {
+function sameAnchorUnit(match: SearchMatch, previous: SearchMatch, avAlias?: string): boolean {
     if (match.blockId !== previous.blockId) return false;
+    if (previous.embeddedAvViewId !== undefined && match.embeddedAvViewId !== previous.embeddedAvViewId) return false;
     if (
         !previous.unitId?.startsWith("embed:") && previous.highlightKind === "inline-math" &&
         previous.mathOrdinal !== undefined && previous.mathUnitText !== undefined
@@ -141,7 +160,10 @@ function sameAnchorUnit(match: SearchMatch, previous: SearchMatch): boolean {
         return match.highlightKind === "inline-memo" && match.anchorOffset === previous.anchorOffset &&
             !match.unitId?.startsWith("embed:") && !match.unitId?.startsWith("table-memo:");
     }
-    return match.unitId === previous.unitId;
+    return match.unitId === previous.unitId || Boolean(
+        avAlias && match.embeddedAvViewId === previous.embeddedAvViewId &&
+            avApiUnitId(match.unitId) === avAlias,
+    );
 }
 
 function matchesContext(match: SearchMatch, context: {before: string; after: string;}): boolean {

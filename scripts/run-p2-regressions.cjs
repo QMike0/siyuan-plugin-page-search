@@ -72,6 +72,61 @@ const view = (rows, total = rows.length) => ({rows, rowCount: total, columns: [{
 const raw = {name: "database", views: [{id: "v", name: "view"}]};
 
 async function main() {
+    // Native renderCell formats number/date text before painting. Cold matching
+    // must use that same text, not stored timestamps or unformatted numbers.
+    const stamp = new Date(2026, 9, 12, 9, 5).valueOf();
+    const endStamp = new Date(2026, 9, 13, 10, 6).valueOf();
+    const languageBefore = global.siyuan;
+    global.siyuan = {languages: {_attrView: {
+        dateFormatFullTemplate: "${year}年${month}${day}日",
+        dateMonths: "一月|二月|三月|四月|五月|六月|七月|八月|九月|十月|十一月|十二月",
+    }}};
+    try {
+        const cases = [
+            ["number", "", {content: 1200, formattedContent: "1,200", isNotEmpty: true}, "1,200"],
+            ["number", "", {content: 0, formattedContent: "0", isNotEmpty: true}, "0"],
+            ["number", "", {content: 8, formattedContent: "8"}, "8"],
+            ["number", "", {content: 0, isNotEmpty: false}, ""],
+            ["date", "", {content: stamp, isNotEmpty: true}, "2026-10-12"],
+            ["date", "year-month-day", {content: stamp, isNotEmpty: true, isNotTime: false}, "2026/10/12 09:05"],
+            ["date", "month-day-year", {content: stamp, isNotEmpty: true, isNotTime: true}, "10/12/2026"],
+            ["date", "day-month-year", {content: stamp, isNotEmpty: true, isNotTime: true}, "12/10/2026"],
+            ["date", "full", {content: stamp, isNotEmpty: true, isNotTime: true}, "2026年十月12日"],
+            ["date", "", {content: stamp, content2: endStamp, hasEndDate: true, isNotEmpty: true, isNotEmpty2: true}, "2026-10-122026-10-13"],
+            ["created", "full", {content: stamp, isNotEmpty: true, formattedContent: "原生时间"}, "原生时间"],
+            ["updated", "day-month-year", {content: stamp, isNotEmpty: true}, "12/10/2026"],
+            ["updated", "", {content: 0, isNotEmpty: true}, ""],
+        ];
+        for (const [type, dateFormat, value, expected] of cases) {
+            av.invalidateAvCache();
+            api = async url => ({code: 0, data: url.endsWith("getAttributeView") ? raw : {view: {
+                columns: [{id: "k", type, dateFormat}, {id: "hidden", type, dateFormat, hidden: true}],
+                rowCount: 1, rows: [{id: "row", cells: [
+                    {value: {keyID: "k", type, [type]: value}},
+                    {value: {keyID: "hidden", type, [type]: value}},
+                ]}],
+            }}});
+            const cells = (await av.loadAvUnits([ref()])).filter(unit => unit.unitId.startsWith("av:"));
+            assert.deepEqual(cells.map(cell => cell.text), expected ? [expected] : [], type + "/" + dateFormat);
+            if (expected) {
+                const host = document.createElement("div");
+                host.innerHTML = '<div class="av" data-node-id="b" data-type="NodeAttributeView"><div class="av__row" data-id="row"><div class="av__cell" data-col-id="k"></div></div></div>';
+                host.querySelector(".av__cell").textContent = expected;
+                document.body.appendChild(host);
+                const live = blocks.collectSearchableBlocks(host, {
+                    includeAttributeView: true, scopeRoots: [host.firstElementChild],
+                });
+                const hits = matcher.matchTextUnitsDetailed(cells, expected).hits;
+                const rebound = project.fillLiveRanges(hits, live, true);
+                assert.equal(rebound[0].range?.toString(), expected, "formatted cold offset binds to native DOM");
+                host.remove();
+            }
+        }
+    } finally {
+        global.siyuan = languageBefore;
+        av.invalidateAvCache();
+    }
+    console.log("AV native number/date display and cold-to-DOM offsets OK");
     const metaModule = source("frontend/corpus/meta");
     const orderModule = source("frontend/corpus/order");
     for (const invalidation of ["root", "all", "other", "abort"]) {
@@ -331,17 +386,23 @@ async function main() {
     );
     const grouped = (body) => ({
         view: {
+            columns: [{id: "k", name: "column"}],
             groups: [
-                {id: "g1", ...view(body.groupPaging.g1 ? [row("last")] : pageRows, 201)},
-                {id: "g2", ...view([row("last")], 1)},
+                {id: "g1", ...view(body.groupPaging.g1 ? [row("last")] : pageRows, 201), columns: null},
+                {id: "g2", ...view([row("last")], 1), columns: null},
             ],
         },
     });
     const groupComplete = await checkPages(grouped);
     assert.equal(
-        groupComplete.filter((unit) => unit.unitId.startsWith("av:")).length,
-        201,
-        "same row in multiple groups is legal and cells retain one identity",
+        groupComplete.filter((unit) => unit.unitId.startsWith("av-group:")).length,
+        202,
+        "same row in multiple groups retains each displayed instance",
+    );
+    assert.deepEqual(
+        groupComplete.slice(-2).map(unit => unit.unitId),
+        ["av-group:g1:last:k", "av-group:g2:last:k"],
+        "all pages of the first group precede the next group",
     );
     await checkPages((body) => {
         const data = grouped(body);
@@ -358,6 +419,119 @@ async function main() {
         if (body.groupPaging.g1) data.view.groups[0].rowCount = 202;
         return data;
     }, true);
+    let visibleGroupRequests = 0;
+    const visibleGroups = await checkPages(body => {
+        visibleGroupRequests++;
+        assert.equal(body.groupPaging.hidden, undefined, "hidden group never requests another page");
+        return {
+            view: {
+                columns: [{id: "k"}],
+                groups: [
+                    {id: "hidden", groupHidden: 2, ...view(pageRows, 201), columns: null},
+                    {id: "visible", groupHidden: 0, ...view([row("i", "visible")]), columns: null},
+                    {id: "folded", groupHidden: 0, groupFolded: true, ...view([row("i", "folded")]), columns: null},
+                ],
+            },
+        };
+    });
+    assert.equal(visibleGroupRequests, 1, "201 hidden rows need no additional request");
+    assert.deepEqual(
+        visibleGroups.filter(unit => unit.unitId.startsWith("av-group:")).map(unit => [unit.unitId, unit.text]),
+        [["av-group:visible:i:k", "visible"], ["av-group:folded:i:k", "folded"]],
+        "hidden groups are excluded while visible folded groups keep their search instances",
+    );
+    const namedGroups = await checkPages(() => ({view: {
+        columns: [{id: "k"}],
+        groups: [
+            {id: "text", name: " 文本组 ", groupValue: {type: "text"}, ...view([row("i", "body")])},
+            {id: "multi", name: "not-visible", groupValue: {type: "mSelect", mSelect: [{content: "甲"}, {content: "乙"}]}, ...view([])},
+            {id: "select", name: "not-visible", groupValue: {type: "select", mSelect: [{content: "选项"}]}, ...view([])},
+            {id: "check", name: "not-visible", groupValue: {type: "checkbox", checkbox: {checked: true}}, ...view([])},
+            {id: "hidden", name: "not-visible", groupHidden: 2, ...view([])},
+        ],
+    }}));
+    assert.deepEqual(namedGroups.filter(unit => unit.unitId.startsWith("group-title:")).map(unit => [unit.unitId, unit.text]), [
+        ["group-title:text", " 文本组 "], ["group-title:multi", "甲乙"], ["group-title:select", "选项"],
+    ], "group names follow native chips/icons/visibility, preserving offsets and whitespace");
+    assert.ok(namedGroups.findIndex(unit => unit.unitId === "group-title:text") <
+        namedGroups.findIndex(unit => unit.unitId === "av-group:text:i:k"), "group names precede their own rows");
+    const hiddenGroups = [1, 2].map(groupHidden => {
+        const group = {id: "hidden" + groupHidden, groupHidden, rowCount: groupHidden === 1 ? 0 : 201};
+        Object.defineProperty(group, "rows", {
+            get: () => {
+                throw new Error("hidden group rows were traversed");
+            },
+        });
+        return group;
+    });
+    const allHidden = await checkPages(() => ({view: {groups: hiddenGroups}}));
+    assert.deepEqual(allHidden.map(unit => unit.unitId), ["av-title", "av-view:v"], "all-hidden view completes");
+    const mixedHidden = await checkPages(body => ({
+        view: {
+            columns: [{id: "k", name: "column"}],
+            groups: [...hiddenGroups, ...grouped(body).view.groups],
+        },
+    }));
+    assert.deepEqual(mixedHidden, groupComplete, "hidden groups do not disturb visible pagination or order");
+    for (const transition of ["hide", "reveal"]) {
+        await checkPages(body => {
+            const data = grouped(body);
+            if (transition === "hide" && body.groupPaging.g1) data.view.groups[0].groupHidden = 2;
+            if (transition === "reveal") {
+                data.view.groups.push({
+                    id: "new-visible",
+                    groupHidden: body.groupPaging.g1 ? 0 : 2,
+                    ...view([row("i")]),
+                });
+            }
+            return data;
+        }, true);
+    }
+    console.log(
+        "P2 hidden/empty-hidden groups skip traversal and pagination; folded groups, order and visibility races OK",
+    );
+    for (const layout of ["table", "list", "gallery", "kanban", "calendar"]) {
+        for (const selected of ["v", "v2", "", "deleted-view"]) {
+            av.invalidateAvCache();
+            let titleRequests = 0;
+            const carrier = {...ref(), carrierViewId: selected};
+            api = async (url, body) => {
+                titleRequests++;
+                if (url.endsWith("getAttributeView")) {
+                    return {
+                        code: 0,
+                        data: {name: "database", views: [{id: "v", name: "view"}, {id: "v2", name: "other"}]},
+                    };
+                }
+                assert.equal(body.viewID, selected === "v2" ? "v2" : "v");
+                return {
+                    code: 0,
+                    data: {view: {...view([row("i", "cell")]), type: layout, hideAttrViewName: body.viewID === "v"}},
+                };
+            };
+            const titleUnits = await av.loadAvUnits([carrier]);
+            assert.deepEqual(
+                titleUnits.map(unit => unit.unitId),
+                selected === "v2" ? ["av-title", "av-view:v2", "av:i:k"] : ["av-view:v", "av:i:k"],
+                "title visibility follows the selected/fallback rendered view: " + layout + "/" + selected,
+            );
+            await av.loadAvUnits([carrier]);
+            assert.equal(titleRequests, 2, "name visibility reuses render metadata and cache");
+        }
+    }
+    av.invalidateAvCache();
+    api = async url => ({
+        code: 0,
+        data: url.endsWith("getAttributeView") ?
+            {name: "database", views: []} :
+            {view: {...view([]), hideAttrViewName: true}},
+    });
+    assert.deepEqual(
+        await av.loadAvUnits([ref()]),
+        [],
+        "fallback render without view metadata also excludes hidden title",
+    );
+    console.log("P2 AV title visibility: all layouts, selected/default/stale/empty view, ordering and cache OK");
     const controller = new AbortController();
     av.invalidateAvCache();
     api = async (url, body) => {
@@ -378,6 +552,32 @@ async function main() {
         assert.equal(av.peekAvUnits([ref()]).missing.length, 1, "late invalidated task cannot refill cache");
     }
     console.log("P2 AV missing view, duplicate rows, totals, group independence/completeness and cancellation OK");
+
+    av.invalidateAvCache();
+    const hiddenValue = {keyID: "hidden"};
+    Object.defineProperty(hiddenValue, "text", {
+        get: () => {
+            throw new Error("hidden value was traversed");
+        },
+    });
+    const rawMetadata = {...raw};
+    Object.defineProperty(rawMetadata, "keyValues", {
+        get: () => {
+            throw new Error("raw values were traversed");
+        },
+    });
+    api = async url => ({
+        code: 0,
+        data: url.endsWith("getAttributeView") ? rawMetadata : {
+            view: {
+                ...view([{id: "i", cells: [row("i", "visible").cells[0], {value: hiddenValue}]}]),
+                columns: [{id: "k", hidden: false}, {id: "hidden", hidden: true}],
+            },
+        },
+    });
+    const filtered = await av.loadAvUnits([ref()]);
+    assert.deepEqual(filtered.filter(unit => unit.unitId.startsWith("av:")).map(unit => unit.text), ["visible"]);
+    console.log("P2 hidden/raw values skip text extraction and retention OK");
 
     av.invalidateAvCache();
     av.pinAvCache("large", [ref()], new Map());

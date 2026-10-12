@@ -10,6 +10,10 @@ import {
 } from "../blocks";
 import type {CollectSearchableBlocksOptions} from "../blocks";
 import type {SearchableBlock} from "../dom-types";
+import {
+    createEmbeddedSourceReader,
+    recordEmbeddedOrder,
+} from "../embedded-order";
 import {isUnderNonHeadingCssFold} from "../fold-dom";
 import {
     DIAGRAM_SUBTYPE_SET,
@@ -100,6 +104,48 @@ function keepOwnedUnits(blocks: SearchableBlock[], ownerId: string, embed: boole
         return blocks.filter((block) => block.blockId === ownerId);
     }
     return blocks.map((block) => ownEmbeddedSearchUnit(block, ownerId));
+}
+
+/** Keep carrier references, not field values, in the embed's versioned DOM cache. */
+export function collectEmbeddedAvCarriers(
+    owner: HTMLElement,
+    options: CollectSearchableBlocksOptions,
+): {blocks: SearchableBlock[]; incomplete: boolean;} {
+    const blocks: SearchableBlock[] = [];
+    if (options.includeAttributeView === false) return {blocks, incomplete: false};
+    const accepts = createRendererElementFilter(options);
+    const sourceOf = createEmbeddedSourceReader();
+    let incomplete = false;
+    for (const element of owner.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"]')) {
+        // The carrier is only a reference to the source database.  Even a partly
+        // mounted AV still needs its unloaded rows from the paged API; mounted
+        // cells are filtered later from the live coverage map.
+        if (!accepts(element)) continue;
+        const blockId = element.dataset.nodeId?.trim();
+        const avId = element.dataset.avId?.trim();
+        if (!blockId || !avId) {
+            incomplete = true;
+            continue;
+        }
+        blocks.push({
+            blockId,
+            blockType: "NodeAttributeView",
+            blockIndex: 0,
+            element,
+            text: "",
+            textNodes: [],
+            unitId: "av-carrier",
+            embeddedSourceId: sourceOf(element, blockId),
+            embeddedAvRef: {
+                blockId,
+                avId,
+                updated: element.getAttribute("updated") ?? "",
+                carrierViewId: element.getAttribute("custom-sy-av-view")?.trim() ||
+                    element.querySelector<HTMLElement>(".av__views .item--focus")?.dataset.id?.trim() || "",
+            },
+        });
+    }
+    return {blocks, incomplete};
 }
 
 export function rendererOutputCompleted(element: HTMLElement): boolean {
@@ -310,6 +356,14 @@ export async function extractUnitsFromDoms(
                     includeAttributeView: false,
                 }) :
                 collected;
+            if (embedIds.has(id) && options.includeAttributeView !== false && !recoveryAttribute) {
+                const carriers = collectEmbeddedAvCarriers(owner, options);
+                if (carriers.incomplete) unrendered.add(id);
+                if (carriers.blocks.length) {
+                    sourceBlocks.push(...carriers.blocks);
+                    recordEmbeddedOrder(owner, sourceBlocks);
+                }
+            }
             if (embedIds.has(id) && mode !== "none") {
                 const incomplete = new Set<string>();
                 const bySource = new Map<HTMLElement, SearchableBlock[]>();
@@ -383,7 +437,7 @@ export async function extractUnitsFromDoms(
                     !isRendererUnitId(block.unitId) &&
                     (block.blockType === "NodeParagraph" || block.blockType === "NodeHeading" ||
                         block.blockType === "NodeCodeBlock" || block.blockType === "NodeTable");
-                if (!(ordinaryText ? text.length : text.trim().length)) {
+                if (!block.embeddedAvRef && !(ordinaryText ? text.length : text.trim().length)) {
                     continue;
                 }
                 blocks.push(block);

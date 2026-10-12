@@ -128,7 +128,8 @@ async function diagramRegressions() {
     // Keep real observers/pipeline/state guards; shorten only the shared 400ms user-input delay.
     const originalTimeout = window.setTimeout.bind(window);
     window.setTimeout = (callback, delay, ...args) => originalTimeout(callback, delay === 400 ? 15 : delay, ...args);
-    const settle = () => new Promise(resolve => originalTimeout(resolve, 45));
+    // Allow observer, debounce and budgeted paint turns to finish on slower hosts.
+    const settle = () => new Promise(resolve => originalTimeout(resolve, 300));
     try {
         for (const language of ["mermaid", "flowchart"]) {
             const bar = pipelineFixture("dynamic-" + language);
@@ -402,7 +403,7 @@ async function diagramRegressions() {
 async function embedRefreshRegressions() {
     const originalTimeout = window.setTimeout.bind(window);
     window.setTimeout = (callback, delay, ...args) => originalTimeout(callback, delay === 400 ? 15 : delay, ...args);
-    const settle = () => new Promise(resolve => originalTimeout(resolve, 100));
+    const settle = () => new Promise(resolve => originalTimeout(resolve, 300));
     const child = '<div data-node-id="source" data-type="NodeParagraph"><div contenteditable="true">foo</div></div>';
     try {
         for (
@@ -556,6 +557,368 @@ async function embedRefreshRegressions() {
         window.setTimeout = originalTimeout;
     }
     console.log("embedded async text/formula/zero-hit/removal, merged overflow, busy and identical/disabled gates OK");
+}
+
+async function embeddedAvMountRegressions() {
+    const originalTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (callback, delay, ...args) => originalTimeout(callback, delay === 400 ? 15 : delay, ...args);
+    const settle = () => new Promise(resolve => originalTimeout(resolve, 300));
+    const row = id =>
+        '<div class="av__row" data-id="row' + id + '"><div class="av__cell" data-col-id="col">foo</div></div>';
+    try {
+        for (const mode of ["full", "groups", "degraded", "selection"]) {
+            const fullCoverage = mode === "full" || mode === "groups";
+            const mountedBody = () =>
+                mode === "groups" ?
+                    '<div class="av__items">' + [0, 1, 2].map(index =>
+                        '<div class="av__body" data-group-id="g' + index + '">' +
+                        (index === 0 ? row(0) : "") + "</div>"
+                    ).join("") + "</div>" :
+                    '<div class="av__body">' + row(0) + "</div>";
+            const bar = pipelineFixture("embed-av-mount-" + mode);
+            bar.avWatchPausedUntil = 0;
+            bar.restrictInlineTypes = [];
+            bar.includeAttributeView = true;
+            bar.selectionOnly = mode === "selection";
+            bar.resolveScopeForSearch = () => new Map();
+            const root = bar.edit.querySelector(".protyle-wysiwyg");
+            root.innerHTML = '<div data-node-id="embed" data-type="NodeBlockQueryEmbed">' +
+                '<div data-node-id="source-av" data-type="NodeAttributeView" data-av-id="av-id">' +
+                '<div class="av__title">database</div>' + mountedBody() + "</div></div>";
+            const body = root.querySelector(mode === "groups" ? ".av__items" : ".av__body");
+            const fullMatches = [0, 1, 2].map(index => ({
+                ...textMatches(
+                    "foo",
+                    "embed",
+                    mode === "groups" ?
+                        "embed:source-av:av-group:g" + index + ":row0:col" :
+                        "embed:source-av:av:row" + index + ":col",
+                )[0],
+                blockType: "NodeBlockQueryEmbed",
+                replaceable: false,
+            }));
+            const collect = source("frontend/blocks").collectSearchableBlocks;
+            const projection = source("frontend/corpus/project");
+            bar.runSearchPipeline = async () => {
+                const live = collect(bar.edit, {includeAttributeView: true});
+                bar.embedSearchState.capture(live);
+                bar.diagramRefreshPending = false;
+                return {
+                    matches: fullCoverage ?
+                        projection.projectRanges(bar.edit, fullMatches, {}, live) :
+                        projection.projectRanges(
+                            bar.edit,
+                            live.filter(block => block.text === "foo").flatMap(block =>
+                                textMatches(block.text, block.blockId, block.unitId)
+                            ),
+                            {},
+                            live,
+                        ),
+                    error: "",
+                    degraded: mode === "degraded",
+                };
+            };
+            let searches = 0;
+            const highlight = bar.highlightHitResult.bind(bar);
+            bar.highlightHitResult = (...args) => {
+                searches++;
+                return highlight(...args);
+            };
+            await bar.highlightHitResult("foo", true);
+            bar.stopEditorDomWatch = watchEditorDom(bar.edit, {
+                onMutate: () => {
+                    bar.domEpoch++;
+                    bar.repairRangeAbort?.abort();
+                },
+                onSettled: change => bar.onEditorDomSettled(change),
+            }, 1);
+            for (const index of [1, 2]) {
+                bar.pauseAvWatch(2000);
+                if (mode === "groups") {
+                    body.querySelectorAll(".av__body").forEach((group, groupIndex) => {
+                        group.innerHTML = '<div class="av__spacer"></div>' +
+                            (groupIndex === index ? row(0).replace(">foo<", "><") : "");
+                    });
+                } else {
+                    body.innerHTML = '<div class="av__spacer"></div>' + row(index).replace(">foo<", "><");
+                }
+                body.querySelector(".av__cell").insertAdjacentHTML("beforeend", '<span class="av__rich">foo</span>');
+                await settle();
+                assert.equal(
+                    searches,
+                    fullCoverage ? 1 : index + 1,
+                    mode + " virtual mounts refresh only when needed",
+                );
+                if (fullCoverage) {
+                    assert.equal(bar.resultCount, 3, "virtual rows do not alter full API coverage");
+                    assert.equal(bar.resultMatches[index].range?.toString(), "foo", "new row receives its cold Range");
+                    assert.ok(
+                        bar.resultMatches.filter((_match, rowIndex) => rowIndex !== index).every(match => !match.range),
+                        "unmounted AV cells release detached ranges rather than retaining old row trees",
+                    );
+                }
+            }
+            const beforeMixed = searches;
+            body.querySelector(".av__rich").firstChild.data = "changed";
+            const additional = mode === "groups" ? body.querySelector('[data-group-id="g1"]') : body;
+            additional.insertAdjacentHTML("beforeend", row(mode === "groups" ? 0 : 1));
+            await settle();
+            assert.equal(searches, beforeMixed + 1, "mixed virtual mounts and retained-row edits still refresh");
+            const beforeTextEdit = searches;
+            body.querySelector(".av__rich").firstChild.data = "bar";
+            await settle();
+            assert.equal(searches, beforeTextEdit + 1, "real cell text edits still refresh during navigation pause");
+            const beforeTitleEdit = searches;
+            root.querySelector(".av__title").firstChild.data = "changed";
+            await settle();
+            assert.equal(searches, beforeTitleEdit + 1, "database title edits are not virtual mounts");
+            const beforeRemoval = searches;
+            root.querySelector('[data-type="NodeAttributeView"]').remove();
+            await settle();
+            assert.equal(searches, beforeRemoval + 1, "removing the carrier still refreshes the embed");
+            bar.destroy();
+        }
+    } finally {
+        window.setTimeout = originalTimeout;
+    }
+    console.log(
+        "embedded AV virtual mounts repair only full-coverage ranges; edits, degraded and selection still refresh OK",
+    );
+}
+
+async function galleryNavigationRegressions() {
+    const originalRect = window.Range.prototype.getBoundingClientRect;
+    window.Range.prototype.getBoundingClientRect = () => ({top: 0, bottom: 20, left: 0, right: 100});
+    const markup = (id = "source-av") =>
+        '<div class="av" data-node-id="' + id + '" data-type="NodeAttributeView" custom-sy-av-view="v">' +
+        ["target", "other"].map(group =>
+            '<div class="av__group-title"><button data-type="av-group-fold" data-id="' + group +
+            '"><svg></svg></button><span class="av__group-name">foo</span></div><div class="av__body fn__none" data-group-id="' + group +
+            '"><div class="av__gallery-item" data-id="row"><div class="av__cell" data-field-id="col">foo</div></div></div>'
+        ).join("") + '</div>';
+    const setup = (embedded, local = "av-group:target:row:col", mounted = true) => {
+        const bar = fixture("gallery-nav");
+        last = bar.root;
+        Object.assign(bar, {
+            includeFoldedBlocks: true, includeAttributeView: true, includeEmbedBlock: true,
+            avWatchPausedUntil: 0, indexResetPausedUntil: 0,
+            repairHighlightRanges: () => {}, syncReplaceButtons: () => {},
+            bindUnfoldedHeadingSection: () => {},
+        });
+        const root = bar.edit.querySelector(".protyle-wysiwyg");
+        root.innerHTML = mounted ? (embedded ?
+            '<div data-node-id="embed" data-type="NodeBlockQueryEmbed">' + markup() + '</div>' +
+            '<div data-node-id="other-embed" data-type="NodeBlockQueryEmbed">' + markup() + '</div>' :
+            markup("ordinary-av")) : "";
+        if (local.endsWith("#run-0")) {
+            // Split-run identities require a genuinely split DOM cell.
+            root.querySelectorAll(".av__cell").forEach(cell => cell.innerHTML = "foo<br>tail");
+        }
+        bar.resultMatches = [{
+            ...textMatches("foo", embedded ? "embed" : "ordinary-av", embedded ? "embed:source-av:" + local : local)[0],
+            blockType: embedded ? "NodeBlockQueryEmbed" : "NodeAttributeView", replaceable: false,
+            embeddedAvViewId: embedded ? "v" : undefined,
+        }];
+        let clicks = 0;
+        let groupScrolls = 0;
+        const wire = () => {
+            root.querySelectorAll('[data-type="NodeAttributeView"]').forEach(av => {
+                Object.defineProperty(av, "clientHeight", {value: 100});
+                av.scrollIntoView = () => assert.fail("group navigation should scroll its group, not the entire database");
+            });
+            root.querySelectorAll(".av__group-title").forEach(title => title.scrollIntoView = () => groupScrolls++);
+            root.querySelectorAll('[data-type="av-group-fold"]').forEach(fold => fold.addEventListener("click", () => {
+                clicks++;
+                fold.firstElementChild.classList.add("av__group-arrow--open");
+                fold.closest(".av__group-title").nextElementSibling.classList.remove("fn__none");
+            }));
+        };
+        wire();
+        return {bar, root, wire, clicks: () => clicks, groupScrolls: () => groupScrolls};
+    };
+    try {
+        for (const embedded of [false, true]) {
+            for (const local of ["group-title:target", "av-group:target:row:col", "cell:target:row:col", "cell:target:row:col#run-0"]) {
+                const test = setup(embedded, local);
+                const {bar, root} = test;
+                await bar.scrollIntoRangesAsync(0, false);
+                assert.equal(test.clicks(), 0, "painting alone never unfolds a group");
+                await bar.scrollIntoRangesAsync(0, true);
+                assert.equal(test.clicks(), 1, "exactly the target native fold control is clicked");
+                assert.equal(bar.resultMatches[0].range?.toString(), "foo", `${embedded}:${local}`);
+                if (local !== "group-title:target") {
+                    assert.equal(bar.resultMatches[0].range.startContainer.parentElement.closest("[data-group-id]").dataset.groupId, "target");
+                }
+                assert.equal(CSS.highlights.get(bar.getComponentHighlights().focusName)?.size, 1);
+                assert.ok(root.querySelector('.av__body[data-group-id="other"]').classList.contains("fn__none"));
+                if (embedded) assert.ok(root.querySelector('[data-node-id="other-embed"] .av__body').classList.contains("fn__none"));
+                await bar.scrollIntoRangesAsync(0, true);
+                assert.equal(test.clicks(), 1, "revisiting an unfolded group never toggles it closed");
+                bar.destroy();
+            }
+            const virtual = setup(embedded, "av-group:target:unmounted:col");
+            if (embedded) Object.defineProperty(virtual.root.firstElementChild, "clientHeight", {value: 100});
+            await virtual.bar.scrollIntoRangesAsync(0, true);
+            assert.equal(virtual.clicks(), 1);
+            assert.equal(virtual.groupScrolls(), 1, "unmounted cards fall back to the target group");
+            assert.equal(virtual.bar.resultMatches.length, 1, "unmounted cards retain their search result");
+            assert.equal(virtual.bar.resultMatches[0].range, undefined);
+            assert.equal(CSS.highlights.has(virtual.bar.getComponentHighlights().focusName), false);
+            virtual.bar.destroy();
+        }
+        const duplicate = setup(true);
+        const copied = duplicate.root.querySelector('[data-node-id="source-av"]').cloneNode(true);
+        duplicate.root.firstElementChild.append(copied);
+        duplicate.wire();
+        duplicate.bar.resultMatches[0].unitId = "embed:source-av@1:av-group:target:row:col";
+        await duplicate.bar.scrollIntoRangesAsync(0, true);
+        assert.equal(duplicate.clicks(), 1, "duplicate source copies use their displayed instance ID");
+        assert.ok(duplicate.root.firstElementChild.firstElementChild.querySelector('.av__body').classList.contains("fn__none"));
+        assert.equal(duplicate.bar.resultMatches[0].range?.startContainer.parentElement.closest('[data-node-id="source-av"]'), copied);
+        duplicate.bar.destroy();
+
+        for (const layout of ["table", "list"]) {
+            const asyncTable = setup(false);
+            const asyncAv = asyncTable.root.firstElementChild;
+            asyncAv.dataset.avType = layout;
+            const asyncBody = asyncAv.querySelector('.av__body[data-group-id="target"]');
+            asyncBody.replaceChildren();
+            asyncAv.querySelector('[data-type="av-group-fold"]').addEventListener("click", () => {
+                window.setTimeout(() => {
+                    asyncBody.innerHTML = '<div class="av__row" data-id="row"><div class="av__cell" data-col-id="col">foo</div></div>';
+                }, 30);
+            });
+            await asyncTable.bar.scrollIntoRangesAsync(0, true);
+            assert.equal(asyncTable.bar.resultMatches[0].range?.toString(), "foo", "native async " + layout + " mounting binds without reindex");
+            assert.equal(CSS.highlights.get(asyncTable.bar.getComponentHighlights().focusName)?.size, 1);
+            asyncTable.bar.destroy();
+        }
+        for (const embedded of [false, true]) {
+            const sequence = setup(embedded, "group-title:target");
+            const titleMatch = sequence.bar.resultMatches[0];
+            const rowMatch = {...textMatches("foo", titleMatch.blockId,
+                embedded ? "embed:source-av:av-group:target:row:col" : "av-group:target:row:col")[0],
+                blockType: titleMatch.blockType, replaceable: false, embeddedAvViewId: titleMatch.embeddedAvViewId};
+            sequence.bar.resultMatches.push(rowMatch);
+            sequence.bar.resultCount = 2;
+            await sequence.bar.scrollIntoRangesAsync(0, true);
+            assert.equal(sequence.clicks(), 1);
+            const targetBody = sequence.bar.attributeViewGroupBody(titleMatch);
+            const targetFold = targetBody.previousElementSibling.querySelector('[data-type="av-group-fold"]');
+            targetBody.classList.add("fn__none");
+            targetFold.firstElementChild.classList.remove("av__group-arrow--open");
+            sequence.bar.resultIndex = 2;
+            await sequence.bar.scrollIntoRangesAsync(1, true);
+            assert.equal(sequence.clicks(), 2, "title-to-entry navigation unfolds a refolded target group");
+            assert.equal(sequence.bar.resultMatches[1].range?.toString(), "foo");
+            assert.equal(sequence.bar.resultMatches[1].range.startContainer.parentElement.closest("[data-group-id]"), targetBody);
+            sequence.bar.destroy();
+        }
+
+        const wrongView = setup(true);
+        wrongView.bar.resultMatches[0].embeddedAvViewId = "different-view";
+        assert.equal(wrongView.bar.unfoldAttributeViewGroup(wrongView.bar.resultMatches[0]), false);
+        assert.equal(wrongView.clicks(), 0, "stale-view matches cannot expand the new view");
+        wrongView.bar.destroy();
+
+        const loadedLater = setup(false, "av-group:target:row:col", false);
+        const later = loadedLater.bar.finishLocatedMatch(1, true);
+        window.setTimeout(() => {
+            loadedLater.root.innerHTML = markup("ordinary-av");
+            loadedLater.wire();
+        }, 10);
+        await later;
+        assert.equal(loadedLater.clicks(), 1, "after outer-block loading the target group is unfolded");
+        assert.equal(loadedLater.bar.resultMatches[0].range?.toString(), "foo");
+        loadedLater.bar.destroy();
+
+        for (const cancel of ["query", "navigate"]) {
+            const test = setup(false, "av-group:target:row:col", false);
+            test.bar.highlightHitResult = async () => assert.fail("cancelled locating must not reindex");
+            const waiting = test.bar.finishLocatedMatch(1, true);
+            window.setTimeout(() => {
+                if (cancel === "query") test.bar.searchGeneration++;
+                else test.bar.resultIndex = 2;
+                test.root.innerHTML = markup("ordinary-av");
+                test.wire();
+            }, 10);
+            await waiting;
+            assert.equal(test.clicks(), 0, "cancelled locating cannot unfold the old target");
+            test.bar.destroy();
+        }
+        const cancelledScroll = setup(false);
+        const scrolling = cancelledScroll.bar.scrollIntoRangesAsync(0, true);
+        cancelledScroll.bar.searchGeneration++;
+        await scrolling;
+        assert.equal(cancelledScroll.bar.resultMatches[0].range, undefined, "old layout waits cannot paint the new query");
+        cancelledScroll.bar.destroy();
+    } finally {
+        window.Range.prototype.getBoundingClientRect = originalRect;
+    }
+    console.log("ordinary/embedded gallery navigation: native unfold, exact highlight, late loading, virtual fallback and cancellation OK");
+}
+
+async function avFoldCacheRegressions() {
+    const av = source("frontend/corpus/av");
+    const {isAttrViewFoldOnlyTransaction} = source("frontend/av-watch");
+    const fold = {action: "foldAttrViewGroup", avID: "a"};
+    const edit = {action: "updateAttrViewCell", avID: "a"};
+    const event = (doOperations, undoOperations = []) => ({cmd: "transactions", data: [{doOperations, undoOperations}]});
+    for (const detail of [event([fold]), event([{...fold, action: "foldAttrViewGroups"}], [fold])]) {
+        assert.equal(isAttrViewFoldOnlyTransaction(detail), true);
+    }
+    for (const detail of [null, {}, event([]), event([fold, edit]), event([fold], [edit]), event([{action: "unknown"}])]) {
+        assert.equal(isAttrViewFoldOnlyTransaction(detail), false, "mixed/unknown/empty transactions retain invalidation");
+    }
+    const oldLoad = Module._load;
+    const oldScss = require.extensions[".scss"];
+    Module._load = function(request, parent, main) {
+        const loaded = oldLoad.call(this, request, parent, main);
+        return request === "siyuan" ? {...loaded, Plugin: class {}} : loaded;
+    };
+    require.extensions[".scss"] = () => {};
+    try {
+        const plugin = new (source("index").default)();
+        const bar = fixture("fold-cache");
+        bar.edit.querySelector(".protyle-wysiwyg").innerHTML = '<div data-type="NodeAttributeView" data-av-id="a"></div>';
+        Object.assign(bar, {
+            includeAttributeView: true, avWatchPausedUntil: 0,
+            highlightHitResult: async () => bar.resultMatches,
+        });
+        const ref = {blockId: "b", avId: "a", updated: "u", carrierViewId: "v"};
+        const apiModule = source("frontend/corpus/api");
+        const oldPost = apiModule.postJson;
+        let reads = 0;
+        apiModule.postJson = async url => {
+            reads++;
+            return url.endsWith("getAttributeView") ? {name: "db", views: [{id: "v", name: "view"}]} :
+                {view: {columns: [{id: "k"}], rowCount: 1, rows: [{id: "i", cells: [{value: {keyID: "k", text: {content: "foo"}}}]}]}};
+        };
+        try {
+            for (const detail of [event([fold]), event([fold, edit]), event([fold], [edit])]) {
+                av.invalidateAvCache();
+                await av.loadAvUnits([ref]);
+                const before = reads;
+                plugin.onSearchHistoryBroadcast({detail});
+                bar.onEventBus({detail});
+                assert.equal(av.peekAvUnits([ref]).missing.length, isAttrViewFoldOnlyTransaction(detail) ? 0 : 1);
+                if (isAttrViewFoldOnlyTransaction(detail)) {
+                    await av.loadAvUnits([ref]);
+                    assert.equal(reads, before, "fold-only broadcast and active-search refresh reuse the full text cache");
+                }
+                window.clearTimeout(bar.avRefreshTimer);
+            }
+        } finally {
+            apiModule.postJson = oldPost;
+            bar.destroy();
+            av.invalidateAvCache();
+        }
+    } finally {
+        Module._load = oldLoad;
+        if (oldScss) require.extensions[".scss"] = oldScss;
+        else delete require.extensions[".scss"];
+    }
+    console.log("AV fold-only native broadcasts preserve cache; mixed edits and undo invalidate it OK");
 }
 
 async function anchorRegressions() {
@@ -1077,6 +1440,9 @@ async function main() {
     await lifecycleRegressions();
     await diagramRegressions();
     await embedRefreshRegressions();
+    await embeddedAvMountRegressions();
+    await avFoldCacheRegressions();
+    await galleryNavigationRegressions();
     console.log(
         "p3-regressions OK (component isolation, prompt pane lifecycle, unchanged-unit/live anchors, budget/cancellation/races and existing initial position)",
     );

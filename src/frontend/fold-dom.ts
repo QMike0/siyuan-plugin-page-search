@@ -19,3 +19,11 @@ export function isUnderNonHeadingCssFold(element: Element | null): boolean {
     }
     return false;
 }
+
+/** Native AV gallery bodies keep their cards while folded.  Their lack of a
+ * client rect is a layout state, not author-hidden text. */
+export function foldedAttributeViewGroupBody(element: Element | null): HTMLElement | null {
+    const body = element?.closest<HTMLElement>(".av__body[data-group-id].fn__none");
+    const fold = body?.previousElementSibling?.querySelector<HTMLElement>('[data-type="av-group-fold"]');
+    return body && fold?.dataset.id === body.dataset.groupId ? body : null;
+}

@@ -22,6 +22,8 @@ export interface EditorDomChange {
     diagramBlocks: ReadonlySet<HTMLElement> | null;
     /** 嵌入内容变化的宿主；与新增块数量无关，也覆盖删除和属性文字。 */
     embedBlocks: ReadonlySet<HTMLElement> | null;
+    /** Direct data-row/spacer mounts in AV bodies; full API coverage needs only Range repair. */
+    virtualAvEmbeds?: ReadonlySet<HTMLElement> | null;
 }
 
 export interface EditorDomWatchHandlers {
@@ -49,6 +51,7 @@ export function watchEditorDom(
     let diagramBlocks: Set<HTMLElement> | null = new Set();
     let scannedDiagramTrees = new WeakSet<Element>();
     let embedBlocks: Set<HTMLElement> | null = new Set();
+    let virtualAvEmbeds: Set<HTMLElement> | null = new Set();
     let scannedEmbedTrees = new WeakSet<Element>();
 
     const noteEmbedTree = (element: Element) => {
@@ -85,12 +88,19 @@ export function watchEditorDom(
     };
 
     const flush = () => {
-        const change: EditorDomChange = {addedInBlocks: touched, foldChanged, diagramBlocks, embedBlocks};
+        const change: EditorDomChange = {
+            addedInBlocks: touched,
+            foldChanged,
+            diagramBlocks,
+            embedBlocks,
+            virtualAvEmbeds,
+        };
         touched = new Set();
         foldChanged = false;
         diagramBlocks = new Set();
         scannedDiagramTrees = new WeakSet();
         embedBlocks = new Set();
+        virtualAvEmbeds = new Set();
         scannedEmbedTrees = new WeakSet();
         pendingSince = 0;
         handlers.onSettled(change);
@@ -98,6 +108,7 @@ export function watchEditorDom(
 
     const observer = new MutationObserver((records) => {
         let relevant = false;
+        const virtualAvRows = new WeakSet<Element>();
         for (const record of records) {
             const target = record.target.nodeType === Node.ELEMENT_NODE ?
                 record.target as Element :
@@ -106,11 +117,19 @@ export function watchEditorDom(
                 continue;
             }
             relevant = true;
+            const virtualRow = target.closest(AV_VIRTUAL_ROW_SELECTOR);
+            const virtualAv = isVirtualAvMount(record, target) || Boolean(virtualRow && virtualAvRows.has(virtualRow));
+            if (virtualAv && virtualAvEmbeds) {
+                const owner = target.closest<HTMLElement>(EMBED_BLOCK_SELECTOR);
+                if (owner) virtualAvEmbeds.add(owner);
+                if (virtualAvEmbeds.size > MAX_TOUCHED_BLOCKS) virtualAvEmbeds = null;
+            }
             // SVG 子树只记最近的图表块；不在每个路径/标签突变上扫描整张图。
             const code = target.closest<HTMLElement>('[data-type="NodeCodeBlock"]');
             if (!code || !(code.matches(SOURCE_DIAGRAM_SELECTOR) || handlers.knownDiagram?.(code))) {
                 if (
                     target.closest(EMBED_BLOCK_SELECTOR) &&
+                    !virtualAv &&
                     !target.closest(".protyle-icons, .protyle-attr, .protyle-cursor")
                 ) noteEmbedTree(target);
             }
@@ -135,8 +154,11 @@ export function watchEditorDom(
             if (record.type === "childList" && !code) {
                 for (const nodes of [record.addedNodes, record.removedNodes]) {
                     for (const node of nodes) {
+                        if (virtualAv && node instanceof Element && node.matches(AV_VIRTUAL_ROW_SELECTOR)) {
+                            virtualAvRows.add(node);
+                        }
                         if (node instanceof Element) noteDiagramTree(node);
-                        if (node instanceof Element) noteEmbedTree(node);
+                        if (!virtualAv && node instanceof Element) noteEmbedTree(node);
                         if (!diagramBlocks && !embedBlocks) break;
                     }
                     if (!diagramBlocks && !embedBlocks) break;
@@ -192,6 +214,25 @@ export function watchEditorDom(
  * 超过上限返回 false。
  */
 const EMBED_BLOCK_SELECTOR = '[data-type="NodeBlockQueryEmbed"]';
+const AV_VIRTUAL_ROW_SELECTOR =
+    ".av__row[data-id]:not(.av__row--header):not(.av__row--footer):not(.av__row--util), .av__gallery-item[data-id]";
+
+/** SiYuan virtualScroll.ts mounts/removes complete data rows and spacers directly
+ * in the body. Cell edits, headers and replacing the body itself stay semantic. */
+function isVirtualAvMount(record: MutationRecord, target: Element): boolean {
+    if (
+        record.type !== "childList" || !target.matches(".av__body, .av__gallery, .av__kanban") ||
+        !target.closest('[data-type="NodeAttributeView"]')
+    ) return false;
+    const nodes = [...record.addedNodes, ...record.removedNodes];
+    return nodes.length > 0 && nodes.every(node =>
+        node instanceof Element ?
+            node.matches(
+                `${AV_VIRTUAL_ROW_SELECTOR}, .av__spacer`,
+            ) :
+            node.nodeType === Node.TEXT_NODE && !node.textContent?.trim()
+    );
+}
 
 function addTouchedBlockIds(target: Element, added: NodeList, into: Set<string>): boolean {
     let block = target.closest("[data-node-id]");

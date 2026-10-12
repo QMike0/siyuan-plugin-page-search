@@ -18,6 +18,7 @@ import type {
     TableReplaceLock,
     TableSlot,
 } from "../dom-types";
+import type {AvBlockRef} from "./av";
 
 const HOST_TYPES = new Set<string>(
     RESTRICT_INLINE_TYPE_ALLOWLIST.filter((token) => token !== INLINE_MATH_TYPE && token !== INLINE_MEMO_TYPE),
@@ -31,6 +32,7 @@ export interface CachedUnit {
     text: string;
     unitId?: string;
     embeddedOrder?: readonly EmbeddedOrderSegment[];
+    embeddedAvRef?: AvBlockRef;
     /** Mounted recovery cache: embeddedOrder is relative to this renderer's current anchor. */
     embeddedRecoveryKey?: string;
     segmentLengths?: number[];
@@ -174,6 +176,7 @@ export function freezeBlock(
         text: block.text,
         unitId: block.unitId,
         embeddedOrder: block.embeddedOrder,
+        embeddedAvRef: block.embeddedAvRef,
         segmentLengths: lengths?.some((length) => length > 0) ? lengths : undefined,
         highlightKind,
         restrictSpans: includeRestrict ? collectRestrictSpans(block) : [],
