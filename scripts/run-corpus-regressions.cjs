@@ -2288,6 +2288,9 @@ async function main() {
                 const cold = await settle("galleryKeyword", options);
                 full(cold);
                 assert.equal(cold.matches.length, 202, "all pages of visible and folded groups are searched");
+                const withoutDocumentFolds = {...options, includeFoldedBlocks: false};
+                assert.equal((await search("galleryKeyword", withoutDocumentFolds)).matches.length, 202,
+                    "database group folding is independent of the document fold switch");
                 assert.equal((await search("secretKeyword", options)).matches.length, 0);
                 assert.equal((await search("NameKeyword", options)).matches.length, 2, "cold visible group names are searchable");
                 const beforeMount = reads;
@@ -2308,6 +2311,11 @@ async function main() {
                 full(mounted);
                 assert.equal(mounted.matches.length, 202, "folded mounted cards must not erase API matches");
                 assert.equal(mounted.matches.filter(match => match.range).length, 1);
+                const mountedWithoutDocumentFolds = await search("galleryKeyword", withoutDocumentFolds);
+                full(mountedWithoutDocumentFolds);
+                assert.equal(mountedWithoutDocumentFolds.matches.length, 202,
+                    "disabling document folds must not silently discard mounted folded cards");
+                assert.equal(mountedWithoutDocumentFolds.matches.filter(match => match.range).length, 1);
                 const ordered = await search("NameKeyword|galleryKeyword", {...options, regex: true});
                 assert.equal(ordered.matches.length, 204, "mounted names and cells do not duplicate API results");
                 assert.ok(ordered.matches[0].unitId.endsWith("group-title:folded"));
@@ -2333,10 +2341,15 @@ async function main() {
                 cell.textContent = "localKeyword";
                 assert.equal((await search("galleryKeyword", options)).matches.length, 201, "folded pending edits win over API");
                 assert.equal((await search("localKeyword", options)).matches.length, 1);
+                assert.equal((await search("galleryKeyword", withoutDocumentFolds)).matches.length, 201);
+                assert.equal((await search("localKeyword", withoutDocumentFolds)).matches.length, 1,
+                    "folded live pending edits remain authoritative with the document fold switch off");
                 cell.textContent = "";
                 assert.equal((await search("galleryKeyword", options)).matches.length, 201, "empty folded cells keep coverage");
+                assert.equal((await search("galleryKeyword", withoutDocumentFolds)).matches.length, 201);
                 wysiwyg.innerHTML = "";
                 assert.equal((await search("galleryKeyword", options)).matches.length, 202);
+                assert.equal((await search("galleryKeyword", withoutDocumentFolds)).matches.length, 202);
                 assert.equal(reads, beforeMount, "mount, fold, edit and unmount reuse current-view cache");
                 assert.equal(renderCalls, 0, "complete gallery search never renders offscreen cards");
             } finally {
@@ -2395,6 +2408,14 @@ async function main() {
                     assert.deepEqual(checkbox.matches.map(match => match.unitId.replace(/^embed:[^:]+:/, "")), [
                         "group-counter:g1", "av-group:g1:row:col", "group-counter:g2", "av-group:g2:row:col",
                     ], "icon-only group titles/counters anchor their own unloaded entries");
+                    const secondBody = wysiwyg.querySelector('.av__body[data-group-id="g2"]');
+                    secondBody.classList.remove("fn__none");
+                    secondBody.innerHTML = '<div class="av__row" data-id="row"><div class="av__cell" data-col-id="col">g2Keyword</div></div>';
+                    const mixed = await search("^1$|Keyword", {...options, regex: true});
+                    full(mixed);
+                    assert.deepEqual(mixed.matches.map(match => match.unitId.replace(/^embed:[^:]+:/, "")), [
+                        "group-counter:g1", "av-group:g1:row:col", "group-counter:g2", "cell:g2:row:col",
+                    ], "a folded icon-only group's entries precede the next mounted group title");
                 } finally {
                     avModule.releaseAvCacheOwner("r", edit);
                     corpus.releaseBackgroundCorpusRoot("r");

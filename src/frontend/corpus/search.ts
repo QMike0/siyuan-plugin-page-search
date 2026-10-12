@@ -33,7 +33,6 @@ import {
 import {
     avApiCellPosition,
     avApiUnitId,
-    embeddedAvApiUnitId,
 } from "../../shared/av-live";
 import {supportsDiagramSourceSearch} from "../../shared/code-block-language";
 import {
@@ -2480,11 +2479,11 @@ async function searchCurrentDocumentImpl(
             continue;
         }
         // 非标题折叠只用 CSS 隐藏，正文和行内公式仍在 DOM 里。
-        // collectSearchableBlocks 已按开关和类型门闩过滤过；开启“搜索折叠块内容”后，
-        // 这里不能再以几何可见性丢掉这些已有文字，否则会先少计、再离屏重抽一次。
-        const reusableFoldedLiveText = options.includeFoldedBlocks === true &&
-            Boolean(block.text.trim()) &&
-            (isUnderNonHeadingCssFold(block.element) || foldedAttributeViewGroupBody(block.element));
+        // collectSearchableBlocks 已按开关和类型门闩过滤过；这里不能再以几何可见性
+        // 丢掉这些已有文字。数据库分组折叠独立于文档折叠开关，保留其 DOM 文字和待保存编辑。
+        const reusableFoldedLiveText = Boolean(block.text.trim()) &&
+            (foldedAttributeViewGroupBody(block.element) ||
+                (options.includeFoldedBlocks === true && isUnderNonHeadingCssFold(block.element)));
         if (!isVisuallyInEditor(block.element) && !reusableFoldedLiveText) {
             continue;
         }
@@ -3009,25 +3008,11 @@ async function searchCurrentDocumentImpl(
             apiByBlock.set(unit.blockId, list);
         }
         for (const [blockId, api] of apiByBlock) {
-            const bounds = avBounds.get(blockId);
-            const following: Array<number | undefined> = [];
-            let next: number | undefined;
-            for (let index = api.length - 1; index >= 0; index--) {
-                following[index] = next;
-                const bound = bounds?.get(api[index].unitId ?? "");
-                if (bound) next = bound.first;
-            }
-            let previous: number | undefined;
+            const bounds = avBounds.get(blockId)!;
+            const ranks = avApiNavigationRanks(api, bounds);
             api.forEach((unit, index) => {
-                const bound = bounds?.get(unit.unitId ?? "");
-                if (bound) previous = bound.last;
-                // Checkbox/empty group names have no API text unit, but their
-                // mounted title/counter still precedes the group's rows.
-                const groupTitle = unit.unitId?.startsWith("av-group:") ?
-                    bounds?.get(`group-title:${unit.unitId.split(":")[1]}`) : undefined;
-                if (groupTitle) previous = Math.max(previous ?? groupTitle.last, groupTitle.last);
-                const rank = bound?.first ?? (following[index] !== undefined ? following[index]! - 0.5 :
-                    previous !== undefined ? previous + 0.5 : index);
+                const bound = bounds.get(unit.unitId ?? "");
+                const rank = ranks[index] ?? index;
                 avNavigationOrder.set(`${blockId}\0${unit.unitId ?? ""}`, rank + (bound ? 0 : index / (api.length + 1) * 0.25));
             });
         }
@@ -3083,7 +3068,7 @@ async function searchCurrentDocumentImpl(
             // rank alone would put every API row before every painted row.
             const bounds = new Map<string, {first: number; last: number;}>();
             for (const block of shown) {
-                const id = embeddedAvApiUnitId(prefix + block.unitId?.replace(/#run-\d+$/, "").replace(/^group-counter:/, "group-title:"));
+                const id = avApiUnitId(block.unitId?.replace(/#run-\d+$/, "").replace(/^group-counter:/, "group-title:"));
                 const paths = block.embeddedOrder;
                 if (!id || !paths?.length) continue;
                 const first = paths[0].path[0];
@@ -3091,31 +3076,15 @@ async function searchCurrentDocumentImpl(
                 const old = bounds.get(id);
                 bounds.set(id, {first: Math.min(first, old?.first ?? first), last: Math.max(last, old?.last ?? last)});
             }
-            const following: Array<number | undefined> = [];
-            let next: number | undefined;
-            for (let index = cached.units.length - 1; index >= 0; index--) {
-                following[index] = next;
-                const bound = bounds.get(prefix + cached.units[index].unitId);
-                if (bound) next = bound.first;
-            }
-            let previous: number | undefined;
+            const ranks = avApiNavigationRanks(cached.units, bounds);
             cached.units.forEach((unit, index) => {
-                const bound = bounds.get(prefix + unit.unitId);
-                if (bound) previous = bound.last;
-                const groupTitle = unit.unitId?.startsWith("av-group:") ?
-                    bounds.get(`${prefix}group-title:${unit.unitId.split(":")[1]}`) : undefined;
-                if (groupTitle) previous = Math.max(previous ?? groupTitle.last, groupTitle.last);
                 if (
                     coverage && (
                         !avApiUnitInView(unit.unitId ?? "", coverage, viewType) ||
                         avApiUnitShown(unit.unitId ?? "", unit.text, coverage, labels)
                     )
                 ) return;
-                const rank = following[index] !== undefined ?
-                    following[index]! - 0.5 :
-                    previous !== undefined ?
-                    previous + 0.5 :
-                    undefined;
+                const rank = ranks[index];
                 units.push({
                     ...avToCached(unit, orderIndex),
                     blockId: carrier.blockId,
@@ -3528,6 +3497,58 @@ function avMatchPosition(unitId: string | undefined): {row: string; col: string;
 function sameStructuralBlock(left: SearchMatch, right: SearchMatch): boolean {
     return (left.blockType === "NodeTable" || left.blockType === "NodeAttributeView") &&
         left.blockType === right.blockType;
+}
+
+/** Keep missing AV cells inside their own group's DOM interval. Bounds are
+ * inserted in DOM order; icon-only titles still have a counter anchor. */
+function avApiNavigationRanks(
+    api: ReadonlyArray<{unitId?: string;}>,
+    bounds: ReadonlyMap<string, {first: number; last: number;}>,
+): Array<number | undefined> {
+    if (!bounds.size) return [];
+    const groups = api.map((unit) => /^(?:av-group|group-title):([^:]+)/.exec(unit.unitId ?? "")?.[1] ?? "");
+    const anchoredGroups = new Set<string>();
+    api.forEach((unit, index) => {
+        if (bounds.has(unit.unitId ?? "")) anchoredGroups.add(groups[index]);
+    });
+    const nextTitle = new Map<string, number>();
+    let lastGroup: string | undefined;
+    for (const [id, bound] of bounds) {
+        if (!id.startsWith("group-title:")) continue;
+        const group = id.slice("group-title:".length);
+        anchoredGroups.add(group);
+        if (lastGroup !== undefined) nextTitle.set(lastGroup, bound.first);
+        lastGroup = group;
+    }
+    const following: Array<number | undefined> = [];
+    const nextByGroup = new Map<string, number>();
+    let next: number | undefined;
+    for (let index = api.length - 1; index >= 0; index--) {
+        const group = groups[index];
+        // A completely unmounted group has no interval; keep the original API
+        // order relative to neighbouring mounted groups instead.
+        following[index] = nextByGroup.get(group) ?? nextTitle.get(group) ??
+            (!group || !anchoredGroups.has(group) ? next : undefined);
+        const bound = bounds.get(api[index].unitId ?? "");
+        if (bound) {
+            nextByGroup.set(group, bound.first);
+            next = bound.first;
+        }
+    }
+    const previousByGroup = new Map<string, number>();
+    let last: number | undefined;
+    return api.map((unit, index) => {
+        const group = groups[index];
+        const bound = bounds.get(unit.unitId ?? "");
+        const groupTitle = group ? bounds.get(`group-title:${group}`) : undefined;
+        if (bound) last = bound.last;
+        let previous = bound?.last ?? previousByGroup.get(group) ??
+            (!group || !anchoredGroups.has(group) ? last : undefined);
+        if (groupTitle) previous = Math.max(previous ?? groupTitle.last, groupTitle.last);
+        if (previous !== undefined) previousByGroup.set(group, previous);
+        return bound?.first ?? (following[index] !== undefined ? following[index]! - 0.5 :
+            previous !== undefined ? previous + 0.5 : undefined);
+    });
 }
 
 function avViewTypeOf(edit: Element, blockId: string, cache: Map<string, string>): string {
