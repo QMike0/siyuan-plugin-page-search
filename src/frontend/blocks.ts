@@ -128,6 +128,7 @@ const AV_EXCLUDED_CLOSEST = [
     "svg",
     "style",
     "script",
+    ".katex-mathml, math, annotation",
     ".av__gallery-tip",
     ".av__widthdrag",
     ".av__pulse",
@@ -419,7 +420,7 @@ export function collectSearchableBlocks(
         }
         if (collectMath) {
             blocks.push(...filterAttributeUnitsByIncludeGates(
-                collectInlineMathSearchUnits(docRoot),
+                collectInlineMathSearchUnits(docRoot, restrictInlineTypes.length === 0),
                 includeGates,
             ));
         }
@@ -550,6 +551,7 @@ export function collectSearchableBlocks(
                 blockIndex,
                 includeImageTitle,
                 includeGates,
+                restrictInlineTypes.length > 0,
             ));
             return;
         }
@@ -638,7 +640,7 @@ export function collectSearchableBlocks(
     if (collectMath) {
         attributeRoots.forEach((root) => {
             blocks.push(...filterAttributeUnitsByIncludeGates(
-                collectInlineMathSearchUnits(root),
+                collectInlineMathSearchUnits(root, restrictInlineTypes.length === 0),
                 includeGates,
             ));
         });
@@ -659,7 +661,7 @@ export function collectSearchableBlocks(
 /** Source IDs identify copied labels; the embed ID identifies their search/navigation owner. */
 export function ownEmbeddedSearchUnit(block: SearchableBlock, ownerId: string): SearchableBlock {
     let sourceUnit = block.unitId ?? "text";
-    if (isInlineMathSearchUnit(block)) {
+    if (isInlineMathSearchUnit(block) && block.blockType !== ATTRIBUTE_VIEW_TYPE) {
         sourceUnit = `inline-math:${inlineMathIdentityText(block.text)}:${block.mathOrdinal ?? 0}`;
     } else if (isInlineMemoSearchUnit(block)) {
         sourceUnit = `inline-memo:${block.anchorOffset ?? 0}`;
@@ -1476,6 +1478,7 @@ function collectAttributeViewSearchUnits(
     blockIndex: number,
     includeImageTitle = true,
     headingGates?: HeadingIncludeGates,
+    separateInlineMath = false,
 ): SearchableBlock[] {
     const units: SearchableBlock[] = [];
     const seenUnitKeys = new Set<string>();
@@ -1489,6 +1492,7 @@ function collectAttributeViewSearchUnits(
             avBlock,
             includeImageTitle,
             headingGates,
+            separateInlineMath,
         );
         const visible = omitAuthorCssHiddenText(textNodes);
         const text = visible.map((node) => node.nodeValue ?? "").join("");
@@ -1756,10 +1760,14 @@ function collectTextNodesInContainer(
     avBlock: HTMLElement,
     includeImageTitle = true,
     headingGates?: HeadingIncludeGates,
+    separateInlineMath = false,
 ): Text[] {
     // Native gallery folding retains card DOM. Keep its actual text (including
     // pending edits) as cell coverage, while still excluding all other hidden UI.
     const foldedBody = foldedAttributeViewGroupBody(container);
+    // Keep formulas in their cell's reading order and group identity. Retain
+    // only the same visible glyph nodes used by the independent math collector.
+    let mathGlyphs: WeakMap<HTMLElement, Set<Text> | null> | undefined;
     const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
             if (!(node instanceof Text) || !node.nodeValue?.length) {
@@ -1769,6 +1777,17 @@ function collectTextNodesInContainer(
             const parentElement = node.parentElement;
             if (!parentElement || parentElement.closest(AV_EXCLUDED_CLOSEST)) {
                 return NodeFilter.FILTER_REJECT;
+            }
+            const math = parentElement.closest<HTMLElement>('span[data-type~="inline-math"]');
+            if (math) {
+                if (separateInlineMath) return NodeFilter.FILTER_REJECT;
+                mathGlyphs ??= new WeakMap();
+                let glyphs = mathGlyphs.get(math);
+                if (glyphs === undefined) {
+                    glyphs = math.querySelector(".katex-html") ? new Set(collectKatexGlyphTextNodes(math)) : null;
+                    mathGlyphs.set(math, glyphs);
+                }
+                if (glyphs && !glyphs.has(node)) return NodeFilter.FILTER_REJECT;
             }
             let hidden = parentElement.closest(".fn__none");
             if (hidden && hidden === foldedBody) hidden = hidden.parentElement?.closest(".fn__none") ?? null;
@@ -2383,7 +2402,7 @@ export function isInlineMemoSearchUnit(block: Pick<SearchableBlock, "matchSource
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
  *   `output: "html"` → 可见在 `.katex-html`；`.katex-mathml` 含源码 annotation，必须排除
  */
-function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
+function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews = false): SearchableBlock[] {
     const units: SearchableBlock[] = [];
     const spans = Array.from(
         docRoot.querySelectorAll<HTMLElement>('span[data-type~="inline-math"]'),
@@ -2398,10 +2417,18 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
     const slotCache = createTableSlotCache();
     const ordinals = new Map<HTMLElement, Map<string, number>>();
     const embeddedOrdinals = new Map<HTMLElement, number>();
+    const avCellOrdinals = new Map<HTMLElement, number>();
     let mathIndex = 0;
 
     for (const span of spans) {
         const owner = searchOwnerBlock(span);
+        const inAv = owner?.dataset.type === ATTRIBUTE_VIEW_TYPE;
+        // Default searches already collect the formula as a cell run.
+        // Restricted searches still need an independent attribute unit.
+        if (inAv && skipAttributeViews) continue;
+        const avCell = inAv ? span.closest<HTMLElement>(".av__cell, .av__calendar-field") : null;
+        const avOrdinal = avCell ? avCellOrdinals.get(avCell) ?? 0 : 0;
+        if (avCell) avCellOrdinals.set(avCell, avOrdinal + 1);
         let embeddedOrdinal: number | undefined;
         if (owner && span.closest('[data-type="NodeBlockQueryEmbed"]')) {
             // Include pending/hidden spans in copied formula identity. Completing
@@ -2409,7 +2436,11 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
             embeddedOrdinal = embeddedOrdinals.get(owner) ?? 0;
             embeddedOrdinals.set(owner, embeddedOrdinal + 1);
         }
-        if (span.closest(".protyle-attr, .fn__none") || isAuthorCssHiddenElement(span)) {
+        let hidden = span.closest(".fn__none");
+        if (hidden && hidden === foldedAttributeViewGroupBody(span)) {
+            hidden = hidden.parentElement?.closest(".fn__none") ?? null;
+        }
+        if (span.closest(".protyle-attr") || hidden || isAuthorCssHiddenElement(span)) {
             continue;
         }
 
@@ -2438,6 +2469,13 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
             seen.set(visible, mathOrdinal + 1);
         }
 
+        let unitId = `${INLINE_MATH_UNIT_PREFIX}${mathIndex}`;
+        if (avCell) {
+            const group = avCell.closest<HTMLElement>("[data-group-id]")?.dataset.groupId || "nogroup";
+            const row = avCell.closest<HTMLElement>(".av__row, .av__gallery-item, .av__calendar-item")?.dataset.id;
+            const col = avCell.dataset.colId || avCell.dataset.fieldId || avCell.dataset.keyId || avCell.dataset.avKeyId;
+            if (row && col) unitId = `cell:${group}:${row}:${col}:inline-math:${avOrdinal}`;
+        }
         units.push({
             blockId,
             blockType,
@@ -2445,7 +2483,7 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement): SearchableBlock[] {
             element: span,
             text,
             textNodes,
-            unitId: `${INLINE_MATH_UNIT_PREFIX}${mathIndex}`,
+            unitId,
             matchSource: "inline-math",
             tableSlot: blockType === TABLE_TYPE && owner ? tableSlotOf(span, owner, slotCache) : undefined,
             mathOrdinal,

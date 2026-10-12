@@ -927,8 +927,8 @@ export class SearchBar {
                 }
             },
         });
-        this.stopAvDomWatch = watchAttributeViewDom(this.edit, () => {
-            this.scheduleAttrViewResearch();
+        this.stopAvDomWatch = watchAttributeViewDom(this.edit, (avIds, invalidateValues) => {
+            this.scheduleAttrViewResearch(avIds, invalidateValues);
         });
         this.stopEditorDomWatch = watchEditorDom(this.edit, {
             knownDiagram: (element) => this.diagramSearchState.knows(element),

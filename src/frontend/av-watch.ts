@@ -143,26 +143,72 @@ export function isAttrViewRelevantToEdit(edit: Element, detail?: unknown): boole
  */
 export function watchAttributeViewDom(
     edit: Element,
-    onChange: () => void,
+    onChange: (avIds?: readonly string[], invalidateValues?: boolean) => void,
     debounceMs: number = 50,
 ): () => void {
     let timer: number | undefined;
+    let invalidateValues = false;
+    let unknownAv = false;
+    const changedIds = new Set<string>();
+    const composing = new WeakSet<Element>();
     const schedule = () => {
         window.clearTimeout(timer);
-        timer = window.setTimeout(() => onChange(), debounceMs);
+        timer = window.setTimeout(() => {
+            const ids = unknownAv || !changedIds.size ? undefined : [...changedIds];
+            const invalidate = invalidateValues;
+            changedIds.clear();
+            unknownAv = invalidateValues = false;
+            onChange(ids, invalidate);
+        }, debounceMs);
     };
+    const queryInput = (target: EventTarget | Node | null) =>
+        (target instanceof Element ? target : target instanceof Node ? target.parentElement : null)
+            ?.closest('[data-type="av-search"]') ?? null;
     const onInput = (event: Event) => {
-        if (event.target instanceof Element && event.target.closest('[data-type="av-search"]')) schedule();
+        const input = queryInput(event.target);
+        if (!input) return;
+        if ((event as InputEvent).isComposing) {
+            composing.add(input);
+            if (!invalidateValues) window.clearTimeout(timer);
+        }
+        if (!composing.has(input)) schedule();
+    };
+    const onCompositionStart = (event: Event) => {
+        const input = queryInput(event.target);
+        if (input) {
+            composing.add(input);
+            if (!invalidateValues) window.clearTimeout(timer);
+        }
+    };
+    const onCompositionEnd = (event: Event) => {
+        const input = queryInput(event.target);
+        if (!input) return;
+        composing.delete(input);
+        schedule();
     };
     edit.addEventListener("input", onInput, true);
+    // Native AV handlers stop propagation; observe in capture phase. Cut may
+    // have no input event, but the debounce runs after its native text update.
+    edit.addEventListener("cut", onInput, true);
+    edit.addEventListener("compositionstart", onCompositionStart, true);
+    edit.addEventListener("compositionend", onCompositionEnd, true);
 
     const observer = new MutationObserver((mutations) => {
+        let changed = false;
         for (const mutation of mutations) {
+            const input = mutation.type === "childList" ? queryInput(mutation.target) : null;
+            if (input) {
+                if (!composing.has(input)) changed = true;
+                continue;
+            }
             if (isStructuralAttributeViewMutation(mutation)) {
-                schedule();
-                return;
+                const ids = mutatedAttributeViewIds(mutation);
+                invalidateValues = changed = true;
+                if (!ids?.length) unknownAv = true;
+                ids?.forEach(id => changedIds.add(id));
             }
         }
+        if (changed) schedule();
     });
 
     observer.observe(edit, {
@@ -172,13 +218,39 @@ export function watchAttributeViewDom(
         attributes: true,
         // 仅根级渲染标记；不要监听 data-page-size（滚动加载会改）
         attributeFilter: ["data-render", "data-av-id", "data-av-type"],
+        attributeOldValue: true,
     });
 
     return () => {
         window.clearTimeout(timer);
         observer.disconnect();
         edit.removeEventListener("input", onInput, true);
+        edit.removeEventListener("cut", onInput, true);
+        edit.removeEventListener("compositionstart", onCompositionStart, true);
+        edit.removeEventListener("compositionend", onCompositionEnd, true);
     };
+}
+
+/** Identify the affected carrier, including removed shells and replaced AV IDs. */
+function mutatedAttributeViewIds(mutation: MutationRecord): string[] {
+    const ids = new Set<string>();
+    const collect = (element: Element) => {
+        const id = element.getAttribute("data-av-id");
+        if (id) ids.add(id);
+        element.querySelectorAll(AV_BLOCK_SELECTOR).forEach(child => {
+            const id = child.getAttribute("data-av-id");
+            if (id) ids.add(id);
+        });
+    };
+    const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+    const carrier = target?.closest(AV_BLOCK_SELECTOR);
+    if (carrier?.getAttribute("data-av-id")) ids.add(carrier.getAttribute("data-av-id")!);
+    else if (carrier) collect(carrier);
+    else for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
+        if (node instanceof Element) collect(node);
+    }
+    if (mutation.attributeName === "data-av-id" && mutation.oldValue) ids.add(mutation.oldValue);
+    return [...ids];
 }
 
 /**
@@ -186,10 +258,6 @@ export function watchAttributeViewDom(
  * 而非虚拟滚动在 body 内增删行。
  */
 function isStructuralAttributeViewMutation(mutation: MutationRecord): boolean {
-    if (mutation.type === "childList") {
-        const parent = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-        if (parent?.closest('[data-type="av-search"]')) return true;
-    }
     if (mutation.type === "attributes") {
         const el = mutation.target as Element;
         // 只关心 AV 根节点的渲染标记，避免 body 上属性抖动

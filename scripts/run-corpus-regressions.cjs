@@ -2035,6 +2035,81 @@ async function main() {
             '<div data-node-id="' + id +
             '" data-type="NodeBlockQueryEmbed" data-content="select * from blocks"></div>';
         const avRaw = {name: "database", views: [{id: "v", name: "table"}, {id: "v2", name: "other"}]};
+        // Default AV search uses cell runs; inline restrictions use independent
+        // math units. Neither path should duplicate glyphs or expose MathML.
+        const avFormula = '<span data-type="inline-math" data-subtype="math" data-content="\\alpha" data-render="true">' +
+            '<span class="katex"><span class="katex-mathml">mathmlSecret</span>' +
+            '<span class="katex-html" aria-hidden="true"><span class="base"><span class="mord">α</span></span>' +
+            '<span class="base"><span class="mord">α</span></span></span></span></span>';
+        for (const embedded of [false, true]) {
+            for (const folded of [false, true]) {
+                reset();
+                const shell = (embedded ? avShell() : avShell().replace('data-node-id="source-av"', 'data-node-id="b"'))
+                    .replace('data-av-type="table"', 'data-av-type="gallery"');
+                add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell);
+                doms.b = embedded ? embedShell("b") : shell;
+                if (embedded) embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]}});
+                avResponder = async url => ({code: 0, data: url.endsWith("getAttributeView") ? avRaw : {view: {
+                    type: "gallery", fields: [{id: "col", type: "text"}],
+                    groups: [{id: "g", groupHidden: 0, cardCount: 1,
+                        cards: [{id: "row", values: [{value: {keyID: "col", type: "text", text: {content: "storedSecret"}}}]}]}],
+                }}});
+                const cell = '<div class="av__cell" data-col-id="col"><div class="av__celltext av__celltext--rich b3-typography">' +
+                    '<p>beforeKeyword' + avFormula + 'middleKeyword' + avFormula + 'afterKeyword</p>' +
+                    // Block math in a rich preview has no NodeMathBlock owner;
+                    // the ordinary cell collector must still retain its glyphs.
+                    '<div data-subtype="math"><span class="katex"><span class="katex-mathml">mathmlSecret</span>' +
+                    '<span class="katex-html">β</span></span></div></div></div>';
+                const content = '<div class="av__group-title"><span data-type="av-group-fold" data-id="g"></span></div>' +
+                    '<div class="av__body' + (folded ? ' fn__none' : '') + '" data-group-id="g">' +
+                    '<div class="av__gallery-item" data-id="row">' + cell + '</div></div>';
+                wysiwyg.innerHTML = (embedded ? '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' : "") +
+                    shell.replace("<div></div>", content) + (embedded ? "</div>" : "");
+                corpus.retainBackgroundCorpusRoot("r");
+                try {
+                    const options = {includeAttributeView: true};
+                    const result = await settle("α", options);
+                    full(result);
+                    assert.equal(result.matches.length, 2, "two real formulas, no cell/glyph duplication");
+                    assert.ok(result.matches.every(match => !match.replaceable));
+                    const mathOnly = await search("α", {...options, restrictInlineTypes: ["inline-math"]});
+                    assert.equal(mathOnly.matches.length, 2);
+                    assert.ok(mathOnly.matches.every(match => match.highlightKind === "inline-math" && !match.replaceable));
+                    assert.ok(mathOnly.matches.every(match => match.unitId.includes("cell:g:row:col:inline-math:")),
+                        "math-only units retain the target group and cell identity");
+                    assert.equal((await search("α", {...options, restrictInlineTypes: ["inline-math", "strong"]})).matches.length, 2,
+                        "mixed inline restrictions still collect each formula exactly once");
+                    assert.equal((await search("α", {...options, restrictInlineTypes: ["strong"]})).matches.length, 0);
+                    assert.equal((await search("α", {includeAttributeView: false})).matches.length, 0);
+                    const ordered = await search("Keyword|α|β", {...options, regex: true});
+                    assert.deepEqual(ordered.matches.map(match => match.matchedText), ["Keyword", "α", "Keyword", "α", "Keyword", "β"],
+                        "formula deduplication preserves cell reading order");
+                    for (const query of ["beforeKeyword", "middleKeyword", "afterKeyword", "β"]) {
+                        assert.equal((await search(query, options)).matches.length, 1, "surrounding text and block math retained: " + query);
+                    }
+                    for (const query of ["mathmlSecret", "storedSecret", "beforeKeywordmiddleKeyword"]) {
+                        assert.equal((await search(query, options)).matches.length, 0, "hidden source and cross-formula text excluded: " + query);
+                    }
+                    if (folded) wysiwyg.querySelector(".av__body").classList.remove("fn__none");
+                    const rebound = source("frontend/corpus/project").fillLiveRanges(result.matches,
+                        source("frontend/blocks").collectSearchableBlocks(edit, options), true);
+                    assert.ok(rebound.every(match => match.range?.toString() === "α"), "formula offsets bind after group expansion");
+                    // A separately hidden UI ancestor still excludes its formula.
+                    wysiwyg.querySelector(".av__body").classList.add("fn__none");
+                    wysiwyg.querySelector(".av__celltext").classList.add("fn__none");
+                    assert.equal((await search("α", options)).matches.length, 0);
+                } finally {
+                    avModule.releaseAvCacheOwner("r", edit);
+                    corpus.releaseBackgroundCorpusRoot("r");
+                }
+            }
+        }
+        assert.deepEqual(source("frontend/blocks").attributeViewHtmlTexts(avFormula), ["α"],
+            "inert API template glyphs remain searchable without MathML or a live formula collector");
+        assert.deepEqual(source("frontend/blocks").attributeViewHtmlTexts('<math>mathmlSecret</math><annotation>annotationSecret</annotation>'), []);
+        assert.deepEqual(source("frontend/blocks").attributeViewHtmlTexts('<span data-type="inline-math">templateKeyword</span>'), ["templateKeyword"],
+            "unrendered template spans retain their actual visible fallback text");
+        console.log("ordinary/embedded AV inline math counts, folded groups, restrictions and block-math coverage OK");
         // Native kanban titles have no fold button: the ID is on their parent.
         for (const embedded of [false, true]) {
             reset();

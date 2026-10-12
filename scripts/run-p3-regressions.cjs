@@ -738,6 +738,27 @@ async function galleryNavigationRegressions() {
     };
     try {
         for (const embedded of [false, true]) {
+            for (const restrictInlineTypes of [[], ["inline-math"]]) {
+                const test = setup(embedded);
+                const {bar, root} = test;
+                root.querySelectorAll(".av__cell").forEach(cell => cell.innerHTML =
+                    '<span data-type="inline-math" data-content="x" data-render="true"><span class="katex-html">foo</span></span>');
+                const options = {includeAttributeView: true, includeEmbedBlock: true, restrictInlineTypes};
+                const live = source("frontend/blocks").collectSearchableBlocks(bar.edit, options);
+                const formula = live.find(unit => unit.text === "foo" && unit.unitId.includes("cell:target:row:col") &&
+                    unit.blockId === (embedded ? "embed" : "ordinary-av"));
+                assert.ok(formula, "folded AV formula has a stable cell/group identity");
+                const target = {...matchTextUnitsDetailed([formula], "foo").hits[0], replaceable: false,
+                    highlightKind: restrictInlineTypes.length ? "inline-math" : "text",
+                    mathOrdinal: formula.mathOrdinal, mathUnitText: "foo"};
+                bar.resultMatches = [target];
+                bar.searchCollectOptions = () => options;
+                await bar.scrollIntoRangesAsync(0, true);
+                assert.equal(test.clicks(), 1, "default/math-only formula navigation unfolds exactly its group");
+                assert.equal(bar.resultMatches[0].range?.toString(), "foo");
+                assert.equal(bar.resultMatches[0].range.startContainer.parentElement.closest("[data-group-id]").dataset.groupId, "target");
+                bar.destroy();
+            }
             for (const local of ["group-title:target", "av-group:target:row:col", "cell:target:row:col", "cell:target:row:col#run-0"]) {
                 const test = setup(embedded, local);
                 const {bar, root} = test;
@@ -891,6 +912,112 @@ async function avFoldCacheRegressions() {
     assert.equal(changes, 2, "query watcher releases input and mutation subscriptions");
     queryHost.remove();
     console.log("AV native query input/clear refresh, virtual-mount isolation and listener disposal OK");
+    // Exercise the real SearchBar invalidation callback, with two databases
+    // sharing a root. Query identity already belongs to each AV cache key.
+    const bar = fixture("query-cache");
+    const queryRoot = bar.edit.querySelector(".protyle-wysiwyg");
+    queryRoot.innerHTML = ["a", "b"].map(id => '<div data-type="NodeAttributeView" data-av-id="' + id + '">' +
+        '<div class="av__views"><div data-type="av-search">keep</div></div><div class="av__body"></div></div>').join("");
+    Object.assign(bar, {rememberCurrentRootId: () => "query-root", effectiveQuery: () => "", includeAttributeView: true});
+    const refs = ["a", "b"].map(id => ({blockId: "carrier-" + id, avId: id, updated: "u", carrierViewId: "v"}));
+    const apiModule = source("frontend/corpus/api");
+    const oldPost = apiModule.postJson;
+    let queryReads = 0;
+    apiModule.postJson = async url => {
+        queryReads++;
+        return url.endsWith("getAttributeView") ? {name: "db", views: [{id: "v", name: "view"}]} :
+            {view: {columns: [{id: "k"}], rowCount: 1, rows: [{id: "i", cells: [{value: {keyID: "k", text: {content: "foo"}}}]}]}};
+    };
+    const calls = [];
+    const stopCacheWatch = watchAttributeViewDom(bar.edit, (ids, invalidate) => {
+        calls.push({ids, invalidate});
+        bar.scheduleAttrViewResearch(ids, invalidate);
+    }, 5);
+    const queryA = queryRoot.querySelector('[data-av-id="a"] [data-type="av-search"]');
+    const waitWatch = () => new Promise(resolve => setTimeout(resolve, 20));
+    const assertCached = () => assert.equal(av.peekAvUnits(refs).missing.length, 0);
+    try {
+        av.invalidateAvCache();
+        av.pinAvCache("query-root", refs, new Map(), bar.edit);
+        await av.loadAvUnits(refs);
+        const beforeQuery = queryReads;
+        queryA.firstChild.nodeValue = "changed";
+        queryA.dispatchEvent(new window.Event("input", {bubbles: true}));
+        await waitWatch();
+        assert.deepEqual(calls, [{ids: undefined, invalidate: false}]);
+        assertCached();
+        await av.loadAvUnits(refs);
+        assert.equal(queryReads, beforeQuery, "native query input retains cached values of both databases");
+        // Start composing while a previous query-only debounce is pending.
+        queryA.dispatchEvent(new window.Event("input", {bubbles: true}));
+        queryA.dispatchEvent(new window.CompositionEvent("compositionstart", {bubbles: true}));
+        queryA.textContent = "interim";
+        queryA.dispatchEvent(new window.InputEvent("input", {bubbles: true, isComposing: true}));
+        await waitWatch();
+        assert.equal(calls.length, 1, "IME input and its childList mutation do not refresh provisional queries");
+        assertCached();
+        queryA.textContent = "final";
+        queryA.dispatchEvent(new window.CompositionEvent("compositionend", {bubbles: true}));
+        queryA.dispatchEvent(new window.InputEvent("input", {bubbles: true}));
+        await waitWatch();
+        assert.equal(calls.length, 2, "compositionend and final input coalesce");
+        assert.equal(calls[1].invalidate, false);
+        assertCached();
+        queryA.firstChild.nodeValue = "cut";
+        queryA.dispatchEvent(new window.Event("cut", {bubbles: true}));
+        await waitWatch();
+        assert.equal(calls.length, 3, "native cut refreshes without an input event");
+        assertCached();
+        queryA.textContent = "";
+        await waitWatch();
+        assert.equal(calls.length, 4);
+        assertCached();
+        const queryRef = {...refs[0], query: "final"};
+        await av.loadAvUnits([queryRef]);
+        assert.equal(queryReads, beforeQuery + 2, "new native query uses its own cache entry");
+        await av.loadAvUnits([queryRef]);
+        assert.equal(queryReads, beforeQuery + 2, "repeated native query reuses its entry");
+        // Native avRender rebuilds the queried shell. It must not evict B.
+        queryRoot.querySelector('[data-av-id="a"]').insertAdjacentHTML("beforeend", '<div class="av__header">rebuilt</div>');
+        await waitWatch();
+        assert.deepEqual(calls.at(-1), {ids: ["a"], invalidate: true});
+        assert.equal(av.peekAvUnits([refs[0], queryRef]).missing.length, 2, "real structural changes invalidate all affected AV query variants");
+        assert.equal(av.peekAvUnits([refs[1]]).missing.length, 0);
+        const beforeB = queryReads;
+        await av.loadAvUnits([refs[1]]);
+        assert.equal(queryReads, beforeB, "query-induced rebuild of A does not reload B");
+        await av.loadAvUnits([refs[0]]);
+        queryA.dispatchEvent(new window.Event("input", {bubbles: true}));
+        for (const shell of queryRoot.children) shell.setAttribute("data-render", "true");
+        await waitWatch();
+        assert.deepEqual(calls.at(-1), {ids: ["a", "b"], invalidate: true}, "mixed batches retain every structural invalidation");
+        assert.equal(av.peekAvUnits(refs).missing.length, 2);
+        await av.loadAvUnits(refs);
+        // Replacing a whole AV ID invalidates both its previous and new values.
+        queryRoot.firstElementChild.setAttribute("data-av-id", "b");
+        await waitWatch();
+        assert.deepEqual(new Set(calls.at(-1).ids), new Set(["a", "b"]));
+        assert.equal(av.peekAvUnits(refs).missing.length, 2);
+        await av.loadAvUnits(refs);
+        queryRoot.insertAdjacentHTML("beforeend", '<div data-type="NodeAttributeView"><div class="av__header">unknown</div></div>');
+        await waitWatch();
+        assert.deepEqual(calls.at(-1), {ids: undefined, invalidate: true}, "unidentified structural change retains conservative fallback");
+        assert.equal(av.peekAvUnits(refs).missing.length, 2);
+    } finally {
+        stopCacheWatch();
+        const beforeStop = calls.length;
+        queryA.textContent = "disposed";
+        for (const type of ["input", "cut", "compositionstart", "compositionend"]) {
+            queryA.dispatchEvent(new window.Event(type, {bubbles: true}));
+        }
+        await waitWatch();
+        assert.equal(calls.length, beforeStop, "all query/composition listeners are disposed");
+        apiModule.postJson = oldPost;
+        av.releaseAvCacheOwner("query-root", bar.edit);
+        av.invalidateAvCache();
+        bar.destroy();
+    }
+    console.log("AV query/IME/cut handling, scoped cache invalidation, mixed batches and ID replacement OK");
     const fold = {action: "foldAttrViewGroup", avID: "a"};
     const edit = {action: "updateAttrViewCell", avID: "a"};
     const event = (doOperations, undoOperations = []) => ({cmd: "transactions", data: [{doOperations, undoOperations}]});
