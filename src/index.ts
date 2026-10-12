@@ -1,0 +1,1055 @@
+import {
+    fetchPost,
+    getFrontend,
+    IKernelPluginState,
+    Plugin,
+} from "siyuan";
+import "./index.scss";
+import {
+    attributeViewTransactionIds,
+    isAttrViewFoldOnlyTransaction,
+    isAttrViewWsTransaction,
+} from "./frontend/av-watch";
+import {
+    invalidateAvCache,
+    invalidateAvCacheForIds,
+} from "./frontend/corpus/av";
+import {isEditorReplaceModeBlocked} from "./frontend/editor-mode";
+import {
+    createClientId,
+    isKernelRunning,
+    rpcGetPrefs,
+    rpcSetPrefs,
+} from "./frontend/kernel-client";
+import {
+    SearchBar,
+    type SearchBarHost,
+    type SearchBarI18n,
+    type HeadingIncludeLevel,
+} from "./frontend/search-bar";
+import {
+    bindSearchHistoryIo,
+    SEARCH_HISTORY_STORAGE_KEY,
+    searchHistory,
+} from "./frontend/search-history";
+import {
+    scrubSelectionScopePollution,
+    clearAllSelectionScopeSessionOverlays,
+} from "./frontend/selection-scope-visual";
+import {
+    PREFS_STORAGE_PATH,
+    type RestrictInlineType,
+} from "./shared";
+
+export { isKernelRunning, rpcGetPrefs, rpcSetPrefs } from "./frontend/kernel-client";
+export { findOffsetMatchesInText, generateSearchVariants, matchTextUnits } from "./shared";
+export type { MatchHit, SearchableUnit, SearchStateEvent } from "./shared";
+
+export const CLASS_NAME = "highlight-search-result";
+
+export const isMobileFrontend = (): boolean => {
+    const frontEnd = getFrontend();
+    return frontEnd === "mobile" || frontEnd === "browser-mobile" || !!(window as any).siyuan?.mobile;
+};
+
+/**
+ * 页内查找替换 — 前端插件（偏好 / 跨窗口同步 / i18n）
+ */
+export default class PluginPageSearch extends Plugin implements SearchBarHost {
+    private isMobile = false;
+    private kernelReady = false;
+    private readonly clientId = createClientId();
+
+    private searchComponentCallbacks: Set<(event: CustomEvent) => void> = new Set();
+    private searchBars: Map<Element, SearchBar> = new Map();
+    private activeSearchComponentsCount = 0;
+    private lastHighlightComponent: Element | null = null;
+    private cleanupTimer: number | null = null;
+    /**
+     * 本次软件运行期内保留的查找/替换框文案（仅内存，不写 prefs）。
+     * 关闭搜索窗后再次打开可恢复；退出软件 / 禁用插件后丢弃。
+     */
+    private sessionSearchText = "";
+    private sessionReplaceText = "";
+
+    isMobileView(): boolean {
+        return this.isMobile;
+    }
+
+    getClientId(): string {
+        return this.clientId;
+    }
+
+    updateLastHighlightComponent(element: Element) {
+        this.lastHighlightComponent = element;
+    }
+
+    isLastHighlightComponent(element: Element): boolean {
+        return this.lastHighlightComponent === element;
+    }
+
+    onload() {
+        this.isMobile = isMobileFrontend();
+        this.kernelReady = isKernelRunning(this);
+        this.bindSearchHistory();
+        searchHistory.load();
+
+        // 描边属性写在 g 上，避免被思源全局 svg { fill } 覆盖
+        this.addIcons(`<symbol id="iconPageSearch" viewBox="0 0 48 48">
+<g fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+<path d="M10 44H38C39.1046 44 40 43.1046 40 42V14H30V4H10C8.89543 4 8 4.89543 8 6V42C8 43.1046 8.89543 44 10 44Z"/>
+<path d="M30 4L40 14"/>
+<circle cx="22" cy="26" r="6"/>
+<path d="M27 30L32 34"/>
+</g>
+</symbol>`);
+
+        const openFind = () => {
+            void this.addSearchElement({intent: "find"});
+        };
+        const openReplace = () => {
+            void this.addSearchElement({intent: "replace"});
+        };
+        // 思源：定义 editorCallback 等后，仅在对应焦点区域触发；callback 在其它区域作兜底。
+        // 四处都挂上，避免「只有光标在编辑器里快捷键才生效」。
+        this.addCommand({
+            langKey: "showSearch",
+            hotkey: "⌘F",
+            callback: openFind,
+            editorCallback: openFind,
+            dockCallback: openFind,
+            fileTreeCallback: openFind,
+        });
+        this.addCommand({
+            langKey: "showReplace",
+            hotkey: "⌘H",
+            callback: openReplace,
+            editorCallback: openReplace,
+            dockCallback: openReplace,
+            fileTreeCallback: openReplace,
+        });
+
+        // 只读 / 预览：焦点不在可编辑 wysiwyg，editorCallback 不触发；
+        // 且存在专用 callback 时普通 callback 也不会兜底。用捕获阶段补一层。
+        window.addEventListener("keydown", this.onWindowKeydownCapture, true);
+
+        this.eventBus.on("kernel-plugin-state-change", this.onKernelPluginStateChange);
+        // 清扫历史版本误写入 td/th 的选区提示 class（曾被 outerHTML 持久化进文档）
+        this.eventBus.on("loaded-protyle-static", this.onProtyleLoadedScrub);
+        scrubSelectionScopePollution();
+
+        console.log(this.i18n.pluginOnload, {
+            isMobile: this.isMobile,
+            kernelReady: this.kernelReady,
+            clientId: this.clientId,
+        });
+    }
+
+    onLayoutReady() {
+        this.addTopBar({
+            icon: "iconPageSearch",
+            title: this.i18n.topBarTitle,
+            position: "right",
+            callback: () => {
+                this.closePanel();
+                void this.addSearchElement({isFromTopBar: true, intent: "find"});
+            },
+        });
+    }
+
+    /**
+     * 禁用 / 关闭 / 卸载前清理运行时资源。
+     * 思源卸载顺序：onunload → kernel.destroy → uninstall（仅真卸载，非重载）。
+     * 此处不删 prefs：禁用后重开应保留面板位置与块类型开关。
+     * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/plugin/uninstall.ts
+     */
+    onunload() {
+        this.teardownRuntime();
+        console.log(this.i18n.pluginOnunload);
+    }
+
+    /**
+     * 真卸载时删除配置数据（`data/storage/petal/<name>/prefs.json`）。
+     * 禁用不会进入此钩子；重载插件（isReload）也不会。
+     */
+    async uninstall() {
+        try {
+            await this.removeData(PREFS_STORAGE_PATH);
+        } catch (error) {
+            console.warn("[page-search] uninstall removeData prefs.json failed", error);
+        }
+        searchHistory.removePersisted();
+        console.log(this.i18n.pluginUninstall);
+    }
+
+    /**
+     * 查找历史走思源 localStorage，不写 prefs。
+     * setLocalStorageVal 不回推给本窗口，内存列表在 push 时已经更新。
+     */
+    private bindSearchHistory() {
+        bindSearchHistoryIo({
+            read: (apply) => {
+                fetchPost(
+                    "/api/storage/getLocalStorageVal",
+                    {key: SEARCH_HISTORY_STORAGE_KEY},
+                    (response) => apply(response?.data),
+                );
+            },
+            write: (entries) => {
+                fetchPost("/api/storage/setLocalStorageVal", {
+                    app: this.app?.appId ?? "",
+                    key: SEARCH_HISTORY_STORAGE_KEY,
+                    val: entries,
+                });
+            },
+            remove: () => {
+                fetchPost("/api/storage/removeLocalStorageVal", {
+                    app: this.app?.appId ?? "",
+                    key: SEARCH_HISTORY_STORAGE_KEY,
+                });
+            },
+        });
+        this.eventBus.on("ws-main", this.onSearchHistoryBroadcast);
+    }
+
+    private readonly onSearchHistoryBroadcast = (event: CustomEvent) => {
+        // 搜索窗关闭后仍接收 AV 事务，不能在下次打开时复用未更新载体 hash 的旧单元格。
+        if (isAttrViewWsTransaction(event.detail) && !isAttrViewFoldOnlyTransaction(event.detail)) {
+            const avIds = attributeViewTransactionIds(event.detail);
+            // 某些内核事务只标记 AttrView action 而不带 avID；此时精确失效不可用，
+            // 保守清空 AV 显示值缓存，避免下次冷搜索复用旧字段文字。
+            if (avIds.length) invalidateAvCacheForIds(avIds);
+            else invalidateAvCache();
+        }
+        searchHistory.acceptBroadcast(event.detail);
+    };
+
+    /** 卸下快捷键、搜索条、事件与选区视觉残留（不碰持久化配置） */
+    private teardownRuntime() {
+        this.eventBus.off("ws-main", this.onSearchHistoryBroadcast);
+        window.removeEventListener("keydown", this.onWindowKeydownCapture, true);
+        this.closeSearchDialog();
+        this.stopCleanupTimer();
+        this.eventBus.off("kernel-plugin-state-change", this.onKernelPluginStateChange);
+        this.eventBus.off("loaded-protyle-static", this.onProtyleLoadedScrub);
+        scrubSelectionScopePollution();
+        clearAllSelectionScopeSessionOverlays();
+    }
+
+    /** 文档加载后清扫误写入内容块的选区提示 class */
+    private readonly onProtyleLoadedScrub = () => {
+        scrubSelectionScopePollution();
+    };
+
+    /**
+     * 窗口捕获阶段快捷键：
+     * - Esc：搜索面板已打开且焦点不在面板内时关闭（编辑器内也能退出）
+     * - Ctrl+F/H：只读 / 预览兜底（正常编辑仍走 editorCallback）
+     */
+    private readonly onWindowKeydownCapture = (event: KeyboardEvent) => {
+        if (event.defaultPrevented || event.isComposing) {
+            return;
+        }
+
+        if (
+            event.key === "Escape" &&
+            !event.ctrlKey &&
+            !event.metaKey &&
+            !event.altKey &&
+            !event.shiftKey
+        ) {
+            if (this.tryCloseSearchOnEscape(event.target)) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            return;
+        }
+
+        const mod = event.ctrlKey || event.metaKey;
+        if (!mod || event.altKey || event.shiftKey) {
+            return;
+        }
+        const key = event.key.toLowerCase();
+        if (key !== "f" && key !== "h") {
+            return;
+        }
+
+        const target = event.target instanceof Element ? event.target : null;
+        // 搜索面板内已有自己的快捷键处理
+        if (target?.closest(`.${CLASS_NAME}`)) {
+            return;
+        }
+        // 设置页等外部输入框：不要抢走
+        if (target && isForeignTextInput(target)) {
+            return;
+        }
+
+        const host = resolveHotkeyHostElement(target);
+        if (!host || !isEditorReplaceModeBlocked(host)) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        void this.addSearchElement({intent: key === "f" ? "find" : "replace"});
+    };
+
+    /**
+     * 焦点已回到编辑器等面板外区域时，Esc 仍关闭搜索窗。
+     * 面板内 Esc 由 SearchBar 自行处理，此处跳过以免重复销毁。
+     */
+    private tryCloseSearchOnEscape(eventTarget: EventTarget | null): boolean {
+        if (this.searchBars.size === 0) {
+            return false;
+        }
+
+        const target = eventTarget instanceof Element ? eventTarget : null;
+        if (target?.closest(`.${CLASS_NAME}`)) {
+            return false;
+        }
+        // 思源确认框 / 菜单打开时，把 Esc 留给它们
+        if (target?.closest(".b3-dialog, .b3-menu")) {
+            return false;
+        }
+
+        const host = resolveHotkeyHostElement(target);
+        const candidates: Element[] = [];
+        for (const root of this.searchBars.keys()) {
+            if (!root.isConnected) {
+                continue;
+            }
+            if (host && (host.contains(root) || root.contains(host) || host === root.parentElement)) {
+                candidates.push(root);
+            }
+        }
+
+        const toClose = candidates.length > 0 ?
+            candidates :
+            Array.from(this.searchBars.keys()).filter((root) => (
+                root.isConnected && (
+                    this.searchBars.size === 1 ||
+                    Boolean(root.closest(".layout__wnd--active"))
+                )
+            ));
+
+        if (toClose.length === 0) {
+            return false;
+        }
+
+        for (const root of toClose) {
+            this.closeCurrentSearchDialog(root);
+        }
+        return true;
+    }
+
+    private getSearchI18n(): SearchBarI18n {
+        const t = this.i18n as Record<string, string>;
+        return {
+            searchPlaceholder: t.searchPlaceholder || "Search (↑↓ view history)",
+            replacePlaceholder: t.replacePlaceholder || "Replace with",
+            searchPrev: t.searchPrev || "Previous (Shift+Enter)",
+            searchNext: t.searchNext || "Next (Enter)",
+            searchClose: t.searchClose || "Close",
+            selectionOnly: t.selectionOnly || "Search in selection",
+            matchCase: t.matchCase || "Match case",
+            wholeWord: t.wholeWord || "Whole word",
+            searchMethodKeyword: t.searchMethodKeyword || "Keyword",
+            searchMethodRegex: t.searchMethodRegex || "Regular expression",
+            preserveCase: t.preserveCase || "Preserve case",
+            preserveCaseDisabledByRegex: t.preserveCaseDisabledByRegex ||
+                "Unavailable with regex (replace uses $1 templates)",
+            replaceUnsupportedHelp: t.replaceUnsupportedHelp ||
+                "Replacement is unavailable in read-only mode, export preview, and the publish service; math formulas, databases, HTML blocks, Mermaid diagrams, and text with complex formatting also cannot be replaced; replacing the document title cannot be undone with Ctrl+Z. When the search mode is Regular expression, the replace box can use $1, $&, and similar syntax",
+            replaceAction: t.replaceAction || "Replace (Enter)",
+            replaceAllAction: t.replaceAllAction || "Replace all (Ctrl+Alt+Enter)",
+            replaceToggle: t.replaceToggle || "Expand or collapse replace row",
+            replaceCurrentUnsupported: t.replaceCurrentUnsupported ||
+                "This match cannot be replaced directly",
+            replaceRegexExpandFailed: t.replaceRegexExpandFailed ||
+                "Regex replace expansion failed; skipped",
+            replaceAttributeViewUnsupported: t.replaceAttributeViewUnsupported ||
+                "Database results cannot be replaced",
+            replaceMermaidUnsupported: t.replaceMermaidUnsupported ||
+                "Mermaid diagrams support search and highlight only, not replace",
+            replaceHtmlBlockUnsupported: t.replaceHtmlBlockUnsupported ||
+                "HTML blocks support search and highlight of rendered text only; replacement is not supported",
+            replaceTableRichUnsupported: t.replaceTableRichUnsupported ||
+                "Rich-text table cells support search and highlight only; replacement is not supported",
+            replaceTableCellEditingUnsupported: t.replaceTableCellEditingUnsupported ||
+                "This cell is being edited. Click outside the cell to finish editing, then replace",
+            replaceTablePendingEdit: t.replaceTablePendingEdit ||
+                "This table still has an edit that has not been saved. Click outside the cell, then replace",
+            replaceModeUnsupported: t.replaceModeUnsupported ||
+                "Replacement is unavailable in publish, export preview, or read-only mode",
+            replaceDocTitleFailed: t.replaceDocTitleFailed ||
+                "Failed to rename the document title",
+            replaceDocTitleEmpty: t.replaceDocTitleEmpty ||
+                "Document title is invalid; skipped",
+            replaceAllConfirm: t.replaceAllConfirm || "Replace {count} matches?",
+            replaceAllConfirmTitle: t.replaceAllConfirmTitle || "Replace all",
+            replaceAllIncomplete: t.replaceAllIncomplete ||
+                "Search results are incomplete. Wait for indexing before replacing all.",
+            replaceCurrentDone: t.replaceCurrentDone || "Current match replaced",
+            replaceAllResult: t.replaceAllResult ||
+                "Replacement complete: {replacedCount} replaced, {skippedCount} skipped",
+            replaceProtyleMissing: t.replaceProtyleMissing ||
+                "Cannot find Protyle editor; replace aborted to keep undo available",
+            selectionOnlyNoScope: t.selectionOnlyNoScope ||
+                "Selection-only mode is on, but there is no usable selection",
+            searchDegradedLoadedOnly: t.searchDegradedLoadedOnly ||
+                "This environment cannot query unloaded content. Results include only what is already loaded.",
+            searchIndexingBadge: t.searchIndexingBadge || "Indexing",
+            searchRetryIncomplete: t.searchRetryIncomplete || "{count} incomplete databases (click to retry)",
+            replaceStaleTarget: t.replaceStaleTarget ||
+                "The target changed. Replacement was cancelled and results refreshed. Review them and try again.",
+            searchUnrendered: t.searchUnrendered ||
+                "{count} blocks failed to render and were not counted",
+            resultsPanelToggle: t.resultsPanelToggle || "Search results",
+            resultsPanelEmpty: t.resultsPanelEmpty || "No results",
+            settingsTitle: t.settingsTitle || "Search scope",
+            settingsRestrictInline: t.settingsRestrictInline || "Limit search",
+            settingsRestrictInlineHint: t.settingsRestrictInlineHint ||
+                "When enabled, search only within the selected inline elements (multi-select). With an empty search box, preview all matching inline elements of the selected types. Limit-search choices reset when the search UI closes",
+            settingsIncludeScope: t.settingsIncludeScope || "Include in search",
+            settingsIncludeScopeHint: t.settingsIncludeScopeHint ||
+                "Controls which block-level types (and inline memos) may be searched",
+            settingsIncludeDocTitle: t.settingsIncludeDocTitle || "Document title",
+            settingsIncludeDocTitleHint: t.settingsIncludeDocTitleHint ||
+                "Replacing the document title cannot be undone with Ctrl+Z",
+            settingsIncludeImageTitle: t.settingsIncludeImageTitle || "Image title",
+            settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database block",
+            settingsIncludeTable: t.settingsIncludeTable || "Table block",
+            settingsIncludeBlockquote: t.settingsIncludeBlockquote || "Blockquote",
+            settingsIncludeCallout: t.settingsIncludeCallout || "Callout",
+            settingsIncludeSuperBlock: t.settingsIncludeSuperBlock || "Super block",
+            settingsIncludeTabs: t.settingsIncludeTabs || "Tabs",
+            settingsIncludeMindmap: t.settingsIncludeMindmap || "Mind map",
+            settingsIncludeList: t.settingsIncludeList || "List blocks",
+            settingsIncludeListUnordered: t.settingsIncludeListUnordered || "Unordered list",
+            settingsIncludeListOrdered: t.settingsIncludeListOrdered || "Ordered list",
+            settingsIncludeListTask: t.settingsIncludeListTask || "Task list",
+            settingsIncludeParagraph: t.settingsIncludeParagraph || "Paragraph block",
+            settingsIncludeHeading: t.settingsIncludeHeading || "Heading blocks",
+            settingsIncludeHeadingH1: t.settingsIncludeHeadingH1 || "Heading 1",
+            settingsIncludeHeadingH2: t.settingsIncludeHeadingH2 || "Heading 2",
+            settingsIncludeHeadingH3: t.settingsIncludeHeadingH3 || "Heading 3",
+            settingsIncludeHeadingH4: t.settingsIncludeHeadingH4 || "Heading 4",
+            settingsIncludeHeadingH5: t.settingsIncludeHeadingH5 || "Heading 5",
+            settingsIncludeHeadingH6: t.settingsIncludeHeadingH6 || "Heading 6",
+            settingsIncludeMathBlock: t.settingsIncludeMathBlock || "Math block",
+            settingsIncludeEmbedBlock: t.settingsIncludeEmbedBlock || "Embed block",
+            settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
+            settingsIncludePlainCodeBlock: t.settingsIncludePlainCodeBlock || "Plain code blocks",
+            settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
+            settingsIncludeFlowchart: t.settingsIncludeFlowchart || "flowchart",
+            settingsIncludeHtmlBlock: t.settingsIncludeHtmlBlock || "HTML block",
+            settingsIncludeHtmlBlockHint: t.settingsIncludeHtmlBlockHint ||
+                "Match visible rendered text inside HTML blocks, not the HTML source",
+            settingsIncludeFoldedBlocks: t.settingsIncludeFoldedBlocks || "Folded block content",
+            settingsIncludeFoldedBlocksHint: t.settingsIncludeFoldedBlocksHint ||
+                "Controls whether to search hidden content inside folded blocks",
+            settingsIncludeInlineMemo: t.settingsIncludeInlineMemo || "Inline memos",
+            settingsIncludeInlineMemoHint: t.settingsIncludeInlineMemoHint ||
+                "Matches show a yellow/orange dashed underline under the corresponding text; replacement is supported and can be undone with Ctrl+Z",
+            settingsRestrictBlockRef: t.settingsRestrictBlockRef || "Block ref",
+            settingsRestrictLink: t.settingsRestrictLink || "Link",
+            settingsRestrictStrong: t.settingsRestrictStrong || "Bold",
+            settingsRestrictEm: t.settingsRestrictEm || "Italic",
+            settingsRestrictU: t.settingsRestrictU || "Underline",
+            settingsRestrictS: t.settingsRestrictS || "Strikethrough",
+            settingsRestrictMark: t.settingsRestrictMark || "Highlight",
+            settingsRestrictSup: t.settingsRestrictSup || "Superscript",
+            settingsRestrictSub: t.settingsRestrictSub || "Subscript",
+            settingsRestrictCode: t.settingsRestrictCode || "Inline code",
+            settingsRestrictKbd: t.settingsRestrictKbd || "Keyboard",
+            settingsRestrictTag: t.settingsRestrictTag || "Tag",
+            settingsRestrictInlineMath: t.settingsRestrictInlineMath || "Inline math",
+            settingsRestrictInlineMathHint: t.settingsRestrictInlineMathHint ||
+                "Match visible rendered formula text rather than LaTeX source",
+            settingsRestrictInlineMemo: t.settingsRestrictInlineMemo || "Inline memo",
+            settingsRestrictInlineMemoHint: t.settingsRestrictInlineMemoHint ||
+                "Turn on Include in search → Inline memos first",
+            settingsRestrictInlineMemoOnHint: t.settingsRestrictInlineMemoOnHint ||
+                "Turn on Include in search → Inline memos first",
+            invalidRegex: t.invalidRegex || "Invalid regex: {error}",
+        };
+    }
+
+    /** 将文档标题匹配开关同步到其它已打开面板 */
+    syncIncludeDocTitle(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeDocTitle(value);
+        });
+    }
+
+    /** 将图片标题匹配开关同步到其它已打开面板 */
+    syncIncludeImageTitle(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeImageTitle(value);
+        });
+    }
+
+    /** 将数据库匹配开关同步到其它已打开面板 */
+    syncIncludeAttributeView(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeAttributeView(value);
+        });
+    }
+
+    /** 将表格匹配开关同步到其它已打开面板 */
+    syncIncludeTable(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeTable(value);
+        });
+    }
+
+    /** 将引述块匹配开关同步到其它已打开面板 */
+    syncIncludeBlockquote(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeBlockquote(value);
+        });
+    }
+
+    /** 将提示块匹配开关同步到其它已打开面板 */
+    syncIncludeCallout(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeCallout(value);
+        });
+    }
+
+    /** 将超级块匹配开关同步到其它已打开面板 */
+    syncIncludeSuperBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeSuperBlock(value);
+        });
+    }
+
+    /** 将页签块匹配开关同步到其它已打开面板 */
+    syncIncludeTabs(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeTabs(value);
+        });
+    }
+
+    /** 将思维导图块匹配开关同步到其它已打开面板 */
+    syncIncludeMindmap(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeMindmap(value);
+        });
+    }
+
+    /** 将无序列表匹配开关同步到其它已打开面板 */
+    syncIncludeListUnordered(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeListUnordered(value);
+        });
+    }
+
+    /** 将有序列表匹配开关同步到其它已打开面板 */
+    syncIncludeListOrdered(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeListOrdered(value);
+        });
+    }
+
+    /** 将任务列表匹配开关同步到其它已打开面板 */
+    syncIncludeListTask(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeListTask(value);
+        });
+    }
+
+    /** 将段落块匹配开关同步到其它已打开面板 */
+    syncIncludeParagraph(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeParagraph(value);
+        });
+    }
+
+    /** 将标题级别匹配开关同步到其它已打开面板 */
+    syncIncludeHeadingLevel(level: HeadingIncludeLevel, value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeHeadingLevel(level, value);
+        });
+    }
+
+    /** 将公式块匹配开关同步到其它已打开面板 */
+    syncIncludeMathBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeMathBlock(value);
+        });
+    }
+
+    /** 将嵌入块匹配开关同步到其它已打开面板 */
+    syncIncludeEmbedBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeEmbedBlock(value);
+        });
+    }
+
+    /** 将代码块匹配开关同步到其它已打开面板 */
+    syncIncludeCodeBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeCodeBlock(value);
+        });
+    }
+
+    /** 将 Mermaid 匹配开关同步到其它已打开面板 */
+    syncIncludeMermaid(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeMermaid(value);
+        });
+    }
+
+    /** 将 flowchart 匹配开关同步到其它已打开面板 */
+    syncIncludeFlowchart(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeFlowchart(value);
+        });
+    }
+
+    /** 将 HTML 块匹配开关同步到其它已打开面板 */
+    syncIncludeHtmlBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeHtmlBlock(value);
+        });
+    }
+
+    /** 将折叠块内容匹配开关同步到其它已打开面板 */
+    syncIncludeFoldedBlocks(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeFoldedBlocks(value);
+        });
+    }
+
+    /** 将行内备注匹配开关同步到其它已打开面板 */
+    syncIncludeInlineMemo(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeInlineMemo(value);
+        });
+    }
+
+    /** 将限制查找类型同步到其它已打开面板 */
+    syncRestrictInlineTypes(value: RestrictInlineType[], source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyRestrictInlineTypes(value);
+        });
+    }
+
+    /** 将查找方法（关键字/正则）同步到其它已打开面板 */
+    syncUseRegex(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyUseRegex(value);
+        });
+    }
+
+    private readonly onKernelPluginStateChange = ({detail}: CustomEvent<IKernelPluginState>) => {
+        this.kernelReady = detail?.code === 2;
+    };
+
+    private cleanupInvalidComponents() {
+        const invalidElements: Element[] = [];
+        this.searchBars.forEach((_, element) => {
+            if (!document.contains(element)) {
+                invalidElements.push(element);
+            }
+        });
+
+        if (invalidElements.length > 0) {
+            console.warn("[page-search] cleaning unexpectedly removed search bars");
+        }
+
+        invalidElements.forEach((element) => {
+            const bar = this.searchBars.get(element);
+            this.searchBars.delete(element);
+            if (bar) {
+                this.rememberSessionInputs(bar);
+                try {
+                    bar.destroy(false);
+                } catch (error) {
+                    console.error("[page-search] destroy invalid bar failed", error);
+                    this.activeSearchComponentsCount = Math.max(0, this.activeSearchComponentsCount - 1);
+                }
+            } else {
+                this.activeSearchComponentsCount = Math.max(0, this.activeSearchComponentsCount - 1);
+            }
+        });
+
+        if (this.activeSearchComponentsCount === 0) {
+            this.searchComponentCallbacks.clear();
+            this.eventBusOff();
+            this.lastHighlightComponent = null;
+        }
+    }
+
+    private startCleanupTimer() {
+        if (this.cleanupTimer) {
+            clearInterval(this.cleanupTimer);
+        }
+        this.cleanupTimer = window.setInterval(() => {
+            this.cleanupInvalidComponents();
+        }, 30000);
+    }
+
+    private stopCleanupTimer() {
+        if (this.cleanupTimer) {
+            clearInterval(this.cleanupTimer);
+            this.cleanupTimer = null;
+        }
+    }
+
+    private eventBusOn() {
+        this.eventBus.on("ws-main", this.handleEventBusEvent);
+        this.eventBus.on("loaded-protyle-dynamic", this.handleEventBusEvent);
+        this.eventBus.on("loaded-protyle-static", this.handleEventBusEvent);
+        this.eventBus.on("switch-protyle", this.handleEventBusEvent);
+        this.eventBus.on("switch-protyle-mode", this.handleEventBusEvent);
+    }
+
+    private eventBusOff() {
+        this.eventBus.off("ws-main", this.handleEventBusEvent);
+        this.eventBus.off("loaded-protyle-dynamic", this.handleEventBusEvent);
+        this.eventBus.off("loaded-protyle-static", this.handleEventBusEvent);
+        this.eventBus.off("switch-protyle", this.handleEventBusEvent);
+        this.eventBus.off("switch-protyle-mode", this.handleEventBusEvent);
+    }
+
+    private handleEventBusEvent = (event: CustomEvent) => {
+        this.searchComponentCallbacks.forEach((callback) => {
+            callback(event);
+        });
+    };
+
+    onSearchComponentMounted(callback: (event: CustomEvent) => void) {
+        this.searchComponentCallbacks.add(callback);
+        this.activeSearchComponentsCount++;
+        if (this.activeSearchComponentsCount === 1) {
+            this.eventBusOn();
+            this.startCleanupTimer();
+        }
+    }
+
+    onSearchComponentUnmounted(callback?: (event: CustomEvent) => void, root?: Element) {
+        if (callback) {
+            this.searchComponentCallbacks.delete(callback);
+        }
+        this.activeSearchComponentsCount--;
+        if (root === this.lastHighlightComponent) this.lastHighlightComponent = null;
+        if (this.activeSearchComponentsCount === 0) {
+            this.lastHighlightComponent = null;
+            this.eventBusOff();
+            this.stopCleanupTimer();
+        }
+    }
+
+    /** 宿主移除窗格时立即释放组件；不写配置，也不恢复焦点到被搬走的正文。 */
+    onSearchComponentDetached(root: Element) {
+        const bar = this.searchBars.get(root);
+        if (!bar) return;
+        this.searchBars.delete(root);
+        this.rememberSessionInputs(bar);
+        bar.destroy(false);
+    }
+
+    closeSearchDialog() {
+        this.searchBars.forEach((bar) => {
+            this.rememberSessionInputs(bar);
+            try {
+                bar.destroy();
+            } catch (error) {
+                console.error("[page-search] destroy search bar failed", error);
+            }
+        });
+        this.searchBars.clear();
+        this.activeSearchComponentsCount = 0;
+        document.querySelectorAll(`.${CLASS_NAME}`).forEach((element) => {
+            try {
+                element.remove();
+            } catch (error) {
+                console.error("[page-search] remove search root failed", error);
+            }
+        });
+        this.lastHighlightComponent = null;
+        // 限制查找不持久化：关闭时清回默认空，避免下次打开带回旧勾选
+        // 查找/替换文案仅留在 session*，不写 prefs、不跨次启动恢复
+        void rpcSetPrefs(this, {restrictInlineTypes: []});
+    }
+
+    closeCurrentSearchDialog(element: Element) {
+        const bar = this.searchBars.get(element);
+        if (bar) {
+            this.rememberSessionInputs(bar);
+            try {
+                this.searchBars.delete(element);
+                bar.destroy();
+            } catch (error) {
+                console.error("[page-search] close current search failed", error);
+            }
+        } else {
+            try {
+                element.remove();
+            } catch (error) {
+                console.error("[page-search] remove element failed", error);
+            }
+        }
+
+        void rpcSetPrefs(this, {restrictInlineTypes: []});
+    }
+
+    /** 关闭前记下输入框文案，供本进程内再次打开时恢复 */
+    private rememberSessionInputs(bar: SearchBar) {
+        this.sessionSearchText = bar.getSearchText();
+        this.sessionReplaceText = bar.getReplaceText();
+    }
+
+    closePanel() {
+        if (!this.isMobile) {
+            return;
+        }
+        const menuElement = document.getElementById("menu");
+        const sidebarElement = document.getElementById("sidebar");
+        const modelElement = document.getElementById("model");
+        if (menuElement) {
+            menuElement.style.transform = "";
+        }
+        if (sidebarElement) {
+            sidebarElement.style.transform = "";
+        }
+        if (modelElement) {
+            modelElement.style.transform = "";
+        }
+        const maskElement = document.querySelector(".side-mask") as HTMLElement | null;
+        if (maskElement) {
+            maskElement.classList.add("fn__none");
+            maskElement.style.opacity = "";
+        }
+        (window as any).siyuan?.menus?.menu?.remove?.();
+    }
+
+    async addSearchElement(options: {
+        isFromTopBar?: boolean;
+        /** find=Ctrl+F；replace=Ctrl+H */
+        intent?: "find" | "replace";
+    } = {}) {
+        const isFromTopBar = Boolean(options.isFromTopBar);
+        const intent = options.intent ?? "find";
+        const replaceVisibleOnCreate = intent === "replace";
+        this.cleanupInvalidComponents();
+
+        const mobile = this.isMobile;
+        let edits: NodeListOf<Element> | Element[] = mobile ?
+            document.querySelectorAll("#editor") :
+            document.querySelectorAll(".layout__wnd--active > .layout-tab-container");
+
+        if (edits.length === 0) {
+            const protyle = document.activeElement?.closest(".protyle");
+            if (protyle) {
+                edits = [protyle];
+            } else {
+                console.error("[page-search] no protyle found");
+                return;
+            }
+        }
+
+        const prefs = await rpcGetPrefs(this);
+        // 会话内保留查找/替换文案；有选区时优先用选区填查找框（对齐常见编辑器）
+        const selectedText = this.getSelectedText();
+        const initialQuery = selectedText || this.sessionSearchText;
+        const initialReplace = this.sessionReplaceText;
+        const selectSearchOnOpen = !selectedText;
+
+        edits.forEach((edit) => {
+            const existingElement = mobile ?
+                document.querySelector(`.${CLASS_NAME}`) :
+                edit.querySelector(`.${CLASS_NAME}`);
+
+            if (!existingElement) {
+                // (1) 关闭态：Ctrl+F 折叠替换；Ctrl+H 展开替换；焦点均在查找框
+                const element = document.createElement("div");
+                element.className = `${CLASS_NAME}${mobile ? ` ${CLASS_NAME}--mobile` : ""}`;
+
+                if (mobile) {
+                    edit.insertAdjacentElement("afterend", element);
+                } else {
+                    edit.appendChild(element);
+                }
+
+                const bar = new SearchBar({
+                    edit,
+                    root: element,
+                    plugin: this,
+                    i18n: this.getSearchI18n(),
+                    presetText: initialQuery || undefined,
+                    presetReplaceText: initialReplace || undefined,
+                    selectSearchOnOpen,
+                    // 选区预填是一次新查找；会话里带回的词只恢复输入框，不记入历史。
+                    recordInitialQuery: Boolean(selectedText),
+                    replaceVisible: replaceVisibleOnCreate,
+                    includeDocTitle: prefs.includeDocTitle !== false,
+                    includeImageTitle: prefs.includeImageTitle !== false,
+                    includeAttributeView: prefs.includeAttributeView !== false,
+                    includeTable: prefs.includeTable !== false,
+                    includeBlockquote: prefs.includeBlockquote !== false,
+                    includeCallout: prefs.includeCallout !== false,
+                    includeSuperBlock: prefs.includeSuperBlock !== false,
+                    includeTabs: prefs.includeTabs !== false,
+                    includeMindmap: prefs.includeMindmap !== false,
+                    includeListUnordered: prefs.includeListUnordered !== false,
+                    includeListOrdered: prefs.includeListOrdered !== false,
+                    includeListTask: prefs.includeListTask !== false,
+                    includeParagraph: prefs.includeParagraph !== false,
+                    includeHeadingH1: prefs.includeHeadingH1 !== false,
+                    includeHeadingH2: prefs.includeHeadingH2 !== false,
+                    includeHeadingH3: prefs.includeHeadingH3 !== false,
+                    includeHeadingH4: prefs.includeHeadingH4 !== false,
+                    includeHeadingH5: prefs.includeHeadingH5 !== false,
+                    includeHeadingH6: prefs.includeHeadingH6 !== false,
+                    includeMathBlock: prefs.includeMathBlock !== false,
+                    includeEmbedBlock: prefs.includeEmbedBlock !== false,
+                    includeCodeBlock: prefs.includeCodeBlock !== false,
+                    includeMermaid: prefs.includeMermaid !== false,
+                    includeFlowchart: prefs.includeFlowchart !== false,
+                    includeHtmlBlock: prefs.includeHtmlBlock !== false,
+                    includeFoldedBlocks: prefs.includeFoldedBlocks === true,
+                    includeInlineMemo: prefs.includeInlineMemo === true,
+                    useRegex: prefs.useRegex === true,
+                    // 限制查找仅会话内有效，打开时始终不限制
+                    restrictInlineTypes: [],
+                });
+                this.searchBars.set(element, bar);
+
+                if (
+                    !isFromTopBar &&
+                    typeof prefs.dialogLeft === "number" &&
+                    typeof prefs.dialogTop === "number"
+                ) {
+                    bar.applySavedPosition(prefs.dialogLeft, prefs.dialogTop);
+                }
+            } else {
+                const bar = this.searchBars.get(existingElement);
+                if (isFromTopBar && bar) {
+                    bar.resetPanelPosition();
+                }
+                if (!bar) {
+                    const inputElement = existingElement.querySelector(
+                        ".search-dialog .b3-text-field",
+                    ) as HTMLInputElement | null;
+                    inputElement?.focus();
+                    inputElement?.select();
+                    return;
+                }
+
+                if (selectedText) {
+                    // 预填时不抢焦点，由 intent 决定最终落点
+                    bar.applyPresetAndSearch(selectedText, {focusFind: false});
+                }
+
+                // (2)(3)(4) 已打开时的快捷键行为
+                bar.applyHotkeyIntent(intent);
+            }
+        });
+    }
+
+    private getSelectedText(): string {
+        const selection = window.getSelection();
+        if (!selection || selection.rangeCount === 0) {
+            return "";
+        }
+        return selection.getRangeAt(0).toString().trim() || "";
+    }
+}
+
+/** 当前快捷键应对准的编辑宿主（焦点处 protyle / 活动窗口） */
+function resolveHotkeyHostElement(target: Element | null): Element | null {
+    const fromTarget = target?.closest(".protyle") ??
+        target?.closest(".layout-tab-container");
+    if (fromTarget) {
+        return fromTarget;
+    }
+    return document.querySelector(".layout__wnd--active > .layout-tab-container") ??
+        document.querySelector(".layout__wnd--active .protyle:not(.fn__none)") ??
+        document.querySelector("#editor .protyle:not(.fn__none)");
+}
+
+/** 设置页等非文档输入区，避免抢 Ctrl+F/H */
+function isForeignTextInput(el: Element): boolean {
+    const tag = el.tagName;
+    const isField = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" ||
+        (el as HTMLElement).isContentEditable;
+    if (!isField) {
+        return false;
+    }
+    return !el.closest(".protyle") && !el.closest(`.${CLASS_NAME}`);
+}

@@ -1,0 +1,10 @@
+.idea
+.vscode
+.DS_Store
+package-lock.json
+package.zip
+node_modules
+dev
+dist
+tmp
+.env
