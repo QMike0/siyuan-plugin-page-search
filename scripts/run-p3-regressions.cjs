@@ -860,7 +860,37 @@ async function galleryNavigationRegressions() {
 
 async function avFoldCacheRegressions() {
     const av = source("frontend/corpus/av");
-    const {isAttrViewFoldOnlyTransaction} = source("frontend/av-watch");
+    const {isAttrViewFoldOnlyTransaction, watchAttributeViewDom} = source("frontend/av-watch");
+    const queryHost = document.createElement("div");
+    queryHost.innerHTML = '<div data-type="NodeAttributeView"><div data-type="av-search">keep</div>' +
+        '<div class="av__kanban"><div class="av__body"><div class="av__cell">value</div></div></div></div>';
+    document.body.appendChild(queryHost);
+    let changes = 0;
+    const stopQueryWatch = watchAttributeViewDom(queryHost, () => changes++, 5);
+    const input = queryHost.querySelector('[data-type="av-search"]');
+    const cell = queryHost.querySelector(".av__cell");
+    try {
+        input.firstChild.nodeValue = "other";
+        input.dispatchEvent(new window.Event("input", {bubbles: true}));
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(changes, 1, "native contenteditable input refreshes AV query completion");
+        input.textContent = "";
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(changes, 2, "native query clearing also refreshes");
+        cell.textContent = "changed";
+        cell.dispatchEvent(new window.Event("input", {bubbles: true}));
+        queryHost.querySelector(".av__body").insertAdjacentHTML("beforeend", '<div class="av__cell">virtual</div>');
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(changes, 2, "card edits/virtual mounts do not enter the structural query watcher");
+    } finally {
+        stopQueryWatch();
+    }
+    input.textContent = "after-stop";
+    input.dispatchEvent(new window.Event("input", {bubbles: true}));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(changes, 2, "query watcher releases input and mutation subscriptions");
+    queryHost.remove();
+    console.log("AV native query input/clear refresh, virtual-mount isolation and listener disposal OK");
     const fold = {action: "foldAttrViewGroup", avID: "a"};
     const edit = {action: "updateAttrViewCell", avID: "a"};
     const event = (doOperations, undoOperations = []) => ({cmd: "transactions", data: [{doOperations, undoOperations}]});

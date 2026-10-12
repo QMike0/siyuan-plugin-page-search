@@ -1,5 +1,6 @@
 import type {SearchableUnit} from "../../shared";
 import {avCellUnitId} from "../../shared/av-live";
+import {attributeViewHtmlTexts} from "../blocks";
 import {postJson} from "./api";
 
 const PAGE_SIZE = 200;
@@ -35,11 +36,14 @@ export interface AvBlockRef {
     updated: string;
     /** 载体块 IAL 持久化的当前视图；空值使用默认首个可用视图。 */
     carrierViewId: string;
+    /** Native AV search is transient DOM state, not a persisted field filter. */
+    query?: string;
 }
 
 interface AvCell {
     text: string;
     snippet: string;
+    texts?: string[];
 }
 
 interface AvUnitDraft {
@@ -242,6 +246,10 @@ export function readAvCarrierViewId(...sources: string[]): string {
     return "";
 }
 
+export function readAvSearchQuery(element: HTMLElement): string | undefined {
+    return element.querySelector('[data-type="av-search"]')?.textContent?.trim();
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
     return value && typeof value === "object" && !Array.isArray(value) ?
         value as Record<string, unknown> :
@@ -310,6 +318,8 @@ interface AvColumnInfo {
     hidden: boolean;
     type: string;
     dateFormat: string;
+    renderTemplate: string;
+    cardCheckboxName?: string;
 }
 
 function columnInfo(view: Record<string, unknown>): Map<string, AvColumnInfo> {
@@ -331,6 +341,9 @@ function columnInfo(view: Record<string, unknown>): Map<string, AvColumnInfo> {
                 hidden: record.hidden === true,
                 type: String(record.type ?? ""),
                 dateFormat: String(record.dateFormat ?? ""),
+                renderTemplate: String(record.renderTemplate ?? ""),
+                cardCheckboxName: ["gallery", "kanban"].includes(String(view.type)) && view.displayFieldName !== true ?
+                    name || avLanguageValue("languages.checkbox") : undefined,
             });
         }
     }
@@ -383,12 +396,140 @@ function formatAvDate(content: unknown, format: string, isNotTime: boolean): str
     return result;
 }
 
-function displayValueText(value: Record<string, unknown>, column?: AvColumnInfo): string {
+/** cellValue.ts hasAVRenderTemplateResult; an empty rendered result must not expose raw data. */
+function templateContent(value: Record<string, unknown>, column?: AvColumnInfo): string | undefined {
+    if (value.type === "template") return String(asRecord(value.template)?.content ?? "");
+    if (value.hasRenderTemplate || typeof value.renderedContent === "string" || column?.renderTemplate.trim()) {
+        return String(value.renderedContent ?? "");
+    }
+    return undefined;
+}
+
+/** SiYuan imageURL.ts: HEIF is displayed as text unless the internal preview can serve it. */
+function avAssetIsImage(path: string): boolean {
+    let decoded = path.trim().split(/[?#]/, 1)[0].toLowerCase();
+    try { decoded = decodeURIComponent(decoded).toLowerCase(); } catch { /* Native keeps an invalid URL undecoded. */ }
+    if (!/\.(heic|heif)$/.test(decoded)) return true;
+    try {
+        const origin = typeof location === "undefined" ? "http://siyuan.invalid" : location.origin;
+        const base = new URL(origin);
+        const source = path.trim();
+        if (/^file:/i.test(source) || /^[a-z]:[\\/]/i.test(source) || source.startsWith("\\\\")) return false;
+        const url = new URL(source, base.origin + "/");
+        return ["http:", "https:"].includes(base.protocol) && url.origin === base.origin &&
+            decodeURIComponent(url.pathname).startsWith("/assets/") &&
+            !url.searchParams.getAll("download").some(value => value.toLowerCase() === "true");
+    } catch { return false; }
+}
+
+function escapeAvText(text: string): string {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Only types with HTML/gaps need an inert DOM parse; ordinary fields stay on the string path. */
+function displayValueHtml(value: Record<string, unknown>, column?: AvColumnInfo): string | undefined {
+    const template = templateContent(value, column);
+    if (template !== undefined) return `<span class="av__celltext--template">${template}</span>`;
+    if (value.type === "mAsset") {
+        if (!Array.isArray(value.mAsset) || !value.mAsset.some(item => {
+            const asset = asRecord(item);
+            return asset?.type === "image" && avAssetIsImage(String(asset.content ?? ""));
+        })) return undefined;
+        return Array.isArray(value.mAsset) ? value.mAsset.map(item => {
+            const asset = asRecord(item);
+            if (!asset) return "";
+            if (asset.type === "image" && avAssetIsImage(String(asset.content ?? ""))) return "<img>";
+            return `<span class="b3-chip">${escapeAvText(String(asset.name || asset.content || ""))}</span>`;
+        }).join("") : "";
+    }
+    if (value.type === "relation") {
+        const items = asRecord(value.relation)?.contents;
+        if (!Array.isArray(items) || !items.some(item => {
+            const record = asRecord(item);
+            return record?.block && templateContent(record) !== undefined;
+        })) return undefined;
+        return Array.isArray(items) ? items.map(item => {
+            const record = asRecord(item);
+            if (!record?.block) return "";
+            const template = templateContent(record);
+            const html = template ?? escapeAvText(String(asRecord(record.block)?.content || avLanguageValue("languages.untitled")));
+            return `<span class="av__cell--relation"><span class="av__celltext">${html}</span></span>`;
+        }).join("") : "";
+    }
+    if (value.type === "rollup") {
+        const items = asRecord(value.rollup)?.contents;
+        if (!Array.isArray(items)) return "";
+        if (!items.some(item => ["template", "select", "mSelect", "mAsset", "relation"].includes(String(asRecord(item)?.type)))) {
+            return undefined;
+        }
+        let html = "";
+        let lastType = "";
+        for (const item of items) {
+            const record = asRecord(item);
+            if (!record) continue;
+            lastType = String(record.type);
+            const nestedCell = ["template", "select", "mSelect", "mAsset", "relation"].includes(lastType);
+            const piece = lastType === "checkbox" ? "<svg></svg><span class=\"fn__space\"></span>" :
+                nestedCell ? displayValueHtml(record) ?? escapeAvText(displayValueText(record)) :
+                escapeAvText(displayValueText(record, undefined, true));
+            if (piece) html += piece + (lastType === "checkbox" ? "" : ", ");
+        }
+        if (lastType === "checkbox") return `<div class="fn__flex">${html}</div>`;
+        return html.endsWith(", ") ? html.slice(0, -2) : html;
+    }
+    return undefined;
+}
+
+function displayValueText(value: Record<string, unknown>, column?: AvColumnInfo, rollup = false): string {
     const type = String(value.type ?? column?.type ?? "");
+    if (["text", "block", "url", "email", "phone"].includes(type)) {
+        const content = asRecord(value[type])?.content;
+        return String(content || (type === "block" && rollup ? avLanguageValue("languages.untitled") : ""));
+    }
+    if (type === "select" || type === "mSelect") {
+        const items = Array.isArray(value.mSelect) ? value.mSelect : [];
+        return (type === "select" ? items.slice(0, 1) : items).map(item => String(asRecord(item)?.content ?? "")).join("");
+    }
+    if (type === "mAsset") {
+        return Array.isArray(value.mAsset) ? value.mAsset.map(item => {
+            const asset = asRecord(item);
+            return String(asset?.name || asset?.content || "");
+        }).join("") : "";
+    }
+    if (type === "relation") {
+        const items = asRecord(value.relation)?.contents;
+        return Array.isArray(items) ? items.map(item => {
+            const record = asRecord(item);
+            return record?.block ? String(asRecord(record.block)?.content || avLanguageValue("languages.untitled")) : "";
+        }).join("") : "";
+    }
+    if (type === "rollup") {
+        const items = asRecord(value.rollup)?.contents;
+        if (!Array.isArray(items)) return "";
+        let text = "";
+        let lastType = "";
+        for (const item of items) {
+            const record = asRecord(item);
+            if (!record) continue;
+            lastType = String(record.type);
+            const piece = displayValueText(record, undefined, true);
+            if (piece) text += piece + ", ";
+        }
+        return lastType !== "checkbox" && text.endsWith(", ") ? text.slice(0, -2) : text;
+    }
+    if (type === "checkbox") return column?.cardCheckboxName ?? "";
     if (type === "number") {
         const number = asRecord(value.number);
         if (!number) return "";
-        return String(number.formattedContent || number.content || "");
+        return String(number.formattedContent || (rollup ? number.content?.toString() : number.content) || "");
+    }
+    if (rollup && ["date", "created", "updated"].includes(type)) {
+        const date = asRecord(value[type]);
+        if (!date) return "";
+        if (date.formattedContent) return String(date.formattedContent);
+        // Native renderRollup replaces the first date with the end date when a range is present.
+        if (!date.isNotEmpty) return "";
+        return formatAvDate(date.hasEndDate && date.isNotEmpty2 ? date.content2 : date.content, "", date.isNotTime !== false);
     }
     if (type === "date") {
         const date = asRecord(value.date);
@@ -428,13 +569,15 @@ function cellDisplay(
     // view's flags before extracting/retaining any of their text.
     const column = columns.get(keyId);
     if (column?.hidden) return null;
-    const text = displayValueText(value, column);
+    const html = displayValueHtml(value, column);
+    const texts = html === undefined ? undefined : attributeViewHtmlTexts(html);
+    const text = texts ? texts.join("") : displayValueText(value, column);
     if (!itemId || !keyId || !text) {
         return null;
     }
     const columnName = column?.name ?? "";
     const snippet = [viewName, columnName, text].filter(Boolean).join(" · ");
-    return {itemId, keyId, cell: {text, snippet}};
+    return {itemId, keyId, cell: {text, snippet, texts}};
 }
 
 function rowList(view: Record<string, unknown>): unknown[] {
@@ -538,6 +681,7 @@ async function renderView(
     blockId: string,
     viewId: string,
     viewName: string,
+    query: string,
     target: Map<string, AvCell>,
     shouldContinue: () => boolean,
     signal?: AbortSignal,
@@ -551,7 +695,7 @@ async function renderView(
         viewID: viewId,
         page: 1,
         pageSize: PAGE_SIZE,
-        query: "",
+        query,
         groupPaging: {},
         createIfNotExist: false,
     }, signal);
@@ -612,7 +756,7 @@ async function renderView(
                 viewID: viewId,
                 page: 1,
                 pageSize: PAGE_SIZE,
-                query: "",
+                query,
                 groupPaging,
                 createIfNotExist: false,
             }, signal);
@@ -663,7 +807,7 @@ async function renderView(
             viewID: viewId,
             page: progress.page,
             pageSize: PAGE_SIZE,
-            query: "",
+            query,
             groupPaging: {},
             createIfNotExist: false,
         }, signal);
@@ -713,7 +857,7 @@ function toUnits(blockId: string, drafts: AvUnitDraft[]): Array<SearchableUnit &
 
 /** 打开中的数据库按载体 viewID 缓存；未挂载时按内核规则使用默认首个可用视图。 */
 function cacheKey(ref: AvBlockRef, viewId = ""): string {
-    return `${ref.blockId}:${ref.avId}:${ref.updated}:${viewId ? `view:${viewId}` : "default"}`;
+    return `${ref.blockId}:${ref.avId}:${ref.updated}:${viewId ? `view:${viewId}` : "default"}:query:${JSON.stringify(ref.query ?? "")}`;
 }
 
 function selectedViewId(ref: AvBlockRef, viewIds: ReadonlyMap<string, string>): string {
@@ -735,7 +879,7 @@ function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUn
     keys.add(key);
     cacheKeysByCarrier.set(prefix, keys);
     if (!pinnedAvKeys.has(key)) unpinnedAvKeys.set(key, true);
-    const bytes = avUnitsBytes(units);
+    const bytes = avUnitsBytes(units) + key.length * 2;
     cachedBytes.set(key, bytes);
     retainedBytes += bytes;
     trimAvCache();
@@ -889,6 +1033,7 @@ async function loadAvCarrier(
         ref.blockId,
         view?.id ?? "",
         view?.name ?? info.name,
+        ref.query ?? "",
         cells,
         canContinue,
         signal,
@@ -898,7 +1043,11 @@ async function loadAvCarrier(
         drafts.push({unitId: "av-title", text: info.name, snippet: info.name});
     }
     if (view?.name) drafts.push({unitId: `av-view:${view.id}`, text: view.name, snippet: view.name});
-    for (const [key, cell] of cells) drafts.push({unitId: key, text: cell.text, snippet: cell.snippet});
+    for (const [key, cell] of cells) {
+        if (cell.texts && cell.texts.length > 1) {
+            cell.texts.forEach((text, index) => drafts.push({unitId: `${key}#run-${index}`, text, snippet: cell.snippet}));
+        } else drafts.push({unitId: key, text: cell.text, snippet: cell.snippet});
+    }
     const built = toUnits(ref.blockId, drafts);
     if (!canContinue()) return null;
     resolvedViews.set(built, view?.id ?? "");

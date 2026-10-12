@@ -23,6 +23,7 @@ import {
     type DiagramSubtype,
 } from "../renderer-adapters";
 import {postJson} from "./api";
+import {readAvSearchQuery} from "./av";
 import {resolveEmbedQuery} from "./embed-query";
 import {
     createOffscreenHost,
@@ -142,6 +143,7 @@ export function collectEmbeddedAvCarriers(
                 updated: element.getAttribute("updated") ?? "",
                 carrierViewId: element.getAttribute("custom-sy-av-view")?.trim() ||
                     element.querySelector<HTMLElement>(".av__views .item--focus")?.dataset.id?.trim() || "",
+                query: readAvSearchQuery(element),
             },
         });
     }

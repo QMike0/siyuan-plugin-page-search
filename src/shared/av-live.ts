@@ -44,10 +44,15 @@ export function avApiCellPosition(unitId: string): {row: string; col: string;} |
     return splitAt > 0 ? {row: rest.slice(0, splitAt), col: rest.slice(splitAt + 1)} : null;
 }
 
-/** API and DOM spell the same AV cell differently. Do not alias split
- * text runs, unstable rows/columns, calendar labels or table headers. */
+/** API and DOM spell the same AV cell differently. Split runs only alias the
+ * corresponding split run, never the whole cell. */
 export function avApiUnitId(unitId?: string): string | undefined {
-    if (!unitId || /#run-\d+$/.test(unitId)) return undefined;
+    if (!unitId) return undefined;
+    const run = /#run-\d+$/.exec(unitId)?.[0];
+    if (run) {
+        const base = avApiUnitId(unitId.slice(0, -run.length));
+        return base && avApiCellPosition(base.replace(/^embed:[^:]+:/, "")) ? base + run : undefined;
+    }
     const sourceEnd = unitId.startsWith("embed:") ? unitId.indexOf(":", 6) : -1;
     if (unitId.startsWith("embed:") && sourceEnd < 0) return undefined;
     const prefix = sourceEnd < 0 ? "" : unitId.slice(0, sourceEnd + 1);
@@ -106,6 +111,7 @@ export function avApiUnitShown(
     coverage: AvDomCoverage,
     usedRowLabels: Set<string>,
 ): boolean {
+    unitId = unitId.replace(/#run-\d+$/, "");
     if (coverage.unstable) {
         return true;
     }
@@ -144,6 +150,7 @@ export function avApiUnitInView(
     coverage: AvDomCoverage,
     viewType: string,
 ): boolean {
+    unitId = unitId.replace(/#run-\d+$/, "");
     if (coverage.unstable) {
         return true;
     }

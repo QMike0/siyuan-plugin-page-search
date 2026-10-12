@@ -1708,12 +1708,13 @@ function collectAttributeViewSearchUnits(
     return units;
 }
 
-/** 从分组标题解析 group id（fold 按钮 data-id） */
+/** 表格/画廊使用 fold 按钮；看板标题没有 fold，ID 在分组容器上。 */
 function resolveAvGroupId(groupTitle: HTMLElement, index: number): string {
     const foldId = groupTitle.querySelector<HTMLElement>('[data-type="av-group-fold"]')
         ?.dataset.id
         ?.trim();
-    return foldId || `idx-${index}`;
+    return foldId || groupTitle.closest<HTMLElement>(".av__kanban-group[data-group-id]")?.dataset.groupId?.trim() ||
+        `idx-${index}`;
 }
 
 /** 分组标题对应的 av__body（优先 data-group-id，其次紧随的兄弟节点） */
@@ -1789,6 +1790,18 @@ function collectTextNodesInContainer(
     });
 
     return collectWalkerTextNodes(walker);
+}
+
+/** Detached, inert AV template HTML uses the same exclusions and text runs as live cells. */
+export function attributeViewHtmlTexts(html: string): string[] {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    // Stay in the template's inert document: no custom-element upgrades, scripts or resource loads.
+    const cell = template.content.ownerDocument.createElement("div");
+    cell.append(template.content);
+    cell.querySelectorAll("textarea, noscript, title, head, template, noembed, noframes, iframe, object, canvas").forEach(element => element.remove());
+    const nodes = omitAuthorCssHiddenText(collectTextNodesInContainer(cell, cell));
+    return splitTextNodesAtBarriers(nodes).map(joinTextNodes).filter(Boolean);
 }
 
 function elementHasBox(element: HTMLElement): boolean {

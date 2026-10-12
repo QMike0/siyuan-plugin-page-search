@@ -151,6 +151,10 @@ export function watchAttributeViewDom(
         window.clearTimeout(timer);
         timer = window.setTimeout(() => onChange(), debounceMs);
     };
+    const onInput = (event: Event) => {
+        if (event.target instanceof Element && event.target.closest('[data-type="av-search"]')) schedule();
+    };
+    edit.addEventListener("input", onInput, true);
 
     const observer = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
@@ -173,6 +177,7 @@ export function watchAttributeViewDom(
     return () => {
         window.clearTimeout(timer);
         observer.disconnect();
+        edit.removeEventListener("input", onInput, true);
     };
 }
 
@@ -181,6 +186,10 @@ export function watchAttributeViewDom(
  * 而非虚拟滚动在 body 内增删行。
  */
 function isStructuralAttributeViewMutation(mutation: MutationRecord): boolean {
+    if (mutation.type === "childList") {
+        const parent = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+        if (parent?.closest('[data-type="av-search"]')) return true;
+    }
     if (mutation.type === "attributes") {
         const el = mutation.target as Element;
         // 只关心 AV 根节点的渲染标记，避免 body 上属性抖动

@@ -90,6 +90,7 @@ import {
     loadAvUnits,
     peekAvUnits,
     pinAvCache,
+    readAvSearchQuery,
     releaseAvCache,
     releaseAvCacheOwner,
     resolveMissingAvIds,
@@ -367,7 +368,7 @@ function estimateCacheEntryBytes(hash: string, units: readonly CachedUnit[]): nu
         if (unit.embeddedAvRef) {
             const ref = unit.embeddedAvRef;
             bytes += 64 + textBytes(ref.blockId) + textBytes(ref.avId) + textBytes(ref.updated) +
-                textBytes(ref.carrierViewId);
+                textBytes(ref.carrierViewId) + textBytes(ref.query);
         }
         bytes += (unit.segmentLengths?.length ?? 0) * 8;
         bytes += (unit.restrictSpans?.length ?? 0) * 40;
@@ -495,7 +496,7 @@ function writeQueryMemo(key: string, signature: string, value: string[] | AvBloc
     for (const item of value) {
         bytes += typeof item === "string" ?
             24 + item.length * 2 :
-            96 + (item.blockId.length + item.avId.length + item.updated.length + item.carrierViewId.length) * 2;
+            96 + (item.blockId.length + item.avId.length + item.updated.length + item.carrierViewId.length + (item.query?.length ?? 0)) * 2;
     }
     rememberCacheBudget(`query:${key}`, bytes, () => queryMemo.delete(key));
     while (queryMemo.size > QUERY_MEMO_LIMIT) {
@@ -2927,9 +2928,20 @@ async function searchCurrentDocumentImpl(
         if (!loadedRefs || loadedRefs.failed) {
             degraded = true;
         }
+        const mountedAvs = new Map<string, HTMLElement>();
+        const mountedEmbeddedAvs = new Map<string, HTMLElement>();
+        const sourceOfAv = createEmbeddedSourceReader();
+        (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]').forEach(element => {
+            const owner = element.closest<HTMLElement>('[data-type="NodeBlockQueryEmbed"][data-node-id]');
+            if (owner) mountedEmbeddedAvs.set(`${owner.dataset.nodeId}\0${sourceOfAv(element)}`, element);
+            else mountedAvs.set(element.dataset.nodeId!, element);
+        });
         const refs = (loadedRefs?.refs ?? []).filter((ref) => {
             const item = meta.byId.get(ref.blockId);
             return (!item || enabled(item)) && inFocus(ref.blockId);
+        }).map(ref => {
+            const element = mountedAvs.get(ref.blockId);
+            return element ? {...ref, query: readAvSearchQuery(element)} : ref;
         });
         const avDom = collectAvDomCoverage(liveAll.filter((unit) => mountedAvIds.has(unit.blockId)));
         const usedRowLabels = new Map<string, Set<string>>();
@@ -2944,7 +2956,12 @@ async function searchCurrentDocumentImpl(
                 avViewIds.set(ref.blockId, viewId);
             }
         }
-        const embeddedCarriers = units.filter((unit) => unit.embeddedAvRef);
+        const embeddedCarriers = units.filter((unit) => unit.embeddedAvRef).map(carrier => {
+            const sourceId = carrier.unitId?.startsWith("embed:") ? carrier.unitId.split(":")[1] : "";
+            const element = mountedEmbeddedAvs.get(`${carrier.blockId}\0${sourceId}`);
+            if (!element) return carrier;
+            return {...carrier, embeddedAvRef: {...carrier.embeddedAvRef!, query: readAvSearchQuery(element)}};
+        });
         // Coverage is scoped to the displayed source copy, not merely the source
         // block ID: another embed (or another view) may mount different rows.
         const embeddedAvLive = new Map<string, SearchableBlock[]>();
@@ -2965,6 +2982,7 @@ async function searchCurrentDocumentImpl(
                 ref.avId,
                 ref.updated,
                 ref.carrierViewId,
+                ref.query ?? "",
             ]);
         const addRef = (ref: AvBlockRef, ownerId: string) => {
             const key = refKey(ref);

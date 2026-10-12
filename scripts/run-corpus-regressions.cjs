@@ -2035,6 +2035,190 @@ async function main() {
             '<div data-node-id="' + id +
             '" data-type="NodeBlockQueryEmbed" data-content="select * from blocks"></div>';
         const avRaw = {name: "database", views: [{id: "v", name: "table"}, {id: "v2", name: "other"}]};
+        // Native kanban titles have no fold button: the ID is on their parent.
+        for (const embedded of [false, true]) {
+            reset();
+            const shell = (embedded ? avShell() : avShell().replace('data-node-id="source-av"', 'data-node-id="b"'))
+                .replace('data-av-type="table"', 'data-av-type="kanban"');
+            add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell);
+            doms.b = embedded ? embedShell("b") : shell;
+            if (embedded) embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]}});
+            let reads = 0;
+            avResponder = async url => {
+                reads++;
+                return {code: 0, data: url.endsWith("getAttributeView") ? avRaw : {view: {
+                    type: "kanban", fields: [{id: "col", type: "select"}],
+                    groups: ["g1", "g2"].map(id => ({
+                        id, groupHidden: 0, groupValue: {type: "select", mSelect: [{content: "categoryKeyword"}]},
+                        cardCount: 1, cards: [{id: "row", values: [{value: {
+                            keyID: "col", type: "select", mSelect: [{content: "categoryKeyword"}],
+                        }}]}],
+                    })),
+                }}};
+            };
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                const options = {includeAttributeView: true};
+                const cold = await settle("categoryKeyword", options);
+                full(cold);
+                assert.equal(cold.matches.length, 4, "two titles and two visible card fields");
+                const beforeMount = reads;
+                const content = ["g1", "g2"].map(id => '<div class="av__kanban-group" data-group-id="' + id + '">' +
+                    '<div class="av__group-title"><span class="av__group-name"><span class="b3-chip">categoryKeyword</span></span>' +
+                    '<span class="av__group-counter">1</span></div><div class="av__body" data-group-id="' + id + '">' +
+                    '<div class="av__gallery-item" data-id="row"><div class="av__cell" data-field-id="col">' +
+                    '<span class="b3-chip">categoryKeyword</span></div></div></div></div>').join("");
+                wysiwyg.innerHTML = (embedded ? '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' : "") +
+                    shell.replace("<div></div>", content) + (embedded ? "</div>" : "");
+                const mounted = await search("categoryKeyword", options);
+                full(mounted);
+                assert.equal(mounted.matches.length, 4, "native kanban IDs suppress API copies, not real repeated labels");
+                assert.ok(mounted.matches.every(match => match.range && !match.replaceable));
+                assert.deepEqual(mounted.matches.map(match => match.unitId.replace(/^embed:[^:]+:/, "")), [
+                    "group-title:g1", "cell:g1:row:col", "group-title:g2", "cell:g2:row:col",
+                ]);
+                const rebound = source("frontend/corpus/project").fillLiveRanges(cold.matches,
+                    source("frontend/blocks").collectSearchableBlocks(edit, options), true);
+                assert.ok(rebound.every(match => match.range), "cold titles and card fields bind to native kanban DOM");
+                assert.equal((await search("^1$", {...options, regex: true})).matches.length, 2);
+                wysiwyg.innerHTML = "";
+                assert.equal((await search("categoryKeyword", options)).matches.length, 4);
+                assert.equal(reads, beforeMount, "kanban mount/unmount needs no extra requests");
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        console.log("ordinary/embedded native kanban title identity, counts, ranges and cache transitions OK");
+        for (const embedded of [false, true]) {
+            reset();
+            const cases = [
+                {id: "template", type: "text", text: {content: "rawSecret"}, hasRenderTemplate: true,
+                    renderedContent: '<span title="attributeSecret">shownKeyword</span><script>scriptSecret</script><span style="display:none">cssSecret</span>',
+                    html: '<span title="attributeSecret">shownKeyword</span><script>scriptSecret</script><span style="display:none">cssSecret</span>'},
+                {id: "emptyTemplate", type: "text", text: {content: "rawSecret"}, renderedContent: "", html: ""},
+                {id: "columnTemplate", type: "text", text: {content: "rawSecret"}, column: {renderTemplate: "{{.}}"}, html: ""},
+                {id: "templateType", type: "template", template: {content: "<b>templateKeyword</b>"}, html: "<b>templateKeyword</b>"},
+                {id: "templateRuns", type: "text", hasRenderTemplate: true, renderedContent: "oneKeyword<br>twoKeyword",
+                    html: "oneKeyword<br>twoKeyword"},
+                {id: "asset", type: "mAsset", mAsset: [
+                    {type: "file", name: "fileKeyword.pdf", content: "assets/pathSecret.pdf"},
+                    {type: "image", name: "imageSecret", content: "assets/imageSecret.png"},
+                ], html: '<span class="b3-chip">fileKeyword.pdf</span><img src="assets/imageSecret.png">'},
+                {id: "assetRuns", type: "mAsset", mAsset: [
+                    {type: "file", name: "beforeKeyword", content: "assets/pathSecret.pdf"},
+                    {type: "image", content: "assets/imageSecret.png"},
+                    {type: "file", name: "afterKeyword", content: "assets/pathSecret.pdf"},
+                ], html: '<span>beforeKeyword</span><img src="assets/imageSecret.png"><span>afterKeyword</span>'},
+                {id: "select", type: "select", mSelect: [{content: "firstKeyword"}, {content: "selectSecret"}],
+                    html: '<span class="b3-chip">firstKeyword</span>'},
+                {id: "multi", type: "mSelect", mSelect: [{content: "firstKeyword"}, {content: "secondKeyword"}],
+                    html: '<span class="b3-chip">firstKeyword</span><span class="b3-chip">secondKeyword</span>'},
+                {id: "relation", type: "relation", relation: {contents: [
+                    {type: "block", block: {content: "firstKeyword"}}, {type: "block", block: {content: "secondKeyword"}},
+                ]}, html: '<span class="av__celltext">firstKeyword</span><span class="av__celltext">secondKeyword</span>'},
+                {id: "relationRuns", type: "relation", relation: {contents: [
+                    {type: "block", block: {content: "rawSecret"}, renderedContent: "oneKeyword<br>twoKeyword"},
+                ]}, html: '<span class="av__cell--relation"><span class="av__celltext av__celltext--template">oneKeyword<br>twoKeyword</span></span>'},
+                {id: "rollup", type: "rollup", rollup: {contents: [
+                    {type: "text", text: {content: "firstKeyword"}}, {type: "number", number: {content: 0}},
+                    {type: "mSelect", mSelect: [{content: "secondKeyword"}, {content: "thirdKeyword"}]},
+                ]}, html: 'firstKeyword, 0, <span class="b3-chip">secondKeyword</span><span class="b3-chip">thirdKeyword</span>'},
+            ];
+            const shell = embedded ? avShell() : avShell().replace('data-node-id="source-av"', 'data-node-id="b"');
+            add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell);
+            doms.b = embedded ? embedShell("b") : shell;
+            if (embedded) embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]}});
+            avResponder = async url => ({code: 0, data: url.endsWith("getAttributeView") ? avRaw : {view: {
+                type: "table", columns: cases.map(item => ({id: item.id, type: item.type, ...item.column})), rowCount: 1,
+                rows: [{id: "row", cells: cases.map(({html, column, id, ...value}) => ({value: {keyID: id, ...value}}))}],
+            }}});
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                const options = {includeAttributeView: true};
+                const cold = await settle("Keyword", options);
+                full(cold);
+                assert.equal(cold.matches.length, 17, "native display values, not underlying source/attributes");
+                for (const query of ["Secret", "oneKeywordtwoKeyword", "beforeKeywordafterKeyword", "<b>"]) {
+                    assert.equal((await search(query, options)).matches.length, 0, "non-visible/cross-barrier text: " + query);
+                }
+                const content = '<div class="av__row" data-id="row">' + cases.map(item =>
+                    '<div class="av__cell" data-col-id="' + item.id + '">' + item.html + '</div>').join("") + '</div>';
+                wysiwyg.innerHTML = (embedded ? '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' : "") +
+                    shell.replace("<div></div>", content) + (embedded ? "</div>" : "");
+                const live = source("frontend/blocks").collectSearchableBlocks(edit, options);
+                const mounted = await search("Keyword", options);
+                full(mounted);
+                assert.equal(mounted.matches.length, cold.matches.length);
+                const rebound = source("frontend/corpus/project").fillLiveRanges(cold.matches, live, true);
+                assert.ok(rebound.every(match => match.range?.toString() === "Keyword"), "all native offsets bind after mounting");
+                assert.ok(mounted.matches.every(match => match.range && !match.replaceable));
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        console.log("ordinary/embedded AV templates, assets, select, relation, rollup and native offsets OK");
+        let templateUpgrades = 0;
+        window.customElements.define("av-search-contract", class extends HTMLElement {
+            constructor() { super(); templateUpgrades++; }
+        });
+        assert.deepEqual(source("frontend/blocks").attributeViewHtmlTexts(
+            '<av-search-contract>safeKeyword</av-search-contract><img src="http://invalid.test/asset">' +
+            '<script>secret</script><iframe>secret</iframe><template>secret</template>'
+        ), ["safeKeyword"]);
+        assert.equal(templateUpgrades, 0, "template extraction does not upgrade custom elements or mount HTML");
+        for (const embedded of [false, true]) {
+            reset();
+            const shell = embedded ? avShell() : avShell().replace('data-node-id="source-av"', 'data-node-id="b"');
+            add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell);
+            doms.b = embedded ? embedShell("b") : shell;
+            if (embedded) embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]}});
+            const requests = [];
+            avResponder = async (url, body) => {
+                if (url.endsWith("getAttributeView")) return {code: 0, data: avRaw};
+                requests.push(body);
+                const query = body.query || "";
+                const count = query ? 201 : 202;
+                const start = (body.page - 1) * 200;
+                return {code: 0, data: {view: {
+                    type: "table", columns: [{id: "col", type: "text"}], rowCount: count,
+                    rows: Array.from({length: Math.min(count - start, 200)}, (_, index) => ({
+                        id: "row" + (start + index), cells: [{value: {keyID: "col", type: "text",
+                            text: {content: query || start + index < 201 ? "keepKeyword" : "filteredSecret"}}}],
+                    })),
+                }}};
+            };
+            const mount = query => {
+                const content = '<div class="av__header"><div data-type="av-search" contenteditable="plaintext-only">' + query + '</div></div>';
+                wysiwyg.innerHTML = (embedded ? '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' : "") +
+                    shell.replace("<div></div>", content) + (embedded ? "</div>" : "");
+            };
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                const options = {includeAttributeView: true};
+                // Warm the unfiltered cache first; it must never leak into a filtered DOM copy.
+                full(await settle("filteredSecret", options));
+                requests.length = 0;
+                mount("  keep  ");
+                const filtered = await settle("filteredSecret", options);
+                full(filtered);
+                assert.equal(filtered.matches.length, 0, "native query excludes hidden rows from API completion");
+                assert.equal(requests.length, 2);
+                assert.ok(requests.every(body => body.query === "keep"), "all pages retain native trimmed query");
+                assert.equal((await search("keepKeyword", options)).matches.length, 201);
+                mount("other");
+                assert.equal((await settle("keepKeyword", options)).matches.length, 201);
+                assert.ok(requests.slice(-2).every(body => body.query === "other"));
+                mount("");
+                assert.equal((await settle("filteredSecret", options)).matches.length, 1, "clearing query restores unfiltered cache");
+                assert.equal(renderCalls, 0);
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        console.log("ordinary/embedded native AV search query pagination, cache isolation and clear/change OK");
         const avPage = (values) => ({
             code: 0,
             data: {

@@ -96,6 +96,14 @@ async function main() {
             ["created", "full", {content: stamp, isNotEmpty: true, formattedContent: "原生时间"}, "原生时间"],
             ["updated", "day-month-year", {content: stamp, isNotEmpty: true}, "12/10/2026"],
             ["updated", "", {content: 0, isNotEmpty: true}, ""],
+            ["rollup", "", {contents: [
+                {type: "number", number: {content: 0}},
+                {type: "date", date: {content: stamp, isNotEmpty: true}},
+                {type: "checkbox", checkbox: {checked: true}},
+            ]}, "0, 2026-10-12, "],
+            ["rollup", "", {contents: [
+                {type: "date", date: {content: stamp, content2: endStamp, hasEndDate: true, isNotEmpty: true, isNotEmpty2: true}},
+            ]}, "2026-10-13"],
         ];
         for (const [type, dateFormat, value, expected] of cases) {
             av.invalidateAvCache();
@@ -118,7 +126,7 @@ async function main() {
                 });
                 const hits = matcher.matchTextUnitsDetailed(cells, expected).hits;
                 const rebound = project.fillLiveRanges(hits, live, true);
-                assert.equal(rebound[0].range?.toString(), expected, "formatted cold offset binds to native DOM");
+                assert.equal(rebound[0].range?.toString(), hits[0].matchedText, "formatted cold offset binds to native DOM");
                 host.remove();
             }
         }
@@ -127,6 +135,27 @@ async function main() {
         av.invalidateAvCache();
     }
     console.log("AV native number/date display and cold-to-DOM offsets OK");
+    const originalHtmlTexts = blocks.attributeViewHtmlTexts;
+    let htmlParses = 0;
+    blocks.attributeViewHtmlTexts = (...args) => { htmlParses++; return originalHtmlTexts(...args); };
+    try {
+        api = async url => ({code: 0, data: url.endsWith("getAttributeView") ? raw : {view: {
+            rowCount: 1, columns: [], rows: [{id: "i", cells: Array.from({length: 3000}, (_, index) => ({value: {
+                keyID: "k" + index,
+                ...[
+                    {type: "mAsset", mAsset: [{type: "file", name: "fileKeyword", content: "assets/hidden.pdf"}]},
+                    {type: "relation", relation: {contents: [{type: "block", block: {content: "relationKeyword"}}]}},
+                    {type: "rollup", rollup: {contents: [{type: "number", number: {content: 0}}, {type: "text", text: {content: "rollupKeyword"}}]}},
+                ][index % 3],
+            }}))}],
+        }}});
+        const compound = await av.loadAvUnits([ref()]);
+        assert.equal(compound.filter(unit => unit.unitId.startsWith("av:")).length, 3000);
+        assert.equal(htmlParses, 0, "ordinary files/relations/rollups keep the string path, without per-cell DOM parsing");
+    } finally {
+        blocks.attributeViewHtmlTexts = originalHtmlTexts;
+        av.invalidateAvCache();
+    }
     const metaModule = source("frontend/corpus/meta");
     const orderModule = source("frontend/corpus/order");
     for (const invalidation of ["root", "all", "other", "abort"]) {
