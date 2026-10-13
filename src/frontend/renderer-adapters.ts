@@ -59,7 +59,8 @@ export function isCompletedEmptyMermaid(element: Element): boolean {
 
 /**
  * live DOM 与离屏 DOM 共用的 renderer 采集入口。
- * Mermaid / flowchart 在折叠、离屏或无正常输出时只返回源码单元。
+ * Mermaid / flowchart 优先复用正常输出；折叠/离屏本身不表示 SVG 文字不可用。
+ * 缺少输出或渲染失败时立即回退源码，不触发额外渲染或等待。
  * 源码单元没有 Text 节点，不能投影到 SVG 或参与替换；其余 renderer 保持可见文字语义。
  */
 export function collectRendererSearchUnits(
@@ -146,8 +147,7 @@ function collectDiagramUnits(
 ): SearchableBlock[] {
     if (
         supportsDiagramSourceSearch(kind) && element.hasAttribute("data-content") &&
-        (element.closest("[data-page-search-offscreen]") || element.hasAttribute("parent-heading") ||
-            isUnderNonHeadingCssFold(element) || diagramOutputFailed(element) ||
+        (diagramOutputFailed(element) ||
             !Array.from(element.querySelectorAll("svg, canvas, img")).some((output) =>
                 !output.closest(".protyle-icons, .protyle-attr")
             ))

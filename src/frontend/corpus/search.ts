@@ -70,6 +70,7 @@ import {
     DIAGRAM_SUBTYPE_SET,
     collectRendererSearchUnits,
     diagramOutputFailed,
+    diagramSourceText,
     rendererAdapterKind,
 } from "../renderer-adapters";
 import {
@@ -163,6 +164,10 @@ interface TextCacheEntry {
     liveCodeContent?: string;
     units: CachedUnit[];
     hasInlineMath?: boolean;
+    /** 普通批量缓存中的图表输出不能仅按源码关键词预筛。 */
+    hasRenderedDiagram?: boolean;
+    /** 已挂载图表快照；卸载后须先与内核源码核对，不能信任未保存编辑的 hash。 */
+    liveDiagramSource?: string;
     mathRecovery?: OffscreenMathRecovery;
     /** 近似保留大小；用于跨文档的全局缓存预算。 */
     bytes: number;
@@ -440,10 +445,11 @@ function syncRenderSettingsCache(): void {
     for (const key of Array.from(specialCacheKeys.keys())) {
         dropTextCache(key);
     }
-    // 行级公式与正文共用普通缓存；宏变化或 KaTeX 首次加载完成后也必须重新提取。
-    // 只丢弃含公式的正文快照，保留不受影响的普通块。
+    // 行级公式和 Mermaid/flowchart 输出也使用普通缓存，配置变化后须重新提取。
+    // 保留不受影响的普通正文和图表源码。
     for (const key of Array.from(plainCacheKeys.keys())) {
-        if (textCache.get(key)?.hasInlineMath) dropTextCache(key);
+        const cached = textCache.get(key);
+        if (cached?.hasInlineMath || cached?.hasRenderedDiagram) dropTextCache(key);
     }
 }
 
@@ -628,7 +634,7 @@ function writeTextCache(key: string, entry: Omit<TextCacheEntry, "bytes">): void
             )
         ) ? entry.mathRecovery : undefined,
         bytes: estimateCacheEntryBytes(entry.hash, entry.units) + textBytes(entry.codeLanguage) +
-            textBytes(entry.liveCodeContent),
+            textBytes(entry.liveCodeContent) + textBytes(entry.liveDiagramSource),
     };
     textCache.set(key, cached);
     textCacheBytes += cached.bytes;
@@ -1341,7 +1347,11 @@ function readPlainCache(rootId: string, blockId: string, scope: string, hash: st
         return null;
     }
     const cached = readTextCache(cacheKey(rootId, blockId, scope));
-    if (!cached || cached.hash !== hash || !cached.units.some((unit) => unit.text.length > 0)) {
+    if (cached?.hasRenderedDiagram && cached.hash !== hash) dropTextCache(cacheKey(rootId, blockId, scope));
+    if (
+        !cached || cached.hash !== hash || cached.liveDiagramSource !== undefined ||
+        !cached.units.some((unit) => unit.text.length > 0)
+    ) {
         return null;
     }
     const key = cacheKey(rootId, blockId, scope);
@@ -1361,13 +1371,17 @@ function rememberPlain(
     units: CachedUnit[],
     hasInlineMath = false,
     mathRecovery?: OffscreenMathRecovery,
+    liveDiagramSource?: string,
 ): void {
     if (!hash || !units.some((unit) => unit.text.length > 0)) {
         return;
     }
     const key = cacheKey(rootId, blockId, scope);
     specialCacheKeys.delete(key);
-    writeTextCache(key, {hash, units: units.slice(), hasInlineMath, mathRecovery});
+    const hasRenderedDiagram = units.some((unit) =>
+        unit.blockType === "NodeCodeBlock" && rendererUnitSource(unit.unitId) === "rendered-text"
+    );
+    writeTextCache(key, {hash, units: units.slice(), hasInlineMath, hasRenderedDiagram, mathRecovery, liveDiagramSource});
     plainCacheKeys.set(key, true);
     while (plainCacheKeys.size > PLAIN_CACHE_LIMIT) {
         const dropped = plainCacheKeys.keys().next().value as string | undefined;
@@ -1381,7 +1395,7 @@ function rememberPlain(
 
 /**
  * 未加载普通正文：哈希未变则复用上次抽出的文字。
- * Mermaid / flowchart 冷态源码也用此缓存；其它图表、嵌入、公式和 HTML 除外。
+ * Mermaid / flowchart 的已有输出或冷态源码也用此缓存；其它图表、嵌入、公式和 HTML 除外。
  * 嵌入单独复用查询结果缓存；普通正文的哈希查询失败时重抽且不写入普通缓存。
  */
 async function loadPlainUnits(
@@ -1430,12 +1444,41 @@ async function loadPlainUnits(
     const epoch = currentCorpusEpoch(rootId);
     const renderStamp = currentRenderSettingsStamp();
     const extracted = await extractMetas(rootId, notebookId, missing, options, mode, shouldContinue, signal);
+    const restored = new Map<string, CachedUnit[]>();
     if (
-        !extracted.failed && hashes && shouldContinue() && epoch === currentCorpusEpoch(rootId) && storeCache &&
+        hashes && shouldContinue() && epoch === currentCorpusEpoch(rootId) &&
+        renderStamp === currentRenderSettingsStamp()
+    ) {
+        // 内核通常只返回源码。用同一版本和完整源码验证旧 live 输出，验证后才复用标签。
+        // 若内核已经带有正常输出则直接使用；不与快照或源码重复计数。
+        for (const unit of extracted.units) {
+            if (unit.blockType !== "NodeCodeBlock" || !isRendererSourceFallbackUnitId(unit.unitId)) continue;
+            const cached = textCache.get(cacheKey(rootId, unit.blockId, scope));
+            if (
+                cached?.hasRenderedDiagram && cached.hash === hashes.get(unit.blockId) &&
+                cached.liveDiagramSource === unit.text &&
+                cached.units.some((label) => label.unitId === unit.unitId?.replace("source-fallback", "rendered-text"))
+            ) {
+                restored.set(unit.blockId, cached.units);
+            } else if (cached?.hasRenderedDiagram) {
+                dropTextCache(cacheKey(rootId, unit.blockId, scope));
+            }
+        }
+        if (restored.size) {
+            extracted.units = extracted.units.filter((unit) => !restored.has(unit.blockId));
+            for (const list of restored.values()) extracted.units.push(...list);
+        }
+    }
+    if (
+        !extracted.failed && hashes && shouldContinue() && epoch === currentCorpusEpoch(rootId) &&
+        (storeCache || restored.size > 0) &&
         renderStamp === currentRenderSettingsStamp()
     ) {
         const after = await fetchBlockHashes(Array.from(hashAtFetch.keys()), signal);
-        if (after && renderStamp === currentRenderSettingsStamp()) {
+        if (
+            after && shouldContinue() && epoch === currentCorpusEpoch(rootId) &&
+            renderStamp === currentRenderSettingsStamp()
+        ) {
             const byId = new Map<string, CachedUnit[]>();
             for (const unit of extracted.units) {
                 const list = byId.get(unit.blockId) ?? [];
@@ -1444,7 +1487,7 @@ async function loadPlainUnits(
             }
             const failed = new Set(extracted.unrenderedIds);
             for (const [id, hash] of hashAtFetch) {
-                if (failed.has(id) || after.get(id) !== hash) {
+                if ((!storeCache && !restored.has(id)) || failed.has(id) || after.get(id) !== hash) {
                     continue;
                 }
                 rememberPlain(
@@ -2614,6 +2657,7 @@ async function searchCurrentDocumentImpl(
                 if (!acceptsRenderer(element)) {
                     continue;
                 }
+                if (!rendererOutputCompleted(element)) dropTextCache(cacheKey(context.rootId, id, scope));
                 units.push(
                     ...collectRendererSearchUnits(element, {
                         blockId: id,
@@ -2717,6 +2761,24 @@ async function searchCurrentDocumentImpl(
         }
         if (isSpecialRenderMeta(item)) {
             remember(context.rootId, item, liveUnits, scope);
+            continue;
+        }
+        if (item.type === "c" && supportsDiagramSourceSearch(effectiveCodeLanguage(item))) {
+            const element = mountedCodeBlocks.get(blockId);
+            if (element?.hasAttribute("data-content") && rendererOutputCompleted(element)) {
+                rememberPlain(
+                    context.rootId,
+                    blockId,
+                    scope,
+                    item.hash,
+                    liveUnits,
+                    false,
+                    undefined,
+                    diagramSourceText(element),
+                );
+            } else {
+                dropTextCache(cacheKey(context.rootId, blockId, scope));
+            }
             continue;
         }
         if (canCachePlainText(item) && (liveInlineMathIds.has(blockId) || liveUnits.some(isInlineMathSearchUnit))) {
@@ -2841,6 +2903,18 @@ async function searchCurrentDocumentImpl(
         }
     }
 
+    // 已抽出的正常图表输出可能包含源码里没有的生成文字，不能被下一次 SQL 预筛丢掉。
+    // 仅补已知输出；冷态源码仍按候选缩小范围，不新增全文图表读取或后台任务。
+    if (!memoOnlyRestriction) {
+        const queuedPlain = new Set(plainTargets.map((item) => item.id));
+        for (const item of meta.byId.values()) {
+            if (
+                item.type === "c" && supportsDiagramSourceSearch(effectiveCodeLanguage(item)) &&
+                !queuedPlain.has(item.id) && textCache.get(cacheKey(context.rootId, item.id, scope))?.hasRenderedDiagram
+            ) queueUnloaded(item.id);
+        }
+    }
+
     // Renderer text may decode HTML labels or generate numbers absent from source.
     // SQL is a priority hint for diagrams, never proof that an unrendered block cannot match.
     const queuedSpecials = new Set(specialTargets.map((item) => item.id));
@@ -2889,7 +2963,7 @@ async function searchCurrentDocumentImpl(
     units.push(...specialState.ready);
     unrendered += specialState.unrendered;
     // 其余图表仍需 renderer 生成 SVG/foreignObject；候选图块在前台有界渲染。
-    // Mermaid / flowchart 已在 plainTargets 按源码提取，不进入此渲染或后台补全路径。
+    // Mermaid / flowchart 已在 plainTargets 复用输出或回退源码，不进入此渲染或后台补全路径。
     const missingDiagrams = specialState.missing.filter(isDiagramMeta);
     const missingMath = specialState.missing.filter((item) => item.type === "m");
     const specialMissing = specialState.missing.filter((item) => !isDiagramMeta(item) && item.type !== "m");

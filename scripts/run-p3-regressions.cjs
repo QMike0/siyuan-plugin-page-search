@@ -179,9 +179,12 @@ async function diagramRegressions() {
             await settle();
             assert.equal(bar.resultCount, 1, "zero-hit diagrams gain rendered matches");
             container.setAttribute("fold", "1");
+            const beforeFold = refreshes;
             await settle();
-            assert.equal(bar.resultCount, 2, "fold switches back to source even with retained SVG");
+            assert.equal(bar.resultCount, 1, "fold retains the existing rendered labels");
+            assert.equal(refreshes, beforeFold, "CSS folding with unchanged SVG text does not restart indexing");
             graph.setAttribute("data-content", "changed");
+            graph.innerHTML = '<div spin="1"></div>';
             await settle();
             assert.equal(bar.resultCount, 0, "source attribute changes remove Range-less stale matches");
             container.setAttribute("fold", "0");
@@ -370,7 +373,7 @@ async function diagramRegressions() {
         assert.equal(headingBar.resultCount, 1, "heading children mounted as siblings refresh zero-hit results");
         headingGraph.setAttribute("parent-heading", "heading");
         await settle();
-        assert.equal(headingBar.resultCount, 2, "parent-heading marker switches back to source");
+        assert.equal(headingBar.resultCount, 1, "parent-heading marker does not discard existing healthy SVG");
         headingGraph.setAttribute("data-subtype", "graphviz");
         await settle();
         assert.equal(headingBar.resultCount, 1, "leaving a source diagram language invalidates its old identity");

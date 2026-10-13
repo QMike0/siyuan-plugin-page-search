@@ -270,7 +270,7 @@ async function renderEmbeddedDiagrams(
 /**
  * 把块 DOM 挂到离屏编辑器，复用 collectSearchableBlocks。
  * 只保留该块自己的 unit；嵌入块把内部正文记在嵌入块 id 上。
- * Mermaid / flowchart 直接采集源码；其余 renderer 沿用可见 Text 采集。
+ * Mermaid / flowchart 复用已有输出，否则直接采集源码，不额外渲染。
  */
 export async function extractUnitsFromDoms(
     ids: string[],

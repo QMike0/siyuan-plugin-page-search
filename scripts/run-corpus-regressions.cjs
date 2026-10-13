@@ -745,22 +745,43 @@ async function main() {
                 wysiwyg.innerHTML = '<div class="' + className + '" data-node-id="container" data-type="' + type +
                     '" data-subtype="u" fold="1"><div data-node-id="b" data-type="NodeCodeBlock" data-subtype="' +
                     language +
-                    '" data-content="unsaved unsaved"><div><svg><text>partial</text></svg></div></div></div>';
+                    '" data-content="unsaved unsaved"><div></div></div></div>';
                 const folded = await search("unsaved");
                 full(folded);
-                assert.equal(folded.matches.length, 2, "folded source uses unsaved DOM rather than partial SVG or SQL");
+                assert.equal(folded.matches.length, 2, "unrendered folded source uses unsaved DOM rather than SQL");
                 assert.ok(folded.matches.every(hit => !hit.range && !hit.replaceable));
                 assert.equal(domCalls, 0);
-                assert.equal(
-                    (await search("partial")).matches.length,
-                    0,
-                    "source and incomplete SVG never count together",
-                );
                 assert.equal((await search("unsaved", {includeFoldedBlocks: false})).matches.length, 0);
                 assert.equal((await search("unsaved", {[gate]: false})).matches.length, 0);
                 wysiwyg.querySelector('[data-node-id="b"]').setAttribute("data-content", "changed");
                 assert.equal((await search("unsaved")).matches.length, 0);
                 assert.equal((await search("changed")).matches.length, 1);
+                const graph = wysiwyg.querySelector('[data-node-id="b"]');
+                // Native Mermaid inserts the awaited SVG into the block; flowchart draws synchronously.
+                // data-render alone is not completion, but an existing healthy output survives CSS folding.
+                graph.innerHTML = '<div><svg><text>visible</text><foreignObject><div>visible</div></foreignObject></svg></div>';
+                const visible = await search("visible");
+                full(visible);
+                assert.equal(visible.matches.length, 2, "folded containers reuse each SVG label once");
+                assert.ok(visible.matches.every(hit => hit.range && !hit.replaceable));
+                assert.equal((await search("changed")).matches.length, 0, "rendered labels exclude source fallback");
+                assert.equal((await search("visible", {includeFoldedBlocks: false})).matches.length, 0);
+                assert.equal((await search("visible", {[gate]: false})).matches.length, 0);
+                graph.style.display = "none";
+                assert.equal((await search("visible")).matches.length, 0, "author-hidden output stays excluded");
+                graph.style.display = "";
+                const state = new (source("frontend/diagram-search-state").DiagramSearchState)();
+                state.capture(source("frontend/blocks").collectSearchableBlocks(edit, {includeFoldedBlocks: true}));
+                wysiwyg.firstElementChild.setAttribute("fold", "0");
+                assert.equal(state.changed(edit, new Set([graph]), {includeFoldedBlocks: true}), false,
+                    "unfolding unchanged labels does not request a diagram reindex");
+                assert.equal((await search("visible")).matches.length, 2);
+                graph.insertAdjacentHTML("beforeend", '<div class="ft__error">failed</div>');
+                const failed = await search("changed");
+                full(failed);
+                assert.equal(failed.matches.length, 1, "failed output falls back immediately to current source");
+                assert.equal((await search("visible")).matches.length, 0, "error SVG is never combined with source");
+                assert.equal(domCalls, 0);
                 assert.equal(renderCalls, 0);
             }
             reset();
@@ -806,14 +827,96 @@ async function main() {
             wysiwyg.innerHTML = "";
             assert.equal(diagramState.changed(edit, new Set([liveDiagram]), {includeFoldedBlocks: true}), true);
             doms.b = mounted;
-            const unloadedAfterVisible = await search("sourceOnly");
+            corpus.invalidateDocumentSearchCaches();
+            assert.equal((await search("sourceOnly")).matches.length, 0,
+                "existing offscreen output excludes source and populates the versioned text cache");
+            const unloadedAfterVisible = await search("generated");
             full(unloadedAfterVisible);
             assert.equal(
                 unloadedAfterVisible.matches.length,
                 1,
-                "unloaded diagram searches source even after seeing SVG",
+                "an offscreen DOM that already has output keeps its visible labels",
             );
+            assert.equal((await search("sourceOnly")).matches.length, 0);
+            assert.equal((await search("generated", {regex: true})).matches.length, 1,
+                "regex literal candidates also retain known rendered labels absent from source");
+            assert.equal((await search("generated", {[switchName]: false})).matches.length, 0);
+            // Real kernel DOM normally carries only source, not the renderer's transient SVG.
+            doms.b = mounted.replace(/<svg>.*?<\/svg>/, "");
+            db.prepare("UPDATE blocks SET hash='new-diagram-version' WHERE id='b'").run();
+            const unloadedWithoutOutput = await search("sourceOnly");
+            full(unloadedWithoutOutput);
+            assert.equal(unloadedWithoutOutput.matches.length, 1, "cold shell still falls back to source");
             assert.equal((await search("generated")).matches.length, 0);
+            assert.equal(renderCalls, 0);
+
+            // Native kernel DOM has no transient SVG. Reuse live labels only after source/version validation.
+            for (const options of [{}, {regex: true}, {regex: true, unfiltered: true}]) {
+                const query = options.unfiltered ? ".+" : "generated";
+                reset();
+                add("b", "c", "sourceOnly", language);
+                wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeCodeBlock" data-subtype="' + language +
+                    '" data-content="sourceOnly"><svg><text>generated</text><text>generated</text></svg></div>';
+                doms.b = '<div data-node-id="b" data-type="NodeCodeBlock" data-subtype="' + language +
+                    '" parent-heading="heading" data-content="sourceOnly"><div></div></div>';
+                assert.equal((await search(query, options)).matches.length, 2);
+                wysiwyg.innerHTML = "";
+                const cachedLabels = await search(query, options);
+                full(cachedLabels);
+                assert.equal(cachedLabels.matches.length, 2, "unloaded labels absent from source survive verified reuse");
+                assert.ok(cachedLabels.matches.every(hit => !hit.range && !hit.replaceable));
+                assert.equal((await search("sourceOnly", options)).matches.length, 0);
+                const verifiedReads = domCalls;
+                assert.equal((await search(query, options)).matches.length, 2);
+                assert.equal(domCalls, verifiedReads, "verified diagram snapshot does not fetch DOM again");
+                db.prepare("UPDATE blocks SET hash='changed' WHERE id='b'").run();
+                assert.equal((await search("generated", options)).matches.length, 0, "changed hash invalidates old labels");
+                assert.equal((await search("sourceOnly", options)).matches.length, 1);
+                assert.equal(renderCalls, 0);
+            }
+            reset();
+            add("b", "c", "saved", language);
+            wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeCodeBlock" data-subtype="' + language +
+                '" data-content="unsaved"><svg><text>generated</text></svg></div>';
+            doms.b = '<div data-node-id="b" data-type="NodeCodeBlock" data-subtype="' + language +
+                '" data-content="saved"><div></div></div>';
+            assert.equal((await search("generated")).matches.length, 1);
+            wysiwyg.innerHTML = "";
+            assert.equal((await search("generated")).matches.length, 0,
+                "unchanged SQL hash cannot validate a diagram's unsaved source");
+            assert.equal((await search("saved")).matches.length, 1);
+            assert.equal(renderCalls, 0);
+
+            reset();
+            add("b", "c", "saved", language);
+            wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeCodeBlock" data-subtype="' + language +
+                '" data-content="saved"><svg><text>generated</text></svg></div>';
+            doms.b = '<div data-node-id="b" data-type="NodeCodeBlock" data-subtype="' +
+                (language === "mermaid" ? "flowchart" : "mermaid") + '" data-content="saved"><div></div></div>';
+            assert.equal((await search("generated")).matches.length, 1);
+            wysiwyg.innerHTML = "";
+            assert.equal((await search("generated")).matches.length, 0,
+                "equal source and hash do not reuse labels from a different diagram language");
+            assert.equal((await search("saved")).matches.length, 1);
+
+            reset();
+            add("b", "c", "saved", language);
+            wysiwyg.innerHTML = '<div data-node-id="b" data-type="NodeCodeBlock" data-subtype="' + language +
+                '" data-content="saved"><svg><text>generated</text></svg></div>';
+            doms.b = '<div data-node-id="b" data-type="NodeCodeBlock" data-subtype="' + language +
+                '" data-content="saved"><div></div></div>';
+            assert.equal((await search("generated")).matches.length, 1);
+            wysiwyg.innerHTML = "";
+            assert.equal((await search("generated")).matches.length, 1);
+            window.siyuan = {config: {appearance: {mode: 1}}};
+            try {
+                assert.equal((await search("generated")).matches.length, 0,
+                    "render settings invalidate saved rendered snapshots");
+                assert.equal((await search("saved")).matches.length, 1);
+            } finally {
+                delete window.siyuan;
+            }
+            assert.equal(renderCalls, 0);
 
             reset();
             add("b", "c", "foo & <b>bar</b>", language);
@@ -2235,17 +2338,19 @@ async function main() {
             );
             assert.equal((await search("changedHit")).matches.length, 1);
             wysiwyg.firstElementChild.setAttribute("fold", "1");
-            const sourceGraphs = await search("sourceHit");
-            full(sourceGraphs);
-            assert.equal(sourceGraphs.matches.length, 2, "each folded copy has its own source fallback");
-            assert.notEqual(sourceGraphs.matches[0].unitId, sourceGraphs.matches[1].unitId);
+            const foldedGraphs = await search("visibleHit");
+            full(foldedGraphs);
+            assert.equal(foldedGraphs.matches.length, 1, "folded copies retain their rendered labels");
+            assert.equal((await search("sourceHit")).matches.length, 0);
             doms.b = wysiwyg.innerHTML;
             wysiwyg.innerHTML = "";
             assert.equal(
-                (await search("sourceHit")).matches.length,
-                2,
-                "cold query preserves both graph source copies",
+                (await search("visibleHit")).matches.length,
+                1,
+                "offscreen query preserves existing graph output per copy",
             );
+            assert.equal((await search("changedHit")).matches.length, 1);
+            assert.equal((await search("sourceHit")).matches.length, 0);
             assert.equal(renderCalls, 0, "copied Mermaid/flowchart never offscreen-render");
         }
         // Concurrent panes share a native query, so a second failure cannot overwrite success.
