@@ -131,7 +131,8 @@ function execRegexAt(
 
 /**
  * 展开 $$ / $& / $` / $' / $n / $<name>（对齐 JS String.replace 替换串语义）。
- * 不存在的 $n / $<name> 保留字面量；已参与但未匹配的捕获组展开为空串。
+ * $n 最多消费两位，编号不存在时回退一位；$0 保留字面量。
+ * 无命名组时 $<name> 按普通文本扫描；有命名组时缺失/未匹配的组展开为空串。
  */
 export function expandReplacementTemplate(
     template: string,
@@ -140,42 +141,36 @@ export function expandReplacementTemplate(
     before: string,
     after: string,
 ): string {
-    return template.replace(
-        /\$\$|\$&|\$`|\$'|\$<([^>]+)>|\$(\d{1,3})/g,
-        (token, named?: string, digits?: string) => {
-            if (token === "$$") {
-                return "$";
-            }
-            if (token === "$&") {
-                return matchedText;
-            }
-            if (token === "$`") {
-                return before;
-            }
-            if (token === "$'") {
-                return after;
-            }
-            // 以 token 形态分流，避免未参与的备选捕获组在部分引擎里不是 undefined
-            if (token.startsWith("$<") && token.endsWith(">")) {
-                const name = named ?? token.slice(2, -1);
-                const groups = (match as RegExpExecArray).groups;
-                if (!groups || !Object.prototype.hasOwnProperty.call(groups, name)) {
-                    return token;
-                }
-                return groups[name] ?? "";
-            }
-            if (digits !== undefined) {
-                const index = Number(digits);
-                // JS：$0 不是特殊替换；仅 $1…$99，且仅当该编号捕获组存在时展开
-                if (index < 1 || index > 99) {
-                    return token;
-                }
-                if (index >= match.length) {
-                    return token;
-                }
-                return match[index] ?? "";
-            }
-            return token;
-        },
-    );
+    const groups = (match as RegExpExecArray).groups;
+    // 没有命名组时不能吞掉整个 $<...>，其中的 $1 等仍须正常展开。
+    const tokens = groups ? /\$[$&`']|\$\d{1,2}|\$<[^>]*>/g : /\$[$&`']|\$\d{1,2}/g;
+    return template.replace(tokens, (token) => {
+        if (token === "$$") {
+            return "$";
+        }
+        if (token === "$&") {
+            return matchedText;
+        }
+        if (token === "$`") {
+            return before;
+        }
+        if (token === "$'") {
+            return after;
+        }
+        if (token.startsWith("$<")) {
+            const name = token.slice(2, -1);
+            return groups && Object.prototype.hasOwnProperty.call(groups, name) ? groups[name] ?? "" : "";
+        }
+        const digits = token.slice(1);
+        const index = Number(digits);
+        if (index > 0 && index < match.length) {
+            return match[index] ?? "";
+        }
+        // 如只有一个捕获组，$12 = $1 + "2"；$100 = $1 + "00"。
+        const first = Number(digits[0]);
+        if (digits.length === 2 && first > 0 && first < match.length) {
+            return (match[first] ?? "") + digits[1];
+        }
+        return token;
+    });
 }

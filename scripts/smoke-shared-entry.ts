@@ -21,6 +21,7 @@ import {
     coercePluginPrefs,
     expandRegexReplacement,
     expandRegexReplacementUnits,
+    expandReplacementTemplate,
     extractRegexLiteralGroups,
     regexPrefilterStoresPlainCache,
     searchNormalizeFoldIsSuperset,
@@ -1223,6 +1224,59 @@ assert(preserveReplacementCase("bar", "Foo") === "Bar", "preserve title");
 assert(preserveReplacementCase("baz", "传感器") === "baz", "cjk unchanged");
 
 const dateHaystack = "date 2024-01-02 end";
+// Use the engine's GetSubstitution as the oracle, including digit consumption and fallback.
+function assertTemplateEquivalent(haystack: string, patternSource: string, template: string) {
+    const match = new RegExp(patternSource).exec(haystack)!;
+    const before = haystack.slice(0, match.index);
+    const after = haystack.slice(match.index + match[0].length);
+    const expected = haystack.replace(new RegExp(patternSource), template);
+    const expanded = expandRegexReplacement({
+        haystack,
+        start: match.index,
+        end: match.index + match[0].length,
+        patternSource,
+        template,
+        caseSensitive: true,
+    });
+    assert(before + expanded + after === expected, `GetSubstitution ${patternSource} / ${template}`);
+    assert(
+        before + expandReplacementTemplate(template, match, match[0], before, after) + after === expected,
+        "direct template expansion agrees with String.replace",
+    );
+}
+for (const template of ["$12", "$100", "$001", "$01", "$0", "$00", "$99", "$<missing>", "$<>"]) {
+    assertTemplateEquivalent("pre a post", "(a)", template);
+    assertTemplateEquivalent("pre a post", "(?<known>a)", template);
+}
+const numericTemplate = [
+    ...Array.from({length: 1000}, (_, n) => `$${n}`),
+    ...Array.from({length: 100}, (_, n) => `$${String(n).padStart(2, "0")}`),
+    ...Array.from({length: 100}, (_, n) => `$${String(n).padStart(3, "0")}`),
+].join("|");
+for (let count = 0; count <= 100; count++) {
+    for (const unmatched of [false, true]) {
+        let pattern = "m";
+        let text = "m";
+        for (let n = 1; n <= count; n++) {
+            const missing = unmatched && n % 3 === 0;
+            pattern += missing ? `(c${n};)?` : `(c${n};)`;
+            if (!missing) text += `c${n};`;
+        }
+        assertTemplateEquivalent(`pre ${text} post`, pattern, numericTemplate);
+    }
+}
+const specialTemplates = [
+    "$$|$&|$`|$'|$", "$$1|$$$1|$$$$|$1$2|$12x|$1000", "$<known>|$<missing>|$<>|$<other>",
+    "$<$1>|$<missing$1>|$<known$<other>>", "$<unclosed$1|$<known", "$<__proto__>|$<constructor>",
+];
+for (const [text, pattern] of [
+    ["a", "a"], ["a", "(a)"], ["a", "(?<known>a)|(?<other>b)"],
+    ["b", "(?<known>a)|(?<other>b)"], ["$1$&", "(?<known>\\$1\\$&)"],
+    ["😀a", "(?<known>😀)(a)"], ["a", "(?<__proto__>a)(?<constructor>b)?"],
+]) {
+    for (const template of specialTemplates) assertTemplateEquivalent(`pre ${text} post`, pattern, template);
+}
+
 assert(
     expandRegexReplacement({
         haystack: dateHaystack,

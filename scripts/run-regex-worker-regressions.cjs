@@ -224,6 +224,28 @@ async function main() {
         assert.equal(expanded.expansions[0].replacement, "13-[800138000]-13800138000");
         assert.equal(expanded.expansions[0].haystack, text);
 
+        const substitutionTemplate =
+            "$0|$00|$01|$001|$12|$100|$99|$<known>|$<missing>|$<>|$<missing$1>|$<unclosed$1|$&|$`|$'|$$";
+        for (const query of ["(a)|(b)", "(?<known>a)|(?<other>b)"]) {
+            const haystack = "left a b right";
+            const result = await matcher.match([unit(haystack)], query, options);
+            const expansion = await matcher.expandReplacements(
+                [{id: "b", haystack, replacements: result.hits}], query, substitutionTemplate, {},
+            );
+            assert.equal(expansion.error, "");
+            let output = "";
+            let cursor = 0;
+            for (let index = 0; index < result.hits.length; index++) {
+                const hit = result.hits[index];
+                assert.notEqual(expansion.expansions[index].replacement, null);
+                output += haystack.slice(cursor, hit.start) + expansion.expansions[index].replacement;
+                cursor = hit.end;
+            }
+            output += haystack.slice(cursor);
+            assert.equal(output, haystack.replace(new RegExp(query, "gi"), substitutionTemplate),
+                "packaged Worker retains native GetSubstitution and original context across matches");
+        }
+
         const abort = new AbortController();
         const aborted = matcher.match([unit("a".repeat(35) + "!")], "(a+)+$", options, abort.signal);
         abort.abort();
