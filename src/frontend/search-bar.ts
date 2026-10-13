@@ -5,6 +5,7 @@ import type {
 import {
     confirm,
     Menu,
+    hideMessage,
     showMessage,
 } from "siyuan";
 import {
@@ -123,9 +124,11 @@ import {
     isMatchWritable,
     replaceAllMatchesInEditor,
     replaceCurrentMatchInEditor,
+    type ReplaceWriteResult,
 } from "./protyle-write";
 import {createRangeFromBlockOffsets} from "./ranges";
 import {RegexTextMatcher} from "./regex-matcher";
+import type {ReplaceCommitState} from "./replacement-commit";
 import {
     searchHistory,
     stableSearchHistoryDocId,
@@ -308,6 +311,9 @@ export interface SearchBarI18n {
     replaceAllIncomplete: string;
     replaceCurrentDone: string;
     replaceAllResult: string;
+    replaceCommitPending?: string;
+    replaceCommitUnknown?: string;
+    replaceCommitFailed?: string;
     replaceProtyleMissing: string;
     selectionOnlyNoScope: string;
     /** 发布或预览无法调用文档 API 时的说明 */
@@ -2779,7 +2785,10 @@ export class SearchBar {
                 rootUsesAttributeViews(this.rememberCurrentRootId(), attributeViewTransactionIds(event.detail)))
         ) {
             this.documentEpoch += 1;
-            this.scheduleAttrViewResearch(attributeViewTransactionIds(event.detail), !isAttrViewFoldOnlyTransaction(event.detail));
+            this.scheduleAttrViewResearch(
+                attributeViewTransactionIds(event.detail),
+                !isAttrViewFoldOnlyTransaction(event.detail),
+            );
             return;
         }
 
@@ -3161,8 +3170,10 @@ export class SearchBar {
         }
         const bound = target && await this.waitForLocatedMatchRange(index, target.id, scroll);
         // 加载期间新查询或导航已经接管，不展开旧目标，也不为旧目标重搜全文。
-        if (generation !== this.searchGeneration || (target && this.resultMatches[index - 1]?.id !== target.id) ||
-            (this.resultIndex >= 1 && this.resultIndex !== index)) return;
+        if (
+            generation !== this.searchGeneration || (target && this.resultMatches[index - 1]?.id !== target.id) ||
+            (this.resultIndex >= 1 && this.resultIndex !== index)
+        ) return;
         if (bound) {
             if (this.resultIndex < 1) {
                 this.resultIndex = Math.min(index, this.resultMatches.length);
@@ -4039,12 +4050,17 @@ export class SearchBar {
             local = local.slice(end + 1);
         } else if (match.blockType !== ATTRIBUTE_VIEW_TYPE) return null;
         const group = local.startsWith("av-group:") || local.startsWith("cell:") ?
-            local.split(":")[1] : local.startsWith("group-title:") ? local.slice(12) :
-            local.startsWith("group-counter:") ? local.slice(14) : "";
+            local.split(":")[1] :
+            local.startsWith("group-title:") ?
+            local.slice(12) :
+            local.startsWith("group-counter:") ?
+            local.slice(14) :
+            "";
         if (!group || group === "nogroup" || group.startsWith("idx-")) return null;
         const owner = this.edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(match.blockId)}"]`);
         const readSource = createEmbeddedSourceReader();
-        const av = owner?.matches('[data-type="NodeAttributeView"]') ? owner :
+        const av = owner?.matches('[data-type="NodeAttributeView"]') ?
+            owner :
             Array.from(owner?.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]') ?? [])
                 .find(element => readSource(element) === sourceId);
         if (!av) return null;
@@ -4058,8 +4074,10 @@ export class SearchBar {
     private unfoldAttributeViewGroup(match: SearchMatch | undefined): boolean {
         const body = this.attributeViewGroupBody(match);
         const fold = body?.previousElementSibling?.querySelector<HTMLElement>('[data-type="av-group-fold"]');
-        if (!body?.classList.contains("fn__none") || fold?.dataset.id !== body.dataset.groupId ||
-            fold.firstElementChild?.classList.contains("av__group-arrow--open")) return false;
+        if (
+            !body?.classList.contains("fn__none") || fold?.dataset.id !== body.dataset.groupId ||
+            fold.firstElementChild?.classList.contains("av__group-arrow--open")
+        ) return false;
         this.pauseAvWatch(800);
         this.pauseIndexReset(800);
         fold.click();
@@ -4090,9 +4108,13 @@ export class SearchBar {
                 const generation = this.searchGeneration;
                 await waitForLayout();
                 if (generation !== this.searchGeneration || this.getCurrentMatch()?.id !== match?.id) return;
-                if (!this.tryBindUnfoldedMatch(index + 1, true) && match &&
-                    ["table", "list"].includes(this.attributeViewGroupBody(match)?.closest<HTMLElement>(".av")?.dataset.avType ?? "") &&
-                    !this.attributeViewGroupBody(match)?.querySelector(".av__row--header, .av__row[data-id]")) {
+                if (
+                    !this.tryBindUnfoldedMatch(index + 1, true) && match &&
+                    ["table", "list"].includes(
+                        this.attributeViewGroupBody(match)?.closest<HTMLElement>(".av")?.dataset.avType ?? "",
+                    ) &&
+                    !this.attributeViewGroupBody(match)?.querySelector(".av__row--header, .av__row[data-id]")
+                ) {
                     // Table/list bodies are mounted after the native fold click;
                     // keep the existing bounded, cancellable wait for those rows.
                     await this.waitForLocatedMatchRange(index + 1, match.id);
@@ -4391,6 +4413,56 @@ export class SearchBar {
         return this.i18n.replaceCurrentUnsupported;
     }
 
+    private replacePendingMessageId?: string;
+
+    private onReplaceCommitStateChange(state: ReplaceCommitState): void {
+        if (state === "pending") {
+            this.replacePendingMessageId ??= `page-search-replace-${Date.now()}-${Math.random()}`;
+            showMessage(
+                this.i18n.replaceCommitPending ?? "已提交，正在确认替换结果…",
+                10000,
+                "info",
+                this.replacePendingMessageId,
+            );
+        } else {
+            this.clearReplacePendingMessage();
+        }
+    }
+
+    private clearReplacePendingMessage(): void {
+        if (!this.replacePendingMessageId) return;
+        hideMessage(this.replacePendingMessageId);
+        this.replacePendingMessageId = undefined;
+    }
+
+    private async handleUnconfirmedReplacement(result: ReplaceWriteResult): Promise<boolean> {
+        if (
+            result.commitState !== "unknown" && result.commitState !== "failed" && result.error !== "transaction-failed"
+        ) {
+            return false;
+        }
+        this.clearReplacePendingMessage();
+        this.clearHighlight();
+        await this.highlightHitResult(this.searchText, false);
+        if (result.commitState === "unknown") {
+            showMessage(
+                (this.i18n.replaceCommitUnknown ??
+                    "替换结果尚未确认（已确认 {replacedCount}/{submittedCount}）。请稍后核对内容，再决定是否重试。")
+                    .replace("{replacedCount}", String(result.replacedCount))
+                    .replace("{submittedCount}", String(result.submittedCount ?? 0)),
+                7000,
+                "info",
+            );
+        } else {
+            showMessage(
+                this.i18n.replaceCommitFailed ?? "替换提交发生异常。请核对内容后再操作。",
+                5000,
+                "error",
+            );
+        }
+        return true;
+    }
+
     /**
      * 替换当前：不可替则提示并跳到下一项；可替走 Protyle transaction。
      * 图表无可见字、索引未完成或结果被截断时，全部替换仍要完整快照。
@@ -4474,12 +4546,14 @@ export class SearchBar {
                     searchQuery: this.searchText,
                     caseSensitive: this.caseSensitive,
                     regexMatcher: this.regexMatcher,
+                    onCommitStateChange: (state) => this.onReplaceCommitStateChange(state),
                     isCurrent: () =>
                         this.hasCurrentSearchResults() &&
                         this.resultSearchKey === searchKey && this.searchGeneration === generation &&
                         this.replaceText === replacementText,
                 },
             );
+            if (await this.handleUnconfirmedReplacement(result)) return;
             if (result.error === "readonly-or-preview") {
                 showMessage(this.i18n.replaceModeUnsupported, 3000, "info");
                 return;
@@ -4535,6 +4609,7 @@ export class SearchBar {
             }
             showMessage(this.i18n.replaceCurrentDone, 2000, "info");
         } finally {
+            this.clearReplacePendingMessage();
             this.replaceBusy = false;
             this.scheduleDiagramRefresh();
         }
@@ -4599,12 +4674,14 @@ export class SearchBar {
                     searchQuery: this.searchText,
                     caseSensitive: this.caseSensitive,
                     regexMatcher: this.regexMatcher,
+                    onCommitStateChange: (state) => this.onReplaceCommitStateChange(state),
                     isCurrent: () =>
                         this.hasStableReplaceAllSnapshot() &&
                         this.resultSearchKey === searchKey && this.searchGeneration === searchGeneration &&
                         this.replaceText === replacementText,
                 },
             );
+            if (await this.handleUnconfirmedReplacement(result)) return;
             if (result.error === "readonly-or-preview") {
                 showMessage(this.i18n.replaceModeUnsupported, 3000, "info");
                 return;
@@ -4659,6 +4736,7 @@ export class SearchBar {
                 "info",
             );
         } finally {
+            this.clearReplacePendingMessage();
             this.replaceBusy = false;
             this.scheduleDiagramRefresh();
         }

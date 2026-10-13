@@ -18,6 +18,7 @@ Module._load = function(request, parent, main) {
             getAllEditor: () => editors,
             confirm: (_title, _text, yes) => confirmAction(yes),
             showMessage: () => {},
+            hideMessage: () => {},
         };
     }
     return originalLoad.call(this, request, parent, main);
@@ -77,10 +78,14 @@ async function main() {
     const stamp = new Date(2026, 9, 12, 9, 5).valueOf();
     const endStamp = new Date(2026, 9, 13, 10, 6).valueOf();
     const languageBefore = global.siyuan;
-    global.siyuan = {languages: {_attrView: {
-        dateFormatFullTemplate: "${year}年${month}${day}日",
-        dateMonths: "一月|二月|三月|四月|五月|六月|七月|八月|九月|十月|十一月|十二月",
-    }}};
+    global.siyuan = {
+        languages: {
+            _attrView: {
+                dateFormatFullTemplate: "${year}年${month}${day}日",
+                dateMonths: "一月|二月|三月|四月|五月|六月|七月|八月|九月|十月|十一月|十二月",
+            },
+        },
+    };
     try {
         const cases = [
             ["number", "", {content: 1200, formattedContent: "1,200", isNotEmpty: true}, "1,200"],
@@ -92,41 +97,74 @@ async function main() {
             ["date", "month-day-year", {content: stamp, isNotEmpty: true, isNotTime: true}, "10/12/2026"],
             ["date", "day-month-year", {content: stamp, isNotEmpty: true, isNotTime: true}, "12/10/2026"],
             ["date", "full", {content: stamp, isNotEmpty: true, isNotTime: true}, "2026年十月12日"],
-            ["date", "", {content: stamp, content2: endStamp, hasEndDate: true, isNotEmpty: true, isNotEmpty2: true}, "2026-10-122026-10-13"],
+            [
+                "date",
+                "",
+                {content: stamp, content2: endStamp, hasEndDate: true, isNotEmpty: true, isNotEmpty2: true},
+                "2026-10-122026-10-13",
+            ],
             ["created", "full", {content: stamp, isNotEmpty: true, formattedContent: "原生时间"}, "原生时间"],
             ["updated", "day-month-year", {content: stamp, isNotEmpty: true}, "12/10/2026"],
             ["updated", "", {content: 0, isNotEmpty: true}, ""],
-            ["rollup", "", {contents: [
-                {type: "number", number: {content: 0}},
-                {type: "date", date: {content: stamp, isNotEmpty: true}},
-                {type: "checkbox", checkbox: {checked: true}},
-            ]}, "0, 2026-10-12, "],
-            ["rollup", "", {contents: [
-                {type: "date", date: {content: stamp, content2: endStamp, hasEndDate: true, isNotEmpty: true, isNotEmpty2: true}},
-            ]}, "2026-10-13"],
+            ["rollup", "", {
+                contents: [
+                    {type: "number", number: {content: 0}},
+                    {type: "date", date: {content: stamp, isNotEmpty: true}},
+                    {type: "checkbox", checkbox: {checked: true}},
+                ],
+            }, "0, 2026-10-12, "],
+            ["rollup", "", {
+                contents: [
+                    {
+                        type: "date",
+                        date: {
+                            content: stamp,
+                            content2: endStamp,
+                            hasEndDate: true,
+                            isNotEmpty: true,
+                            isNotEmpty2: true,
+                        },
+                    },
+                ],
+            }, "2026-10-13"],
         ];
         for (const [type, dateFormat, value, expected] of cases) {
             av.invalidateAvCache();
-            api = async url => ({code: 0, data: url.endsWith("getAttributeView") ? raw : {view: {
-                columns: [{id: "k", type, dateFormat}, {id: "hidden", type, dateFormat, hidden: true}],
-                rowCount: 1, rows: [{id: "row", cells: [
-                    {value: {keyID: "k", type, [type]: value}},
-                    {value: {keyID: "hidden", type, [type]: value}},
-                ]}],
-            }}});
+            api = async url => ({
+                code: 0,
+                data: url.endsWith("getAttributeView") ? raw : {
+                    view: {
+                        columns: [{id: "k", type, dateFormat}, {id: "hidden", type, dateFormat, hidden: true}],
+                        rowCount: 1,
+                        rows: [{
+                            id: "row",
+                            cells: [
+                                {value: {keyID: "k", type, [type]: value}},
+                                {value: {keyID: "hidden", type, [type]: value}},
+                            ],
+                        }],
+                    },
+                },
+            });
             const cells = (await av.loadAvUnits([ref()])).filter(unit => unit.unitId.startsWith("av:"));
             assert.deepEqual(cells.map(cell => cell.text), expected ? [expected] : [], type + "/" + dateFormat);
             if (expected) {
                 const host = document.createElement("div");
-                host.innerHTML = '<div class="av" data-node-id="b" data-type="NodeAttributeView"><div class="av__row" data-id="row"><div class="av__cell" data-col-id="k"></div></div></div>';
+                host.innerHTML =
+                    '<div class="av" data-node-id="b" data-type="NodeAttributeView"><div class="av__row" data-id="row"><div class="av__cell" data-col-id="k"></div></div></div>';
                 host.querySelector(".av__cell").textContent = expected;
                 document.body.appendChild(host);
                 const live = blocks.collectSearchableBlocks(host, {
-                    includeAttributeView: true, scopeRoots: [host.firstElementChild],
+                    includeAttributeView: true,
+                    scopeRoots: [host.firstElementChild],
                 });
                 const hits = matcher.matchTextUnitsDetailed(cells, expected).hits;
                 const rebound = project.fillLiveRanges(hits, live, true);
-                assert.equal(rebound[0].range?.toString(), hits[0].matchedText, "formatted cold offset binds to native DOM");
+                assert.equal(
+                    rebound[0].range?.toString(),
+                    hits[0].matchedText,
+                    "formatted cold offset binds to native DOM",
+                );
                 host.remove();
             }
         }
@@ -137,21 +175,54 @@ async function main() {
     console.log("AV native number/date display and cold-to-DOM offsets OK");
     const originalHtmlTexts = blocks.attributeViewHtmlTexts;
     let htmlParses = 0;
-    blocks.attributeViewHtmlTexts = (...args) => { htmlParses++; return originalHtmlTexts(...args); };
+    blocks.attributeViewHtmlTexts = (...args) => {
+        htmlParses++;
+        return originalHtmlTexts(...args);
+    };
     try {
-        api = async url => ({code: 0, data: url.endsWith("getAttributeView") ? raw : {view: {
-            rowCount: 1, columns: [], rows: [{id: "i", cells: Array.from({length: 3000}, (_, index) => ({value: {
-                keyID: "k" + index,
-                ...[
-                    {type: "mAsset", mAsset: [{type: "file", name: "fileKeyword", content: "assets/hidden.pdf"}]},
-                    {type: "relation", relation: {contents: [{type: "block", block: {content: "relationKeyword"}}]}},
-                    {type: "rollup", rollup: {contents: [{type: "number", number: {content: 0}}, {type: "text", text: {content: "rollupKeyword"}}]}},
-                ][index % 3],
-            }}))}],
-        }}});
+        api = async url => ({
+            code: 0,
+            data: url.endsWith("getAttributeView") ? raw : {
+                view: {
+                    rowCount: 1,
+                    columns: [],
+                    rows: [{
+                        id: "i",
+                        cells: Array.from({length: 3000}, (_, index) => ({
+                            value: {
+                                keyID: "k" + index,
+                                ...[
+                                    {
+                                        type: "mAsset",
+                                        mAsset: [{type: "file", name: "fileKeyword", content: "assets/hidden.pdf"}],
+                                    },
+                                    {
+                                        type: "relation",
+                                        relation: {contents: [{type: "block", block: {content: "relationKeyword"}}]},
+                                    },
+                                    {
+                                        type: "rollup",
+                                        rollup: {
+                                            contents: [{type: "number", number: {content: 0}}, {
+                                                type: "text",
+                                                text: {content: "rollupKeyword"},
+                                            }],
+                                        },
+                                    },
+                                ][index % 3],
+                            },
+                        })),
+                    }],
+                },
+            },
+        });
         const compound = await av.loadAvUnits([ref()]);
         assert.equal(compound.filter(unit => unit.unitId.startsWith("av:")).length, 3000);
-        assert.equal(htmlParses, 0, "ordinary files/relations/rollups keep the string path, without per-cell DOM parsing");
+        assert.equal(
+            htmlParses,
+            0,
+            "ordinary files/relations/rollups keep the string path, without per-cell DOM parsing",
+        );
     } finally {
         blocks.attributeViewHtmlTexts = originalHtmlTexts;
         av.invalidateAvCache();
@@ -469,21 +540,47 @@ async function main() {
         [["av-group:visible:i:k", "visible"], ["av-group:folded:i:k", "folded"]],
         "hidden groups are excluded while visible folded groups keep their search instances",
     );
-    const namedGroups = await checkPages(() => ({view: {
-        columns: [{id: "k"}],
-        groups: [
-            {id: "text", name: " 文本组 ", groupValue: {type: "text"}, ...view([row("i", "body")])},
-            {id: "multi", name: "not-visible", groupValue: {type: "mSelect", mSelect: [{content: "甲"}, {content: "乙"}]}, ...view([])},
-            {id: "select", name: "not-visible", groupValue: {type: "select", mSelect: [{content: "选项"}]}, ...view([])},
-            {id: "check", name: "not-visible", groupValue: {type: "checkbox", checkbox: {checked: true}}, ...view([])},
-            {id: "hidden", name: "not-visible", groupHidden: 2, ...view([])},
+    const namedGroups = await checkPages(() => ({
+        view: {
+            columns: [{id: "k"}],
+            groups: [
+                {id: "text", name: " 文本组 ", groupValue: {type: "text"}, ...view([row("i", "body")])},
+                {
+                    id: "multi",
+                    name: "not-visible",
+                    groupValue: {type: "mSelect", mSelect: [{content: "甲"}, {content: "乙"}]},
+                    ...view([]),
+                },
+                {
+                    id: "select",
+                    name: "not-visible",
+                    groupValue: {type: "select", mSelect: [{content: "选项"}]},
+                    ...view([]),
+                },
+                {
+                    id: "check",
+                    name: "not-visible",
+                    groupValue: {type: "checkbox", checkbox: {checked: true}},
+                    ...view([]),
+                },
+                {id: "hidden", name: "not-visible", groupHidden: 2, ...view([])},
+            ],
+        },
+    }));
+    assert.deepEqual(
+        namedGroups.filter(unit => unit.unitId.startsWith("group-title:")).map(unit => [unit.unitId, unit.text]),
+        [
+            ["group-title:text", " 文本组 "],
+            ["group-title:multi", "甲乙"],
+            ["group-title:select", "选项"],
         ],
-    }}));
-    assert.deepEqual(namedGroups.filter(unit => unit.unitId.startsWith("group-title:")).map(unit => [unit.unitId, unit.text]), [
-        ["group-title:text", " 文本组 "], ["group-title:multi", "甲乙"], ["group-title:select", "选项"],
-    ], "group names follow native chips/icons/visibility, preserving offsets and whitespace");
-    assert.ok(namedGroups.findIndex(unit => unit.unitId === "group-title:text") <
-        namedGroups.findIndex(unit => unit.unitId === "av-group:text:i:k"), "group names precede their own rows");
+        "group names follow native chips/icons/visibility, preserving offsets and whitespace",
+    );
+    assert.ok(
+        namedGroups.findIndex(unit => unit.unitId === "group-title:text") <
+            namedGroups.findIndex(unit => unit.unitId === "av-group:text:i:k"),
+        "group names precede their own rows",
+    );
     const hiddenGroups = [1, 2].map(groupHidden => {
         const group = {id: "hidden" + groupHidden, groupHidden, rowCount: groupHidden === 1 ? 0 : 201};
         Object.defineProperty(group, "rows", {
@@ -696,17 +793,25 @@ async function main() {
     document.body.append(edit);
     const wysiwyg = edit.querySelector(".protyle-wysiwyg");
     let commits = 0;
+    const writtenHtml = new Map();
     const protyle = {
         protyle: {element: edit, notebookId: "", block: {rootID: "r", id: "r"}, disabled: false},
-        transaction: () => {
+        transaction: (operations) => {
             commits++;
+            for (const operation of operations) writtenHtml.set(operation.id, operation.data);
         },
-        updateTransactionElement: () => {
+        updateTransactionElement: (element) => {
             commits++;
+            writtenHtml.set(element.getAttribute("data-node-id"), element.outerHTML);
         },
     };
     editors = [protyle];
     const html = '<div data-node-id="b" data-type="NodeParagraph"><div contenteditable="true">foo</div></div>';
+    const committedDomApi = async (_url, body) => ({
+        code: 0,
+        data: Object.fromEntries(body.ids.map(id => [id, writtenHtml.get(id) ?? html])),
+    });
+    api = committedDomApi;
     function liveMatches() {
         const live = blocks.collectSearchableBlocks(edit, {includeDocTitle: false});
         return matcher.matchTextUnitsDetailed(
@@ -760,7 +865,16 @@ async function main() {
         const before = commits;
         api = async (url) => {
             if (url.includes("getBlockDOMs")) {
-                return {code: 0, data: {b: changed && ++reads > 1 ? html.replace("foo", "new foo") : html}};
+                return {
+                    code: 0,
+                    data: {
+                        b: commits > before ?
+                            writtenHtml.get("b") :
+                            changed && ++reads > 1 ?
+                            html.replace("foo", "new foo") :
+                            html,
+                    },
+                };
             }
             if (url.includes("sql")) return {code: 0, data: [{id: "b", hash: commits === before ? "before" : "after"}]};
             return {code: 0, data: []};
@@ -770,6 +884,7 @@ async function main() {
         assert.equal(commits - before, changed ? 0 : 1);
     }
     console.log("P2 single/all write guards, readonly, root/node identity, edits and fetched snapshot OK");
+    api = committedDomApi;
 
     const {SearchBar} = source("frontend/search-bar");
     function searchBarFixture(reset = true) {

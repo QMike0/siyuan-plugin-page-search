@@ -22,7 +22,6 @@ import {
     editorRootId,
     invalidateEditedDocument,
 } from "./corpus/search";
-import {fetchBlockHashes} from "./corpus/sql";
 import {isDocTitleMatch} from "./doc-title-replace";
 import type {SearchableBlock} from "./dom-types";
 import type {SearchMatch} from "./dom-types";
@@ -36,11 +35,17 @@ import {
     createRegexReplacementPlan,
     type RegexReplacementPlan,
 } from "./replacement";
+import {
+    confirmBlockUpdates,
+    createCommitContentReader,
+    type CommitObserver,
+    type ReplaceCommitState,
+} from "./replacement-commit";
 import {unitKey} from "./selection";
 
 const DOC_TITLE_BLOCK_ID = "__doc-title__";
 
-export interface ReplaceWriteOptions {
+export interface ReplaceWriteOptions extends CommitObserver {
     preserveCase?: boolean;
     /** 正则查找：替换串展开 $1 等 */
     regex?: boolean;
@@ -55,6 +60,9 @@ export interface ReplaceWriteOptions {
 export interface ReplaceWriteResult {
     replacedCount: number;
     skippedCount: number;
+    /** Only confirmed content contributes to replacedCount after a submitted write. */
+    commitState?: ReplaceCommitState;
+    submittedCount?: number;
     error?: string;
     /** 透传标题 rename 等失败时的内核 msg */
     detail?: string;
@@ -200,6 +208,37 @@ function restoreOuterHtml(element: HTMLElement, html: string): void {
     if (restored && element.parentNode) {
         element.parentNode.replaceChild(restored, element);
     }
+}
+
+/** Restore only this call's optimistic content, never a newer edit or another editor. */
+function captureLiveRollback(
+    edit: Element,
+    protyle: Protyle,
+    updates: readonly PreparedBlockUpdate[],
+    oldLiveHtml?: ReadonlyMap<string, string>,
+): () => void {
+    const rootId = editorRootId(edit);
+    const readContent = createCommitContentReader(protyle);
+    const snapshots = updates.map((update) => ({
+        id: update.id,
+        oldHTML: oldLiveHtml?.get(update.id) ?? resolveSubmitBlockElement(edit, update.id)?.outerHTML,
+        expectedHTML: update.newHTML,
+    }));
+    return () => {
+        if (!edit.isConnected || editorRootId(edit) !== rootId || resolveProtyleFromEdit(edit) !== protyle) return;
+        // Restore children first, so a parent can match its submitted HTML with old children.
+        for (let index = snapshots.length - 1; index >= 0; index -= 1) {
+            const snapshot = snapshots[index];
+            const live = resolveSubmitBlockElement(edit, snapshot.id);
+            const expected = readContent(snapshot.expectedHTML);
+            if (
+                live && snapshot.oldHTML && expected !== undefined &&
+                live.outerHTML !== snapshot.oldHTML && readContent(live.outerHTML) === expected
+            ) {
+                restoreOuterHtml(live, snapshot.oldHTML);
+            }
+        }
+    };
 }
 function buildUnitMap(blocks: SearchableBlock[]): Map<string, SearchableBlock> {
     const map = new Map<string, SearchableBlock>();
@@ -380,16 +419,31 @@ export async function replaceCurrentMatchInEditor(
         return {replacedCount: 0, skippedCount: 1};
     }
 
+    const update: PreparedBlockUpdate = {
+        id: match.blockId,
+        oldHTML,
+        newHTML: submit.outerHTML,
+        appliedCount: outcome.appliedCount,
+    };
+    // The replacement is already the same text. Native updateTransaction also skips this write.
+    if (update.newHTML === oldHTML) {
+        return {replacedCount: outcome.appliedCount, skippedCount: outcome.skippedCount, commitState: "confirmed"};
+    }
+    const rootId = editorRootId(edit);
+    const rollback = captureLiveRollback(edit, protyle, [update], new Map([[match.blockId, oldHTML]]));
     try {
         protyle.updateTransactionElement(submit, oldHTML);
     } catch (error) {
         console.warn("[page-search] updateTransactionElement failed", error);
-        return {replacedCount: 0, skippedCount: 1, error: "transaction-failed"};
+        rollback();
+        invalidateEditedDocument(rootId, [match.blockId]);
+        return {replacedCount: 0, skippedCount: 1, error: "transaction-failed", commitState: "failed"};
     }
 
-    invalidateEditedDocument(editorRootId(edit), [match.blockId]);
+    const confirmation = await confirmBlockUpdates(protyle, [update], options);
+    invalidateEditedDocument(rootId, [match.blockId]);
     return {
-        replacedCount: outcome.appliedCount,
+        ...confirmation,
         skippedCount: outcome.skippedCount,
     };
 }
@@ -509,71 +563,6 @@ function prepareBlockElementUpdate(
         },
         skippedCount: outcome.skippedCount,
     };
-}
-
-const BLOCK_COMMIT_WAIT_MS = 8000;
-const BLOCK_COMMIT_POLL_MS = 80;
-
-/**
- * protyle.transaction 把请求放进编辑器队列后就返回，不等内核写完。
- * @see https://github.com/siyuan-note/siyuan/blob/v3.8.6/app/src/protyle/wysiwyg/transaction.ts promiseTransaction
- */
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-        window.setTimeout(resolve, ms);
-    });
-}
-
-async function blockHash(blockId: string): Promise<string> {
-    const hashes = await fetchBlockHashes([blockId]);
-    return hashes?.get(blockId) ?? "";
-}
-
-/**
- * 等这一笔事务落盘。previousHash 必须在调用 transaction 之前读好。
- * 事务返回时内核可能已经写完，那时再读到的是新哈希，不能当作替换前的值。
- * 哈希读不到时，再退回比对这一块的 HTML。
- */
-async function waitUntilReplacementVisible(
-    update: PreparedBlockUpdate,
-    previousHash: string,
-): Promise<void> {
-    if (previousHash) {
-        const deadline = Date.now() + BLOCK_COMMIT_WAIT_MS;
-        while (Date.now() < deadline) {
-            const after = await fetchBlockHashes([update.id]);
-            const nextHash = after?.get(update.id);
-            if (nextHash && nextHash !== previousHash) {
-                return;
-            }
-            await sleep(BLOCK_COMMIT_POLL_MS);
-        }
-        return;
-    }
-    await waitUntilBlockHtmlChanges(update.id, update.oldHTML);
-}
-
-function smallestFetchedUpdate(updates: readonly PreparedBlockUpdate[]): PreparedBlockUpdate {
-    return updates.reduce((best, item) => (item.newHTML.length < best.newHTML.length ? item : best));
-}
-
-async function waitUntilBlockHtmlChanges(blockId: string, previousHtml: string): Promise<void> {
-    const deadline = Date.now() + BLOCK_COMMIT_WAIT_MS;
-    while (Date.now() < deadline) {
-        await sleep(BLOCK_COMMIT_POLL_MS);
-        try {
-            const response = await fetchSyncPost("/api/block/getBlockDOMs", {ids: [blockId]});
-            if (response?.code !== 0 || !response.data || typeof response.data !== "object") {
-                continue;
-            }
-            const html = (response.data as Record<string, string>)[blockId];
-            if (html !== previousHtml) {
-                return;
-            }
-        } catch {
-            // 请求还没写完时继续等到上限，避免刷新读到旧文本
-        }
-    }
 }
 
 async function fetchBlockHtmlBatch(ids: string[]): Promise<Map<string, string>> {
@@ -937,67 +926,47 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
-    const probe = fetched.updates.length > 0 ? smallestFetchedUpdate(fetched.updates) : undefined;
-    // 同一笔事务一起落盘。哈希要在入队前记下，探测最小的那一块。
-    const previousHash = probe ? await blockHash(probe.id) : "";
     const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates);
     const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
     if (conflict) {
         return {replacedCount: 0, skippedCount: matches.length, error: conflict};
     }
+    const changed = ordered.filter((update) => update.newHTML !== update.oldHTML);
+    const unchangedCount = ordered.reduce(
+        (count, update) => count + (update.newHTML === update.oldHTML ? update.appliedCount : 0),
+        0,
+    );
+    if (!changed.length) {
+        return {replacedCount: unchangedCount, skippedCount, commitState: "confirmed"};
+    }
+    const rootId = editorRootId(edit);
+    const rollback = captureLiveRollback(edit, protyle, changed);
     try {
         protyle.transaction(
-            ordered.map((update) => lockedUpdate(update.id, update.newHTML)),
-            ordered.map((update) => lockedUpdate(update.id, update.oldHTML)),
+            changed.map((update) => lockedUpdate(update.id, update.newHTML)),
+            changed.map((update) => lockedUpdate(update.id, update.oldHTML)),
         );
     } catch (error) {
         console.warn("[page-search] transaction failed", error);
+        rollback();
+        invalidateEditedDocument(rootId, changed.map((update) => update.id));
         return {
             replacedCount: 0,
             skippedCount: skippedBeforeBody + bodyMatches.length,
             error: "transaction-failed",
+            commitState: "failed",
         };
     }
 
-    if (probe) {
-        await waitUntilReplacementVisible(probe, previousHash);
-    }
-    invalidateEditedDocument(editorRootId(edit), ordered.map((update) => update.id));
+    const confirmation = await confirmBlockUpdates(protyle, changed, options);
+    invalidateEditedDocument(rootId, changed.map((update) => update.id));
 
     return {
-        replacedCount: ordered.reduce((count, update) => count + update.appliedCount, 0),
+        ...confirmation,
+        replacedCount: confirmation.replacedCount + unchangedCount,
+        submittedCount: confirmation.submittedCount + unchangedCount,
         skippedCount: skippedBeforeBody + bodySkipped,
     };
-}
-
-async function commitBlockHtml(
-    protyle: Protyle,
-    blockId: string,
-    oldHTML: string,
-    newHTML: string,
-): Promise<boolean> {
-    try {
-        protyle.transaction(
-            [lockedUpdate(blockId, newHTML)],
-            [lockedUpdate(blockId, oldHTML)],
-        );
-        return true;
-    } catch (error) {
-        console.warn("[page-search] transaction failed, trying /api/transactions", error);
-    }
-    try {
-        const response = await fetchSyncPost("/api/transactions", {
-            session: "page-search",
-            app: "page-search",
-            transactions: [{
-                doOperations: [lockedUpdate(blockId, newHTML)],
-                undoOperations: [lockedUpdate(blockId, oldHTML)],
-            }],
-        });
-        return response?.code === 0;
-    } catch {
-        return false;
-    }
 }
 
 /** getBlockDOMs 是 cleanRenderNode 底稿；无法再次确认或底稿改变时保守拒绝写回。 */
@@ -1019,7 +988,7 @@ async function replaceFetchedBlockMatches(
     matches: SearchMatch[],
     replacementText: string,
     options: ReplaceWriteOptions,
-    liveRoot: ParentNode,
+    liveRoot: Element,
     guard: () => string | undefined,
 ): Promise<ReplaceWriteResult> {
     const prepared = await prepareFetchedBlockUpdates(
@@ -1036,17 +1005,28 @@ async function replaceFetchedBlockMatches(
             error: prepared.error ?? "apply-failed",
         };
     }
-    const previousHash = await blockHash(update.id);
     const kernelCurrent = await fetchedUpdatesUnchanged(prepared.updates);
     const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
     if (conflict) {
         return {replacedCount: 0, skippedCount: matches.length, error: conflict};
     }
-    const committed = await commitBlockHtml(protyle, update.id, update.oldHTML, update.newHTML);
-    if (!committed) {
-        return {replacedCount: 0, skippedCount: matches.length, error: "transaction-failed"};
+    if (update.newHTML === update.oldHTML) {
+        return {replacedCount: update.appliedCount, skippedCount: prepared.skippedCount, commitState: "confirmed"};
     }
-    await waitUntilReplacementVisible(update, previousHash);
-    invalidateEditedDocument(protyle.protyle?.block?.rootID, [update.id]);
-    return {replacedCount: update.appliedCount, skippedCount: prepared.skippedCount};
+    const rootId = protyle.protyle?.block?.rootID;
+    const rollback = captureLiveRollback(liveRoot, protyle, [update]);
+    try {
+        protyle.transaction(
+            [lockedUpdate(update.id, update.newHTML)],
+            [lockedUpdate(update.id, update.oldHTML)],
+        );
+    } catch (error) {
+        console.warn("[page-search] transaction failed", error);
+        rollback();
+        invalidateEditedDocument(rootId, [update.id]);
+        return {replacedCount: 0, skippedCount: matches.length, error: "transaction-failed", commitState: "failed"};
+    }
+    const confirmation = await confirmBlockUpdates(protyle, [update], options);
+    invalidateEditedDocument(rootId, [update.id]);
+    return {...confirmation, skippedCount: prepared.skippedCount};
 }

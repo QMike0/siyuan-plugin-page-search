@@ -263,7 +263,7 @@ async function main() {
             const calls = [];
             let requests = 0;
             const protyle = {
-                protyle: {element: f.edit, notebookId: "", block: {rootID: "r", id: "r"}, disabled: false},
+                protyle: {element: f.edit, notebookId: "", block: {rootID: "r", id: "r"}, disabled: false, lute},
                 transaction: (doOps, undoOps) => calls.push({doOps, undoOps}),
                 updateTransactionElement: (element, before) =>
                     calls.push({
@@ -277,9 +277,12 @@ async function main() {
             if (fetched) f.wysiwyg.innerHTML = "";
             api = async url => {
                 requests++;
-                if (url.endsWith("getBlockDOMs")) return {code: 0, data: {[blockId]: oldHTML}};
-                if (url.endsWith("sql")) {
-                    return {code: 0, data: [{id: blockId, hash: calls.length ? "after" : "before"}]};
+                if (url.endsWith("getBlockDOMs")) {
+                    const submitted = calls.at(-1)?.doOps[0].data;
+                    return {
+                        code: 0,
+                        data: {[blockId]: submitted ? (lute ? lute.SpinBlockDOM(submitted) : submitted) : oldHTML},
+                    };
                 }
                 throw new Error("Unexpected extra API: " + url);
             };
@@ -288,8 +291,9 @@ async function main() {
                 await write.replaceCurrentMatchInEditor(f.edit, matches[0], "自定义");
             assert.equal(result.replacedCount, all ? 2 : 1);
             assert.equal(result.skippedCount, 0);
+            assert.equal(result.commitState, "confirmed");
             assert.equal(calls.length, 1, "one original transaction, no extra reference transaction");
-            assert.equal(requests, fetched ? 4 : 0, "reference conversion adds no API reads");
+            assert.equal(requests, fetched ? 3 : 1, "one confirmation read; fetched paths also verify their base");
             const {doOps, undoOps} = calls[0];
             assert.equal(doOps.length, 1);
             assert.equal(undoOps.length, 1);
@@ -304,7 +308,7 @@ async function main() {
             }
         }
     }
-    console.log("Current/all × live/fetched: do/undo/redo HTML and unchanged transaction/API counts OK");
+    console.log("Current/all × live/fetched: confirmed content, do/undo/redo HTML and one transaction OK");
 
     // Observe DOM access, avoiding flaky timing assertions. Many unrelated references
     // must not add traversal to the replacement itself after units have been collected.

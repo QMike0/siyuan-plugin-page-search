@@ -390,6 +390,11 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             replaceAllIncomplete: t.replaceAllIncomplete ||
                 "Search results are incomplete. Wait for indexing before replacing all.",
             replaceCurrentDone: t.replaceCurrentDone || "Current match replaced",
+            replaceCommitPending: t.replaceCommitPending || "Submitted; confirming replacement…",
+            replaceCommitUnknown: t.replaceCommitUnknown ||
+                "Replacement is not fully confirmed ({replacedCount}/{submittedCount} confirmed). Check the content later before retrying.",
+            replaceCommitFailed: t.replaceCommitFailed ||
+                "Replacement submission encountered an error. Check the content before continuing.",
             replaceAllResult: t.replaceAllResult ||
                 "Replacement complete: {replacedCount} replaced, {skippedCount} skipped",
             replaceProtyleMissing: t.replaceProtyleMissing ||
