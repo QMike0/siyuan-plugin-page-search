@@ -124,6 +124,26 @@ function resolveSubmitBlockElement(
     });
 }
 
+function resolveSubmitBlockElements(
+    edit: Element,
+    blockId: string,
+): HTMLElement[] {
+    if (!blockId || blockId === DOC_TITLE_BLOCK_ID) {
+        return [];
+    }
+    const root = edit.classList.contains("protyle") ?
+        edit :
+        edit.querySelector(".protyle:not(.fn__none)") ?? edit;
+    const candidates = Array.from(
+        root.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"][data-type]`),
+    ).filter((el) => !el.closest(".protyle-attr, .fn__none"));
+    if (candidates.length) {
+        return candidates;
+    }
+    const fallback = root.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"]`);
+    return fallback ? [fallback] : [];
+}
+
 /**
  * 是否可写回。判别顺序：
  * 1) 发布服务 / 导出预览 / 只读模式
@@ -215,27 +235,54 @@ function captureLiveRollback(
     edit: Element,
     protyle: Protyle,
     updates: readonly PreparedBlockUpdate[],
-    oldLiveHtml?: ReadonlyMap<string, string>,
+    oldLiveHtml?: ReadonlyMap<HTMLElement, string>,
 ): () => void {
     const rootId = editorRootId(edit);
     const readContent = createCommitContentReader(protyle);
-    const snapshots = updates.map((update) => ({
-        id: update.id,
-        oldHTML: oldLiveHtml?.get(update.id) ?? resolveSubmitBlockElement(edit, update.id)?.outerHTML,
-        expectedHTML: update.newHTML,
-    }));
+    const childPositions = new WeakMap<Element, Map<Element, number>>();
+    const snapshots = updates.map((update) => {
+        const elements = resolveSubmitBlockElements(edit, update.id);
+        return {
+            id: update.id,
+            expectedHTML: update.newHTML,
+            entries: elements.map((element) => {
+                // Native sync replaces elements in place. Keep each copy's position and old HTML together.
+                const path: number[] = [];
+                let current: Element | null = element;
+                while (current && current !== edit) {
+                    const parent: Element | null = current.parentElement;
+                    if (!parent) break;
+                    let positions = childPositions.get(parent);
+                    if (!positions) {
+                        positions = new Map(Array.from(parent.children, (child, index) => [child, index]));
+                        childPositions.set(parent, positions);
+                    }
+                    path.push(positions.get(current)!);
+                    current = parent;
+                }
+                return {element, path: path.reverse(), oldHTML: oldLiveHtml?.get(element) ?? element.outerHTML};
+            }),
+        };
+    });
     return () => {
         if (!edit.isConnected || editorRootId(edit) !== rootId || resolveProtyleFromEdit(edit) !== protyle) return;
         // Restore children first, so a parent can match its submitted HTML with old children.
         for (let index = snapshots.length - 1; index >= 0; index -= 1) {
             const snapshot = snapshots[index];
-            const live = resolveSubmitBlockElement(edit, snapshot.id);
             const expected = readContent(snapshot.expectedHTML);
-            if (
-                live && snapshot.oldHTML && expected !== undefined &&
-                live.outerHTML !== snapshot.oldHTML && readContent(live.outerHTML) === expected
-            ) {
-                restoreOuterHtml(live, snapshot.oldHTML);
+            if (expected === undefined) continue;
+            for (const entry of snapshot.entries) {
+                let live: Element | undefined = entry.element;
+                if (!edit.contains(live)) {
+                    live = edit;
+                    for (const position of entry.path) live = live?.children[position];
+                }
+                if (
+                    live instanceof HTMLElement && live.getAttribute("data-node-id") === snapshot.id &&
+                    live.outerHTML !== entry.oldHTML && readContent(live.outerHTML) === expected
+                ) {
+                    restoreOuterHtml(live, entry.oldHTML);
+                }
             }
         }
     };
@@ -430,7 +477,7 @@ export async function replaceCurrentMatchInEditor(
         return {replacedCount: outcome.appliedCount, skippedCount: outcome.skippedCount, commitState: "confirmed"};
     }
     const rootId = editorRootId(edit);
-    const rollback = captureLiveRollback(edit, protyle, [update], new Map([[match.blockId, oldHTML]]));
+    const rollback = captureLiveRollback(edit, protyle, [update], new Map([[submit, oldHTML]]));
     try {
         protyle.updateTransactionElement(submit, oldHTML);
     } catch (error) {
@@ -565,11 +612,14 @@ function prepareBlockElementUpdate(
     };
 }
 
-async function fetchBlockHtmlBatch(ids: string[]): Promise<Map<string, string>> {
+async function fetchBlockHtmlBatch(ids: string[], notebook = ""): Promise<Map<string, string>> {
     const htmlById = new Map<string, string>();
     let data: Record<string, string> | null = null;
     try {
-        const response = await fetchSyncPost("/api/block/getBlockDOMs", {ids});
+        const response = await fetchSyncPost(
+            "/api/block/getBlockDOMs",
+            notebook ? {ids, notebook} : {ids},
+        );
         if (response?.code === 0 && response.data && typeof response.data === "object") {
             data = response.data as Record<string, string>;
         }
@@ -679,6 +729,7 @@ async function prepareFetchedBlockUpdates(
     replacementText: string,
     options: ReplaceWriteOptions,
     liveRoot: ParentNode | null,
+    notebook = "",
 ): Promise<{updates: PreparedBlockUpdate[]; skippedCount: number; error?: string; fatal?: boolean;}> {
     const ids = Array.from(matchesById.keys());
     const totalMatches = Array.from(matchesById.values()).reduce((count, items) => count + items.length, 0);
@@ -691,7 +742,7 @@ async function prepareFetchedBlockUpdates(
 
     for (let index = 0; index < ids.length; index += BLOCK_DOM_BATCH_SIZE) {
         const batch = ids.slice(index, index + BLOCK_DOM_BATCH_SIZE);
-        const htmlById = await fetchBlockHtmlBatch(batch);
+        const htmlById = await fetchBlockHtmlBatch(batch, notebook);
         const present: string[] = [];
         const doms: Record<string, string> = {};
         for (const id of batch) {
@@ -806,6 +857,7 @@ export async function replaceAllMatchesInEditor(
     if (protyle.protyle?.disabled) {
         return {replacedCount: 0, skippedCount: matches.length, error: "readonly-or-preview"};
     }
+    const notebook = protyle.protyle?.notebookId ?? "";
 
     const bodyMatches: SearchMatch[] = [];
     let skippedCount = 0;
@@ -900,6 +952,7 @@ export async function replaceAllMatchesInEditor(
         replacementText,
         options,
         edit,
+        notebook,
     );
     bodySkipped += fetched.skippedCount;
     if (fetched.fatal) {
@@ -926,7 +979,7 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
-    const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates);
+    const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, notebook);
     const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
     if (conflict) {
         return {replacedCount: 0, skippedCount: matches.length, error: conflict};
@@ -970,10 +1023,13 @@ export async function replaceAllMatchesInEditor(
 }
 
 /** getBlockDOMs 是 cleanRenderNode 底稿；无法再次确认或底稿改变时保守拒绝写回。 */
-async function fetchedUpdatesUnchanged(updates: readonly PreparedBlockUpdate[]): Promise<boolean> {
+async function fetchedUpdatesUnchanged(
+    updates: readonly PreparedBlockUpdate[],
+    notebook = "",
+): Promise<boolean> {
     for (let index = 0; index < updates.length; index += BLOCK_DOM_BATCH_SIZE) {
         const batch = updates.slice(index, index + BLOCK_DOM_BATCH_SIZE);
-        const current = await fetchBlockHtmlBatch(batch.map((update) => update.id));
+        const current = await fetchBlockHtmlBatch(batch.map((update) => update.id), notebook);
         if (batch.some((update) => current.get(update.id) !== update.kernelHTML)) {
             return false;
         }
@@ -991,11 +1047,13 @@ async function replaceFetchedBlockMatches(
     liveRoot: Element,
     guard: () => string | undefined,
 ): Promise<ReplaceWriteResult> {
+    const notebook = protyle.protyle?.notebookId ?? "";
     const prepared = await prepareFetchedBlockUpdates(
         new Map([[blockId, matches]]),
         replacementText,
         options,
         liveRoot,
+        notebook,
     );
     const update = prepared.updates[0];
     if (!update) {
@@ -1005,7 +1063,7 @@ async function replaceFetchedBlockMatches(
             error: prepared.error ?? "apply-failed",
         };
     }
-    const kernelCurrent = await fetchedUpdatesUnchanged(prepared.updates);
+    const kernelCurrent = await fetchedUpdatesUnchanged(prepared.updates, notebook);
     const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
     if (conflict) {
         return {replacedCount: 0, skippedCount: matches.length, error: conflict};

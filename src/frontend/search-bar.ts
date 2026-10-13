@@ -1226,6 +1226,7 @@ export class SearchBar {
     destroy(restoreFocus = true) {
         if (this.destroyed) return;
         this.destroyed = true;
+        this.clearReplacePendingMessage();
         this.stopComponentLifecycleWatch?.();
         this.stopComponentLifecycleWatch = null;
         this.viewportRangeAbort?.abort();
@@ -4416,6 +4417,7 @@ export class SearchBar {
     private replacePendingMessageId?: string;
 
     private onReplaceCommitStateChange(state: ReplaceCommitState): void {
+        if (this.destroyed) return;
         if (state === "pending") {
             this.replacePendingMessageId ??= `page-search-replace-${Date.now()}-${Math.random()}`;
             showMessage(
@@ -4442,8 +4444,10 @@ export class SearchBar {
             return false;
         }
         this.clearReplacePendingMessage();
+        if (this.destroyed) return true;
         this.clearHighlight();
         await this.highlightHitResult(this.searchText, false);
+        if (this.destroyed) return true;
         if (result.commitState === "unknown") {
             showMessage(
                 (this.i18n.replaceCommitUnknown ??
@@ -4470,7 +4474,7 @@ export class SearchBar {
      */
     private async clickReplace() {
         if (
-            this.replaceBusy || !this.hasCurrentSearchResults() || this.resultCount === 0 ||
+            this.destroyed || this.replaceBusy || !this.hasCurrentSearchResults() || this.resultCount === 0 ||
             this.isRestrictEnumerateMode()
         ) {
             return;
@@ -4519,7 +4523,7 @@ export class SearchBar {
                         openBlockInEditor(app, current.blockId, done, this.edit);
                         window.setTimeout(done, 4500);
                     });
-                    if (this.searchResultKey() !== searchKey) return;
+                    if (this.destroyed || this.searchResultKey() !== searchKey) return;
                     await this.highlightHitResult(this.searchText, false);
                     const rebound = this.resultMatches.find((candidate) =>
                         candidate.blockId === match.blockId && candidate.unitId === match.unitId &&
@@ -4531,7 +4535,7 @@ export class SearchBar {
                 }
             }
             if (
-                !this.hasCurrentSearchResults() || this.resultSearchKey !== searchKey ||
+                this.destroyed || !this.hasCurrentSearchResults() || this.resultSearchKey !== searchKey ||
                 this.resultSelectionScope !== selectionScope
             ) return;
             const generation = this.searchGeneration;
@@ -4548,12 +4552,14 @@ export class SearchBar {
                     regexMatcher: this.regexMatcher,
                     onCommitStateChange: (state) => this.onReplaceCommitStateChange(state),
                     isCurrent: () =>
+                        !this.destroyed &&
                         this.hasCurrentSearchResults() &&
                         this.resultSearchKey === searchKey && this.searchGeneration === generation &&
                         this.replaceText === replacementText,
                 },
             );
-            if (await this.handleUnconfirmedReplacement(result)) return;
+            if (this.destroyed) return;
+            if (await this.handleUnconfirmedReplacement(result) || this.destroyed) return;
             if (result.error === "readonly-or-preview") {
                 showMessage(this.i18n.replaceModeUnsupported, 3000, "info");
                 return;
@@ -4602,6 +4608,7 @@ export class SearchBar {
             this.clearHighlight();
             // 替换后保持相对索引，不按光标重新锚定
             await this.highlightHitResult(this.searchText, false);
+            if (this.destroyed) return;
             if (this.resultCount > 0) {
                 this.resultIndex = Math.min(keepIndex, this.resultCount);
                 this.updateCountLabel();
@@ -4611,13 +4618,13 @@ export class SearchBar {
         } finally {
             this.clearReplacePendingMessage();
             this.replaceBusy = false;
-            this.scheduleDiagramRefresh();
+            if (!this.destroyed) this.scheduleDiagramRefresh();
         }
     }
 
     private async clickReplaceAll() {
         if (
-            this.replaceBusy || !this.hasCurrentSearchResults() || this.searchCoverageIncomplete ||
+            this.destroyed || this.replaceBusy || !this.hasCurrentSearchResults() || this.searchCoverageIncomplete ||
             this.resultCount === 0 || this.isRestrictEnumerateMode()
         ) {
             return;
@@ -4630,7 +4637,9 @@ export class SearchBar {
         // 更新一次陈旧快照；确认框显示的数量必须来自此次稳定结果。
         if (!this.hasStableReplaceAllSnapshot()) {
             await this.highlightHitResult(this.searchText, false);
-            if (!this.hasStableReplaceAllSnapshot() || this.replaceBusy || this.resultCount === 0) return;
+            if (this.destroyed || !this.hasStableReplaceAllSnapshot() || this.replaceBusy || this.resultCount === 0) {
+                return;
+            }
         }
         const searchGeneration = this.searchGeneration;
         const confirmText = this.i18n.replaceAllConfirm.replace(
@@ -4641,7 +4650,7 @@ export class SearchBar {
             this.i18n.replaceAllConfirmTitle,
             confirmText,
         );
-        if (!confirmed) {
+        if (!confirmed || this.destroyed) {
             return;
         }
         if (
@@ -4676,12 +4685,14 @@ export class SearchBar {
                     regexMatcher: this.regexMatcher,
                     onCommitStateChange: (state) => this.onReplaceCommitStateChange(state),
                     isCurrent: () =>
+                        !this.destroyed &&
                         this.hasStableReplaceAllSnapshot() &&
                         this.resultSearchKey === searchKey && this.searchGeneration === searchGeneration &&
                         this.replaceText === replacementText,
                 },
             );
-            if (await this.handleUnconfirmedReplacement(result)) return;
+            if (this.destroyed) return;
+            if (await this.handleUnconfirmedReplacement(result) || this.destroyed) return;
             if (result.error === "readonly-or-preview") {
                 showMessage(this.i18n.replaceModeUnsupported, 3000, "info");
                 return;
@@ -4728,6 +4739,7 @@ export class SearchBar {
 
             this.clearHighlight();
             await this.highlightHitResult(this.searchText, false);
+            if (this.destroyed) return;
             showMessage(
                 this.i18n.replaceAllResult
                     .replace("{replacedCount}", String(result.replacedCount))
@@ -4738,7 +4750,7 @@ export class SearchBar {
         } finally {
             this.clearReplacePendingMessage();
             this.replaceBusy = false;
-            this.scheduleDiagramRefresh();
+            if (!this.destroyed) this.scheduleDiagramRefresh();
         }
     }
 

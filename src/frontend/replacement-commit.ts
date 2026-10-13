@@ -14,6 +14,11 @@ export interface CommitObserver {
     onCommitStateChange?: (state: ReplaceCommitState) => void;
 }
 
+export interface CommitContentReaderOptions {
+    /** Ignore only derived anchor text of untouched dynamic block references. */
+    ignoreDynamicReferenceText?: boolean;
+}
+
 const COMMIT_WAIT_MS = 8000;
 const COMMIT_BATCH_SIZE = 64;
 
@@ -26,7 +31,10 @@ function notify(observer: CommitObserver, state: ReplaceCommitState): void {
 }
 
 /** Use the editor's serializer: rendered UI and persisted content have different HTML. */
-export function createCommitContentReader(protyle: Protyle): (html: string) => string | undefined {
+export function createCommitContentReader(
+    protyle: Protyle,
+    options: CommitContentReaderOptions = {},
+): (html: string) => string | undefined {
     const lute = protyle.protyle?.lute;
     return (html) => {
         if (!lute?.BlockDOM2Md) return html;
@@ -52,6 +60,20 @@ export function createCommitContentReader(protyle: Protyle): (html: string) => s
                     element.remove();
                 }
             });
+            if (options.ignoreDynamicReferenceText) {
+                template.content.querySelectorAll(
+                    '[data-type~="block-ref"][data-subtype="d"]',
+                ).forEach((element) => {
+                    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+                    let text: Node | null;
+                    let hasText = false;
+                    while ((text = walker.nextNode())) {
+                        text.nodeValue = hasText ? "" : "__page_search_dynamic_ref__";
+                        hasText = true;
+                    }
+                    if (!hasText) element.appendChild(document.createTextNode("__page_search_dynamic_ref__"));
+                });
+            }
             const markdown = lute.BlockDOM2Md(template.innerHTML);
             return markdown || undefined;
         } catch {
@@ -110,7 +132,7 @@ export async function confirmBlockUpdates(
     updates: readonly CommitUpdate[],
     observer: CommitObserver,
 ): Promise<{commitState: ReplaceCommitState; replacedCount: number; submittedCount: number;}> {
-    const readContent = createCommitContentReader(protyle);
+    const readContent = createCommitContentReader(protyle, {ignoreDynamicReferenceText: true});
     // Encrypted notebooks require an explicit notebook scope; keep the submission's scope.
     const notebook = protyle.protyle?.notebookId;
     const pending = new Map<string, {update: CommitUpdate; expected?: string; lastHtml?: string;}>();

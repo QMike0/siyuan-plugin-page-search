@@ -111,10 +111,12 @@ function fixture(contents = [paragraph(id, "foo")], mode = "success") {
         calls.push({operations, undo});
         if (mode === "throw-before") throw new Error("synchronous queue rejection");
         for (const op of operations) {
-            const live = wysiwyg.querySelector(`[data-node-id="${op.id}"]`);
-            if (live) live.outerHTML = normalize(op.data);
+            const lives = mode === "throw-after-all" ?
+                wysiwyg.querySelectorAll(`[data-node-id="${op.id}"]`) :
+                [wysiwyg.querySelector(`[data-node-id="${op.id}"]`)].filter(Boolean);
+            for (const live of lives) live.outerHTML = normalize(op.data);
         }
-        if (mode === "throw-after") throw new Error("native optimistic rendering failed");
+        if (mode === "throw-after" || mode === "throw-after-all") throw new Error("native optimistic rendering failed");
         if (mode === "new-edit-then-throw") {
             wysiwyg.querySelector('[contenteditable="true"]').textContent = "new user edit";
             throw new Error("sync handler failed after a new edit");
@@ -172,6 +174,7 @@ function barFixture(f) {
         resultSelectionScope: null,
         searchGeneration: 1,
         replaceBusy: false,
+        destroyed: false,
         searchCoverageIncomplete: false,
         hasCurrentSearchResults: () => true,
         hasStableReplaceAllSnapshot: () => true,
@@ -195,6 +198,25 @@ function barFixture(f) {
     return bar;
 }
 
+function makeDestroyable(bar) {
+    Object.assign(bar, {
+        root: document.createElement("div"),
+        regexMatcher: {dispose: () => {}},
+        backgroundCorpusRootId: "r",
+        plugin: {onSearchComponentUnmounted: () => {}},
+        closeSettingsMenu: () => {},
+        closeSearchMethodMenu: () => {},
+        teardownSelectionScopeLayoutSync: () => {},
+        teardownMemoUnderlineLayoutSync: () => {},
+        clearSelectionScopeVisual: () => {},
+        closeResultsPanel: () => {},
+        clearDiagramSearchState: () => {},
+    });
+    document.body.append(bar.root);
+    corpus.retainBackgroundCorpusRoot("r");
+    return bar;
+}
+
 async function main() {
     for (const all of [false, true]) {
         for (const fetched of [false, true]) {
@@ -214,6 +236,94 @@ async function main() {
         }
     }
     console.log("Current/all × live/fetched: confirmed success, native undo and no-op paths OK");
+
+    for (const all of [false, true]) {
+        for (const fetched of [false, true]) {
+            const dynamic = fixture([paragraph(id, reference("foo") + " | " + reference("untouched"))]);
+            if (fetched) dynamic.wysiwyg.innerHTML = "";
+            if (!lute) dynamic.protyle.protyle.lute = {BlockDOM2Md: html => html};
+            const dynamicApi = api;
+            api = async (url, body) => {
+                const response = await dynamicApi(url, body);
+                if (dynamic.calls.length && response.data?.[id]) {
+                    response.data[id] = response.data[id].replace(">untouched</span>", ">authoritative</span>");
+                }
+                return response;
+            };
+            const result = await run(dynamic, all);
+            assert.equal(
+                result.commitState,
+                "confirmed",
+                "untouched dynamic anchor refresh does not hide a confirmed write",
+            );
+            assert.equal(result.replacedCount, 1);
+            assert.ok(dynamic.calls[0].operations[0].data.includes('data-subtype="s"'));
+            api = dynamicApi;
+        }
+    }
+    const contentFixture = fixture();
+    // A lightweight serializer covers the same normalization path when native Lute is not supplied.
+    if (!lute) contentFixture.protyle.protyle.lute = {BlockDOM2Md: html => html};
+    const strictReader = commit.createCommitContentReader(contentFixture.protyle);
+    const confirmReader = commit.createCommitContentReader(contentFixture.protyle, {ignoreDynamicReferenceText: true});
+    const untouched = paragraph(id, reference("untouched"));
+    assert.equal(confirmReader(untouched), confirmReader(untouched.replace("untouched", "authoritative")));
+    assert.equal(
+        confirmReader(untouched),
+        confirmReader(untouched.replace("untouched", "")),
+        "empty derived anchors are equivalent",
+    );
+    assert.notEqual(
+        strictReader(untouched),
+        strictReader(untouched.replace("untouched", "authoritative")),
+        "rollback stays strict",
+    );
+    for (
+        const changed of [
+            untouched.replace(referenceId, otherId),
+            untouched.replace('data-subtype="d"', 'data-subtype="s"'),
+            untouched.replace("strong block-ref", "em block-ref"),
+        ]
+    ) {
+        assert.notEqual(
+            confirmReader(untouched),
+            confirmReader(changed),
+            "reference ID, subtype and marks stay significant",
+        );
+    }
+    const staticRef = untouched.replace('data-subtype="d"', 'data-subtype="s"');
+    assert.notEqual(
+        confirmReader(staticRef),
+        confirmReader(staticRef.replace("untouched", "authoritative")),
+        "static text stays strict",
+    );
+    const originalCreateElement = document.createElement.bind(document);
+    const expectedUnsplit = confirmReader(untouched);
+    const innerHTML = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
+    document.createElement = (...args) => {
+        const element = originalCreateElement(...args);
+        if (args[0] === "template") {
+            Object.defineProperty(element, "innerHTML", {
+                get: () => innerHTML.get.call(element),
+                set: html => {
+                    innerHTML.set.call(element, html);
+                    const text = element.content.querySelector('span[data-subtype="d"]')?.firstChild;
+                    if (text instanceof Text && text.length > 3) text.splitText(3);
+                },
+            });
+        }
+        return element;
+    };
+    try {
+        assert.equal(
+            confirmReader(untouched),
+            expectedUnsplit,
+            "split Text nodes normalize to one derived anchor placeholder",
+        );
+    } finally {
+        document.createElement = originalCreateElement;
+    }
+    console.log("Untouched dynamic-reference refresh remains a confirmed replacement OK");
 
     for (const all of [false, true]) {
         const scoped = fixture(undefined, "delayed");
@@ -243,6 +353,44 @@ async function main() {
         }
     }
     console.log("Confirmation notebook scope and submitted-document cache invalidation survive navigation OK");
+
+    for (const all of [false, true]) {
+        const fetchedNotebook = fixture();
+        fetchedNotebook.wysiwyg.innerHTML = "";
+        fetchedNotebook.protyle.protyle.notebookId = "encrypted-fetched-notebook";
+        const fetchedApi = api;
+        const fetchedBodies = [];
+        api = async (url, body) => {
+            fetchedBodies.push(body);
+            if (body.notebook !== "encrypted-fetched-notebook") return {code: 0, data: {}};
+            return fetchedApi(url, body);
+        };
+        assert.equal((await run(fetchedNotebook, all)).commitState, "confirmed");
+        assert.equal(fetchedBodies.length, 3, "same request count as ordinary fetched replacements");
+        assert.ok(fetchedBodies.every(body => body.notebook === "encrypted-fetched-notebook"));
+
+        const navigated = fixture();
+        navigated.wysiwyg.innerHTML = "";
+        navigated.protyle.protyle.notebookId = "original-notebook";
+        const navigationApi = api;
+        let navigationReads = 0;
+        api = async (url, body) => {
+            assert.equal(
+                body.notebook,
+                "original-notebook",
+                "preparation and recheck keep the same scope after navigation",
+            );
+            if (++navigationReads === 1) {
+                navigated.protyle.protyle.notebookId = "other-notebook";
+                navigated.protyle.protyle.block.rootID = "other-root";
+            }
+            return navigationApi(url, body);
+        };
+        assert.equal((await run(navigated, all)).error, "stale-target");
+        assert.equal(navigated.calls.length, 0);
+        api = fetchedApi;
+    }
+    console.log("Fetched replacement and confirmation retain encrypted notebook scope OK");
 
     const savedWarn = console.warn;
     console.warn = () => {};
@@ -276,6 +424,55 @@ async function main() {
         console.warn = savedWarn;
     }
     console.log("Synchronous failures restore only optimistic content, preserve newer edits and never retry writes OK");
+
+    console.warn = () => {};
+    try {
+        for (const all of [false, true]) {
+            for (const newerCopy of [false, true]) {
+                const duplicate = fixture([
+                    paragraph(id, reference("foo")).replace(
+                        'data-type="NodeParagraph"',
+                        'data-type="NodeParagraph" data-copy="body"',
+                    ),
+                    '<div class="protyle-wysiwyg__embed">' + paragraph(id, reference("foo")).replace(
+                        'data-type="NodeParagraph"',
+                        'data-type="NodeParagraph" data-copy="embed"',
+                    ) + "</div>",
+                ], "throw-after-all");
+                const duplicateBefore = Array.from(duplicate.wysiwyg.querySelectorAll(`[data-node-id="${id}"]`)).map(
+                    node => node.outerHTML,
+                );
+                if (newerCopy) {
+                    const originalSubmit = duplicate.protyle.transaction;
+                    const submitWithNewerCopy = (operations, undo) => {
+                        try {
+                            originalSubmit(operations, undo);
+                        } catch (error) {
+                            duplicate.wysiwyg.querySelector('.protyle-wysiwyg__embed [contenteditable="true"]')
+                                .textContent = "new copy edit";
+                            throw error;
+                        }
+                    };
+                    duplicate.protyle.transaction = submitWithNewerCopy;
+                    duplicate.protyle.updateTransactionElement = (element, before) =>
+                        submitWithNewerCopy(
+                            [{id, action: "update", data: element.outerHTML}],
+                            [{id, action: "update", data: before}],
+                        );
+                }
+                const result = await run(duplicate, all);
+                assert.equal(result.commitState, "failed");
+                const after = Array.from(duplicate.wysiwyg.querySelectorAll(`[data-node-id="${id}"]`));
+                assert.equal(after[0].outerHTML, duplicateBefore[0], "body copy gets its own old HTML");
+                if (newerCopy) {
+                    assert.equal(after[1].querySelector('[contenteditable="true"]').textContent, "new copy edit");
+                } else assert.equal(after[1].outerHTML, duplicateBefore[1], "embed copy gets its own old HTML");
+            }
+        }
+    } finally {
+        console.warn = savedWarn;
+    }
+    console.log("Same-ID embedded copies roll back together after synchronous failure OK");
 
     for (const all of [false, true]) {
         for (const mode of ["kernel-rejected", "http-error", "network-error", "unrelated", "missing"]) {
@@ -438,6 +635,105 @@ async function main() {
         }
     }
     console.log("Actual SearchBar single/all: only confirmed writes show success; failed/unknown/pending messages OK");
+
+    for (const all of [false, true]) {
+        for (const mode of ["success", "kernel-rejected"]) {
+            const f = fixture(undefined, mode);
+            const bar = makeDestroyable(barFixture(f));
+            let refreshes = 0;
+            bar.highlightHitResult = async () => {
+                refreshes++;
+            };
+            const originalApi = api;
+            let resolveRead;
+            let readStarted;
+            const started = new Promise(resolve => {
+                readStarted = resolve;
+            });
+            api = (url, body) => {
+                readStarted();
+                return new Promise(resolve => {
+                    resolveRead = () => resolve(originalApi(url, body));
+                });
+            };
+            messages.length = 0;
+            const replacing = all ? bar.clickReplaceAll() : bar.clickReplace();
+            await started;
+            await delay(45);
+            const pendingMessage = messages.find(message => message.text === "PENDING");
+            assert.ok(pendingMessage, "pending message appears while SearchBar is still open");
+            bar.destroy(false);
+            assert.ok(hiddenMessages.includes(pendingMessage.id), "destroy immediately clears pending toast");
+            const messageCount = messages.length;
+            api = originalApi;
+            resolveRead();
+            await replacing;
+            assert.equal(f.calls.length, 1, "an already submitted transaction is not cancelled or retried");
+            assert.equal(refreshes, 0, "closed SearchBar does not refresh or reacquire index ownership");
+            assert.equal(bar.backgroundCorpusRootId, "", "destroyed owner stays released");
+            assert.equal(messages.length, messageCount, "late confirmed/unknown results show no new messages");
+            assert.equal(bar.replaceBusy, false);
+        }
+        const f = fixture();
+        const bar = makeDestroyable(barFixture(f));
+        bar.regex = true;
+        let finishRegex;
+        let regexStarted;
+        const started = new Promise(resolve => {
+            regexStarted = resolve;
+        });
+        bar.regexMatcher = {
+            dispose: () => {},
+            expandReplacements: requests => {
+                regexStarted();
+                return new Promise(resolve => {
+                    finishRegex = () =>
+                        resolve({expansions: requests.map(request => ({...request, replacement: "bar"}))});
+                });
+            },
+        };
+        let refreshes = 0;
+        bar.highlightHitResult = async () => {
+            refreshes++;
+        };
+        const replacing = all ? bar.clickReplaceAll() : bar.clickReplace();
+        await started;
+        bar.destroy(false);
+        finishRegex();
+        await replacing;
+        assert.equal(f.calls.length, 0, "closing during asynchronous preparation prevents a later submit");
+        assert.equal(refreshes, 0);
+    }
+    const closedBar = barFixture(fixture());
+    closedBar.destroyed = true;
+    closedBar.highlightHitResult = async () => {
+        throw new Error("closed handler must not refresh");
+    };
+    assert.equal(
+        await closedBar.handleUnconfirmedReplacement({
+            commitState: "unknown",
+            replacedCount: 0,
+            submittedCount: 1,
+            skippedCount: 0,
+        }),
+        true,
+    );
+    const refreshingBar = barFixture(fixture());
+    refreshingBar.highlightHitResult = async () => {
+        refreshingBar.destroyed = true;
+    };
+    const previousMessageCount = messages.length;
+    assert.equal(
+        await refreshingBar.handleUnconfirmedReplacement({
+            commitState: "unknown",
+            replacedCount: 0,
+            submittedCount: 1,
+            skippedCount: 0,
+        }),
+        true,
+    );
+    assert.equal(messages.length, previousMessageCount, "closing during refresh suppresses the final toast");
+    console.log("Destroyed SearchBar suppresses late replacement refreshes OK");
 }
 main().catch(error => {
     console.error(error);
