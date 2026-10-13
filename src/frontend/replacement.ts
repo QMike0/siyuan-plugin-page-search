@@ -436,6 +436,14 @@ function syncImageTitleAttributeFromTextNodes(textNodes: Text[]): void {
 }
 
 /**
+ * 动态引用的锚文本由内核重算；自定义锚文本需与原生替换一致，转为静态引用。
+ * 兼容复合 mark，只定位本次实际改动的 Text 所属引用，不扫描提交块。
+ */
+function dynamicBlockRefForText(node: Text): Element | null {
+    return node.parentElement?.closest('span[data-type~="block-ref"][data-subtype="d"]') ?? null;
+}
+
+/**
  * 将 nextText 写入 [start,end)。单节点直接改 nodeValue；多节点纯文本用 Range。
  */
 function applyReplacementToTextNodes(
@@ -455,11 +463,16 @@ function applyReplacementToTextNodes(
         if (currentText !== replacement.matchedText) {
             return false;
         }
+        if (currentText === nextText) {
+            return true;
+        }
+        const dynamicRef = dynamicBlockRefForText(single.node);
         single.node.nodeValue = [
             text.slice(0, single.startOffset),
             nextText,
             text.slice(single.endOffset),
         ].join("");
+        dynamicRef?.setAttribute("data-subtype", "s");
         return true;
     }
 
@@ -479,8 +492,14 @@ function applyReplacementToTextNodes(
         if (!isRangePlainTextOnly(range)) {
             return false;
         }
+        if (replacement.matchedText === nextText) {
+            return true;
+        }
+        // Range 删除可能移除起始 Text；先记下宿主，写入成功后再转换。
+        const dynamicRef = dynamicBlockRefForText(startPoint.node);
         range.deleteContents();
         range.insertNode(document.createTextNode(nextText));
+        dynamicRef?.setAttribute("data-subtype", "s");
         return true;
     } catch {
         return false;
