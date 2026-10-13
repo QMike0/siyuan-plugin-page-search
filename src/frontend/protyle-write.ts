@@ -216,9 +216,9 @@ function editorTableOmitsRows(element: HTMLElement): boolean {
     ) !== null;
 }
 
-/** 思源 3.8 的块类型锁：更新后的根类型必须和原块一致。 */
-function lockedUpdate(id: string, data: string): IOperation {
-    return {action: "update", id, data, lockType: true} as IOperation;
+/** 通用事务不接受 lockType；块类型由替换前后的 DOM 检查保护。 */
+function updateOperation(id: string, data: string): IOperation {
+    return {action: "update", id, data};
 }
 
 function restoreOuterHtml(element: HTMLElement, html: string): void {
@@ -996,8 +996,8 @@ export async function replaceAllMatchesInEditor(
     const rollback = captureLiveRollback(edit, protyle, changed);
     try {
         protyle.transaction(
-            changed.map((update) => lockedUpdate(update.id, update.newHTML)),
-            changed.map((update) => lockedUpdate(update.id, update.oldHTML)),
+            changed.map((update) => updateOperation(update.id, update.newHTML)),
+            changed.map((update) => updateOperation(update.id, update.oldHTML)),
         );
     } catch (error) {
         console.warn("[page-search] transaction failed", error);
@@ -1075,8 +1075,8 @@ async function replaceFetchedBlockMatches(
     const rollback = captureLiveRollback(liveRoot, protyle, [update]);
     try {
         protyle.transaction(
-            [lockedUpdate(update.id, update.newHTML)],
-            [lockedUpdate(update.id, update.oldHTML)],
+            [updateOperation(update.id, update.newHTML)],
+            [updateOperation(update.id, update.oldHTML)],
         );
     } catch (error) {
         console.warn("[page-search] transaction failed", error);
