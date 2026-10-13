@@ -12,6 +12,7 @@ import {
     collectHeadingFoldedIds,
     isBlockTreeEnabled,
     isRendererUnitId,
+    isRendererSourceFallbackUnitId,
     rendererUnitSource,
     isSelfFoldedIal,
     logicalTableRows,
@@ -126,7 +127,10 @@ import {
     noteLiveCodeLanguage,
     type BlockMeta,
 } from "./meta";
-import type {OffscreenRenderMode} from "./offscreen";
+import type {
+    OffscreenMathRecovery,
+    OffscreenRenderMode,
+} from "./offscreen";
 import {
     fetchDocBlocksOrders,
     fetchHeadingChildrenIds,
@@ -158,6 +162,8 @@ interface TextCacheEntry {
     codeLanguage?: string;
     liveCodeContent?: string;
     units: CachedUnit[];
+    hasInlineMath?: boolean;
+    mathRecovery?: OffscreenMathRecovery;
     /** 近似保留大小；用于跨文档的全局缓存预算。 */
     bytes: number;
     /** 渲染失败的短期负缓存；到期后允许用户下一次搜索重试。 */
@@ -437,7 +443,7 @@ function syncRenderSettingsCache(): void {
     // 行级公式与正文共用普通缓存；宏变化或 KaTeX 首次加载完成后也必须重新提取。
     // 只丢弃含公式的正文快照，保留不受影响的普通块。
     for (const key of Array.from(plainCacheKeys.keys())) {
-        if (textCache.get(key)?.units.some((unit) => unit.highlightKind === "inline-math")) dropTextCache(key);
+        if (textCache.get(key)?.hasInlineMath) dropTextCache(key);
     }
 }
 
@@ -614,12 +620,29 @@ function writeTextCache(key: string, entry: Omit<TextCacheEntry, "bytes">): void
     dropTextCache(key);
     const cached: TextCacheEntry = {
         ...entry,
+        hasInlineMath: entry.hasInlineMath || entry.units.some((unit) => unit.highlightKind === "inline-math"),
+        mathRecovery: entry.mathRecovery && entry.units.some((unit) =>
+            isRendererSourceFallbackUnitId(unit.unitId) && (
+                unit.highlightKind === "inline-math" ||
+                unit.unitId?.replace(/^embed:[^:]+:/, "").startsWith("renderer:source-fallback:math:")
+            )
+        ) ? entry.mathRecovery : undefined,
         bytes: estimateCacheEntryBytes(entry.hash, entry.units) + textBytes(entry.codeLanguage) +
             textBytes(entry.liveCodeContent),
     };
     textCache.set(key, cached);
     textCacheBytes += cached.bytes;
     touchTextCache(key);
+}
+
+/** 超时后的原生渲染只发出信号；下一次读取时才重新提取对应公式。 */
+function readTextCache(key: string): TextCacheEntry | undefined {
+    const cached = textCache.get(key);
+    if (cached?.mathRecovery?.rendered) {
+        dropTextCache(key);
+        return undefined;
+    }
+    return cached;
 }
 
 function touchSpecialCache(key: string): void {
@@ -944,18 +967,30 @@ function passesRestrict(unit: CachedUnit, start: number, end: number, options: S
     return restrictSpanCovers(unit.restrictSpans, options.restrictInlineTypes, start, end);
 }
 
-function remember(rootId: string, meta: BlockMeta, units: CachedUnit[], scope: string): void {
+function remember(
+    rootId: string,
+    meta: BlockMeta,
+    units: CachedUnit[],
+    scope: string,
+    mathRecovery?: OffscreenMathRecovery,
+): void {
     // 成功但没有可见文字也是稳定结果；缓存空数组可避免无限重渲染。
     const key = cacheKey(rootId, meta.id, scope);
-    writeSpecialCache(key, {...specialMetaVersion(meta), units});
+    writeSpecialCache(key, {...specialMetaVersion(meta), units, mathRecovery});
     if (isEmbedType(meta.type)) {
         embedCacheKeys.add(key);
     }
 }
 
-function rememberUnrendered(rootId: string, meta: BlockMeta, scope: string, units: CachedUnit[] = []): void {
+function rememberUnrendered(
+    rootId: string,
+    meta: BlockMeta,
+    scope: string,
+    units: CachedUnit[] = [],
+    mathRecovery?: OffscreenMathRecovery,
+): void {
     const key = cacheKey(rootId, meta.id, scope);
-    const existing = textCache.get(key);
+    const existing = readTextCache(key);
     // A pane may enter after the shared SQL response, while another still extracts it.
     // Its later transient failure must not replace a complete snapshot of the same version.
     if (
@@ -966,6 +1001,7 @@ function rememberUnrendered(rootId: string, meta: BlockMeta, scope: string, unit
     writeSpecialCache(key, {
         ...specialMetaVersion(meta),
         units,
+        mathRecovery,
         retryAfter: Date.now() + SPECIAL_FAILURE_RETRY_MS,
     });
     if (isEmbedType(meta.type)) {
@@ -1109,8 +1145,10 @@ async function extractSharedDiagrams(
                         units: result.units.filter((unit) => unit.blockId === id),
                         unrenderedIds: result.unrenderedIds.filter((blockId) => blockId === id),
                         missingIds: result.missingIds.filter((blockId) => blockId === id),
+                        inlineMathIds: result.inlineMathIds.has(id) ? [id] : [],
+                        mathRecoveries: result.mathRecoveries.has(id) ? [[id, result.mathRecoveries.get(id)!] as const] : [],
                     } :
-                    {units: [], unrenderedIds: [id], missingIds: [id]};
+                    {units: [], unrenderedIds: [id], missingIds: [id], inlineMathIds: [], mathRecoveries: []};
             })),
             abandoned,
         ]);
@@ -1121,6 +1159,8 @@ async function extractSharedDiagrams(
             units: completed.flatMap((result) => result.units),
             unrenderedIds: completed.flatMap((result) => result.unrenderedIds),
             missingIds: completed.flatMap((result) => result.missingIds),
+            inlineMathIds: new Set(completed.flatMap((result) => result.inlineMathIds)),
+            mathRecoveries: new Map(completed.flatMap((result) => result.mathRecoveries)),
         };
     } finally {
         if (onAbort) {
@@ -1143,7 +1183,7 @@ function cachedUnits(
     syncRenderSettingsCache();
     for (const meta of metas) {
         const key = cacheKey(rootId, meta.id, scope);
-        const cached = textCache.get(key);
+        const cached = readTextCache(key);
         if (cached && specialCacheMatches(cached, meta)) {
             touchSpecialCache(key);
             touchTextCache(key);
@@ -1164,6 +1204,15 @@ function cachedUnits(
     return {ready, missing, unrendered};
 }
 
+interface MetaExtraction {
+    units: CachedUnit[];
+    unrendered: number;
+    unrenderedIds: string[];
+    failed: boolean;
+    inlineMathIds?: ReadonlySet<string>;
+    mathRecoveries?: ReadonlyMap<string, OffscreenMathRecovery>;
+}
+
 async function extractMetas(
     rootId: string,
     notebookId: string,
@@ -1172,7 +1221,7 @@ async function extractMetas(
     mode: OffscreenRenderMode,
     shouldContinue: () => boolean = () => true,
     signal?: AbortSignal,
-): Promise<{units: CachedUnit[]; unrendered: number; unrenderedIds: string[]; failed: boolean;}> {
+): Promise<MetaExtraction> {
     const consumer = {};
     pinSpecialCacheKeys(rootId, consumer, metas.map((meta) => cacheKey(rootId, meta.id, collectionScope(options))));
     try {
@@ -1190,7 +1239,7 @@ async function extractMetasImpl(
     mode: OffscreenRenderMode,
     shouldContinue: () => boolean = () => true,
     signal?: AbortSignal,
-): Promise<{units: CachedUnit[]; unrendered: number; unrenderedIds: string[]; failed: boolean;}> {
+): Promise<MetaExtraction> {
     if (metas.length === 0) {
         return {units: [], unrendered: 0, unrenderedIds: [], failed: false};
     }
@@ -1266,9 +1315,9 @@ async function extractMetasImpl(
         const cacheSpecial = mode !== "light" || isSpecialRenderMeta(meta) || isEmbedType(meta.type);
         if (keep && cacheSpecial) {
             if (unrenderedIds.has(meta.id)) {
-                rememberUnrendered(rootId, meta, scope, list);
+                rememberUnrendered(rootId, meta, scope, list, extracted.mathRecoveries.get(meta.id));
             } else {
-                remember(rootId, meta, list, scope);
+                remember(rootId, meta, list, scope, extracted.mathRecoveries.get(meta.id));
             }
         }
         units.push(...list);
@@ -1278,6 +1327,8 @@ async function extractMetasImpl(
         unrendered: unrenderedIds.size,
         unrenderedIds: Array.from(unrenderedIds),
         failed: extracted.missingIds.length > 0,
+        inlineMathIds: extracted.inlineMathIds,
+        mathRecoveries: extracted.mathRecoveries,
     };
 }
 
@@ -1289,7 +1340,7 @@ function readPlainCache(rootId: string, blockId: string, scope: string, hash: st
     if (!hash) {
         return null;
     }
-    const cached = textCache.get(cacheKey(rootId, blockId, scope));
+    const cached = readTextCache(cacheKey(rootId, blockId, scope));
     if (!cached || cached.hash !== hash || !cached.units.some((unit) => unit.text.length > 0)) {
         return null;
     }
@@ -1308,13 +1359,15 @@ function rememberPlain(
     scope: string,
     hash: string,
     units: CachedUnit[],
+    hasInlineMath = false,
+    mathRecovery?: OffscreenMathRecovery,
 ): void {
     if (!hash || !units.some((unit) => unit.text.length > 0)) {
         return;
     }
     const key = cacheKey(rootId, blockId, scope);
     specialCacheKeys.delete(key);
-    writeTextCache(key, {hash, units: units.slice()});
+    writeTextCache(key, {hash, units: units.slice(), hasInlineMath, mathRecovery});
     plainCacheKeys.set(key, true);
     while (plainCacheKeys.size > PLAIN_CACHE_LIMIT) {
         const dropped = plainCacheKeys.keys().next().value as string | undefined;
@@ -1394,7 +1447,15 @@ async function loadPlainUnits(
                 if (failed.has(id) || after.get(id) !== hash) {
                     continue;
                 }
-                rememberPlain(rootId, id, scope, hash, byId.get(id) ?? []);
+                rememberPlain(
+                    rootId,
+                    id,
+                    scope,
+                    hash,
+                    byId.get(id) ?? [],
+                    extracted.inlineMathIds?.has(id),
+                    extracted.mathRecoveries?.get(id),
+                );
             }
         }
     }
@@ -2370,9 +2431,9 @@ async function searchCurrentDocumentImpl(
                 renderStamp === currentRenderSettingsStamp()
             ) {
                 if (failed) {
-                    rememberUnrendered(context.rootId, version, scope, frozen);
+                    rememberUnrendered(context.rootId, version, scope, frozen, extracted.mathRecovery);
                 } else {
-                    remember(context.rootId, version, frozen, scope);
+                    remember(context.rootId, version, frozen, scope, extracted.mathRecovery);
                 }
             }
         } catch {
@@ -2622,14 +2683,17 @@ async function searchCurrentDocumentImpl(
         }
     }
     const incompleteLive = new Set<string>();
+    const liveInlineMathIds = new Set<string>();
     if (collectInlineMath) {
         (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>('span[data-type~="inline-math"][data-content]')
             .forEach((span) => {
                 const id = (span.closest<HTMLElement>('[data-type="NodeBlockQueryEmbed"][data-node-id]') ??
                     span.closest<HTMLElement>("[data-node-id][data-type]"))?.dataset.nodeId;
+                if (!id || !liveIds.has(id) || !acceptsRenderer(span)) return;
+                liveInlineMathIds.add(id);
                 if (
-                    id && !refreshedEmbedIds.has(id) && liveIds.has(id) && span.getAttribute("data-content") &&
-                    !span.querySelector(".katex-html") && mathSourceFallbackText(span) === null && acceptsRenderer(span)
+                    !refreshedEmbedIds.has(id) && span.getAttribute("data-content") &&
+                    !span.querySelector(".katex-html") && mathSourceFallbackText(span) === null
                 ) {
                     incompleteLive.add(id);
                 }
@@ -2655,8 +2719,8 @@ async function searchCurrentDocumentImpl(
             remember(context.rootId, item, liveUnits, scope);
             continue;
         }
-        if (canCachePlainText(item) && liveUnits.some(isInlineMathSearchUnit)) {
-            rememberPlain(context.rootId, blockId, scope, item.hash, liveUnits);
+        if (canCachePlainText(item) && (liveInlineMathIds.has(blockId) || liveUnits.some(isInlineMathSearchUnit))) {
+            rememberPlain(context.rootId, blockId, scope, item.hash, liveUnits, liveInlineMathIds.has(blockId));
         }
     }
     let truncated = 0;

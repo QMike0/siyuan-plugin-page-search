@@ -426,6 +426,114 @@ async function main() {
             assert.ok(performance.now() - mathDeadline < 1800, "unsettled math has a bounded source fallback");
             assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
             finishMath();
+            // KaTeX can already exist while SiYuan is still loading mhchem.
+            // Late completion must recover only that formula's source cache, on the next query.
+            const readyKatex = window.katex;
+            try {
+                window.katex = {renderToString() {}};
+                for (const location of ["block", "inline", "embed", "live-embed"]) {
+                    reset();
+                    const paragraph = '<div data-node-id="b" data-type="NodeParagraph">before' + inlineFormula + "after</div>";
+                    const embedded = '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' +
+                        paragraph.replace('data-node-id="b"', 'data-node-id="source"') + "</div>";
+                    add("ordinary", "p", "ordinary");
+                    doms.ordinary = '<div data-node-id="ordinary" data-type="NodeParagraph">ordinary</div>';
+                    add("diagram", "c", "digraph{}", "graphviz");
+                    doms.diagram = '<div data-node-id="diagram" data-type="NodeCodeBlock" data-subtype="graphviz" data-content="digraph{}"></div>';
+                    full(await search("digraph"));
+                    full(await search("ordinary"));
+                    add("b", location.includes("embed") ? "query_embed" : location === "block" ? "m" : "p", "\\delta");
+                    if (location === "inline") db.exec("UPDATE blocks SET markdown='$\\delta$' WHERE id='b'");
+                    doms.b = location.includes("embed") ? embedded : location === "block" ? blockFormula : paragraph;
+                    if (location === "live-embed") wysiwyg.innerHTML = embedded;
+                    corpus.invalidateDocumentStructureCaches("r");
+                    const paint = host => host.querySelectorAll('[data-subtype="math"]').forEach(element => {
+                        element.innerHTML = '<span class="katex-html">δ</span>';
+                        element.setAttribute("data-render", "true");
+                    });
+                    let complete;
+                    nativeRenderMethods.mathRender = host => new Promise(resolve => {
+                        complete = () => { paint(host); resolve(); };
+                    });
+                    const began = performance.now();
+                    const first = await search("delta");
+                    full(first);
+                    assert.equal(first.matches.length, 1, location + " initially falls back to source");
+                    assert.ok(performance.now() - began < 1800);
+                    assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
+                    const beforeRecovery = domCalls;
+                    assert.equal((await search("delta")).matches.length, 1);
+                    assert.equal(domCalls, beforeRecovery, "pending source is cached without background retries");
+                    const ordinaryReads = domReadIds.filter(id => id === "ordinary").length;
+                    const diagramReads = domReadIds.filter(id => id === "diagram").length;
+                    complete();
+                    await Promise.resolve();
+                    nativeRenderMethods.mathRender = paint;
+                    const recovered = await search("δ");
+                    full(recovered);
+                    assert.equal(recovered.matches.length, 1, location + " recovers after late native completion");
+                    assert.equal((await search("delta")).matches.length, 0, "recovered glyph replaces source");
+                    const recoveredReads = domCalls;
+                    assert.equal((await search("δ")).matches.length, 1);
+                    assert.equal(domCalls, recoveredReads, "successful recovery is reused");
+                    assert.equal(domReadIds.filter(id => id === "ordinary").length, ordinaryReads);
+                    assert.equal(domReadIds.filter(id => id === "diagram").length, diagramReads);
+                }
+                for (const outcome of ["reject", "error", "clear"]) {
+                    reset();
+                    add("b", "m", "\\delta");
+                    doms.b = blockFormula;
+                    let complete;
+                    nativeRenderMethods.mathRender = host => new Promise((resolve, reject) => {
+                        complete = () => {
+                            if (outcome === "reject") return reject(new Error("late dependency failure"));
+                            host.querySelector('[data-subtype="math"]').innerHTML = outcome === "error" ?
+                                '<span class="ft__error">parseErrorSecret</span>' : '<span class="katex-html">δ</span>';
+                            resolve();
+                        };
+                    });
+                    full(await search("delta"));
+                    if (outcome === "clear") {
+                        corpus.invalidateDocumentSearchCaches();
+                        nativeRenderMethods.mathRender = host => {
+                            host.querySelector('[data-subtype="math"]').innerHTML = '<span class="katex-html">newGlyph</span>';
+                        };
+                        assert.equal((await search("newGlyph")).matches.length, 1);
+                    }
+                    const reads = domCalls;
+                    complete();
+                    await Promise.resolve();
+                    const after = await search(outcome === "clear" ? "newGlyph" : "delta");
+                    full(after);
+                    assert.equal(after.matches.length, 1);
+                    assert.equal(domCalls, reads, "late failure/old completion cannot invalidate the current cache");
+                }
+                // Completion can race the post-extraction hash check, before the source cache is written.
+                reset();
+                add("b", "p", "\\delta");
+                db.exec("UPDATE blocks SET markdown='$\\delta$'");
+                doms.b = '<div data-node-id="b" data-type="NodeParagraph">' + inlineFormula + "</div>";
+                let completeDuringHash;
+                nativeRenderMethods.mathRender = host => new Promise(resolve => {
+                    completeDuringHash = () => {
+                        host.querySelector('[data-subtype="math"]').innerHTML = '<span class="katex-html">δ</span>';
+                        resolve();
+                    };
+                });
+                let hashReads = 0;
+                failSql = stmt => {
+                    if (/SELECT id, hash FROM blocks/.test(stmt) && ++hashReads === 2) completeDuringHash();
+                    return false;
+                };
+                full(await search("delta"));
+                assert.equal(hashReads, 2);
+                nativeRenderMethods.mathRender = host => {
+                    host.querySelector('[data-subtype="math"]').innerHTML = '<span class="katex-html">δ</span>';
+                };
+                assert.equal((await search("δ")).matches.length, 1, "completion before insertion also expires source");
+            } finally {
+                window.katex = readyKatex;
+            }
             reset();
             add("b", "m", "\\delta");
             doms.b = blockFormula;
@@ -517,6 +625,41 @@ async function main() {
             } finally {
                 window.siyuan = oldSiyuan;
                 window.katex = oldKatex;
+            }
+            // A valid empty macro emits no inline-math unit, but its host still depends on macros.
+            for (const mounted of [false, true]) {
+                reset();
+                add("b", "p", "before \\custom after");
+                db.exec("UPDATE blocks SET markdown='before $\\custom$ after'");
+                doms.b = '<div data-node-id="b" data-type="NodeParagraph">before' +
+                    inlineFormula.replace("delta", "custom") + "after</div>";
+                add("ordinary", "p", "ordinary");
+                doms.ordinary = '<div data-node-id="ordinary" data-type="NodeParagraph">ordinary</div>';
+                try {
+                    window.siyuan = {config: {editor: {katexMacros: ""}}};
+                    window.katex = {renderToString() {}};
+                    nativeRenderMethods.mathRender = host => host.querySelectorAll('[data-subtype="math"]').forEach(element => {
+                        element.innerHTML = '<span class="katex-html">' + window.siyuan.config.editor.katexMacros + "</span>";
+                    });
+                    if (mounted) {
+                        wysiwyg.innerHTML = doms.b;
+                        nativeRenderMethods.mathRender(wysiwyg);
+                    }
+                    full(await search("before"));
+                    wysiwyg.innerHTML = "";
+                    full(await search("ordinary"));
+                    const reads = domCalls;
+                    full(await search("before"));
+                    assert.equal(domCalls, reads, "empty macro host retains its ordinary text cache");
+                    window.siyuan.config.editor.katexMacros = "δ";
+                    const changed = await search("δ");
+                    full(changed);
+                    assert.equal(changed.matches.length, 1, "empty macro cache follows later macro changes");
+                    assert.equal(domReadIds.filter(id => id === "ordinary").length, 1, "unrelated text cache survives");
+                } finally {
+                    window.siyuan = oldSiyuan;
+                    window.katex = oldKatex;
+                }
             }
             reset();
             for (let index = 0; index < 300; index++) {

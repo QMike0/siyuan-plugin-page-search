@@ -21,6 +21,11 @@ type RenderMethod =
 
 export type OffscreenRenderMode = "none" | "light" | "diagram";
 
+/** 只保留完成状态，不把离屏 DOM 留在文本缓存中。 */
+export interface OffscreenMathRecovery {
+    rendered: boolean;
+}
+
 type ProtyleRenderer = Partial<Record<RenderMethod, (el: Element) => void | PromiseLike<unknown>>>;
 
 const LIGHT_METHODS = ["mathRender", "htmlRender"] as const;
@@ -77,8 +82,11 @@ export function offscreenWysiwyg(host: HTMLElement): HTMLElement {
     return host.querySelector(".protyle-wysiwyg") as HTMLElement;
 }
 
-export function callRenders(host: Element, mode: OffscreenRenderMode = "light"): {mathPending: boolean;} {
-    const state = {mathPending: false};
+export function callRenders(
+    host: Element,
+    mode: OffscreenRenderMode = "light",
+): {mathPending: boolean; mathRecovery: OffscreenMathRecovery;} {
+    const state = {mathPending: false, mathRecovery: {rendered: false}};
     if (mode === "none") {
         return state;
     }
@@ -96,12 +104,24 @@ export function callRenders(host: Element, mode: OffscreenRenderMode = "light"):
             continue;
         }
         try {
+            // 原生 mathRender 在依赖加载前捕获节点，超时卸载宿主后仍可能完成。
+            // 仅观察本次尚无输出的公式，避免已完成兄弟使失败公式反复失效。
+            const pendingMath = method === "mathRender" ?
+                Array.from(host.querySelectorAll('[data-subtype="math"]')).filter((el) =>
+                    !el.querySelector(".katex-html")
+                ) :
+                [];
             const result = fn(host);
             if (result && typeof result.then === "function") {
                 if (method === "mathRender") state.mathPending = true;
                 // 吸收加载失败；不能让异步 rejection 中断搜索或一直显示索引中。
                 void Promise.resolve(result).then(() => {
-                    if (method === "mathRender") state.mathPending = false;
+                    if (method === "mathRender") {
+                        state.mathPending = false;
+                        state.mathRecovery.rendered = pendingMath.some((el) =>
+                            Boolean(el.querySelector(".katex-html"))
+                        );
+                    }
                 }, () => {
                     if (method === "mathRender") state.mathPending = false;
                 });
@@ -262,7 +282,7 @@ export async function renderOffscreenBlocks(
     shouldContinue: () => boolean = () => true,
     forceDiagramRender = false,
     acceptsMath: (element: HTMLElement) => boolean = () => true,
-): Promise<void> {
+): Promise<OffscreenMathRecovery | undefined> {
     if (mode === "none" || !shouldContinue()) {
         return;
     }
@@ -293,6 +313,8 @@ export async function renderOffscreenBlocks(
                 diagram: pendingDiagramRenderer,
             }, shouldContinue);
         }
+        // 只为有界等待结束后的源码快照附带恢复信号；不启动后台索引或重试。
+        return state.mathPending ? state.mathRecovery : undefined;
     } finally {
         skippedMath.forEach((element) => element.setAttribute("data-subtype", "math"));
     }

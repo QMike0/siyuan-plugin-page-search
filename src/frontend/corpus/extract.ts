@@ -31,6 +31,7 @@ import {
     createOffscreenHost,
     offscreenWysiwyg,
     renderOffscreenBlocks,
+    type OffscreenMathRecovery,
     type OffscreenRenderMode,
 } from "./offscreen";
 import {
@@ -46,6 +47,9 @@ export interface ExtractedUnits {
     /** 渲染失败或没有取到可用 DOM 的块 */
     unrenderedIds: string[];
     missingIds: string[];
+    /** 含公式但未产生文字的宿主也依赖宏配置。 */
+    inlineMathIds: string[];
+    mathRecovery?: OffscreenMathRecovery;
     /** 卸掉离屏宿主。替换写回前可以先用仍然连着的 textNodes。 */
     dispose: () => void;
 }
@@ -283,8 +287,10 @@ export async function extractUnitsFromDoms(
     const blocks: SearchableBlock[] = [];
     const unrenderedIds: string[] = [];
     const missingIds: string[] = [];
+    const inlineMathIds: string[] = [];
+    let mathRecovery: OffscreenMathRecovery | undefined;
     if (ids.length === 0) {
-        return {blocks, unrenderedIds, missingIds, dispose: () => undefined};
+        return {blocks, unrenderedIds, missingIds, inlineMathIds, dispose: () => undefined};
     }
 
     const host = createOffscreenHost();
@@ -324,7 +330,13 @@ export async function extractUnitsFromDoms(
             }
         }
         if (mode !== "none") {
-            await renderOffscreenBlocks(wysiwyg, mode, shouldContinue, forceDiagramRender, acceptsElement);
+            mathRecovery = await renderOffscreenBlocks(
+                wysiwyg,
+                mode,
+                shouldContinue,
+                forceDiagramRender,
+                acceptsElement,
+            );
             if (embedIds.size > 0 && mode === "light" && shouldContinue()) {
                 for (const id of ids) {
                     if (!embedIds.has(id) || !shouldContinue()) {
@@ -338,7 +350,7 @@ export async function extractUnitsFromDoms(
             }
         }
         if (!shouldContinue()) {
-            return {blocks, unrenderedIds, missingIds, dispose: () => host.remove()};
+            return {blocks, unrenderedIds, missingIds, inlineMathIds, dispose: () => host.remove()};
         }
         const collected = collectSearchableBlocks(host, {
             ...options,
@@ -357,6 +369,10 @@ export async function extractUnitsFromDoms(
                 unrendered.add(id);
                 continue;
             }
+            if (
+                Array.from(owner.querySelectorAll<HTMLElement>('span[data-type~="inline-math"][data-content]'))
+                    .some(acceptsElement)
+            ) inlineMathIds.push(id);
             // Collect each embed independently: source IDs can repeat in sibling embeds.
             let sourceBlocks = embedIds.has(id) ?
                 collectSearchableBlocks(host, {
@@ -455,7 +471,7 @@ export async function extractUnitsFromDoms(
             }
         }
         unrenderedIds.push(...unrendered);
-        return {blocks, unrenderedIds, missingIds, dispose: () => host.remove()};
+        return {blocks, unrenderedIds, missingIds, inlineMathIds, mathRecovery, dispose: () => host.remove()};
     } catch (error) {
         host.remove();
         throw error;
@@ -509,10 +525,20 @@ export async function fetchAndExtractUnits(
     signal?: AbortSignal,
     codeLanguages?: ReadonlyMap<string, string>,
     rootId = "",
-): Promise<{units: CachedUnit[]; unrenderedIds: string[]; missingIds: string[];} | null> {
+): Promise<
+    {
+        units: CachedUnit[];
+        unrenderedIds: string[];
+        missingIds: string[];
+        inlineMathIds: Set<string>;
+        mathRecoveries: Map<string, OffscreenMathRecovery>;
+    } | null
+> {
     const units: CachedUnit[] = [];
     const unrenderedIds: string[] = [];
     const missingIds: string[] = [];
+    const inlineMathIds = new Set<string>();
+    const mathRecoveries = new Map<string, OffscreenMathRecovery>();
     const embedList = ids.filter((id) => embedIds.has(id));
     const plainList = ids.filter((id) => !embedIds.has(id));
 
@@ -581,6 +607,11 @@ export async function fetchAndExtractUnits(
                     units.push(...result.blocks.map((block) => freezeBlock(block)));
                     unrenderedIds.push(...result.unrenderedIds);
                     missingIds.push(...result.missingIds);
+                    result.inlineMathIds.forEach((id) => inlineMathIds.add(id));
+                    const recovery = result.mathRecovery;
+                    if (recovery) {
+                        batches[index].forEach((id) => mathRecoveries.set(id, recovery));
+                    }
                 } finally {
                     result.dispose();
                 }
@@ -595,5 +626,5 @@ export async function fetchAndExtractUnits(
     if (!await run(embedList, true)) {
         return null;
     }
-    return {units, unrenderedIds, missingIds};
+    return {units, unrenderedIds, missingIds, inlineMathIds, mathRecoveries};
 }
