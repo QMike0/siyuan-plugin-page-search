@@ -118,7 +118,7 @@ export async function fetchContentCandidateIds(
     return queryLiteralCandidates(
         rootId,
         `AND type NOT IN (${CONTAINER_SQL}) `,
-        `(${predicate} OR type = 'query_embed' OR instr(markdown, 'inline-math') > 0)`,
+        `(${predicate} OR type IN ('query_embed', 'm') OR instr(markdown, 'inline-math') > 0 OR instr(markdown, '$') > 0)`,
         signal,
     );
 }
@@ -207,7 +207,9 @@ export async function fetchLiteralGroupCandidateIds(
     const root = escSql(rootId);
     let rawColumn = "content";
     let scope = `AND type NOT IN (${CONTAINER_SQL}) `;
-    let extra = " OR type = 'query_embed' OR instr(markdown, 'inline-math') > 0";
+    // ExportNodeStdMd 将行级公式导出成 $…$，不会保留 inline-math DOM 属性。
+    // 公式可见字形不一定出现在 content 中（如 \\delta → δ），候选必须保留宿主。
+    let extra = " OR type IN ('query_embed', 'm') OR instr(markdown, 'inline-math') > 0 OR instr(markdown, '$') > 0";
     if (kind === "imageTitle") {
         rawColumn = "markdown";
         scope = "AND instr(markdown, 'protyle-action__title') > 0 ";

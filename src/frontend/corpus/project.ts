@@ -1,5 +1,6 @@
 import type {RestrictInlineType} from "../../shared";
 import {avApiUnitId} from "../../shared/av-live";
+import {isRendererSourceFallbackUnitId} from "../../shared/renderer-units";
 import {
     collectSearchableBlocks,
     inlineMathIdentityText,
@@ -267,6 +268,7 @@ function createRangeProjection(
         revision: 0,
     };
     const resolve = (match: SearchMatch): SearchableBlock | undefined => {
+        if (isRendererSourceFallbackUnitId(match.unitId)) return undefined;
         let block: SearchableBlock | undefined;
         // 行级公式的 unitId 是全文采集序号；局部补绑（例如标题展开后）会从 0
         // 重新编号。优先使用所属块内序号和可见文字，避免碰巧相同的 unitId 指向另一条公式。
@@ -634,6 +636,7 @@ function rankedLiveUnits(
     mathByKey: ReadonlyMap<string, SearchableBlock[]>,
     memoByKey: ReadonlyMap<string, SearchableBlock[]>,
 ): SearchableBlock[] {
+    if (isRendererSourceFallbackUnitId(match.unitId)) return [];
     let list: SearchableBlock[] | undefined;
     if (
         !match.unitId?.startsWith("embed:") && match.highlightKind === "inline-math" &&

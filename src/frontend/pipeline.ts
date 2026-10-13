@@ -487,7 +487,8 @@ function attachRangesToHits(
         }
 
         if (
-            visibility.includeSourceFallback && !restrictActive &&
+            visibility.includeSourceFallback &&
+            (!restrictActive || (isInlineMathSearchUnit(block) && restrictInlineTypes?.includes("inline-math"))) &&
             isRendererSourceFallbackUnitId(hit.unitId)
         ) {
             acceptedEndByUnit.set(key, hit.end);
@@ -495,6 +496,7 @@ function attachRangesToHits(
                 ...hit,
                 embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
                 replaceable: false,
+                highlightKind: isInlineMathSearchUnit(block) ? "inline-math" : "text",
                 ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
             });
             continue;

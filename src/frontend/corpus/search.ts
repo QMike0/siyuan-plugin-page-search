@@ -133,6 +133,7 @@ import {
     invalidateDocOrder,
 } from "./order";
 import {projectRangesWithBudget} from "./project";
+import {mathSourceFallbackText} from "../renderer-adapters";
 import {
     isAttributeViewType,
     isDiagramBlock,
@@ -414,6 +415,7 @@ function currentRenderSettingsStamp(): string {
         config?.editor?.katexMacros,
         config?.editor?.headingEmbedMode,
         config?.search?.limit,
+        typeof (window as Window & {katex?: {renderToString?: unknown;};}).katex?.renderToString === "function",
     ]);
 }
 
@@ -431,6 +433,11 @@ function syncRenderSettingsCache(): void {
     invalidateEmbedQueries();
     for (const key of Array.from(specialCacheKeys.keys())) {
         dropTextCache(key);
+    }
+    // 行级公式与正文共用普通缓存；宏变化或 KaTeX 首次加载完成后也必须重新提取。
+    // 只丢弃含公式的正文快照，保留不受影响的普通块。
+    for (const key of Array.from(plainCacheKeys.keys())) {
+        if (textCache.get(key)?.units.some((unit) => unit.highlightKind === "inline-math")) dropTextCache(key);
     }
 }
 
@@ -1368,10 +1375,14 @@ async function loadPlainUnits(
         return {units: ready, unrendered: embeds.unrendered, failed: false};
     }
     const epoch = currentCorpusEpoch(rootId);
+    const renderStamp = currentRenderSettingsStamp();
     const extracted = await extractMetas(rootId, notebookId, missing, options, mode, shouldContinue, signal);
-    if (!extracted.failed && hashes && shouldContinue() && epoch === currentCorpusEpoch(rootId) && storeCache) {
+    if (
+        !extracted.failed && hashes && shouldContinue() && epoch === currentCorpusEpoch(rootId) && storeCache &&
+        renderStamp === currentRenderSettingsStamp()
+    ) {
         const after = await fetchBlockHashes(Array.from(hashAtFetch.keys()), signal);
-        if (after) {
+        if (after && renderStamp === currentRenderSettingsStamp()) {
             const byId = new Map<string, CachedUnit[]>();
             for (const unit of extracted.units) {
                 const list = byId.get(unit.blockId) ?? [];
@@ -2618,7 +2629,7 @@ async function searchCurrentDocumentImpl(
                     span.closest<HTMLElement>("[data-node-id][data-type]"))?.dataset.nodeId;
                 if (
                     id && !refreshedEmbedIds.has(id) && liveIds.has(id) && span.getAttribute("data-content") &&
-                    !span.querySelector(".katex-html") && acceptsRenderer(span)
+                    !span.querySelector(".katex-html") && mathSourceFallbackText(span) === null && acceptsRenderer(span)
                 ) {
                     incompleteLive.add(id);
                 }
@@ -2816,7 +2827,8 @@ async function searchCurrentDocumentImpl(
     // 其余图表仍需 renderer 生成 SVG/foreignObject；候选图块在前台有界渲染。
     // Mermaid / flowchart 已在 plainTargets 按源码提取，不进入此渲染或后台补全路径。
     const missingDiagrams = specialState.missing.filter(isDiagramMeta);
-    const specialMissing = specialState.missing.filter((item) => !isDiagramMeta(item));
+    const missingMath = specialState.missing.filter((item) => item.type === "m");
+    const specialMissing = specialState.missing.filter((item) => !isDiagramMeta(item) && item.type !== "m");
     if (missingDiagrams.length > 0) {
         const rendered = await extractMetas(
             context.rootId,
@@ -2830,6 +2842,17 @@ async function searchCurrentDocumentImpl(
         if (cancelled()) {
             return {matches: [], error: "", cancelled: true};
         }
+        units.push(...rendered.units);
+        unrendered += rendered.unrendered;
+        degraded ||= rendered.failed;
+    }
+    // KaTeX 本身同步生成字形，依赖加载也有界；公式在前台完成或兜底源码，
+    // 避免已有匹配返回后还为整批公式持续闪烁、再触发一次全文搜索。
+    if (missingMath.length > 0) {
+        const rendered = await extractMetas(
+            context.rootId, context.notebookId, missingMath, options, "light", () => !cancelled(), options.signal,
+        );
+        if (cancelled()) return {matches: [], error: "", cancelled: true};
         units.push(...rendered.units);
         unrendered += rendered.unrendered;
         degraded ||= rendered.failed;

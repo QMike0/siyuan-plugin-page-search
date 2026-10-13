@@ -1,5 +1,6 @@
 import {
     isRendererUnitId,
+    isRendererSourceFallbackUnitId,
     shouldCollectInlineMathUnits,
 } from "../../shared";
 import {supportsDiagramSourceSearch} from "../../shared/code-block-language";
@@ -19,6 +20,7 @@ import {
     DIAGRAM_SUBTYPE_SET,
     collectRendererSearchUnits,
     isCompletedEmptyMermaid,
+    mathSourceFallbackText,
     rendererAdapterKind,
     type DiagramSubtype,
 } from "../renderer-adapters";
@@ -183,6 +185,9 @@ function markUnrenderedSpecial(
 ): SearchableBlock[] {
     const expectedDiagram = Boolean(expectedDiagramLanguage && DIAGRAM_SUBTYPE_SET.has(expectedDiagramLanguage));
     const failedOutput = Boolean(element?.querySelector(".ft__error"));
+    if (element && rendererAdapterKind(element) === "math" && mathSourceFallbackText(element) !== null) {
+        return blocks;
+    }
     if (
         element?.hasAttribute("data-content") &&
         supportsDiagramSourceSearch(expectedDiagramLanguage ?? element.dataset.subtype ?? "")
@@ -207,13 +212,17 @@ function markUnrenderedSpecial(
         inspectInlineMath && element &&
         Array.from(element.querySelectorAll<HTMLElement>('span[data-type~="inline-math"]')).some((span) =>
             Boolean(span.getAttribute("data-content")) && !span.querySelector(".katex-html") &&
+            mathSourceFallbackText(span) === null &&
             acceptsElement(span)
         )
     ) {
         unrendered.add(ownerId);
     }
     if (failedOutput) {
-        return blocks.filter((block) => block.blockId !== ownerId || !isRendererUnitId(block.unitId));
+        return blocks.filter((block) =>
+            block.blockId !== ownerId || !isRendererUnitId(block.unitId) ||
+            isRendererSourceFallbackUnitId(block.unitId)
+        );
     }
     return blocks;
 }
@@ -315,7 +324,7 @@ export async function extractUnitsFromDoms(
             }
         }
         if (mode !== "none") {
-            await renderOffscreenBlocks(wysiwyg, mode, shouldContinue, forceDiagramRender);
+            await renderOffscreenBlocks(wysiwyg, mode, shouldContinue, forceDiagramRender, acceptsElement);
             if (embedIds.size > 0 && mode === "light" && shouldContinue()) {
                 for (const id of ids) {
                     if (!embedIds.has(id) || !shouldContinue()) {

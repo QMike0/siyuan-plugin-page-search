@@ -1,3 +1,4 @@
+import {ProtyleMethod} from "siyuan";
 import {supportsDiagramSourceSearch} from "../../shared/code-block-language";
 import {
     DIAGRAM_SUBTYPES,
@@ -5,6 +6,7 @@ import {
 } from "../renderer-adapters";
 
 const OFFSCREEN_WIDTH_PX = 800;
+const MATH_RENDER_TIMEOUT_MS = 1000;
 const OFFSCREEN_DIAGRAM_SUBTYPES = DIAGRAM_SUBTYPES.filter((kind) => !supportsDiagramSourceSearch(kind));
 
 type RenderMethod =
@@ -19,7 +21,7 @@ type RenderMethod =
 
 export type OffscreenRenderMode = "none" | "light" | "diagram";
 
-type ProtyleRenderer = Partial<Record<RenderMethod, (el: Element) => void>>;
+type ProtyleRenderer = Partial<Record<RenderMethod, (el: Element) => void | PromiseLike<unknown>>>;
 
 const LIGHT_METHODS = ["mathRender", "htmlRender"] as const;
 const DIAGRAM_METHODS = [
@@ -75,26 +77,51 @@ export function offscreenWysiwyg(host: HTMLElement): HTMLElement {
     return host.querySelector(".protyle-wysiwyg") as HTMLElement;
 }
 
-export function callRenders(host: Element, mode: OffscreenRenderMode = "light"): void {
+export function callRenders(host: Element, mode: OffscreenRenderMode = "light"): {mathPending: boolean;} {
+    const state = {mathPending: false};
     if (mode === "none") {
-        return;
+        return state;
     }
     const renderer = getProtyleRenderer();
-    if (!renderer) {
-        return;
-    }
     const methods = mode === "diagram" ? DIAGRAM_METHODS : LIGHT_METHODS;
     for (const method of methods) {
-        const fn = renderer[method];
+        if (method === "mathRender" && !host.querySelector('[data-subtype="math"]')) continue;
+        // 桌面/移动端插件 API 导出 ProtyleMethod；window.Protyle 是导出预览的入口。
+        // 这里只修正公式入口，其余 renderer 保持原有调用路径。
+        // petal 类型声明为 void，原生实现实际返回 Promise<void>。
+        const fn = (method === "mathRender" ?
+            (ProtyleMethod?.mathRender ?? renderer?.mathRender) :
+            renderer?.[method]) as ProtyleRenderer[RenderMethod];
         if (typeof fn !== "function") {
             continue;
         }
         try {
-            fn(host);
+            const result = fn(host);
+            if (result && typeof result.then === "function") {
+                if (method === "mathRender") state.mathPending = true;
+                // 吸收加载失败；不能让异步 rejection 中断搜索或一直显示索引中。
+                void Promise.resolve(result).then(() => {
+                    if (method === "mathRender") state.mathPending = false;
+                }, () => {
+                    if (method === "mathRender") state.mathPending = false;
+                });
+            }
         } catch {
             // 单个渲染器失败时继续抽其余块
         }
     }
+    return state;
+}
+
+/** 只修正克隆中的渲染标记，保留真实编辑器的公式和折叠状态。 */
+function prepareOffscreenMath(root: ParentNode): void {
+    root.querySelectorAll<HTMLElement>('[data-type="NodeMathBlock"], span[data-type~="inline-math"]').forEach((el) => {
+        if (!el.hasAttribute("data-content")) return;
+        if (!el.getAttribute("data-subtype")) el.setAttribute("data-subtype", "math");
+        if (!el.querySelector(".katex-html") && !el.matches(".ft__error") && !el.querySelector(".ft__error")) {
+            el.removeAttribute("data-render");
+        }
+    });
 }
 
 /**
@@ -194,7 +221,7 @@ function hasPendingDiagramRenderer(root: ParentNode): boolean {
 export async function waitForRender(
     root: ParentNode,
     timeoutMs: number,
-    wait: {math?: boolean; html?: boolean; diagram?: boolean;},
+    wait: {math?: boolean; mathPending?: () => boolean; html?: boolean; diagram?: boolean;},
     shouldContinue: () => boolean = () => true,
 ): Promise<void> {
     const started = Date.now();
@@ -202,8 +229,11 @@ export async function waitForRender(
         if (!shouldContinue()) {
             return;
         }
-        const pendingMath = wait.math &&
-            root.querySelector('[data-subtype="math"]:not([data-render="true"])');
+        const pendingMath = wait.math && (wait.mathPending?.() ?? true) &&
+            Date.now() - started < MATH_RENDER_TIMEOUT_MS &&
+            Array.from(root.querySelectorAll('[data-subtype="math"]')).some((el) =>
+                !el.querySelector(".katex-html") && !el.matches(".ft__error") && !el.querySelector(".ft__error")
+            );
         const pendingDiagram = wait.diagram && OFFSCREEN_DIAGRAM_SUBTYPES.some((subtype) => {
             return Array.from(root.querySelectorAll(`[data-subtype="${subtype}"]`)).some((node) => {
                 // PlantUML 是 img，Chart 常为 canvas；它们没有可投影的 Text，但也不能
@@ -231,6 +261,7 @@ export async function renderOffscreenBlocks(
     mode: OffscreenRenderMode = "light",
     shouldContinue: () => boolean = () => true,
     forceDiagramRender = false,
+    acceptsMath: (element: HTMLElement) => boolean = () => true,
 ): Promise<void> {
     if (mode === "none" || !shouldContinue()) {
         return;
@@ -238,21 +269,31 @@ export async function renderOffscreenBlocks(
     if (mode === "diagram") {
         prepareOffscreenDiagrams(wysiwyg, forceDiagramRender);
     }
-    callRenders(wysiwyg, mode);
-    const hasDiagram = mode === "diagram" && OFFSCREEN_DIAGRAM_SUBTYPES.some((subtype) => {
-        return Boolean(wysiwyg.querySelector(`[data-subtype="${subtype}"]`));
-    });
-    const pendingDiagramRenderer = hasDiagram && hasPendingDiagramRenderer(wysiwyg);
-    const hasHtml = Boolean(wysiwyg.querySelector("[data-type='NodeHTMLBlock'], protyle-html"));
-    const hasMath = Boolean(wysiwyg.querySelector('[data-subtype="math"], [data-type="NodeMathBlock"]'));
-    // Bounded settle window: a missing/failed renderer is reported by extraction,
-    // never treated as complete searchable source text.
-    const timeout = pendingDiagramRenderer ? 2500 : ((hasMath || hasHtml) ? 4000 : 0);
-    if (timeout > 0) {
-        await waitForRender(wysiwyg, timeout, {
-            math: hasMath,
-            html: mode === "light" && hasHtml,
-            diagram: pendingDiagramRenderer,
-        }, shouldContinue);
+    prepareOffscreenMath(wysiwyg);
+    // 只让本次搜索允许的公式进入原生 renderer，避免关闭公式/宿主类型后仍加载 KaTeX。
+    const skippedMath = Array.from(wysiwyg.querySelectorAll<HTMLElement>('[data-subtype="math"]'))
+        .filter((element) => !acceptsMath(element));
+    skippedMath.forEach((element) => element.removeAttribute("data-subtype"));
+    try {
+        const state = callRenders(wysiwyg, mode);
+        const hasDiagram = mode === "diagram" && OFFSCREEN_DIAGRAM_SUBTYPES.some((subtype) => {
+            return Boolean(wysiwyg.querySelector(`[data-subtype="${subtype}"]`));
+        });
+        const pendingDiagramRenderer = hasDiagram && hasPendingDiagramRenderer(wysiwyg);
+        const hasHtml = Boolean(wysiwyg.querySelector("[data-type='NodeHTMLBlock'], protyle-html"));
+        const hasMath = Boolean(wysiwyg.querySelector('[data-subtype="math"], [data-type="NodeMathBlock"]'));
+        // 公式加载有界等待；缺失/失败时立即采源码，避免每批白耗 4 秒。
+        // HTML/其余图表仍保持原来的等待预算。
+        const timeout = pendingDiagramRenderer ? 2500 : (hasHtml ? 4000 : (hasMath ? MATH_RENDER_TIMEOUT_MS : 0));
+        if (timeout > 0) {
+            await waitForRender(wysiwyg, timeout, {
+                math: hasMath,
+                mathPending: () => state.mathPending,
+                html: mode === "light" && hasHtml,
+                diagram: pendingDiagramRenderer,
+            }, shouldContinue);
+        }
+    } finally {
+        skippedMath.forEach((element) => element.setAttribute("data-subtype", "math"));
     }
 }

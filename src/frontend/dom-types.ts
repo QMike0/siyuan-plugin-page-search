@@ -18,7 +18,7 @@ export interface SearchableBlock {
     /**
      * 匹配源：
      * - inline-memo：text 来自 data-inline-memo-content
-     * - inline-math：text 来自 KaTeX `.katex-html` 渲染可见文字（非 data-content 源码）
+     * - inline-math：优先 KaTeX `.katex-html` 字形，冷态失败时源码单元独立标识且无 Range
      * Range 优先按 textNodes 偏移；备注对准宿主 span。
      */
     matchSource?: "text" | "inline-memo" | "inline-math";

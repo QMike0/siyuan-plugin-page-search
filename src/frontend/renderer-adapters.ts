@@ -83,12 +83,33 @@ function collectMathUnits(element: HTMLElement, context: RendererContext): Searc
     // 思源 mathRender 使用 output="html"；只取可见字形层，避免 MathML/源码重复。
     const katexHtml = element.querySelector<HTMLElement>(".katex-html");
     if (!katexHtml) {
-        return [];
+        const text = mathSourceFallbackText(element);
+        return text && !isAuthorCssHiddenElement(element) ?
+            [{
+                ...context,
+                element,
+                text,
+                textNodes: [],
+                unitId: rendererUnitId("source-fallback", "math"),
+            }] :
+            [];
     }
     const textNodes = omitAuthorCssHiddenText(collectTextNodes(katexHtml, (parent) => {
         return !parent.closest(".katex-mathml, math, annotation, svg, style, script");
     }));
     return singleRenderedUnit(element, context, "math", textNodes);
+}
+
+/** 正常挂载公式只搜字形；离屏/折叠且没有字形时才回退原生 data-content。 */
+export function mathSourceFallbackText(element: HTMLElement): string | null {
+    if (!element.hasAttribute("data-content") || element.querySelector(".katex-html")) return null;
+    // 数据库富文本由单元格投影管理，不能混入另一套公式源码偏移。
+    if (element.closest('[data-type="NodeAttributeView"]')) return null;
+    if (
+        !element.closest("[data-page-search-offscreen], [parent-heading]") &&
+        !isUnderNonHeadingCssFold(element)
+    ) return null;
+    return diagramSourceText(element);
 }
 
 function collectHtmlUnits(element: HTMLElement, context: RendererContext): SearchableBlock[] {

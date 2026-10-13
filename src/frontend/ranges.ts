@@ -1,4 +1,5 @@
 import {isInlineMemoSearchUnit, isInlineMathSearchUnit} from "./blocks";
+import {isRendererSourceFallbackUnitId} from "../shared/renderer-units";
 import type {SearchableBlock} from "./dom-types";
 import {isElementVisible, type ElementVisibilityOptions} from "./visibility";
 
@@ -149,6 +150,7 @@ export function createRangeFromBlockOffsets(
   visibility: ElementVisibilityOptions = {},
   existingRange?: Range,
 ): Range | null {
+  if (isRendererSourceFallbackUnitId(block.unitId)) return null
   if (isInlineMemoSearchUnit(block)) {
     return createRangeFromInlineMemo(block, start, end, visibility)
   }

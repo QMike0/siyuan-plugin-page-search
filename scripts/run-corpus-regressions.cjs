@@ -10,10 +10,11 @@ const {JSDOM} = require("../../analysis/node_modules/jsdom");
 const repo = path.resolve(__dirname, "..");
 let api;
 let editors = [];
+const nativeRenderMethods = {};
 const originalLoad = Module._load;
 Module._load = function(request, parent, main) {
     if (request === "siyuan") {
-        return {fetchSyncPost: (...args) => api(...args), getAllEditor: () => editors};
+        return {fetchSyncPost: (...args) => api(...args), getAllEditor: () => editors, ProtyleMethod: nativeRenderMethods};
     }
     return originalLoad.call(this, request, parent, main);
 };
@@ -272,6 +273,7 @@ async function main() {
             });
     };
     const reset = () => {
+        delete nativeRenderMethods.mathRender;
         corpus.invalidateDocumentSearchCaches();
         db.exec("DELETE FROM blocks");
         db.exec("DELETE FROM spans");
@@ -310,6 +312,245 @@ async function main() {
         return result;
     };
     try {
+        {
+            const inlineFormula =
+                '<span data-type="inline-math" data-subtype="math" data-content="\\delta" contenteditable="false" class="render-node"><span></span></span>';
+            const blockFormula =
+                '<div data-node-id="b" data-type="NodeMathBlock" data-subtype="math" data-content="\\delta" class="render-node"><div spin="1"></div></div>';
+            const asyncMathRenderer = async host => {
+                renderCalls++;
+                await new Promise(resolve => setTimeout(resolve, 15));
+                host.querySelectorAll('[data-subtype="math"]:not([data-render="true"])').forEach(element => {
+                    element.setAttribute("data-render", "true");
+                    element.innerHTML = '<span class="katex"><span class="katex-mathml">sourceSecret</span>' +
+                        '<span class="katex-html" aria-hidden="true"><span class="base">δ</span></span></span>';
+                });
+            };
+            for (const options of [{}, {regex: true}]) {
+                for (const inline of [false, true]) {
+                    reset();
+                    add("b", inline ? "p" : "m", "\\delta");
+                    if (inline) db.exec("UPDATE blocks SET markdown='$\\delta$'");
+                    doms.b = inline ?
+                        '<div data-node-id="b" data-type="NodeParagraph">before' + inlineFormula + "after</div>" :
+                        blockFormula;
+                    // Public plugin API works without the export-preview window.Protyle.
+                    window.Protyle = undefined;
+                    nativeRenderMethods.mathRender = asyncMathRenderer;
+                    const rendered = await search("δ", options);
+                    full(rendered);
+                    assert.equal(rendered.matches.length, 1, "first cold query sees generated glyphs absent from SQL content");
+                    assert.ok(!rendered.matches[0].replaceable && !rendered.matches[0].range);
+                    assert.equal((await search("delta", options)).matches.length, 0, "rendered/source are exclusive");
+                    assert.equal((await search("sourceSecret", options)).matches.length, 0, "MathML is not searchable");
+                    const calls = renderCalls;
+                    full(await search("δ", options));
+                    assert.equal(renderCalls, calls, "unchanged formula host reuses its versioned cache");
+                    if (inline) {
+                        assert.equal((await search("δ", {...options, restrictInlineTypes: ["inline-math"]})).matches.length, 1);
+                        assert.equal((await search("δ", {...options, includeParagraph: false})).matches.length, 0);
+                    } else {
+                        assert.equal((await search("δ", {...options, includeMathBlock: false})).matches.length, 0);
+                    }
+                    // Native renderer skips stale data-render=true, so clones must clear it when output is missing.
+                    reset();
+                    add("a", "h", "heading", "", "r", 'fold="1"');
+                    add("b", inline ? "p" : "m", "\\delta");
+                    if (inline) db.exec("UPDATE blocks SET markdown='$\\delta$' WHERE id='b'");
+                    wysiwyg.innerHTML =
+                        '<div data-node-id="a" data-type="NodeHeading" data-subtype="h1" fold="1">heading</div>';
+                    doms.b = inline ?
+                        '<div data-node-id="b" data-type="NodeParagraph" parent-heading="a">' +
+                        inlineFormula.replace('data-subtype="math"', 'data-render="true"') + "</div>" :
+                        blockFormula.replace('data-subtype="math"', 'parent-heading="a" data-render="true"');
+                    nativeRenderMethods.mathRender = asyncMathRenderer;
+                    const heading = await search("δ", options);
+                    full(heading);
+                    assert.equal(heading.matches.length, 1);
+                    assert.equal((await search("δ", {...options, includeFoldedBlocks: false})).matches.length, 0);
+                }
+            }
+            for (const inline of [false, true]) {
+                for (const failure of ["missing", "throw", "reject", "error"]) {
+                    reset();
+                    add("b", inline ? "p" : "m", "\\delta");
+                    if (inline) db.exec("UPDATE blocks SET markdown='$\\delta$'");
+                    doms.b = inline ?
+                        '<div data-node-id="b" data-type="NodeParagraph">' + inlineFormula + "</div>" :
+                        blockFormula;
+                    if (failure === "throw") {
+                        nativeRenderMethods.mathRender = () => {
+                            throw new Error("unavailable");
+                        };
+                    }
+                    if (failure === "reject") nativeRenderMethods.mathRender = () => Promise.reject(new Error("load failed"));
+                    if (failure === "error") {
+                        nativeRenderMethods.mathRender = host => {
+                            host.querySelectorAll('[data-subtype="math"]').forEach(element => {
+                                element.setAttribute("data-render", "true");
+                                element.innerHTML = '<span class="ft__error">parseErrorSecret</span>';
+                            });
+                        };
+                    }
+                    const began = performance.now();
+                    const fallback = await search("delta");
+                    full(fallback);
+                    assert.equal(fallback.matches.length, 1, `${inline ? "inline" : "block"} fallback on ${failure}`);
+                    assert.ok(fallback.matches[0].unitId.includes("renderer:source-fallback:"));
+                    assert.ok(!fallback.matches[0].replaceable && !fallback.matches[0].range);
+                    assert.ok(performance.now() - began < 1000, "missing/rejected renderer does not wait the old four seconds");
+                    assert.equal((await search("parseErrorSecret")).matches.length, 0);
+                    assert.equal((await search("δ")).matches.length, 0, "source fallback cannot invent glyphs");
+                    if (inline) {
+                        const restricted = await search("delta", {restrictInlineTypes: ["inline-math"]});
+                        full(restricted);
+                        assert.equal(restricted.matches.length, 1);
+                    }
+                }
+            }
+            reset();
+            add("b", "m", "\\delta");
+            doms.b = blockFormula;
+            let finishMath;
+            nativeRenderMethods.mathRender = host =>
+                new Promise(resolve => {
+                    finishMath = () => {
+                        host.querySelector('[data-subtype="math"]').innerHTML = '<span class="katex-html">δ</span>';
+                        resolve();
+                    };
+                });
+            const mathDeadline = performance.now();
+            const timedMath = await search("delta");
+            full(timedMath);
+            assert.equal(timedMath.matches.length, 1);
+            assert.ok(performance.now() - mathDeadline < 1800, "unsettled math has a bounded source fallback");
+            assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
+            finishMath();
+            reset();
+            add("b", "m", "\\delta");
+            doms.b = blockFormula;
+            const abortMath = new AbortController();
+            nativeRenderMethods.mathRender = () =>
+                new Promise(resolve => {
+                    setTimeout(() => {
+                        abortMath.abort();
+                        resolve();
+                    }, 10);
+                });
+            assert.equal((await search("δ", {signal: abortMath.signal})).cancelled, true);
+            assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
+            reset();
+            add("b", "query_embed", "select * from blocks");
+            doms.b =
+                '<div data-node-id="b" data-type="NodeBlockQueryEmbed"><div data-node-id="same" data-type="NodeParagraph">' +
+                inlineFormula + inlineFormula + '</div><div data-node-id="same" data-type="NodeParagraph">' + inlineFormula +
+                "</div></div>";
+            const embeddedFallback = await search("delta");
+            full(embeddedFallback);
+            assert.equal(embeddedFallback.matches.length, 3);
+            assert.equal(new Set(embeddedFallback.matches.map(match => match.unitId)).size, 3);
+            assert.ok(embeddedFallback.matches.every(match => !match.range && !match.replaceable));
+            reset();
+            add("l", "i", "", "", "r", 'fold="1"');
+            add("b", "p", "old", "", "l");
+            wysiwyg.innerHTML = '<div class="li" data-node-id="l" data-type="NodeListItem" data-subtype="u" fold="1">' +
+                '<div></div><div></div><div data-node-id="b" data-type="NodeParagraph">' + inlineFormula + "</div></div>";
+            const foldedSource = await search("delta");
+            full(foldedSource);
+            assert.equal(foldedSource.matches.length, 1);
+            assert.equal(domCalls, 0, "folded source preserves unsaved DOM and does not fetch stale SQL");
+            const foldedLiveUnits = source("frontend/blocks").collectSearchableBlocks(edit, {includeFoldedBlocks: true});
+            const formulaSourceUnit = foldedLiveUnits.find(unit => unit.matchSource === "inline-math");
+            assert.equal(
+                source("frontend/ranges").createRangeFromBlockOffsets(formulaSourceUnit, 1, 6, {allowFoldedHidden: true}),
+                null,
+            );
+            const foldedPipeline = await source("frontend/pipeline").calculateSearchMatches({}, edit, "delta", {
+                includeFoldedBlocks: true,
+                restrictInlineTypes: ["inline-math"],
+            });
+            assert.equal(foldedPipeline.matches.length, 1);
+            assert.equal(foldedPipeline.matches[0].range, undefined);
+            assert.equal((await search("delta", {includeFoldedBlocks: false})).matches.length, 0);
+            const selectedFormula = await source("frontend/pipeline").calculateSearchMatches({}, edit, "delta", {
+                includeFoldedBlocks: true,
+                selectionOnly: true,
+                selectionScope: new Map([[source("frontend/selection").unitKeyOf(formulaSourceUnit), [{start: 0, end: formulaSourceUnit.text.length}]]]),
+            });
+            assert.equal(selectedFormula.matches.length, 0, "selection searches cannot borrow an invisible source offset");
+            wysiwyg.querySelector('[data-type="inline-math"]').innerHTML = '<span class="katex-html">δ</span>';
+            assert.equal((await search("delta")).matches.length, 0);
+            assert.equal((await search("δ")).matches.length, 1, "mounted glyphs replace source instead of double counting");
+            // Existing database formula projection must not acquire source offsets.
+            const avSource = document.createElement("div");
+            avSource.dataset.type = "NodeAttributeView";
+            avSource.innerHTML = '<div fold="1">' + inlineFormula + "</div>";
+            assert.equal(source("frontend/renderer-adapters").mathSourceFallbackText(avSource.querySelector("span")), null);
+            reset();
+            add("b", "p", "\\custom");
+            db.exec("UPDATE blocks SET markdown='$\\custom$'");
+            doms.b = '<div data-node-id="b" data-type="NodeParagraph">' + inlineFormula.replace("delta", "custom") + "</div>";
+            const oldSiyuan = window.siyuan;
+            const oldKatex = window.katex;
+            try {
+                window.siyuan = {config: {editor: {katexMacros: "firstGlyph"}}};
+                const sourceOnly = await search("custom");
+                full(sourceOnly);
+                assert.equal(sourceOnly.matches.length, 1);
+                // A fallback retained while scripts were unavailable must not hide glyphs after KaTeX loads.
+                window.katex = {renderToString() {}};
+                nativeRenderMethods.mathRender = host => {
+                    host.querySelectorAll('[data-subtype="math"]').forEach(element => {
+                        element.innerHTML = '<span class="katex-html">' + window.siyuan.config.editor.katexMacros + "</span>";
+                        element.setAttribute("data-render", "true");
+                    });
+                };
+                assert.equal((await search("firstGlyph")).matches.length, 1);
+                assert.equal((await search("custom")).matches.length, 0);
+                window.siyuan.config.editor.katexMacros = "secondGlyph";
+                assert.equal(
+                    (await search("secondGlyph")).matches.length,
+                    1,
+                    "inline formula plain cache follows macro changes",
+                );
+                assert.equal((await search("firstGlyph")).matches.length, 0);
+            } finally {
+                window.siyuan = oldSiyuan;
+                window.katex = oldKatex;
+            }
+            reset();
+            for (let index = 0; index < 300; index++) {
+                const id = "math-" + index;
+                add(id, "m", "\\text{hit}");
+                doms[id] = blockFormula.replace('data-node-id="b"', `data-node-id="${id}"`).replace("delta", "text{hit}");
+            }
+            const manyMath = await search("hit");
+            full(manyMath);
+            assert.equal(manyMath.matches.length, 300);
+            assert.equal(domCalls, 5, "cold formulas retain 64-block batches and do not spawn background rereads");
+            const mathReads = domCalls;
+            const cachedManyMath = await search("hit");
+            full(cachedManyMath);
+            assert.equal(cachedManyMath.matches.length, 300);
+            assert.equal(domCalls, mathReads);
+            reset();
+            add("b", "p", "before \\delta after");
+            db.exec("UPDATE blocks SET markdown='before $\\delta$ after'");
+            doms.b = '<div data-node-id="b" data-type="NodeParagraph">before' + inlineFormula + "after</div>";
+            nativeRenderMethods.mathRender = () => { throw new Error("excluded formula must not render"); };
+            assert.equal((await search("before", {restrictInlineTypes: ["strong"]})).matches.length, 0);
+            reset();
+            add("b", "m", "\\text{<tag>&}");
+            doms.b = blockFormula.replace("\\delta", "\\text{&amp;lt;tag&amp;gt;&amp;amp;}");
+            const entityFormula = await search("<tag>&");
+            full(entityFormula);
+            assert.equal(entityFormula.matches.length, 1, "formula source decodes entities once like Lute.UnEscapeHTMLStr");
+            assert.equal(document.querySelector("tag"), null, "source fallback never creates source markup");
+            console.log(
+                "native API/async cold math, standard Markdown candidates, folds, source fallback, cancellation, timeout and no duplicate/range/write OK",
+            );
+        }
+
         // Cold Mermaid/flowchart use source; their live rendered labels remain searchable.
         for (const language of ["mermaid", "flowchart"]) {
             const switchName = language === "mermaid" ? "includeMermaid" : "includeFlowchart";

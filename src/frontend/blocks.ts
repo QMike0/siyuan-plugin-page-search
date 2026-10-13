@@ -3,6 +3,8 @@ import {
     normalizeRestrictInlineTypes,
     ownTableRows,
     plainTextFromInlineMemoContent,
+    isRendererSourceFallbackUnitId,
+    rendererUnitId,
     shouldCollectBodyTextForRestrict,
     shouldCollectInlineMathUnits,
     shouldCollectInlineMemoUnits,
@@ -22,6 +24,7 @@ import {
 import {foldedAttributeViewGroupBody, isUnderNonHeadingCssFold} from "./fold-dom";
 import {
     collectRendererSearchUnits,
+    mathSourceFallbackText,
     rendererAdapterKind,
     type RendererAdapterKind,
 } from "./renderer-adapters";
@@ -661,7 +664,10 @@ export function collectSearchableBlocks(
 /** Source IDs identify copied labels; the embed ID identifies their search/navigation owner. */
 export function ownEmbeddedSearchUnit(block: SearchableBlock, ownerId: string): SearchableBlock {
     let sourceUnit = block.unitId ?? "text";
-    if (isInlineMathSearchUnit(block) && block.blockType !== ATTRIBUTE_VIEW_TYPE) {
+    if (
+        isInlineMathSearchUnit(block) && block.blockType !== ATTRIBUTE_VIEW_TYPE &&
+        !isRendererSourceFallbackUnitId(block.unitId)
+    ) {
         sourceUnit = `inline-math:${inlineMathIdentityText(block.text)}:${block.mathOrdinal ?? 0}`;
     } else if (isInlineMemoSearchUnit(block)) {
         sourceUnit = `inline-memo:${block.anchorOffset ?? 0}`;
@@ -2394,8 +2400,8 @@ export function isInlineMemoSearchUnit(block: Pick<SearchableBlock, "matchSource
 }
 
 /**
- * 采集行内公式：匹配 KaTeX **渲染可见文本**（`.katex-html`），不搜 `data-content` LaTeX 源。
- * 否则搜 “d” 会命中 `\delta` / `\lambda` 等源码字母。
+ * 采集行内公式：优先匹配 KaTeX 渲染字形；离屏/折叠且没有字形时兜底源码。
+ * 两种来源使用不同 unitId，源码偏移不能绑定到字形或参与替换。
  * 正文/表格 TreeWalker 仍排除整段 inline-math，避免与独立 unit 重复计数；
  * 表内 / 引述 / 提示等内的公式靠本函数扫到，再由 include* 门闩过滤。
  *
@@ -2445,7 +2451,8 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
         }
 
         const textNodes = omitAuthorCssHiddenText(collectKatexGlyphTextNodes(span));
-        const text = textNodes.map((node) => node.nodeValue ?? "").join("");
+        const source = mathSourceFallbackText(span);
+        const text = source ?? textNodes.map((node) => node.nodeValue ?? "").join("");
         // 仅零宽占位则跳过（思源在公式旁插入 ZWSP）
         if (!text.replace(ZERO_WIDTH_RE, "").length) {
             continue;
@@ -2469,7 +2476,9 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
             seen.set(visible, mathOrdinal + 1);
         }
 
-        let unitId = `${INLINE_MATH_UNIT_PREFIX}${mathIndex}`;
+        let unitId = source !== null ?
+            rendererUnitId("source-fallback", "inline-math", embeddedOrdinal ?? mathIndex) :
+            `${INLINE_MATH_UNIT_PREFIX}${mathIndex}`;
         if (avCell) {
             const group = avCell.closest<HTMLElement>("[data-group-id]")?.dataset.groupId || "nogroup";
             const row = avCell.closest<HTMLElement>(".av__row, .av__gallery-item, .av__calendar-item")?.dataset.id;
