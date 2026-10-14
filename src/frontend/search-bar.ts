@@ -50,6 +50,7 @@ import {
     rootUsesAttributeViews,
     releaseAvCacheOwner,
 } from "./corpus/av";
+import {editorFocusId} from "./corpus/focus";
 import {
     blockIsInEditor,
     openBlockInEditor,
@@ -121,6 +122,7 @@ import {
     type SearchPipelineResult,
 } from "./pipeline";
 import {
+    countWritableMatches,
     isMatchWritable,
     replaceAllMatchesInEditor,
     replaceCurrentMatchInEditor,
@@ -308,6 +310,9 @@ export interface SearchBarI18n {
     replaceDocTitleEmpty: string;
     replaceAllConfirm: string;
     replaceAllConfirmTitle: string;
+    replaceAllScopeDocument?: string;
+    replaceAllScopeFocus?: string;
+    replaceAllScopeSelection?: string;
     replaceAllIncomplete: string;
     replaceCurrentDone: string;
     replaceAllResult: string;
@@ -686,6 +691,10 @@ export class SearchBar {
         this.pendingTableCells = snapshotTableControlCells(this.edit);
     };
     private replaceBusy = false;
+    /** savedoc can precede the local DOM replay; defer its search until replacement settles. */
+    private replaceRefreshPending = false;
+    /** savedoc may arrive before the initiating editor replays undo/redo. */
+    private savedocDomEpoch: number | undefined;
 
     private readonly eventBusHandle: (event: CustomEvent) => void;
     private readonly optionButtons = new Map<MatchOptionKey, HTMLElement>();
@@ -2461,6 +2470,9 @@ export class SearchBar {
             this.resultSelectionScope = selectionScope;
             this.resultDomEpoch = domEpoch;
             this.resultDocumentEpoch = documentEpoch;
+            if (this.savedocDomEpoch !== domEpoch && domEpoch === this.domEpoch) {
+                this.savedocDomEpoch = undefined;
+            }
             this.incompleteBlockIds = result.incompleteBlockIds ?? [];
             this.resultCount = matches.length;
             this.pendingDocumentCountDisplay = null;
@@ -2624,6 +2636,10 @@ export class SearchBar {
         }
         this.indexSettledTimer = window.setTimeout(() => {
             this.indexSettledTimer = null;
+            if (this.replaceBusy) {
+                this.replaceRefreshPending = true;
+                return;
+            }
             void this.highlightHitResult(this.searchText, false);
         }, 80);
     }
@@ -2795,13 +2811,22 @@ export class SearchBar {
 
         if (["savedoc", "rename"].includes(event.detail?.cmd)) {
             this.documentEpoch += 1;
+            this.savedocDomEpoch = this.domEpoch;
             const rootId = this.rememberCurrentRootId();
             if (rootId) {
                 invalidateDocumentStructureCaches(rootId);
             }
             clearTimeout(this.typingTimer);
+            if (this.replaceBusy) {
+                this.replaceRefreshPending = true;
+                return;
+            }
             this.typingTimer = window.setTimeout(() => {
                 this.typingTimer = undefined;
+                if (this.replaceBusy) {
+                    this.replaceRefreshPending = true;
+                    return;
+                }
                 if (this.plugin.isLastHighlightComponent(this.root)) {
                     void this.highlightHitResult(this.searchText, false).then(() => {
                         if (this.resultIndex >= 1) {
@@ -2881,6 +2906,10 @@ export class SearchBar {
         window.clearTimeout(this.avRefreshTimer);
         this.avRefreshTimer = window.setTimeout(() => {
             if (Date.now() < this.avWatchPausedUntil) {
+                return;
+            }
+            if (this.replaceBusy) {
+                this.replaceRefreshPending = true;
                 return;
             }
             if (this.plugin.isLastHighlightComponent(this.root)) {
@@ -3601,6 +3630,14 @@ export class SearchBar {
                 this.diagramRefreshTimer = undefined;
             }
             this.scheduleDiagramRefresh();
+        }
+        if (this.savedocDomEpoch !== undefined && this.savedocDomEpoch !== this.domEpoch && !this.replaceBusy) {
+            this.savedocDomEpoch = undefined;
+            if (this.resultDomEpoch !== this.domEpoch && this.effectiveQuery()) {
+                clearTimeout(this.typingTimer);
+                this.typingTimer = undefined;
+                this.scheduleDomRefresh();
+            }
         }
         if (change.foldChanged && this.includeFoldedBlocks) {
             this.noteFoldContentStable(change);
@@ -4437,6 +4474,39 @@ export class SearchBar {
         this.replacePendingMessageId = undefined;
     }
 
+    private finishReplacementRefresh() {
+        this.clearReplacePendingMessage();
+        this.replaceBusy = false;
+        if (this.destroyed) return;
+        if (this.replaceRefreshPending) {
+            this.replaceRefreshPending = false;
+            this.savedocDomEpoch = undefined;
+            clearTimeout(this.typingTimer);
+            this.typingTimer = window.setTimeout(() => {
+                this.typingTimer = undefined;
+                if (this.replaceBusy) {
+                    this.replaceRefreshPending = true;
+                    return;
+                }
+                void this.highlightHitResult(this.searchText, false);
+            }, 0);
+        }
+        this.scheduleDiagramRefresh();
+    }
+
+    private async refreshReplacementResults() {
+        // The normal post-write search absorbs savedoc/AV/index requests received
+        // while waiting for the commit; keep only new events arriving during it.
+        this.replaceRefreshPending = false;
+        clearTimeout(this.typingTimer);
+        this.typingTimer = undefined;
+        window.clearTimeout(this.avRefreshTimer);
+        this.avRefreshTimer = undefined;
+        if (this.indexSettledTimer != null) window.clearTimeout(this.indexSettledTimer);
+        this.indexSettledTimer = null;
+        await this.highlightHitResult(this.searchText, false);
+    }
+
     private async handleUnconfirmedReplacement(result: ReplaceWriteResult): Promise<boolean> {
         if (
             result.commitState !== "unknown" && result.commitState !== "failed" && result.error !== "transaction-failed"
@@ -4445,25 +4515,31 @@ export class SearchBar {
         }
         this.clearReplacePendingMessage();
         if (this.destroyed) return true;
-        this.clearHighlight();
-        await this.highlightHitResult(this.searchText, false);
-        if (this.destroyed) return true;
         if (result.commitState === "unknown") {
+            // The live editor is optimistic, while the kernel may still contain
+            // the old content. Do not search it as authoritative or turn a
+            // pending write into a false zero-result state. Successful commits
+            // may later refresh via savedoc; rejected ones may never emit it.
+            this.searchCoverageIncomplete = true;
+            this.syncReplaceButtons();
             showMessage(
                 (this.i18n.replaceCommitUnknown ??
-                    "替换结果尚未确认（已确认 {replacedCount}/{submittedCount}）。请稍后核对内容，再决定是否重试。")
+                    "替换结果尚未确认（已确认 {replacedCount}/{submittedCount}）。若持续未确认或思源提示事务异常，请重新加载文档并重新搜索，核对内容后再决定是否重试。")
                     .replace("{replacedCount}", String(result.replacedCount))
                     .replace("{submittedCount}", String(result.submittedCount ?? 0)),
                 7000,
                 "info",
             );
-        } else {
-            showMessage(
-                this.i18n.replaceCommitFailed ?? "替换提交发生异常。请核对内容后再操作。",
-                5000,
-                "error",
-            );
+            return true;
         }
+        this.clearHighlight();
+        await this.refreshReplacementResults();
+        if (this.destroyed) return true;
+        showMessage(
+            this.i18n.replaceCommitFailed ?? "替换提交发生异常。请核对内容后再操作。",
+            5000,
+            "error",
+        );
         return true;
     }
 
@@ -4607,7 +4683,7 @@ export class SearchBar {
 
             this.clearHighlight();
             // 替换后保持相对索引，不按光标重新锚定
-            await this.highlightHitResult(this.searchText, false);
+            await this.refreshReplacementResults();
             if (this.destroyed) return;
             if (this.resultCount > 0) {
                 this.resultIndex = Math.min(keepIndex, this.resultCount);
@@ -4616,9 +4692,7 @@ export class SearchBar {
             }
             showMessage(this.i18n.replaceCurrentDone, 2000, "info");
         } finally {
-            this.clearReplacePendingMessage();
-            this.replaceBusy = false;
-            if (!this.destroyed) this.scheduleDiagramRefresh();
+            this.finishReplacementRefresh();
         }
     }
 
@@ -4642,10 +4716,22 @@ export class SearchBar {
             }
         }
         const searchGeneration = this.searchGeneration;
-        const confirmText = this.i18n.replaceAllConfirm.replace(
-            "{count}",
-            String(this.resultCount),
-        );
+        const writableCount = countWritableMatches(this.edit, this.resultMatches);
+        if (!writableCount) {
+            showMessage(this.i18n.replaceCurrentUnsupported, 3000, "info");
+            return;
+        }
+        const scope = this.selectionOnly ?
+            (this.i18n.replaceAllScopeSelection ?? "Current selection") :
+            editorFocusId(this.edit) ?
+            (this.i18n.replaceAllScopeFocus ?? "Focused block and its content") :
+            (this.i18n.replaceAllScopeDocument ?? "Current search scope");
+        // 当前可写数是预检信息；实际成功数仍由提交后的读回确认决定。
+        const confirmText = this.i18n.replaceAllConfirm
+            .replace("{scope}", scope)
+            .replace("{matchCount}", String(this.resultMatches.length))
+            .replace("{count}", String(writableCount))
+            .replace("{skippedCount}", String(this.resultMatches.length - writableCount));
         const confirmed = await confirmDialog(
             this.i18n.replaceAllConfirmTitle,
             confirmText,
@@ -4672,6 +4758,7 @@ export class SearchBar {
         this.replaceBusy = true;
         try {
             const searchKey = this.resultSearchKey;
+            const documentEpoch = this.documentEpoch;
             const replacementText = this.replaceText;
             const result = await replaceAllMatchesInEditor(
                 this.edit,
@@ -4686,7 +4773,11 @@ export class SearchBar {
                     onCommitStateChange: (state) => this.onReplaceCommitStateChange(state),
                     isCurrent: () =>
                         !this.destroyed &&
-                        this.hasStableReplaceAllSnapshot() &&
+                        // Preparation may mount unchanged blocks. The write
+                        // layer validates target DOM identity/content and fetched
+                        // snapshots; document events still invalidate this plan.
+                        this.hasCurrentSearchResults() && !this.searchCoverageIncomplete &&
+                        this.documentEpoch === documentEpoch &&
                         this.resultSearchKey === searchKey && this.searchGeneration === searchGeneration &&
                         this.replaceText === replacementText,
                 },
@@ -4736,9 +4827,20 @@ export class SearchBar {
                 showMessage(this.formatDocTitleReplaceError(result.detail), 4000, "error");
                 return;
             }
+            // Missing/changed units can fail preparation before anything is
+            // submitted. Report cancellation instead of "replacement complete: 0".
+            if (result.replacedCount === 0 && result.error) {
+                showMessage(
+                    this.i18n.replaceStaleTarget ?? "目标内容已变化，已取消替换并刷新结果，请重新确认。",
+                    4000,
+                    "info",
+                );
+                await this.highlightHitResult(this.searchText, false);
+                return;
+            }
 
             this.clearHighlight();
-            await this.highlightHitResult(this.searchText, false);
+            await this.refreshReplacementResults();
             if (this.destroyed) return;
             showMessage(
                 this.i18n.replaceAllResult
@@ -4748,9 +4850,7 @@ export class SearchBar {
                 "info",
             );
         } finally {
-            this.clearReplacePendingMessage();
-            this.replaceBusy = false;
-            if (!this.destroyed) this.scheduleDiagramRefresh();
+            this.finishReplacementRefresh();
         }
     }
 

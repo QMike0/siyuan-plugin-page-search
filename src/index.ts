@@ -385,14 +385,18 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 "Failed to rename the document title",
             replaceDocTitleEmpty: t.replaceDocTitleEmpty ||
                 "Document title is invalid; skipped",
-            replaceAllConfirm: t.replaceAllConfirm || "Replace {count} matches?",
+            replaceAllConfirm: t.replaceAllConfirm ||
+                "Scope: {scope}. {matchCount} matches, {count} currently replaceable, {skippedCount} not replaceable. Replace the replaceable matches?",
             replaceAllConfirmTitle: t.replaceAllConfirmTitle || "Replace all",
+            replaceAllScopeDocument: t.replaceAllScopeDocument || "Current document (using search settings)",
+            replaceAllScopeFocus: t.replaceAllScopeFocus || "Focused block and its content (using search settings)",
+            replaceAllScopeSelection: t.replaceAllScopeSelection || "Current selection (using search settings)",
             replaceAllIncomplete: t.replaceAllIncomplete ||
                 "Search results are incomplete. Wait for indexing before replacing all.",
             replaceCurrentDone: t.replaceCurrentDone || "Current match replaced",
             replaceCommitPending: t.replaceCommitPending || "Submitted; confirming replacement…",
             replaceCommitUnknown: t.replaceCommitUnknown ||
-                "Replacement is not fully confirmed ({replacedCount}/{submittedCount} confirmed). Check the content later before retrying.",
+                "Replacement is not fully confirmed ({replacedCount}/{submittedCount} confirmed). If this persists or SiYuan reports a transaction error, reload the document and search again. Check the content before retrying.",
             replaceCommitFailed: t.replaceCommitFailed ||
                 "Replacement submission encountered an error. Check the content before continuing.",
             replaceAllResult: t.replaceAllResult ||

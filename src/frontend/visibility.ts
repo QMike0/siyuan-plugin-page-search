@@ -8,11 +8,42 @@ interface TextStyle {
 }
 let textStyleCache = new WeakMap<Element, TextStyle>();
 let collectAllowsFoldedHidden = true;
+let collectIncludesMindmapSource = false;
 
 /** 每次采集开始时清掉。样式会变，不能把上一次搜索的 display 留到下一次。 */
-export function beginTextCollection(allowFoldedHidden: boolean): void {
+export function beginTextCollection(allowFoldedHidden: boolean, includeMindmapSource?: boolean): void {
     textStyleCache = new WeakMap<Element, TextStyle>();
     collectAllowsFoldedHidden = allowFoldedHidden;
+    if (includeMindmapSource !== undefined) {
+        collectIncludesMindmapSource = includeMindmapSource;
+    }
+}
+
+/** Native _mindmap-view.scss hides these source items while painting clones. */
+function isMindmapSourceHideBoundary(element: Element): boolean {
+    if (element.hasAttribute("hidden") || (element as HTMLElement).style?.display === "none") return false;
+    const parent = element.parentElement;
+    if (parent?.getAttribute("data-mindmap-view-rendered") !== "true") return false;
+    return (parent.getAttribute("data-type") === "NodeMindmap" &&
+        element.matches('.mindmap-item[data-type="NodeMindmapItem"][data-node-id]')) ||
+        (parent.getAttribute("data-type") === "NodeList" &&
+            parent.getAttribute("custom-sy-list-mindmap") === "1" &&
+            element.getAttribute("data-type") === "NodeListItem");
+}
+
+/** Replacement collection ignores only native mindmap source hiding, never author CSS. */
+export function isCollectedTextHidden(node: Text): boolean {
+    if (!collectIncludesMindmapSource) return isAuthorCssHiddenText(node, collectAllowsFoldedHidden);
+    const parent = node.parentElement;
+    if (!collectAllowsFoldedHidden && isUnderNonHeadingCssFold(parent)) return true;
+    if (parent && textStyle(parent).visibilityHidden) return true;
+    let current: Element | null = parent;
+    while (current && current !== document.body) {
+        if (current.hasAttribute("data-page-search-offscreen")) break;
+        if (textStyle(current).displayHidden && !isMindmapSourceHideBoundary(current)) return true;
+        current = parentElementCrossingShadow(current);
+    }
+    return false;
 }
 
 /**

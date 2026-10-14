@@ -62,7 +62,7 @@ export class DiagramSearchState {
             // 超限时只安排一次合并搜索，避免在观察回调里再全文采集一遍 SVG 文本。
             if (this.units.size) return true;
             if (this.selectionUnits) return false;
-            beginTextCollection(options.includeFoldedBlocks !== false);
+            beginTextCollection(options.includeFoldedBlocks !== false, false);
             const enabled = createRendererElementFilter(options);
             return Array.from(docRoot.querySelectorAll<HTMLElement>(SOURCE_DIAGRAM_SELECTOR)).some(enabled);
         }

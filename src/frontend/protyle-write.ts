@@ -16,7 +16,10 @@ import {
     isPreviewSyntheticBlock,
     isPreviewSyntheticBlockId,
 } from "./blocks";
-import {collectSearchableBlocks} from "./blocks";
+import {
+    collectImageTitleSearchUnits,
+    collectSearchableBlocks,
+} from "./blocks";
 import {extractUnitsFromDoms} from "./corpus/extract";
 import {
     editorRootId,
@@ -105,10 +108,11 @@ function resolveSubmitBlockElement(
 
     const candidates = Array.from(
         root.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"][data-type]`),
-    ).filter((el) => !el.closest(".protyle-attr, .fn__none"));
+    ).filter((el) => !el.closest(".protyle-attr, .fn__none, .protyle-wysiwyg__embed"));
 
     if (!candidates.length) {
-        return root.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"]`);
+        return Array.from(root.querySelectorAll<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"]`))
+            .find((el) => !el.closest(".protyle-attr, .fn__none, .protyle-wysiwyg__embed")) ?? null;
     }
 
     // 优先已渲染 / 内容更完整的实例（与 blocks 采集一致）
@@ -144,6 +148,87 @@ function resolveSubmitBlockElements(
     return fallback ? [fallback] : [];
 }
 
+interface SubmitBlockIndex {
+    all: Map<string, HTMLElement[]>;
+    preferred: Map<string, HTMLElement>;
+}
+
+/** Index live block nodes once for replace-all; per-id DOM queries become quadratic at document scale. */
+function collectSubmitBlockIndex(edit: Element): SubmitBlockIndex {
+    const root = edit.classList.contains("protyle") ?
+        edit :
+        edit.querySelector<HTMLElement>(".protyle:not(.fn__none)") ?? edit;
+    const all = new Map<string, HTMLElement[]>();
+    const typed = new Map<string, HTMLElement[]>();
+    root.querySelectorAll<HTMLElement>("[data-node-id]").forEach((element) => {
+        const id = element.getAttribute("data-node-id");
+        if (!id) {
+            return;
+        }
+        const candidates = all.get(id);
+        if (candidates) {
+            candidates.push(element);
+        } else {
+            all.set(id, [element]);
+        }
+        if (element.hasAttribute("data-type") && !element.closest(".protyle-attr, .fn__none")) {
+            const typedCandidates = typed.get(id);
+            if (typedCandidates) {
+                typedCandidates.push(element);
+            } else {
+                typed.set(id, [element]);
+            }
+        }
+    });
+    const preferred = new Map<string, HTMLElement>();
+    all.forEach((candidates, id) => {
+        const typedCandidates = typed.get(id);
+        const usable = typedCandidates?.length ? typedCandidates : candidates.slice(0, 1);
+        all.set(id, usable);
+        // Retain displayed copies for native sync/rollback, but prepare writes
+        // from the document source. Embedded units have a different search owner.
+        const sourceCandidates = usable.filter((element) => !element.closest(".protyle-wysiwyg__embed"));
+        if (!sourceCandidates.length) return;
+        const best = sourceCandidates.reduce((current, candidate) => {
+            const currentRendered = current.getAttribute("data-render") === "true";
+            const candidateRendered = candidate.getAttribute("data-render") === "true";
+            if (currentRendered !== candidateRendered) {
+                return candidateRendered ? candidate : current;
+            }
+            return (candidate.textContent?.length ?? 0) > (current.textContent?.length ?? 0) ? candidate : current;
+        });
+        if (best) preferred.set(id, best);
+    });
+    return {all, preferred};
+}
+
+function selectionStartIn(element: Element, start: Node): boolean {
+    return element === start || element.contains(start);
+}
+
+/**
+ * promiseTransaction skips every update element containing the current selection,
+ * including selected children and all changed ancestors. Return all such copies so
+ * a replace-all can keep the live DOM in sync without replacing the selected nodes.
+ */
+function selectedChangedBlocks(
+    edit: Element,
+    blockIds: ReadonlySet<string>,
+    index: SubmitBlockIndex,
+): Map<string, HTMLElement[]> {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) return new Map();
+    const start = selection.getRangeAt(0).startContainer;
+    const selected = new Map<string, HTMLElement[]>();
+    for (const id of blockIds) {
+        const elements = (index.all.get(id) ?? []).filter((element) =>
+            edit.contains(element) && selectionStartIn(element, start)
+        );
+        if (elements.length) selected.set(id, elements);
+    }
+    return selected;
+}
+
 /**
  * 是否可写回。判别顺序：
  * 1) 发布服务 / 导出预览 / 只读模式
@@ -154,9 +239,22 @@ export function isMatchWritable(
     edit: Element,
     match: Pick<SearchMatch, "replaceable" | "blockType" | "blockId" | "unitId">,
 ): boolean {
-    if (isEditorReplaceModeBlocked(edit)) {
-        return false;
+    return !isEditorReplaceModeBlocked(edit) && isMatchContentWritable(match);
+}
+
+/** 统计当前搜索快照的可替命中；只检查一次编辑器模式，不重新采集块或准备事务。 */
+export function countWritableMatches(edit: Element, matches: readonly SearchMatch[]): number {
+    if (isEditorReplaceModeBlocked(edit)) return 0;
+    let count = 0;
+    for (const match of matches) {
+        if (isMatchContentWritable(match)) count += 1;
     }
+    return count;
+}
+
+function isMatchContentWritable(
+    match: Pick<SearchMatch, "replaceable" | "blockType" | "blockId" | "unitId">,
+): boolean {
     if (!match.replaceable || isDocTitleMatch(match)) {
         return false;
     }
@@ -236,12 +334,15 @@ function captureLiveRollback(
     protyle: Protyle,
     updates: readonly PreparedBlockUpdate[],
     oldLiveHtml?: ReadonlyMap<HTMLElement, string>,
+    submitIndex?: SubmitBlockIndex,
 ): () => void {
     const rootId = editorRootId(edit);
     const readContent = createCommitContentReader(protyle);
     const childPositions = new WeakMap<Element, Map<Element, number>>();
     const snapshots = updates.map((update) => {
-        const elements = resolveSubmitBlockElements(edit, update.id);
+        const elements = submitIndex ?
+            submitIndex.all.get(update.id) ?? [] :
+            resolveSubmitBlockElements(edit, update.id);
         return {
             id: update.id,
             expectedHTML: update.newHTML,
@@ -287,10 +388,40 @@ function captureLiveRollback(
         }
     };
 }
-function buildUnitMap(blocks: SearchableBlock[]): Map<string, SearchableBlock> {
+function buildUnitMap(
+    blocks: SearchableBlock[],
+    matches: readonly Pick<SearchMatch, "blockId" | "unitId">[],
+): Map<string, SearchableBlock> {
     const map = new Map<string, SearchableBlock>();
     for (const block of blocks) {
-        map.set(unitKey(block.blockId, block.unitId), block);
+        // Renderer copies cannot ever be a write target, even if no source unit
+        // survived collection. Missing source coverage must cancel preparation.
+        if (block.matchSource === "projection") continue;
+        const key = unitKey(block.blockId, block.unitId);
+        const previous = map.get(key);
+        // A tab label / mindmap canvas was skipped above, so a surviving entry
+        // is already the authoritative source unit for this identity.
+        if (!previous) {
+            map.set(key, block);
+        }
+    }
+    // Paragraph-disabled searches give captions separate unit IDs/offsets.
+    // Reuse the same collector only for those owners, without a second DOM/API scan.
+    const imageTitleIds = new Set(
+        matches.filter((match) => match.unitId?.startsWith("image-title:"))
+            .map((match) => match.blockId),
+    );
+    if (imageTitleIds.size) {
+        for (const block of blocks) {
+            if (!imageTitleIds.has(block.blockId)) continue;
+            const owner = block.element.closest<HTMLElement>("[data-node-id][data-type]");
+            if (!owner || owner.getAttribute("data-node-id") !== block.blockId) continue;
+            for (const title of collectImageTitleSearchUnits(owner, block.blockId, block.blockIndex)) {
+                map.set(unitKey(title.blockId, title.unitId), title);
+            }
+            imageTitleIds.delete(block.blockId);
+            if (!imageTitleIds.size) break;
+        }
     }
     return map;
 }
@@ -321,13 +452,17 @@ function createWriteGuard(
     protyle: Protyle,
     blockIds: Iterable<string>,
     isCurrent?: () => boolean,
-): () => string | undefined {
+    submitIndex?: SubmitBlockIndex,
+    allowMountContents?: ReadonlyMap<string, string>,
+): (allowUnverifiedMount?: boolean) => string | undefined {
     const rootId = editorRootId(edit);
+    const readMountContent = createCommitContentReader(protyle, {ignoreDynamicReferenceText: true});
     const snapshots = Array.from(blockIds, (id) => {
-        const element = resolveSubmitBlockElement(edit, id);
-        return {id, element, html: element?.outerHTML};
+        const element = submitIndex ? submitIndex.preferred.get(id) ?? null : resolveSubmitBlockElement(edit, id);
+        const html = element?.outerHTML;
+        return {id, element, html};
     });
-    return () => {
+    return (allowUnverifiedMount = false) => {
         if (isCurrent && !isCurrent()) return "stale-target";
         if (isEditorReplaceModeBlocked(edit) || protyle.protyle?.disabled) {
             return "readonly-or-preview";
@@ -335,9 +470,30 @@ function createWriteGuard(
         if (!edit.isConnected || resolveProtyleFromEdit(edit) !== protyle || editorRootId(edit) !== rootId) {
             return "stale-target";
         }
+        // Re-index after each boundary; fetched targets may mount before their
+        // kernel snapshot is read, but must match it at the final check.
+        const currentIndex = submitIndex ? collectSubmitBlockIndex(edit) : undefined;
         for (const snapshot of snapshots) {
-            const current = resolveSubmitBlockElement(edit, snapshot.id);
-            if (current !== snapshot.element || current?.outerHTML !== snapshot.html) {
+            const current = currentIndex ?
+                currentIndex.preferred.get(snapshot.id) ?? null :
+                resolveSubmitBlockElement(edit, snapshot.id);
+            if (current !== snapshot.element) {
+                if (snapshot.element === null && allowMountContents && current) {
+                    const kernelHTML = allowMountContents.get(snapshot.id);
+                    // The early guard runs before the first fetched read. No
+                    // live write occurs until all fetched snapshots are populated.
+                    if (kernelHTML === undefined && allowUnverifiedMount) continue;
+                    if (kernelHTML === undefined) return "stale-target";
+                    const expected = readMountContent(kernelHTML);
+                    const actual = readMountContent(current.outerHTML);
+                    if (expected !== undefined && actual !== undefined && actual === expected) {
+                        continue;
+                    }
+                    return "stale-target";
+                }
+                return "stale-target";
+            }
+            if (current?.outerHTML !== snapshot.html) {
                 return "stale-target";
             }
         }
@@ -422,10 +578,12 @@ export async function replaceCurrentMatchInEditor(
         includeInlineMemo: true,
         includeImageTitle: true,
         includeDocTitle: false,
+        includeTabSourceForReplace: true,
+        includeMindmapSourceForReplace: true,
         scopeRoots: [submit],
     })
         .filter((block) => !isPreviewSyntheticBlock(block));
-    const unitsByKey = buildUnitMap(blocks);
+    const unitsByKey = buildUnitMap(blocks, [match]);
     const unit = createReplacementUnitLookup(unitsByKey)(match);
     if (!unit) {
         return {replacedCount: 0, skippedCount: 1, error: "unit-missing"};
@@ -496,12 +654,16 @@ export async function replaceCurrentMatchInEditor(
 }
 
 const BLOCK_DOM_BATCH_SIZE = 64;
+/** Keep read pressure aligned with corpus extraction; writes remain one native transaction. */
+const BLOCK_DOM_BATCH_CONCURRENCY = 4;
 
 interface PreparedBlockUpdate {
     id: string;
     oldHTML: string;
     newHTML: string;
     appliedCount: number;
+    /** Reuse the exact plan if a fetched block mounts with the editor selection. */
+    replaceOptions?: PreparedReplaceOptions;
     /** 获取时的内核底稿，可能与并入未落盘虚拟表格后的 oldHTML 不同。 */
     kernelHTML?: string;
 }
@@ -580,7 +742,7 @@ function prepareBlockElementUpdate(
     unitsByKey: Map<string, SearchableBlock>,
     matches: SearchMatch[],
     replacementText: string,
-    replaceOpts: ReturnType<typeof replaceOptionsFrom>,
+    replaceOpts: PreparedReplaceOptions,
 ): PreparedBlockResult {
     const clone = blockEl.cloneNode(true) as HTMLElement;
     const outcome = applyMatchesToSubmitClone(
@@ -607,6 +769,7 @@ function prepareBlockElementUpdate(
             oldHTML,
             newHTML: clone.outerHTML,
             appliedCount: outcome.appliedCount,
+            replaceOptions: replaceOpts,
         },
         skippedCount: outcome.skippedCount,
     };
@@ -740,97 +903,113 @@ async function prepareFetchedBlockUpdates(
         return {updates, skippedCount};
     }
 
+    const batches: string[][] = [];
     for (let index = 0; index < ids.length; index += BLOCK_DOM_BATCH_SIZE) {
-        const batch = ids.slice(index, index + BLOCK_DOM_BATCH_SIZE);
-        const htmlById = await fetchBlockHtmlBatch(batch, notebook);
-        const present: string[] = [];
-        const doms: Record<string, string> = {};
-        for (const id of batch) {
-            const html = htmlById.get(id);
-            const blockMatches = matchesById.get(id) ?? [];
-            if (!html) {
-                skippedCount += blockMatches.length;
-                error ??= "block-missing";
-                continue;
-            }
-            const merged = mergeKernelHtmlWithLiveTable(liveRoot, id, html);
-            if (merged.conflict) {
-                skippedCount += blockMatches.length;
-                error ??= "table-pending-edit";
-                continue;
-            }
-            present.push(id);
-            doms[id] = merged.html;
-        }
-        if (present.length === 0) {
-            continue;
-        }
-
-        let extracted: Awaited<ReturnType<typeof extractUnitsFromDoms>> | null = null;
-        try {
-            extracted = await extractUnitsFromDoms(
-                present,
-                doms,
-                {includeInlineMemo: true, includeImageTitle: true, includeDocTitle: false},
-                new Set(),
-                "none",
-            );
-        } catch (extractError) {
-            console.warn("[page-search] prepare unloaded replace failed", extractError);
-            for (const id of present) {
-                skippedCount += matchesById.get(id)?.length ?? 0;
-            }
-            error ??= "block-missing";
-            continue;
-        }
-
-        try {
-            const unitsByKey = buildUnitMap(extracted.blocks);
-            const batchMatches = present.flatMap((id) => matchesById.get(id) ?? []);
-            const preparedOptions = await prepareRegexReplaceOptions(
-                unitsByKey,
-                batchMatches,
-                replacementText,
-                options,
-            );
-            if (preparedOptions.error) {
-                return {
-                    updates: [],
-                    skippedCount: totalMatches,
-                    error: preparedOptions.error,
-                    fatal: true,
-                };
-            }
-            for (const id of present) {
+        batches.push(ids.slice(index, index + BLOCK_DOM_BATCH_SIZE));
+    }
+    // Reads are independent and read-only. Keep the wave bounded so a large
+    // document does not serialize dozens of kernel renders or flood the API.
+    for (let waveStart = 0; waveStart < batches.length; waveStart += BLOCK_DOM_BATCH_CONCURRENCY) {
+        const wave = batches.slice(waveStart, waveStart + BLOCK_DOM_BATCH_CONCURRENCY);
+        const htmlResults = await Promise.all(wave.map((batch) => fetchBlockHtmlBatch(batch, notebook)));
+        for (let waveIndex = 0; waveIndex < wave.length; waveIndex += 1) {
+            const batch = wave[waveIndex];
+            const htmlById = htmlResults[waveIndex];
+            const present: string[] = [];
+            const doms: Record<string, string> = {};
+            for (const id of batch) {
+                const html = htmlById.get(id);
                 const blockMatches = matchesById.get(id) ?? [];
-                const unit = extracted.blocks.find((block) => block.blockId === id);
-                const blockEl = unit?.element.closest<HTMLElement>(
-                    `[data-node-id="${CSS.escape(id)}"]`,
-                ) ?? unit?.element ?? null;
-                if (!blockEl) {
+                if (!html) {
                     skippedCount += blockMatches.length;
                     error ??= "block-missing";
                     continue;
                 }
-                const prepared = prepareBlockElementUpdate(
-                    id,
-                    blockEl,
-                    doms[id],
-                    unitsByKey,
-                    blockMatches,
-                    replacementText,
-                    preparedOptions.options,
-                );
-                skippedCount += prepared.skippedCount;
-                if (prepared.update) {
-                    prepared.update.kernelHTML = htmlById.get(id);
-                    updates.push(prepared.update);
-                } else if (prepared.error) {
-                    error ??= prepared.error;
+                const merged = mergeKernelHtmlWithLiveTable(liveRoot, id, html);
+                if (merged.conflict) {
+                    skippedCount += blockMatches.length;
+                    error ??= "table-pending-edit";
+                    continue;
                 }
+                present.push(id);
+                doms[id] = merged.html;
             }
-        } finally {
-            extracted.dispose();
+            if (present.length === 0) {
+                continue;
+            }
+
+            let extracted: Awaited<ReturnType<typeof extractUnitsFromDoms>> | null = null;
+            try {
+                extracted = await extractUnitsFromDoms(
+                    present,
+                    doms,
+                    {
+                        includeInlineMemo: true,
+                        includeImageTitle: true,
+                        includeDocTitle: false,
+                        includeTabSourceForReplace: true,
+                        includeMindmapSourceForReplace: true,
+                    },
+                    new Set(),
+                    "none",
+                );
+            } catch (extractError) {
+                console.warn("[page-search] prepare unloaded replace failed", extractError);
+                for (const id of present) {
+                    skippedCount += matchesById.get(id)?.length ?? 0;
+                }
+                error ??= "block-missing";
+                continue;
+            }
+
+            try {
+                const batchMatches = present.flatMap((id) => matchesById.get(id) ?? []);
+                const unitsByKey = buildUnitMap(extracted.blocks, batchMatches);
+                const preparedOptions = await prepareRegexReplaceOptions(
+                    unitsByKey,
+                    batchMatches,
+                    replacementText,
+                    options,
+                );
+                if (preparedOptions.error) {
+                    return {
+                        updates: [],
+                        skippedCount: totalMatches,
+                        error: preparedOptions.error,
+                        fatal: true,
+                    };
+                }
+                for (const id of present) {
+                    const blockMatches = matchesById.get(id) ?? [];
+                    const unit = extracted.blocks.find((block) => block.blockId === id);
+                    const blockEl = unit?.element.closest<HTMLElement>(
+                        `[data-node-id="${CSS.escape(id)}"]`,
+                    ) ?? unit?.element ?? null;
+                    if (!blockEl) {
+                        skippedCount += blockMatches.length;
+                        error ??= "block-missing";
+                        continue;
+                    }
+                    const prepared = prepareBlockElementUpdate(
+                        id,
+                        blockEl,
+                        doms[id],
+                        unitsByKey,
+                        blockMatches,
+                        replacementText,
+                        preparedOptions.options,
+                    );
+                    skippedCount += prepared.skippedCount;
+                    if (prepared.update) {
+                        prepared.update.kernelHTML = htmlById.get(id);
+                        updates.push(prepared.update);
+                    } else if (prepared.error) {
+                        error ??= prepared.error;
+                    }
+                }
+            } finally {
+                extracted.dispose();
+            }
         }
     }
     return {updates, skippedCount, error};
@@ -863,7 +1042,7 @@ export async function replaceAllMatchesInEditor(
     let skippedCount = 0;
 
     for (const match of matches) {
-        if (!isMatchWritable(edit, match)) {
+        if (!isMatchContentWritable(match)) {
             skippedCount += 1;
             continue;
         }
@@ -880,19 +1059,26 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
+    const submitIndex = collectSubmitBlockIndex(edit);
+    const fetchedMountContents = new Map<string, string>();
+
     const guard = createWriteGuard(
         edit,
         protyle,
         new Set(bodyMatches.map((match) => match.blockId)),
         options.isCurrent,
+        submitIndex,
+        fetchedMountContents,
     );
 
     const blocks = collectSearchableBlocks(edit, {
         includeInlineMemo: true,
         includeImageTitle: true,
+        includeTabSourceForReplace: true,
+        includeMindmapSourceForReplace: true,
     })
         .filter((block) => !isPreviewSyntheticBlock(block));
-    const unitsByKey = buildUnitMap(blocks);
+    const unitsByKey = buildUnitMap(blocks, bodyMatches);
     const loadedOptions = await prepareRegexReplaceOptions(
         unitsByKey,
         bodyMatches,
@@ -906,8 +1092,14 @@ export async function replaceAllMatchesInEditor(
             error: loadedOptions.error,
         };
     }
-    const loadedConflict = guard();
+    const loadedConflict = guard(true);
     if (loadedConflict) {
+        console.warn("[page-search] replace-all cancelled", {
+            stage: "loaded-guard",
+            error: loadedConflict,
+            liveBlocks: submitIndex.preferred.size,
+            matches: bodyMatches.length,
+        });
         return {replacedCount: 0, skippedCount: matches.length, error: loadedConflict};
     }
 
@@ -924,7 +1116,7 @@ export async function replaceAllMatchesInEditor(
     let bodySkipped = 0;
 
     for (const [blockId, blockMatches] of grouped) {
-        const submit = resolveSubmitBlockElement(edit, blockId);
+        const submit = submitIndex.preferred.get(blockId) ?? null;
         // 折叠容器或缺行大表不用界面上的残缺 HTML，改走 getBlockDOM。
         if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
             unloadedMatches.set(blockId, blockMatches);
@@ -965,8 +1157,19 @@ export async function replaceAllMatchesInEditor(
     if (fetched.error) {
         firstError ??= fetched.error;
     }
+    fetched.updates.forEach((update) => {
+        if (update.kernelHTML !== undefined) fetchedMountContents.set(update.id, update.kernelHTML);
+    });
     // 搜索时标为可替换的目标现在准备失败，说明快照已陈旧或覆盖丢失；全部替换不得部分提交。
     if (bodySkipped > 0) {
+        console.warn("[page-search] replace-all cancelled", {
+            stage: "block-preparation",
+            bodySkipped,
+            firstError,
+            loadedUpdates: loadedUpdates.length,
+            fetchedUpdates: fetched.updates.length,
+            unloadedIds: unloadedMatches.size,
+        });
         return {replacedCount: 0, skippedCount: matches.length, error: firstError ?? "stale-target"};
     }
 
@@ -979,9 +1182,16 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
-    const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, notebook);
+    const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, notebook, protyle);
     const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
     if (conflict) {
+        console.warn("[page-search] replace-all cancelled", {
+            stage: "final-guard",
+            error: conflict,
+            kernelCurrent,
+            updates: ordered.length,
+            fetched: fetched.updates.length,
+        });
         return {replacedCount: 0, skippedCount: matches.length, error: conflict};
     }
     const changed = ordered.filter((update) => update.newHTML !== update.oldHTML);
@@ -993,7 +1203,85 @@ export async function replaceAllMatchesInEditor(
         return {replacedCount: unchangedCount, skippedCount, commitState: "confirmed"};
     }
     const rootId = editorRootId(edit);
-    const rollback = captureLiveRollback(edit, protyle, changed);
+    const submitIndexBeforeCommit = collectSubmitBlockIndex(edit);
+    const changedIds = new Set(changed.map((update) => update.id));
+    const selectedBlocks = selectedChangedBlocks(edit, changedIds, submitIndexBeforeCommit);
+    const liveRollbackHtml = new Map<HTMLElement, string>();
+    const selectedPlans: Array<{
+        element: HTMLElement;
+        units: Map<string, SearchableBlock>;
+        matches: SearchMatch[];
+        appliedCount: number;
+        options: PreparedReplaceOptions;
+    }> = [];
+    // Validate every selected copy before touching live content. Only complete
+    // mounted fetched blocks may use the plan; missing rows/children stay guarded.
+    for (const update of changed) {
+        const selectedCopies = selectedBlocks.get(update.id);
+        const selectedMatches = grouped.get(update.id);
+        if (!selectedCopies?.length || !selectedMatches?.length) continue;
+        if (
+            update.kernelHTML !== undefined &&
+            selectedCopies.some((element) => foldedContainerOmitsChildBlocks(element) || editorTableOmitsRows(element))
+        ) {
+            return {replacedCount: 0, skippedCount: matches.length, error: "stale-target"};
+        }
+        const replaceOptions = update.replaceOptions ?? loadedOptions.options;
+        for (const selectedBlock of selectedCopies) {
+            const localBlocks = collectSearchableBlocks(edit, {
+                includeInlineMemo: true,
+                includeImageTitle: true,
+                includeDocTitle: false,
+                includeTabSourceForReplace: true,
+                includeMindmapSourceForReplace: true,
+                scopeRoots: [selectedBlock],
+            }).filter((block) => !isPreviewSyntheticBlock(block));
+            const localUnits = buildUnitMap(localBlocks, selectedMatches);
+            liveRollbackHtml.set(selectedBlock, selectedBlock.outerHTML);
+            const prepared = prepareBlockElementUpdate(
+                update.id,
+                selectedBlock,
+                selectedBlock.outerHTML,
+                localUnits,
+                selectedMatches,
+                replacementText,
+                replaceOptions,
+            );
+            if (prepared.update?.appliedCount !== update.appliedCount || prepared.skippedCount) {
+                return {replacedCount: 0, skippedCount: matches.length, error: "stale-target"};
+            }
+            selectedPlans.push({
+                element: selectedBlock,
+                units: localUnits,
+                matches: selectedMatches,
+                appliedCount: update.appliedCount,
+                options: replaceOptions,
+            });
+        }
+    }
+    const rollback = captureLiveRollback(
+        edit,
+        protyle,
+        changed,
+        liveRollbackHtml,
+        submitIndexBeforeCommit,
+    );
+    for (const plan of selectedPlans) {
+        const liveOutcome = applyMatchesToLiveUnits(
+            plan.units,
+            plan.matches,
+            replacementText,
+            plan.options,
+        );
+        if (liveOutcome.appliedCount !== plan.appliedCount || liveOutcome.skippedCount) {
+            // No await or native submit occurred: all snapshots still belong to
+            // this synchronous preparation. Parents restore their whole subtree.
+            for (const [element, html] of liveRollbackHtml) {
+                if (edit.contains(element)) restoreOuterHtml(element, html);
+            }
+            return {replacedCount: 0, skippedCount: matches.length, error: "stale-target"};
+        }
+    }
     try {
         protyle.transaction(
             changed.map((update) => updateOperation(update.id, update.newHTML)),
@@ -1026,12 +1314,34 @@ export async function replaceAllMatchesInEditor(
 async function fetchedUpdatesUnchanged(
     updates: readonly PreparedBlockUpdate[],
     notebook = "",
+    protyle?: Protyle,
 ): Promise<boolean> {
+    const readContent = protyle ? createCommitContentReader(protyle) : undefined;
+    const equal = (left: string | undefined, right: string | undefined): boolean => {
+        if (left === undefined || right === undefined) return left === right;
+        if (left === right) return true;
+        if (!readContent) return left === right;
+        const leftContent = readContent(left);
+        const rightContent = readContent(right);
+        return leftContent !== undefined && rightContent !== undefined ?
+            leftContent === rightContent :
+            left === right;
+    };
+    const batches: PreparedBlockUpdate[][] = [];
     for (let index = 0; index < updates.length; index += BLOCK_DOM_BATCH_SIZE) {
-        const batch = updates.slice(index, index + BLOCK_DOM_BATCH_SIZE);
-        const current = await fetchBlockHtmlBatch(batch.map((update) => update.id), notebook);
-        if (batch.some((update) => current.get(update.id) !== update.kernelHTML)) {
-            return false;
+        batches.push([...updates.slice(index, index + BLOCK_DOM_BATCH_SIZE)]);
+    }
+    for (let waveStart = 0; waveStart < batches.length; waveStart += BLOCK_DOM_BATCH_CONCURRENCY) {
+        const wave = batches.slice(waveStart, waveStart + BLOCK_DOM_BATCH_CONCURRENCY);
+        const currentResults = await Promise.all(
+            wave.map((batch) => fetchBlockHtmlBatch(batch.map((update) => update.id), notebook)),
+        );
+        for (let waveIndex = 0; waveIndex < wave.length; waveIndex += 1) {
+            const batch = wave[waveIndex];
+            const current = currentResults[waveIndex];
+            if (batch.some((update) => !equal(current.get(update.id), update.kernelHTML))) {
+                return false;
+            }
         }
     }
     return true;
@@ -1063,7 +1373,7 @@ async function replaceFetchedBlockMatches(
             error: prepared.error ?? "apply-failed",
         };
     }
-    const kernelCurrent = await fetchedUpdatesUnchanged(prepared.updates, notebook);
+    const kernelCurrent = await fetchedUpdatesUnchanged(prepared.updates, notebook, protyle);
     const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
     if (conflict) {
         return {replacedCount: 0, skippedCount: matches.length, error: conflict};

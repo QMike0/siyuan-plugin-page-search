@@ -38,6 +38,7 @@ import {
 import {supportsDiagramSourceSearch} from "../../shared/code-block-language";
 import {
     collectSearchableBlocks,
+    isInactiveTabSourceElement,
     createRendererElementFilter,
     directTableCellColumn,
     isDirectTableCell,
@@ -60,7 +61,10 @@ import {
     relativeEmbeddedOrder,
     rebaseEmbeddedOrder,
 } from "../embedded-order";
-import {foldedAttributeViewGroupBody, isUnderNonHeadingCssFold} from "../fold-dom";
+import {
+    foldedAttributeViewGroupBody,
+    isUnderNonHeadingCssFold,
+} from "../fold-dom";
 import {buildListSnippet} from "../list-snippet";
 import type {
     SearchPipelineOptions,
@@ -73,6 +77,7 @@ import {
     diagramSourceText,
     rendererAdapterKind,
 } from "../renderer-adapters";
+import {mathSourceFallbackText} from "../renderer-adapters";
 import {
     collectAuthorHiddenBlockIds,
     isAuthorCssHiddenElement,
@@ -138,7 +143,6 @@ import {
     invalidateDocOrder,
 } from "./order";
 import {projectRangesWithBudget} from "./project";
-import {mathSourceFallbackText} from "../renderer-adapters";
 import {
     isAttributeViewType,
     isDiagramBlock,
@@ -515,7 +519,9 @@ function writeQueryMemo(key: string, signature: string, value: string[] | AvBloc
     for (const item of value) {
         bytes += typeof item === "string" ?
             24 + item.length * 2 :
-            96 + (item.blockId.length + item.avId.length + item.updated.length + item.carrierViewId.length + (item.query?.length ?? 0)) * 2;
+            96 +
+            (item.blockId.length + item.avId.length + item.updated.length + item.carrierViewId.length +
+                    (item.query?.length ?? 0)) * 2;
     }
     rememberCacheBudget(`query:${key}`, bytes, () => queryMemo.delete(key));
     while (queryMemo.size > QUERY_MEMO_LIMIT) {
@@ -628,11 +634,13 @@ function writeTextCache(key: string, entry: Omit<TextCacheEntry, "bytes">): void
         ...entry,
         hasInlineMath: entry.hasInlineMath || entry.units.some((unit) => unit.highlightKind === "inline-math"),
         mathRecovery: entry.mathRecovery && entry.units.some((unit) =>
-            isRendererSourceFallbackUnitId(unit.unitId) && (
-                unit.highlightKind === "inline-math" ||
-                unit.unitId?.replace(/^embed:[^:]+:/, "").startsWith("renderer:source-fallback:math:")
-            )
-        ) ? entry.mathRecovery : undefined,
+                isRendererSourceFallbackUnitId(unit.unitId) && (
+                    unit.highlightKind === "inline-math" ||
+                    unit.unitId?.replace(/^embed:[^:]+:/, "").startsWith("renderer:source-fallback:math:")
+                )
+            ) ?
+            entry.mathRecovery :
+            undefined,
         bytes: estimateCacheEntryBytes(entry.hash, entry.units) + textBytes(entry.codeLanguage) +
             textBytes(entry.liveCodeContent) + textBytes(entry.liveDiagramSource),
     };
@@ -1152,7 +1160,9 @@ async function extractSharedDiagrams(
                         unrenderedIds: result.unrenderedIds.filter((blockId) => blockId === id),
                         missingIds: result.missingIds.filter((blockId) => blockId === id),
                         inlineMathIds: result.inlineMathIds.has(id) ? [id] : [],
-                        mathRecoveries: result.mathRecoveries.has(id) ? [[id, result.mathRecoveries.get(id)!] as const] : [],
+                        mathRecoveries: result.mathRecoveries.has(id) ?
+                            [[id, result.mathRecoveries.get(id)!] as const] :
+                            [],
                     } :
                     {units: [], unrenderedIds: [id], missingIds: [id], inlineMathIds: [], mathRecoveries: []};
             })),
@@ -1381,7 +1391,14 @@ function rememberPlain(
     const hasRenderedDiagram = units.some((unit) =>
         unit.blockType === "NodeCodeBlock" && rendererUnitSource(unit.unitId) === "rendered-text"
     );
-    writeTextCache(key, {hash, units: units.slice(), hasInlineMath, hasRenderedDiagram, mathRecovery, liveDiagramSource});
+    writeTextCache(key, {
+        hash,
+        units: units.slice(),
+        hasInlineMath,
+        hasRenderedDiagram,
+        mathRecovery,
+        liveDiagramSource,
+    });
     plainCacheKeys.set(key, true);
     while (plainCacheKeys.size > PLAIN_CACHE_LIMIT) {
         const dropped = plainCacheKeys.keys().next().value as string | undefined;
@@ -1955,6 +1972,12 @@ function indexMountedTableRows(tableBlock: HTMLElement): {
 }
 
 function isVisuallyInEditor(element: HTMLElement): boolean {
+    // Inactive tab panels are source content hidden by tabsRender CSS. They are
+    // still part of the document and must enter the corpus; Range projection
+    // remains deferred until navigation activates the panel.
+    if (isInactiveTabSourceElement(element)) {
+        return true;
+    }
     // 行内公式是 inline，clientHeight 为 0，但仍然占位。用客户区矩形判断。
     const hasBox = element.clientHeight > 0 ||
         (typeof element.getClientRects === "function" && element.getClientRects().length > 0);
@@ -2168,9 +2191,12 @@ async function searchCurrentDocumentImpl(
     const authorHiddenIds = collectAuthorHiddenBlockIds(resolveDocRoot(edit) ?? edit);
     const surfacedIds = new Set(
         liveAll.filter((unit) =>
-            unit.text && (unit.textNodes.length ?
-                unit.textNodes.some((node) => !isAuthorCssHiddenText(node, options.includeFoldedBlocks === true)) :
-                !isAuthorCssHiddenElement(unit.element))
+            unit.text && (
+                isInactiveTabSourceElement(unit.element) ||
+                (unit.textNodes.length ?
+                    unit.textNodes.some((node) => !isAuthorCssHiddenText(node, options.includeFoldedBlocks === true)) :
+                    !isAuthorCssHiddenElement(unit.element))
+            )
         ).map((unit) => unit.blockId),
     );
     const authorHiddenCache = new Map<string, boolean>();
@@ -2988,7 +3014,13 @@ async function searchCurrentDocumentImpl(
     // 避免已有匹配返回后还为整批公式持续闪烁、再触发一次全文搜索。
     if (missingMath.length > 0) {
         const rendered = await extractMetas(
-            context.rootId, context.notebookId, missingMath, options, "light", () => !cancelled(), options.signal,
+            context.rootId,
+            context.notebookId,
+            missingMath,
+            options,
+            "light",
+            () => !cancelled(),
+            options.signal,
         );
         if (cancelled()) return {matches: [], error: "", cancelled: true};
         units.push(...rendered.units);
@@ -3092,11 +3124,12 @@ async function searchCurrentDocumentImpl(
         const mountedAvs = new Map<string, HTMLElement>();
         const mountedEmbeddedAvs = new Map<string, HTMLElement>();
         const sourceOfAv = createEmbeddedSourceReader();
-        (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]').forEach(element => {
-            const owner = element.closest<HTMLElement>('[data-type="NodeBlockQueryEmbed"][data-node-id]');
-            if (owner) mountedEmbeddedAvs.set(`${owner.dataset.nodeId}\0${sourceOfAv(element)}`, element);
-            else mountedAvs.set(element.dataset.nodeId!, element);
-        });
+        (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]')
+            .forEach(element => {
+                const owner = element.closest<HTMLElement>('[data-type="NodeBlockQueryEmbed"][data-node-id]');
+                if (owner) mountedEmbeddedAvs.set(`${owner.dataset.nodeId}\0${sourceOfAv(element)}`, element);
+                else mountedAvs.set(element.dataset.nodeId!, element);
+            });
         const refs = (loadedRefs?.refs ?? []).filter((ref) => {
             const item = meta.byId.get(ref.blockId);
             return (!item || enabled(item)) && inFocus(ref.blockId);
@@ -3192,7 +3225,10 @@ async function searchCurrentDocumentImpl(
             api.forEach((unit, index) => {
                 const bound = bounds.get(unit.unitId ?? "");
                 const rank = ranks[index] ?? index;
-                avNavigationOrder.set(`${blockId}\0${unit.unitId ?? ""}`, rank + (bound ? 0 : index / (api.length + 1) * 0.25));
+                avNavigationOrder.set(
+                    `${blockId}\0${unit.unitId ?? ""}`,
+                    rank + (bound ? 0 : index / (api.length + 1) * 0.25),
+                );
             });
         }
         const missingByKey = new Map<string, AvBlockRef>();
@@ -3247,7 +3283,9 @@ async function searchCurrentDocumentImpl(
             // rank alone would put every API row before every painted row.
             const bounds = new Map<string, {first: number; last: number;}>();
             for (const block of shown) {
-                const id = avApiUnitId(block.unitId?.replace(/#run-\d+$/, "").replace(/^group-counter:/, "group-title:"));
+                const id = avApiUnitId(
+                    block.unitId?.replace(/#run-\d+$/, "").replace(/^group-counter:/, "group-title:"),
+                );
                 const paths = block.embeddedOrder;
                 if (!id || !paths?.length) continue;
                 const first = paths[0].path[0];
@@ -3351,6 +3389,22 @@ async function searchCurrentDocumentImpl(
     for (const unit of units) {
         byKey.set(`${unit.blockId}\u0000${unit.unitId ?? ""}`, unit);
     }
+    // A projection is writable only when its source block is currently mounted.
+    // Keep the live check cheap and per-id; the write layer still performs the
+    // final source-text validation. Fully unloaded mindmap content arrives as
+    // ordinary source units through the kernel extraction path.
+    const liveRoot = resolveDocRoot(edit) ?? edit;
+    const projectionSourceBacked = new Set<string>();
+    for (const unit of liveAll) {
+        if (unit.matchSource !== "projection" || projectionSourceBacked.has(unit.blockId)) continue;
+        if (
+            liveRoot.querySelector<HTMLElement>(
+                `[data-node-id="${CSS.escape(unit.blockId)}"][data-type]:not(.mindmap-view)`,
+            )
+        ) {
+            projectionSourceBacked.add(unit.blockId);
+        }
+    }
     const matches: SearchMatch[] = [];
     let phaseStarted = performance.now();
     for (let hitIndex = 0; hitIndex < matched.hits.length; hitIndex += 1) {
@@ -3391,10 +3445,11 @@ async function searchCurrentDocumentImpl(
             start: hit.start,
             end: hit.end,
             matchedText: hit.matchedText,
-            replaceable:
-                (nonReplaceable || Boolean(replaceLock) || tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`)) ?
-                    false :
-                    hit.replaceable,
+            replaceable: (nonReplaceable || Boolean(replaceLock) ||
+                    (unit.matchSource === "projection" && !projectionSourceBacked.has(hit.blockId)) ||
+                    tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`)) ?
+                false :
+                hit.replaceable,
             replaceLock,
             highlightKind: unit.highlightKind,
             ...(unit.highlightKind === "inline-math" && unit.mathOrdinal !== undefined ?
@@ -3725,8 +3780,11 @@ function avApiNavigationRanks(
             (!group || !anchoredGroups.has(group) ? last : undefined);
         if (groupTitle) previous = Math.max(previous ?? groupTitle.last, groupTitle.last);
         if (previous !== undefined) previousByGroup.set(group, previous);
-        return bound?.first ?? (following[index] !== undefined ? following[index]! - 0.5 :
-            previous !== undefined ? previous + 0.5 : undefined);
+        return bound?.first ?? (following[index] !== undefined ?
+            following[index]! - 0.5 :
+            previous !== undefined ?
+            previous + 0.5 :
+            undefined);
     });
 }
 
@@ -3849,6 +3907,7 @@ function toSearchUnits(units: CachedUnit[], orderIndex: Map<string, number>): Se
         blockIndex: unit.blockId === "__doc-title__" ? -1 : (orderIndex.get(unit.blockId) ?? unit.blockIndex),
         text: unit.text,
         unitId: unit.unitId,
+        matchSource: unit.matchSource,
         segmentLengths: unit.segmentLengths,
     }));
 }

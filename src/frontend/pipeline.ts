@@ -20,6 +20,7 @@ import {
     TABLE_TYPE,
     collectSearchableBlocks,
     isDocTitleSearchUnit,
+    isInactiveTabSourceElement,
     tableCellReplaceLock,
     inlineMathIdentityText,
     isInlineMathSearchUnit,
@@ -153,13 +154,24 @@ const DOC_TITLE_BLOCK_TYPE = "doc-title";
 const PREVIEW_BLOCK_TYPE = "preview";
 
 function toSearchableUnit(block: SearchableBlock): SearchableUnit {
+    // A renderer projection may split one source text run across presentational
+    // spans. Its offsets are validated against the source block before commit,
+    // so those visual boundaries must not make an otherwise source-backed hit
+    // look non-replaceable.
+    const segmentLengths = block.matchSource === "projection" ?
+        (block.text.length > 0 ? [block.text.length] : undefined) :
+        block.textNodes.map((node) => node.nodeValue?.length ?? 0);
     return {
         blockId: block.blockId,
         blockType: block.blockType,
         blockIndex: block.blockIndex,
         text: block.text,
         unitId: block.unitId,
-        segmentLengths: block.textNodes.map((node) => node.nodeValue?.length ?? 0),
+        matchSource: block.matchSource,
+        // Projection offsets are still useful for validating a source-backed
+        // replacement. The write layer resolves the same blockId back to the
+        // source DOM before committing.
+        segmentLengths,
     };
 }
 
@@ -220,6 +232,7 @@ function isDomReplaceable(
     range: Range,
     blockType: string,
     blockId?: string,
+    projectionSourceBacked = false,
 ): boolean {
     if (blockType === ATTRIBUTE_VIEW_TYPE) {
         return false;
@@ -247,6 +260,11 @@ function isDomReplaceable(
         node.parentElement;
     if (!element) {
         return false;
+    }
+    // Tab labels and mindmap canvas nodes are renderer copies. Their source
+    // block is the transaction target; never serialize the copy itself.
+    if (projectionSourceBacked) {
+        return true;
     }
     if (element.closest(NON_REPLACEABLE_DOM_CLOSEST)) {
         return false;
@@ -503,6 +521,22 @@ function attachRangesToHits(
         }
         const range = createRangeFromBlockOffsets(block, hit.start, hit.end, visibility);
         if (!range) {
+            // An inactive tab source is valid document text, but its panel has
+            // no paintable Range until navigation activates the tab. Keep the
+            // hit so counts and replacement still work in the DOM fallback.
+            if (isInactiveTabSourceElement(block.element)) {
+                acceptedEndByUnit.set(key, hit.end);
+                result.push({
+                    ...hit,
+                    embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
+                    replaceable: !modeBlocked && !isDocTitleSearchUnit(block) &&
+                        !isInlineMathSearchUnit(block) && !isRendererUnitId(hit.unitId) &&
+                        !hit.unitId?.startsWith("embed:") && hit.replaceable,
+                    range: undefined,
+                    highlightKind: "text",
+                    ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
+                });
+            }
             continue;
         }
 
@@ -527,14 +561,24 @@ function attachRangesToHits(
         const replaceLock = hit.blockType === TABLE_TYPE && !isDocTitle && !isMath ?
             tableCellReplaceLock(block.element) :
             undefined;
+        const projectionHost = block.element.closest(".tabs-header, .mindmap-view");
+        const projectionSourceBacked = block.matchSource === "projection" &&
+            Boolean(projectionHost) &&
+            Boolean(
+                edit?.querySelector<HTMLElement>(
+                    `[data-node-id="${CSS.escape(block.blockId)}"][data-type]:not(.mindmap-view)`,
+                ),
+            );
         const replaceable = !replaceLock &&
             !isRendererUnitId(hit.unitId) &&
             !hit.unitId?.startsWith("embed:") &&
             !isDocTitle &&
             !isMath &&
             !modeBlocked &&
-            isDomReplaceable(range, hit.blockType, hit.blockId) &&
-            (isMemo || isRangePlainTextOnly(range));
+            isDomReplaceable(range, hit.blockType, hit.blockId, projectionSourceBacked) &&
+            // The projection may add presentational wrappers; the source write
+            // path rechecks its own Text-node boundaries before committing.
+            (isMemo || projectionSourceBacked || isRangePlainTextOnly(range));
 
         result.push({
             id: hit.id,

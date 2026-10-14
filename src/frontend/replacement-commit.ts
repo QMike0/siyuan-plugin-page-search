@@ -21,6 +21,7 @@ export interface CommitContentReaderOptions {
 
 const COMMIT_WAIT_MS = 8000;
 const COMMIT_BATCH_SIZE = 64;
+const COMMIT_READ_CONCURRENCY = 4;
 
 function notify(observer: CommitObserver, state: ReplaceCommitState): void {
     try {
@@ -41,6 +42,16 @@ export function createCommitContentReader(
         try {
             const template = document.createElement("template");
             template.innerHTML = html;
+            // Siyuan serializes list/mindmap blocks after removing the rendered
+            // canvas and its state markers. Normalize the same derived DOM here
+            // so a redraw between the preflight and final read is not mistaken
+            // for user content changing underneath a replacement.
+            template.content.querySelectorAll(".mindmap-view, .list-mindmap").forEach((element) => element.remove());
+            template.content.querySelectorAll("[data-mindmap-view-rendered], [data-mindmap-view-editing]")
+                .forEach((element) => {
+                    element.removeAttribute("data-mindmap-view-rendered");
+                    element.removeAttribute("data-mindmap-view-editing");
+                });
             // The kernel changes timestamps and adds folded-heading context on render.
             template.content.querySelectorAll("[data-node-id]").forEach((element) => {
                 element.removeAttribute("updated");
@@ -152,34 +163,54 @@ export async function confirmBlockUpdates(
         let delay = 120;
         while (pending.size && Date.now() < deadline) {
             const ids = Array.from(pending.keys());
-            for (let index = 0; index < ids.length && Date.now() < deadline; index += COMMIT_BATCH_SIZE) {
-                const batch = ids.slice(index, index + COMMIT_BATCH_SIZE);
-                const remaining = deadline - Date.now();
-                let timeout: number | undefined;
-                // fetchSyncPost has no cancellation option. A hung read ends this wait;
-                // do not create overlapping requests while the original is unresolved.
-                const response = await Promise.race([
-                    Promise.resolve().then(() =>
-                        fetchSyncPost("/api/block/getBlockDOMs", notebook ? {ids: batch, notebook} : {ids: batch})
-                    )
-                        .catch((): undefined => undefined),
-                    new Promise<undefined>((resolve) => {
-                        timeout = window.setTimeout(() => resolve(undefined), remaining);
-                    }),
-                ]).finally(() => window.clearTimeout(timeout));
-                if (response?.code !== 0 || !response.data || typeof response.data !== "object") continue;
-                const data = response.data as Record<string, unknown>;
-                for (const id of batch) {
-                    const item = pending.get(id);
-                    const html = data[id];
-                    if (!item || typeof html !== "string" || !html || html === item.lastHtml) continue;
-                    item.lastHtml = html;
-                    if (item.expected !== undefined && readContent(html) === item.expected) {
-                        replacedCount += item.update.appliedCount;
-                        pending.delete(id);
+            for (
+                let index = 0;
+                index < ids.length && Date.now() < deadline;
+                index += COMMIT_BATCH_SIZE * COMMIT_READ_CONCURRENCY
+            ) {
+                const batches: string[][] = [];
+                for (
+                    let batchIndex = index;
+                    batchIndex < ids.length && batches.length < COMMIT_READ_CONCURRENCY;
+                    batchIndex += COMMIT_BATCH_SIZE
+                ) {
+                    batches.push(ids.slice(batchIndex, batchIndex + COMMIT_BATCH_SIZE));
+                }
+                // Reads are independent. Keep a small bounded wave so a large
+                // replace-all does not spend the full confirmation budget serially.
+                const responses = await Promise.all(batches.map(async (batch) => {
+                    const remaining = deadline - Date.now();
+                    if (remaining <= 0) return undefined;
+                    let timeout: number | undefined;
+                    // fetchSyncPost has no cancellation option. A timed-out read
+                    // is the last wave; never start a second request for that batch.
+                    return Promise.race([
+                        Promise.resolve().then(() =>
+                            fetchSyncPost("/api/block/getBlockDOMs", notebook ? {ids: batch, notebook} : {ids: batch})
+                        )
+                            .catch((): undefined => undefined),
+                        new Promise<undefined>((resolve) => {
+                            timeout = window.setTimeout(() => resolve(undefined), remaining);
+                        }),
+                    ]).finally(() => window.clearTimeout(timeout));
+                }));
+                for (let responseIndex = 0; responseIndex < responses.length; responseIndex += 1) {
+                    const batch = batches[responseIndex];
+                    const response = responses[responseIndex];
+                    if (response?.code !== 0 || !response.data || typeof response.data !== "object") continue;
+                    const data = response.data as Record<string, unknown>;
+                    for (const id of batch) {
+                        const item = pending.get(id);
+                        const html = data[id];
+                        if (!item || typeof html !== "string" || !html || html === item.lastHtml) continue;
+                        item.lastHtml = html;
+                        if (item.expected !== undefined && readContent(html) === item.expected) {
+                            replacedCount += item.update.appliedCount;
+                            pending.delete(id);
+                        }
+                        const pause = yieldWork();
+                        if (pause) await pause;
                     }
-                    const pause = yieldWork();
-                    if (pause) await pause;
                 }
             }
             if (!pending.size || Date.now() >= deadline) break;

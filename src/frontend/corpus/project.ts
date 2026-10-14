@@ -610,6 +610,12 @@ function liveUnitRank(block: SearchableBlock): number {
     if (!block.element.closest(EMBED_BLOCK_SELECTOR)) {
         rank += 1;
     }
+    // Mindmap/tab projections are the only live copy that can paint a match
+    // while the source block is hidden. Prefer that copy for Range projection;
+    // replacement still resolves the same blockId back to the source DOM.
+    if (block.matchSource === "projection") {
+        rank += 2;
+    }
     return rank;
 }
 

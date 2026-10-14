@@ -9,14 +9,18 @@ const {JSDOM} = require("../../analysis/node_modules/jsdom");
 const repo = path.resolve(__dirname, "..");
 let api;
 let editors = [];
+let editorReads = 0;
 let confirmAction = (yes) => yes();
 const originalLoad = Module._load;
 Module._load = function(request, parent, main) {
     if (request === "siyuan") {
         return {
             fetchSyncPost: (...args) => api(...args),
-            getAllEditor: () => editors,
-            confirm: (_title, _text, yes) => confirmAction(yes),
+            getAllEditor: () => {
+                editorReads++;
+                return editors;
+            },
+            confirm: (title, text, yes, no) => confirmAction(yes, no, text, title),
             showMessage: () => {},
             hideMessage: () => {},
         };
@@ -925,6 +929,101 @@ async function main() {
         bar.resultSearchKey = bar.searchResultKey();
         return bar;
     }
+    const writableMatch = searchBarFixture().resultMatches[0];
+    const nonWritableMatches = [
+        {...writableMatch, id: "title", blockId: "__doc-title__", blockType: "doc-title", replaceable: true},
+        {...writableMatch, id: "av", blockId: "av", blockType: "NodeAttributeView", replaceable: true},
+        {...writableMatch, id: "preview", blockId: "__preview__", replaceable: true},
+        {...writableMatch, id: "math", blockId: "math", blockType: "NodeMathBlock", replaceable: false},
+        {...writableMatch, id: "rich", blockId: "rich", replaceable: false, replaceLock: "table-rich"},
+        {...writableMatch, id: "editing", blockId: "editing", replaceable: false, replaceLock: "table-cell-editor"},
+        {...writableMatch, id: "embed", blockId: "embed", unitId: "embed:source", replaceable: false},
+        {...writableMatch, id: "complex", blockId: "complex", replaceable: false},
+    ];
+    const mixedMatches = [writableMatch, ...nonWritableMatches];
+    assert.equal(write.countWritableMatches(edit, mixedMatches), 1);
+    assert.equal(
+        write.countWritableMatches(edit, mixedMatches),
+        mixedMatches.filter(match => write.isMatchWritable(edit, match)).length,
+        "confirmation and writer share the content eligibility policy",
+    );
+    assert.equal(
+        write.countWritableMatches(edit, [{...writableMatch, range: undefined}]),
+        1,
+        "unloaded/folded matches remain eligible without a live Range",
+    );
+    const beforeCountReads = editorReads;
+    assert.equal(write.countWritableMatches(edit, new Array(20000).fill(writableMatch)), 20000);
+    assert.equal(editorReads - beforeCountReads, 1, "counting checks editor mode once, not once per match");
+    protyle.protyle.disabled = true;
+    assert.equal(write.countWritableMatches(edit, mixedMatches), 0, "readonly mode has no writable matches");
+    protyle.protyle.disabled = false;
+
+    for (const language of ["zh-CN", "en"]) {
+        const text = JSON.parse(fs.readFileSync(path.join(repo, "src/i18n", language + ".json"), "utf8"));
+        for (const scope of ["document", "focus", "selection"]) {
+            const bar = searchBarFixture();
+            bar.i18n = text;
+            bar.resultMatches = mixedMatches;
+            bar.resultCount = mixedMatches.length;
+            protyle.protyle.block.id = scope === "focus" ? "b" : "r";
+            protyle.protyle.block.showAll = scope === "focus";
+            if (scope === "selection") {
+                bar.selectionOnly = true;
+                bar.rememberedSelectionScope = new Map();
+                bar.resultSelectionScope = bar.rememberedSelectionScope;
+                bar.resultSearchKey = bar.searchResultKey();
+            }
+            let confirmation;
+            confirmAction = (_yes, no, message, title) => {
+                confirmation = {message, title};
+                no();
+            };
+            const before = commits;
+            const previousApi = api;
+            api = () => {
+                throw new Error("confirmation must not fetch or prepare replacement DOM");
+            };
+            try {
+                await bar.clickReplaceAll();
+            } finally {
+                api = previousApi;
+                protyle.protyle.block.id = "r";
+                protyle.protyle.block.showAll = false;
+            }
+            const scopeText = text["replaceAllScope" + scope[0].toUpperCase() + scope.slice(1)];
+            assert.deepEqual(confirmation, {
+                title: text.replaceAllConfirmTitle,
+                message: text.replaceAllConfirm
+                    .replace("{scope}", scopeText)
+                    .replace("{matchCount}", "9")
+                    .replace("{count}", "1")
+                    .replace("{skippedCount}", "8"),
+            }, "localized confirmation describes the actual eligible count and scope");
+            assert.equal(commits, before, "cancelled confirmation does not write");
+        }
+    }
+    const unsupportedAll = searchBarFixture();
+    unsupportedAll.resultMatches = nonWritableMatches;
+    unsupportedAll.resultCount = nonWritableMatches.length;
+    unsupportedAll.syncReplaceButtons();
+    assert.equal(unsupportedAll.replaceAllBtn.getAttribute("aria-disabled"), "true");
+    confirmAction = () => {
+        throw new Error("zero eligible matches must not open a confirmation");
+    };
+    const beforeUnsupportedAll = commits;
+    await unsupportedAll.clickReplaceAll();
+    assert.equal(commits, beforeUnsupportedAll);
+    confirmAction = (yes) => yes();
+    const mixedAll = searchBarFixture();
+    mixedAll.resultMatches = [mixedAll.resultMatches[0], ...nonWritableMatches];
+    mixedAll.resultCount = mixedAll.resultMatches.length;
+    const beforeMixedAll = commits;
+    await mixedAll.clickReplaceAll();
+    assert.equal(commits - beforeMixedAll, 1, "mixed results keep the existing single transaction behavior");
+    assert.match(writtenHtml.get("b"), /zap/);
+    assert.equal(writtenHtml.has("av"), false, "unsupported results never enter the transaction");
+    console.log("P2 replacement confirmation: writable/skip counts, scopes, locales and one mode check OK");
     for (const all of [false, true]) {
         for (const change of ["input", "option", "root", "generation"]) {
             const bar = searchBarFixture();

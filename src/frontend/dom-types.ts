@@ -21,7 +21,7 @@ export interface SearchableBlock {
      * - inline-math：优先 KaTeX `.katex-html` 字形，冷态失败时源码单元独立标识且无 Range
      * Range 优先按 textNodes 偏移；备注对准宿主 span。
      */
-    matchSource?: "text" | "inline-memo" | "inline-math";
+    matchSource?: "text" | "inline-memo" | "inline-math" | "projection";
     /**
      * 块内排序锚点。行内备注的 start 是备注正文里的偏移，
      * 这里记宿主 span 在块文本中的位置，跳转才按出现顺序。

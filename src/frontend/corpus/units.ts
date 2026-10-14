@@ -31,6 +31,7 @@ export interface CachedUnit {
     blockIndex: number;
     text: string;
     unitId?: string;
+    matchSource?: SearchableBlock["matchSource"];
     embeddedOrder?: readonly EmbeddedOrderSegment[];
     embeddedAvRef?: AvBlockRef;
     /** Mounted recovery cache: embeddedOrder is relative to this renderer's current anchor. */
@@ -159,9 +160,11 @@ export function freezeBlock(
     // 备注正文在属性里，没有 Text 节点。整段属性是一个可替换片段。
     const lengths = blocked ?
         undefined :
-        (isInlineMemoSearchUnit(block) ?
+        (block.matchSource === "projection" ?
             (block.text.length > 0 ? [block.text.length] : undefined) :
-            block.textNodes.map((node) => node.nodeValue?.length ?? 0));
+            (isInlineMemoSearchUnit(block) ?
+                (block.text.length > 0 ? [block.text.length] : undefined) :
+                block.textNodes.map((node) => node.nodeValue?.length ?? 0)));
     const replaceLock = block.blockType === "NodeTable" ? tableCellReplaceLock(block.element) : undefined;
     let highlightKind: CachedUnit["highlightKind"] = "text";
     if (isInlineMemoSearchUnit(block)) {
@@ -175,6 +178,7 @@ export function freezeBlock(
         blockIndex,
         text: block.text,
         unitId: block.unitId,
+        matchSource: block.matchSource,
         embeddedOrder: block.embeddedOrder,
         embeddedAvRef: block.embeddedAvRef,
         segmentLengths: lengths?.some((length) => length > 0) ? lengths : undefined,

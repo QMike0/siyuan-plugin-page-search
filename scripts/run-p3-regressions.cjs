@@ -124,6 +124,48 @@ function pipelineFixture(name) {
     return bar;
 }
 
+async function undoSavedocRegressions() {
+    const originalTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (callback, ms, ...args) => originalTimeout(callback, ms === 400 ? 15 : ms, ...args);
+    const wait = ms => new Promise(resolve => originalTimeout(resolve, ms));
+    try {
+        for (const timing of ["before-search", "after-search", "without-dom-change"]) {
+            const bar = pipelineFixture("undo-save-" + timing);
+            const content = bar.edit.querySelector('[contenteditable="true"]');
+            content.textContent = "bar";
+            await bar.highlightHitResult("foo", true);
+            assert.equal(bar.resultCount, 0);
+            let refreshes = 0;
+            const highlight = bar.highlightHitResult.bind(bar);
+            bar.highlightHitResult = (...args) => {
+                refreshes++;
+                return highlight(...args);
+            };
+            bar.stopEditorDomWatch = watchEditorDom(bar.edit, {
+                onMutate: () => bar.domEpoch++,
+                onSettled: change => bar.onEditorDomSettled(change),
+            }, 1);
+            bar.onEventBus({detail: {cmd: "savedoc"}});
+            if (timing === "after-search") await wait(80);
+            if (timing !== "without-dom-change") {
+                content.textContent = "foo foo";
+                await wait(150);
+                assert.equal(bar.resultCount, 2, "zero old matches refresh after delayed undo DOM replay: " + timing);
+            } else {
+                await wait(80);
+                assert.equal(refreshes, 1, "savedoc without local DOM still refreshes unloaded content");
+            }
+            const finished = refreshes;
+            await wait(80);
+            assert.equal(refreshes, finished, "undo settles without a recurring search loop");
+            bar.destroy();
+        }
+    } finally {
+        window.setTimeout = originalTimeout;
+    }
+    console.log("savedoc before/after search, zero-result undo DOM replay and no-DOM savedoc refresh OK");
+}
+
 async function diagramRegressions() {
     // Keep real observers/pipeline/state guards; shorten only the shared 400ms user-input delay.
     const originalTimeout = window.setTimeout.bind(window);
@@ -1362,6 +1404,7 @@ async function lifecycleRegressions() {
     assert.equal(unexpected, 0);
 }
 async function main() {
+    await undoSavedocRegressions();
     for (const unitId of ["renderer:source-fallback:mermaid:0", "embed:source:renderer:source-fallback:flowchart:0"]) {
         const sourceBar = fixture("source-owner");
         sourceBar.resultMatches = [{...textMatches("foo", "source-owner", unitId)[0], replaceable: false}];

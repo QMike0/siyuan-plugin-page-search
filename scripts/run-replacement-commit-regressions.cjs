@@ -105,7 +105,20 @@ function fixture(contents = [paragraph(id, "foo")], mode = "success") {
     let afterWriteReads = 0;
     let queued;
     const persist = operations => {
-        for (const op of operations) kernel.set(op.id, normalize(op.data));
+        for (const op of operations) {
+            kernel.set(op.id, normalize(op.data));
+            // The native tree shares children with their containing block DOM.
+            for (const [parentId, html] of kernel) {
+                if (parentId === op.id || !html.includes(`data-node-id="${op.id}"`)) continue;
+                const parent = document.createElement("template");
+                parent.innerHTML = html;
+                const child = parent.content.querySelector(`[data-node-id="${op.id}"]`);
+                if (child) {
+                    child.outerHTML = normalize(op.data);
+                    kernel.set(parentId, parent.innerHTML);
+                }
+            }
+        }
     };
     function submit(operations, undo) {
         calls.push({operations, undo});
@@ -114,7 +127,11 @@ function fixture(contents = [paragraph(id, "foo")], mode = "success") {
             const lives = mode === "throw-after-all" ?
                 wysiwyg.querySelectorAll(`[data-node-id="${op.id}"]`) :
                 [wysiwyg.querySelector(`[data-node-id="${op.id}"]`)].filter(Boolean);
-            for (const live of lives) live.outerHTML = normalize(op.data);
+            for (const live of lives) {
+                const selection = window.getSelection();
+                if (selection?.rangeCount && live.contains(selection.getRangeAt(0).startContainer)) continue;
+                live.outerHTML = normalize(op.data);
+            }
         }
         if (mode === "throw-after" || mode === "throw-after-all") throw new Error("native optimistic rendering failed");
         if (mode === "new-edit-then-throw") {
@@ -236,6 +253,326 @@ async function main() {
         }
     }
     console.log("Current/all × live/fetched: confirmed success, native undo and no-op paths OK");
+
+    const selected = fixture([paragraph(id, "foo"), paragraph(otherId, "foo")]);
+    const selectedText = selected.wysiwyg.querySelector(`[data-node-id="${id}"] [contenteditable="true"]`).firstChild;
+    const selectedRange = document.createRange();
+    selectedRange.selectNodeContents(selectedText);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(selectedRange);
+    const selectedResult = await run(selected, true);
+    assert.equal(selectedResult.commitState, "confirmed");
+    assert.equal(selected.wysiwyg.textContent.match(/bar/g)?.length ?? 0, 2, "selected block syncs after replace-all");
+    window.getSelection().removeAllRanges();
+    console.log("Replace-all selected-block DOM synchronization OK");
+
+    if (!lute) {
+        const selectedContainer = fixture([
+            `<div data-node-id="${id}" data-type="NodeCallout" class="callout">` +
+            '<div class="callout-title">foo</div><div class="callout-content">' +
+            paragraph(otherId, "foo") + '</div><div class="protyle-attr"></div></div>',
+        ]);
+        const nestedRange = document.createRange();
+        nestedRange.selectNodeContents(selectedContainer.wysiwyg.querySelector('[contenteditable="true"]'));
+        window.getSelection().addRange(nestedRange);
+        const containerResult = await run(selectedContainer, true);
+        assert.equal(containerResult.commitState, "confirmed");
+        assert.equal(containerResult.replacedCount, 2);
+        assert.equal(selectedContainer.wysiwyg.textContent.match(/bar/g)?.length ?? 0, 2,
+            "native skips selected ancestors too; both the callout title and child must sync");
+        window.getSelection().removeAllRanges();
+    }
+
+    window.getSelection().removeAllRanges();
+    console.log("Selected container/child and nested content sync together OK");
+
+    // The reported literal-search case spans 1775 blocks. Count editor-wide ID
+    // scans rather than asserting a machine-dependent wall-clock threshold.
+    const largeCount = lute ? 128 : 1775;
+    const large = fixture(Array.from({length: largeCount}, (_, index) =>
+        paragraph("20261013120000-" + index.toString(36).padStart(7, "0"), "foo")
+    ));
+    // Keep the host stub linear too; this case measures the plugin's own scans.
+    const largeElements = new Map(Array.from(large.wysiwyg.children, element => [element.dataset.nodeId, element]));
+    large.protyle.transaction = (operations, undo) => {
+        large.calls.push({operations, undo});
+        for (const operation of operations) {
+            const template = document.createElement("template");
+            template.innerHTML = normalize(operation.data);
+            const replacement = template.content.firstElementChild;
+            largeElements.get(operation.id).replaceWith(replacement);
+            largeElements.set(operation.id, replacement);
+            large.kernel.set(operation.id, replacement.outerHTML);
+        }
+    };
+    let repeatedIdScans = 0;
+    const largeQuery = large.edit.querySelectorAll.bind(large.edit);
+    large.edit.querySelectorAll = (selector) => {
+        if (/^\[data-node-id="/.test(selector)) repeatedIdScans++;
+        return largeQuery(selector);
+    };
+    const largeStarted = Date.now();
+    const largeResult = await run(large, true);
+    assert.equal(largeResult.commitState, "confirmed");
+    assert.equal(largeResult.replacedCount, largeCount);
+    assert.equal(large.calls.length, 1, "large replace-all remains one native transaction");
+    assert.equal(large.calls[0].undo.length, largeCount);
+    assert.equal(repeatedIdScans, 0, "write guards/preparation/rollback never scan the editor once per ID");
+    assert.ok(large.requests.every(request => request.ids.length <= 64));
+    assert.equal(large.requests.length, Math.ceil(largeCount / 64), "confirmed blocks are read once");
+    assert.equal((large.wysiwyg.textContent.match(/bar/g) ?? []).length, largeCount);
+    large.protyle.transaction(large.calls[0].undo, large.calls[0].operations);
+    assert.equal(
+        (large.wysiwyg.textContent.match(/foo/g) ?? []).length,
+        largeCount,
+        "complete undo payload restores all blocks",
+    );
+    console.log(`${largeCount}-block literal replacement: bounded scans/read batches and complete single-transaction undo OK`, {
+        elapsedMs: Date.now() - largeStarted,
+    });
+
+    // A virtualized editor can have every hit outside the live DOM. Reads may
+    // overlap in bounded waves, but preparation still commits one undoable tx.
+    const fetchedLarge = fixture(Array.from({length: 256}, (_, index) =>
+        paragraph("20261013130000-" + index.toString(36).padStart(7, "0"), "foo")
+    ));
+    fetchedLarge.wysiwyg.innerHTML = "";
+    const originalApi = api;
+    let inflightReads = 0;
+    let maxInflightReads = 0;
+    api = async (_url, {ids}) => {
+        inflightReads++;
+        maxInflightReads = Math.max(maxInflightReads, inflightReads);
+        await delay(3);
+        const data = Object.fromEntries(ids.map(blockId => [blockId, fetchedLarge.kernel.get(blockId)]));
+        inflightReads--;
+        return {code: 0, data};
+    };
+    const fetchedLargeResult = await run(fetchedLarge, true);
+    api = originalApi;
+    assert.equal(fetchedLargeResult.commitState, "confirmed");
+    assert.equal(fetchedLargeResult.replacedCount, 256);
+    assert.equal(fetchedLarge.calls.length, 1, "fully fetched replace-all remains one native transaction");
+    assert.equal(fetchedLarge.calls[0].undo.length, 256);
+    assert.equal(maxInflightReads, 4, "unloaded block reads use the bounded four-request wave");
+    assert.equal(
+        fetchedLarge.calls[0].operations.length,
+        256,
+        "all unloaded updates enter the same transaction",
+    );
+    fetchedLarge.protyle.transaction(fetchedLarge.calls[0].undo, fetchedLarge.calls[0].operations);
+    assert.equal(
+        Array.from(fetchedLarge.kernel.values()).filter(html => html.includes(">foo<")).length,
+        256,
+        "unloaded replace-all keeps a complete undo payload",
+    );
+    console.log("Fully unloaded replace-all uses bounded read waves and one complete undoable transaction OK");
+
+    // Native paragraph/list markup contains numbering metadata, runtime action
+    // nodes and the attribute ZWSP. Unloaded paragraphs must retain their own
+    // replacement offsets and native undo data outside the list container.
+    const nativeParagraph = (blockId, text) =>
+        `<div data-node-id="${blockId}" data-node-index="1" data-type="NodeParagraph" class="p" updated="20261014102649">` +
+        `<div contenteditable="true" spellcheck="false">${text}</div>` +
+        '<div class="protyle-attr" contenteditable="false">\u200b</div></div>';
+    const listId = "20261014120000-aaaaaaa";
+    const itemId = "20261014120000-bbbbbbb";
+    for (const mixed of [false, true]) {
+        const native = fixture([
+            nativeParagraph(id, "foo foo"),
+            `<div data-node-id="${listId}" data-type="NodeList" data-subtype="u" class="list">` +
+            `<div data-node-id="${itemId}" data-type="NodeListItem" data-subtype="u" class="li">` +
+            '<div class="protyle-action">1.</div>' + nativeParagraph(otherId, "foo") +
+            '<div class="protyle-attr">\u200b</div></div><div class="protyle-attr">\u200b</div></div>',
+        ]);
+        for (const element of native.wysiwyg.querySelectorAll("[data-node-id]")) {
+            native.kernel.set(element.dataset.nodeId, element.outerHTML);
+        }
+        native.wysiwyg.innerHTML = mixed ? nativeParagraph(id, "foo foo") : "";
+        const result = await run(native, true);
+        assert.equal(result.commitState, "confirmed");
+        assert.equal(result.replacedCount, 3);
+        assert.equal(native.calls.length, 1);
+        assert.equal(native.calls[0].operations.length, 2);
+        assert.ok(native.kernel.get(listId).includes(">bar</div>"), "list child and parent kernel DOM agree");
+        native.protyle.transaction(native.calls[0].undo, native.calls[0].operations);
+        assert.ok(native.kernel.get(listId).includes(">foo</div>"), "unloaded list child undo retains parent content");
+    }
+    console.log("Native paragraph/list DOM: entirely unloaded and mixed coverage replace/undo OK");
+
+    for (const all of [false, true]) {
+        const copiedOnly = fixture();
+        copiedOnly.wysiwyg.innerHTML =
+            `<div data-node-id="${otherId}" data-type="NodeBlockQueryEmbed">` +
+            '<div class="protyle-wysiwyg__embed">' + paragraph(id, "foo") + '</div></div>';
+        const result = await run(copiedOnly, all);
+        assert.equal(result.commitState, "confirmed",
+            "an embedded source copy must not masquerade as the unloaded document block");
+        assert.equal(result.replacedCount, 1);
+        assert.equal(copiedOnly.calls.length, 1);
+        assert.equal(copiedOnly.requests.length, 3, "the actual unloaded source uses the fetched route");
+    }
+    console.log("Unloaded document source plus a mounted embedded copy uses authoritative fetched content OK");
+
+    // With paragraph search disabled, image captions have their own unit IDs
+    // and offsets. Replacement must preserve that identity when recollecting.
+    for (const all of [false, true]) {
+        for (const fetched of [false, true]) {
+            const imageTitle = fixture([paragraph(id,
+                'before <span class="img" data-type="img" contenteditable="false"><span> </span><span>' +
+                '<img src="assets/example.png" data-src="assets/example.png" title="foo">' +
+                '<span class="protyle-action__title"><span>foo</span></span></span><span> </span></span> after')]);
+            imageTitle.matches = matcher.matchTextUnitsDetailed(
+                blocks.collectSearchableBlocks(imageTitle.edit, {includeDocTitle: false, includeParagraph: false})
+                    .map(unit => ({...unit, segmentLengths: unit.textNodes.map(node => node.length)})),
+                "foo",
+            ).hits;
+            assert.equal(imageTitle.matches.length, 1);
+            assert.equal(imageTitle.matches[0].unitId, "image-title:0");
+            if (fetched) imageTitle.wysiwyg.innerHTML = "";
+            const result = await run(imageTitle, all);
+            assert.equal(result.commitState, "confirmed", "image-title-only matches remain replaceable");
+            assert.equal(result.replacedCount, 1);
+            const committed = imageTitle.kernel.get(id);
+            assert.ok(committed.includes('title="bar"'), "caption writes back to img title");
+            assert.ok(committed.includes("before") && committed.includes("after"), "paragraph body is preserved");
+        }
+    }
+    console.log("Image-title-only search: current/all × live/fetched offsets and img title persistence OK");
+
+    for (const all of [false, true]) {
+        for (const change of ["render-metadata", "saved-attribute", "text"]) {
+            const fetchedSnapshot = fixture([nativeParagraph(id, "foo")]);
+            fetchedSnapshot.wysiwyg.innerHTML = "";
+            if (!lute) fetchedSnapshot.protyle.protyle.lute = {BlockDOM2Md: html => html};
+            const snapshotApi = api;
+            let reads = 0;
+            api = async (url, body) => {
+                const response = await snapshotApi(url, body);
+                if (++reads === 2) {
+                    let html = response.data[id];
+                    if (change === "render-metadata") {
+                        html = html.replace('updated="20261014102649"',
+                            'updated="20261014102650" parent-heading="heading-id"');
+                    } else if (change === "saved-attribute") {
+                        html = html.replace('class="p"', 'class="p" style="color: red;"');
+                    } else {
+                        html = html.replace(">foo</div>", ">new foo</div>");
+                    }
+                    response.data[id] = html;
+                }
+                return response;
+            };
+            const result = await run(fetchedSnapshot, all);
+            assert.equal(fetchedSnapshot.calls.length, change === "render-metadata" ? 1 : 0,
+                "fetched comparison ignores only render metadata, not saved attributes or text");
+            assert.equal(result.replacedCount, change === "render-metadata" ? 1 : 0);
+            api = snapshotApi;
+        }
+    }
+    console.log("Fetched snapshot recheck tolerates render metadata and rejects saved-attribute/text changes OK");
+
+    // Exercise the real SearchBar snapshot predicate: a normal mount changes
+    // domEpoch even when the kernel snapshot and writable text are unchanged.
+    for (const [phase, changed, selected] of ["before-read", "during-read"].flatMap(phase =>
+        [false, true].flatMap(changed => [false, true].map(selected => [phase, changed, selected]))
+    )) {
+        const mounted = fixture();
+        mounted.wysiwyg.innerHTML = "";
+        const bar = barFixture(mounted);
+        Object.assign(bar, {
+            resultSearchGeneration: 1,
+            domEpoch: 0,
+            resultDomEpoch: 0,
+            documentEpoch: 0,
+            resultDocumentEpoch: 0,
+        });
+        delete bar.hasStableReplaceAllSnapshot;
+        const mountedApi = api;
+        let mountedOnce = false;
+        const mount = () => {
+            mountedOnce = true;
+            mounted.wysiwyg.innerHTML = paragraph(id, changed ? "edited foo" : "foo");
+            if (selected) {
+                const range = document.createRange();
+                range.selectNodeContents(mounted.wysiwyg.querySelector('[contenteditable="true"]'));
+                window.getSelection().addRange(range);
+            }
+            bar.domEpoch++;
+        };
+        if (phase === "before-read") {
+            const expand = source("shared/regex-replace").expandRegexReplacementUnits;
+            bar.regex = true;
+            bar.regexMatcher = {
+                expandReplacements: async (requests, pattern, template, options) => {
+                    if (!mountedOnce) mount();
+                    return {expansions: expand(requests, pattern, template, options), error: ""};
+                },
+            };
+        }
+        api = async (url, body) => {
+            const response = await mountedApi(url, body);
+            if (!mountedOnce) mount();
+            return response;
+        };
+        messages.length = 0;
+        await bar.clickReplaceAll();
+        assert.equal(mounted.calls.length, changed ? 0 : 1,
+            "normal mounting is allowed; a mounted text edit still cancels before submit");
+        if (!changed) assert.equal(mounted.wysiwyg.querySelector('[contenteditable="true"]').textContent, "bar",
+            "a selected mounted block also receives the replacement in live DOM");
+        window.getSelection().removeAllRanges();
+        api = mountedApi;
+    }
+    console.log("SearchBar replace-all tolerates unchanged block mounting and rejects mounted edits OK");
+
+    for (const change of ["document-event", "query-generation", "replacement", "readonly", "root"]) {
+        const stale = fixture();
+        stale.wysiwyg.innerHTML = "";
+        const bar = barFixture(stale);
+        Object.assign(bar, {
+            resultSearchGeneration: 1,
+            domEpoch: 0,
+            resultDomEpoch: 0,
+            documentEpoch: 0,
+            resultDocumentEpoch: 0,
+        });
+        delete bar.hasStableReplaceAllSnapshot;
+        const staleApi = api;
+        api = async (url, body) => {
+            const response = await staleApi(url, body);
+            if (change === "document-event") bar.documentEpoch++;
+            if (change === "query-generation") bar.searchGeneration++;
+            if (change === "replacement") bar.replaceText = "other";
+            if (change === "readonly") stale.protyle.protyle.disabled = true;
+            if (change === "root") stale.protyle.protyle.block.rootID = "other-doc";
+            return response;
+        };
+        await bar.clickReplaceAll();
+        assert.equal(stale.calls.length, 0, "replace-all preparation still rejects " + change);
+        api = staleApi;
+    }
+    console.log("SearchBar preparation still guards document/query/replacement/readonly/navigation changes OK");
+
+    const failedFetched = fixture(Array.from({length: 128}, (_, index) =>
+        paragraph("20261013140000-" + index.toString(36).padStart(7, "0"), "foo")
+    ));
+    failedFetched.wysiwyg.innerHTML = "";
+    const failedApi = api;
+    let failedRead = false;
+    api = async (_url, {ids}) => {
+        await delay(1);
+        if (!failedRead) {
+            failedRead = true;
+            return {code: -1, data: {}};
+        }
+        return {code: 0, data: Object.fromEntries(ids.map(blockId => [blockId, failedFetched.kernel.get(blockId)]))};
+    };
+    const failedFetchedResult = await run(failedFetched, true);
+    api = failedApi;
+    assert.equal(failedFetchedResult.replacedCount, 0, "a failed fetched read cancels the whole replace-all");
+    assert.equal(failedFetched.calls.length, 0, "a failed fetched read never submits a partial transaction");
+    console.log("Fetched read failure cancels replace-all before any partial write OK");
 
     for (const all of [false, true]) {
         for (const fetched of [false, true]) {
@@ -419,6 +756,33 @@ async function main() {
                 2,
                 "fetched errors keep original queue and do not POST fallback transactions",
             );
+        }
+        for (const mode of ["throw-before", "throw-after"]) {
+            const mounted = fixture([paragraph(id, reference("foo"))], mode);
+            const originalHTML = mounted.wysiwyg.innerHTML;
+            mounted.wysiwyg.innerHTML = "";
+            const mountedApi = api;
+            api = async (url, body) => {
+                const response = await mountedApi(url, body);
+                if (!mounted.wysiwyg.firstElementChild) {
+                    mounted.wysiwyg.innerHTML = originalHTML;
+                    const range = document.createRange();
+                    range.selectNodeContents(mounted.wysiwyg.querySelector('[contenteditable="true"]'));
+                    window.getSelection().addRange(range);
+                }
+                return response;
+            };
+            try {
+                const result = await run(mounted, true);
+                assert.equal(result.commitState, "failed");
+                assert.equal(mounted.calls.length, 1);
+                assert.equal(mounted.requests.length, 2, "selected fetched failures never retry writes");
+                assert.equal(mounted.wysiwyg.innerHTML, originalHTML,
+                    "a selected block mounted during preparation restores its original dynamic reference");
+            } finally {
+                window.getSelection().removeAllRanges();
+                api = mountedApi;
+            }
         }
     } finally {
         console.warn = savedWarn;
@@ -636,6 +1000,68 @@ async function main() {
     }
     console.log("Actual SearchBar single/all: only confirmed writes show success; failed/unknown/pending messages OK");
 
+    const stalePreparation = fixture();
+    stalePreparation.matches[0].start = 1;
+    stalePreparation.matches[0].end = 4;
+    const staleBar = barFixture(stalePreparation);
+    staleBar.i18n.replaceStaleTarget = "CANCELLED";
+    let staleRefreshes = 0;
+    staleBar.highlightHitResult = async () => staleRefreshes++;
+    messages.length = 0;
+    await staleBar.clickReplaceAll();
+    assert.equal(stalePreparation.calls.length, 0, "failed preparation never submits a partial write");
+    assert.equal(staleRefreshes, 1);
+    assert.ok(messages.some(message => message.text === "CANCELLED"));
+    assert.ok(
+        !messages.some(message => message.text.startsWith("SUCCESS")),
+        "preparation failure never shows success: 0",
+    );
+    console.log("SearchBar reports failed replace-all preparation as cancellation, not success: 0 OK");
+
+    for (const all of [false, true]) {
+        const f = fixture(undefined, "delayed");
+        const bar = barFixture(f);
+        Object.assign(bar, {
+            domEpoch: 0,
+            documentEpoch: 0,
+            root: document.createElement("div"),
+            includeAttributeView: true,
+            rememberCurrentRootId: () => "r",
+            plugin: {isLastHighlightComponent: () => false},
+        });
+        let refreshes = 0;
+        bar.highlightHitResult = async () => {
+            refreshes++;
+            bar.searchGeneration++;
+        };
+        const nativeSubmit = f.protyle.transaction;
+        const notifySave = (operations, undo) => {
+            nativeSubmit(operations, undo);
+            bar.onEventBus({detail: {cmd: "savedoc"}});
+            bar.scheduleAttrViewResearch([], false);
+            bar.scheduleIndexRefresh("r");
+        };
+        f.protyle.transaction = notifySave;
+        f.protyle.updateTransactionElement = (element, before) =>
+            notifySave(
+                [{id: element.dataset.nodeId, action: "update", data: element.outerHTML}],
+                [{id: element.dataset.nodeId, action: "update", data: before}],
+            );
+        const read = api;
+        api = async (...args) => {
+            assert.equal(refreshes, 0, "savedoc never starts a search while confirming the replacement");
+            return read(...args);
+        };
+        await (all ? bar.clickReplaceAll() : bar.clickReplace());
+        await delay(450);
+        assert.equal(f.calls.length, 1);
+        assert.equal(refreshes, 1, "savedoc/AV/index notifications merge into the normal completion search");
+        window.clearTimeout(bar.typingTimer);
+        window.clearTimeout(bar.avRefreshTimer);
+        window.clearTimeout(bar.indexSettledTimer);
+    }
+    console.log("Replacement savedoc/AV/index notifications wait for commit and merge into one final search OK");
+
     for (const all of [false, true]) {
         for (const mode of ["success", "kernel-rejected"]) {
             const f = fixture(undefined, mode);
@@ -719,9 +1145,6 @@ async function main() {
         true,
     );
     const refreshingBar = barFixture(fixture());
-    refreshingBar.highlightHitResult = async () => {
-        refreshingBar.destroyed = true;
-    };
     const previousMessageCount = messages.length;
     assert.equal(
         await refreshingBar.handleUnconfirmedReplacement({
@@ -732,8 +1155,23 @@ async function main() {
         }),
         true,
     );
-    assert.equal(messages.length, previousMessageCount, "closing during refresh suppresses the final toast");
-    console.log("Destroyed SearchBar suppresses late replacement refreshes OK");
+    assert.equal(messages.length, previousMessageCount + 1, "unknown replacement reports without optimistic refresh");
+    const failedBar = barFixture(fixture());
+    failedBar.highlightHitResult = async () => {
+        failedBar.destroyed = true;
+    };
+    const failedMessageCount = messages.length;
+    assert.equal(
+        await failedBar.handleUnconfirmedReplacement({
+            commitState: "failed",
+            replacedCount: 0,
+            submittedCount: 1,
+            skippedCount: 0,
+        }),
+        true,
+    );
+    assert.equal(messages.length, failedMessageCount, "closing during failed refresh suppresses the final toast");
+    console.log("Unknown replacement preserves the snapshot; failed refresh remains lifecycle-safe OK");
 }
 main().catch(error => {
     console.error(error);

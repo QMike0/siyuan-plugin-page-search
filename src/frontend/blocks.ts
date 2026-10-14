@@ -21,7 +21,10 @@ import {
     embeddedOwner,
     recordEmbeddedOrder,
 } from "./embedded-order";
-import {foldedAttributeViewGroupBody, isUnderNonHeadingCssFold} from "./fold-dom";
+import {
+    foldedAttributeViewGroupBody,
+    isUnderNonHeadingCssFold,
+} from "./fold-dom";
 import {
     collectRendererSearchUnits,
     mathSourceFallbackText,
@@ -31,6 +34,7 @@ import {
 import {splitTextNodesAtBarriers} from "./text-runs";
 import {
     beginTextCollection,
+    isCollectedTextHidden,
     isAuthorCssHiddenElement,
     omitAuthorCssHiddenText,
 } from "./visibility";
@@ -250,6 +254,10 @@ export interface CollectSearchableBlocksOptions {
     includeSuperBlock?: boolean;
     /** 是否采集页签块（NodeTabs）及其内部、页签标题；默认 true */
     includeTabs?: boolean;
+    /** Replacement preparation also needs the hidden source title behind a tab label. */
+    includeTabSourceForReplace?: boolean;
+    /** Collect native CSS-hidden mindmap source blocks when preparing writes. */
+    includeMindmapSourceForReplace?: boolean;
     /**
      * 是否采集思维导图块（NodeMindmap，以及 custom-sy-list-mindmap="1" 的列表）及其内部；默认 true。
      * 不含代码块子类型 mindmap。
@@ -342,7 +350,7 @@ export function collectSearchableBlocks(
     // 这是被替换、选区可视化等低层路径共用的采集器。省略选项时保留它们
     // 原有的“完整 DOM”语义；搜索管线始终显式传入用户开关。
     const includeFoldedBlocks = options.includeFoldedBlocks !== false;
-    beginTextCollection(includeFoldedBlocks);
+    beginTextCollection(includeFoldedBlocks, options.includeMindmapSourceForReplace === true);
     const includeInlineMemo = options.includeInlineMemo === true;
     // 限制未传 / 空数组：保持旧行为；非空才 normalize（含备注门闩）
     const rawRestrict = options.restrictInlineTypes;
@@ -458,7 +466,7 @@ export function collectSearchableBlocks(
         }
 
         // 页签标题的可见文字在导航标签上。有可见标签时不再采集被隐藏的原文，避免同一个词计两次。
-        if (includeTabs && hiddenTabsTitleCoveredByLabel(element)) {
+        if (includeTabs && !options.includeTabSourceForReplace && hiddenTabsTitleCoveredByLabel(element)) {
             return;
         }
 
@@ -1094,7 +1102,7 @@ function shouldPreferBlockElement(candidate: HTMLElement, existing: HTMLElement)
  * 关段落块但仍开图片标题时：只采集块内 `.img .protyle-action__title` 可见字。
  * 每个标题一个 unit，便于替换路径按标题 DOM 写回。
  */
-function collectImageTitleSearchUnits(
+export function collectImageTitleSearchUnits(
     ownerBlock: HTMLElement,
     blockId: string,
     blockIndex: number,
@@ -1824,7 +1832,8 @@ export function attributeViewHtmlTexts(html: string): string[] {
     // Stay in the template's inert document: no custom-element upgrades, scripts or resource loads.
     const cell = template.content.ownerDocument.createElement("div");
     cell.append(template.content);
-    cell.querySelectorAll("textarea, noscript, title, head, template, noembed, noframes, iframe, object, canvas").forEach(element => element.remove());
+    cell.querySelectorAll("textarea, noscript, title, head, template, noembed, noframes, iframe, object, canvas")
+        .forEach(element => element.remove());
     const nodes = omitAuthorCssHiddenText(collectTextNodesInContainer(cell, cell));
     return splitTextNodesAtBarriers(nodes).map(joinTextNodes).filter(Boolean);
 }
@@ -1852,6 +1861,37 @@ function hiddenTabsTitleCoveredByLabel(element: HTMLElement): boolean {
         `:scope > .tabs-header [data-tab-id="${CSS.escape(tabId)}"] .tabs-tab-label`,
     );
     return Boolean(label && elementHasBox(label) && (label.textContent || "").length > 0);
+}
+
+/**
+ * 页签渲染器保留所有源块，只给非活动项加 data-tabs-hidden="true"，
+ * 再由 CSS 把面板隐藏。这个隐藏状态不代表内容不属于文档语料；搜索和
+ * 替换都应使用源块，而不是仅依赖当前显示的面板。
+ */
+export function isInactiveTabSourceElement(element: Element | null): boolean {
+    if (!element || element.closest(".tabs-header")) {
+        return false;
+    }
+    return Boolean(element.closest('.tab-item[data-tabs-hidden="true"]'));
+}
+
+function shouldKeepHiddenSourceText(node: Text): boolean {
+    const parent = node.parentElement;
+    if (!parent || !isInactiveTabSourceElement(parent)) {
+        return false;
+    }
+    // 不放宽真正的 fn__none/hidden 壳；只放宽 tabsRender 的面板隐藏 CSS。
+    let current: Element | null = parent;
+    while (current && current !== document.body) {
+        if (
+            current.classList.contains("fn__none") || current.hasAttribute("hidden") ||
+            current.getAttribute("aria-hidden") === "true"
+        ) {
+            return false;
+        }
+        current = current.parentElement;
+    }
+    return true;
 }
 
 /** 把可见的页签标题标签记到原标题块上，高亮才能画在导航栏里。 */
@@ -1897,6 +1937,8 @@ function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
                 blockType: blockEl?.getAttribute("data-type") || "NodeParagraph",
                 blockIndex: 0,
                 element: label,
+                // The tab label is a renderer clone; the source title block is elsewhere.
+                matchSource: "projection",
             }, textNodes));
         });
     };
@@ -1967,6 +2009,8 @@ export function collectMindmapPreviewUnits(roots: HTMLElement[]): SearchableBloc
                 blockType: preview.getAttribute("data-type") || "NodeParagraph",
                 blockIndex: 0,
                 element: preview,
+                // Mindmap canvas text is a read-only clone of the source block.
+                matchSource: "projection",
             }, textNodes));
         });
     });
@@ -2006,7 +2050,10 @@ function unitsFromTextNodes(
     base: Omit<SearchableBlock, "text" | "textNodes">,
     textNodes: readonly Text[],
 ): SearchableBlock[] {
-    const visible = omitAuthorCssHiddenText(textNodes);
+    // Keep inactive tab source text in the corpus. Its Range remains absent while
+    // the panel is hidden; navigation can activate the tab, and replacement uses
+    // the source block transaction path.
+    const visible = textNodes.filter((node) => !isCollectedTextHidden(node) || shouldKeepHiddenSourceText(node));
     const runs = splitTextNodesAtBarriers(visible).filter((run) => joinTextNodes(run).length > 0);
     if (runs.length === 0) {
         return [];
@@ -2482,7 +2529,8 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
         if (avCell) {
             const group = avCell.closest<HTMLElement>("[data-group-id]")?.dataset.groupId || "nogroup";
             const row = avCell.closest<HTMLElement>(".av__row, .av__gallery-item, .av__calendar-item")?.dataset.id;
-            const col = avCell.dataset.colId || avCell.dataset.fieldId || avCell.dataset.keyId || avCell.dataset.avKeyId;
+            const col = avCell.dataset.colId || avCell.dataset.fieldId || avCell.dataset.keyId ||
+                avCell.dataset.avKeyId;
             if (row && col) unitId = `cell:${group}:${row}:${col}:inline-math:${avOrdinal}`;
         }
         units.push({
