@@ -31,15 +31,58 @@ function isMindmapSourceHideBoundary(element: Element): boolean {
             element.getAttribute("data-type") === "NodeListItem");
 }
 
+function isMindmapSourceDescendant(element: Element | null): boolean {
+    if (!element?.closest("[data-mindmap-view-rendered=\"true\"]")) {
+        return false;
+    }
+    let current = element;
+    while (current && current !== document.body) {
+        if (isMindmapSourceHideBoundary(current)) {
+            return true;
+        }
+        current = parentElementCrossingShadow(current);
+    }
+    return false;
+}
+
+function isAuthorCssHiddenExceptMindmapSource(element: Element | null): boolean {
+    if (element && textStyle(element).visibilityHidden) {
+        return true;
+    }
+    let current = element;
+    while (current && current !== document.body) {
+        if (current.hasAttribute("data-page-search-offscreen")) {
+            break;
+        }
+        if (
+            current.classList.contains("fn__none") || current.hasAttribute("hidden") ||
+            current.getAttribute("aria-hidden") === "true"
+        ) {
+            return true;
+        }
+        if (textStyle(current).displayHidden && !isMindmapSourceHideBoundary(current)) {
+            return true;
+        }
+        current = parentElementCrossingShadow(current);
+    }
+    return false;
+}
+
 /** Replacement collection ignores only native mindmap source hiding, never author CSS. */
 export function isCollectedTextHidden(node: Text): boolean {
-    if (!collectIncludesMindmapSource) return isAuthorCssHiddenText(node, collectAllowsFoldedHidden);
+    if (!collectIncludesMindmapSource && !isMindmapSourceDescendant(node.parentElement)) {
+        return isAuthorCssHiddenText(node, collectAllowsFoldedHidden);
+    }
     const parent = node.parentElement;
     if (!collectAllowsFoldedHidden && isUnderNonHeadingCssFold(parent)) return true;
     if (parent && textStyle(parent).visibilityHidden) return true;
     let current: Element | null = parent;
     while (current && current !== document.body) {
         if (current.hasAttribute("data-page-search-offscreen")) break;
+        if (
+            current.classList.contains("fn__none") || current.hasAttribute("hidden") ||
+            current.getAttribute("aria-hidden") === "true"
+        ) return true;
         if (textStyle(current).displayHidden && !isMindmapSourceHideBoundary(current)) return true;
         current = parentElementCrossingShadow(current);
     }
@@ -128,7 +171,7 @@ export function collectAuthorHiddenBlockIds(root: ParentNode): Set<string> {
         }
         const id = element.dataset.mindmapSourceId || element.dataset.nodeId;
         if (id) {
-            (isAuthorCssHiddenElement(element) ? hidden : visible).add(id);
+            (isAuthorCssHiddenExceptMindmapSource(element) ? hidden : visible).add(id);
         }
     });
     visible.forEach((id) => hidden.delete(id));
