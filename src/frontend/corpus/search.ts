@@ -133,6 +133,7 @@ import {
     isTabsTitleBlockMeta,
     loadDocMeta,
     noteLiveCodeLanguage,
+    peekDocMeta,
     type BlockMeta,
 } from "./meta";
 import type {
@@ -314,7 +315,41 @@ export function invalidateEditedDocument(rootId?: string, blockIds?: readonly st
 }
 
 /** savedoc 后只作废结构信息。普通正文仍按块哈希复用；嵌入块的来源不在自身哈希里，必须丢掉。 */
-export function invalidateDocumentStructureCaches(rootId?: string): void {
+export function invalidateDocumentStructureCaches(rootId?: string, sources?: unknown): void {
+    // savedoc precedes the SQL upsert. Evict only deleted subtrees from the
+    // text cache, so stale SQL hashes cannot resurrect their unloaded matches.
+    // Delete+insert transactions and undo remain safe: this only evicts, never
+    // stores a deletion tombstone or excludes a block from later searches.
+    if (rootId && Array.isArray(sources)) {
+        const deleted = new Set<string>();
+        for (const source of sources) {
+            if (!Array.isArray(source?.doOperations)) continue;
+            for (const operation of source.doOperations) {
+                if (operation?.action === "delete" && typeof operation.id === "string") deleted.add(operation.id);
+            }
+        }
+        if (deleted.size) {
+            const links = peekDocMeta(rootId)?.links;
+            const affected = new Map<string, boolean>(Array.from(deleted, (id) => [id, true]));
+            for (const id of links?.keys() ?? []) {
+                const path: string[] = [];
+                const visited = new Set<string>();
+                let current = id;
+                while (current && !affected.has(current) && !visited.has(current)) {
+                    visited.add(current);
+                    path.push(current);
+                    current = links.get(current)?.parentId ?? "";
+                }
+                const removed = affected.get(current) === true;
+                for (const part of path) {
+                    affected.set(part, removed);
+                    if (removed) deleted.add(part);
+                }
+            }
+            dropTextCacheForBlocks(rootId, Array.from(deleted));
+            invalidateAvCacheForBlocks(Array.from(deleted));
+        }
+    }
     invalidateDocMeta(rootId);
     invalidateDocOrder(rootId);
     dropEmbedRenderCaches();
@@ -1161,12 +1196,20 @@ async function extractSharedDiagrams(
                         units: result.units.filter((unit) => unit.blockId === id),
                         unrenderedIds: result.unrenderedIds.filter((blockId) => blockId === id),
                         missingIds: result.missingIds.filter((blockId) => blockId === id),
+                        absentIds: result.absentIds.filter((blockId) => blockId === id),
                         inlineMathIds: result.inlineMathIds.has(id) ? [id] : [],
                         mathRecoveries: result.mathRecoveries.has(id) ?
                             [[id, result.mathRecoveries.get(id)!] as const] :
                             [],
                     } :
-                    {units: [], unrenderedIds: [id], missingIds: [id], inlineMathIds: [], mathRecoveries: []};
+                    {
+                        units: [],
+                        unrenderedIds: [id],
+                        missingIds: [id],
+                        absentIds: [],
+                        inlineMathIds: [],
+                        mathRecoveries: [],
+                    };
             })),
             abandoned,
         ]);
@@ -1177,6 +1220,7 @@ async function extractSharedDiagrams(
             units: completed.flatMap((result) => result.units),
             unrenderedIds: completed.flatMap((result) => result.unrenderedIds),
             missingIds: completed.flatMap((result) => result.missingIds),
+            absentIds: completed.flatMap((result) => result.absentIds),
             inlineMathIds: new Set(completed.flatMap((result) => result.inlineMathIds)),
             mathRecoveries: new Map(completed.flatMap((result) => result.mathRecoveries)),
         };
@@ -1227,6 +1271,7 @@ interface MetaExtraction {
     unrendered: number;
     unrenderedIds: string[];
     failed: boolean;
+    absentIds?: string[];
     inlineMathIds?: ReadonlySet<string>;
     mathRecoveries?: ReadonlyMap<string, OffscreenMathRecovery>;
 }
@@ -1263,6 +1308,7 @@ async function extractMetasImpl(
     }
     // Shared metadata can be updated by a concurrent search while rendering awaits.
     metas = metas.map((meta) => ({...meta}));
+    const metadataSnapshot = peekDocMeta(rootId);
     const epoch = currentCorpusEpoch(rootId);
     const embedEpoch = embedCacheEpoch;
     const embedCurrent = (meta: BlockMeta) => !isEmbedType(meta.type) || embedEpoch === embedCacheEpoch;
@@ -1323,7 +1369,18 @@ async function extractMetasImpl(
     const units: CachedUnit[] = [];
     const keep = canContinue() && epoch === currentCorpusEpoch(rootId) && renderStamp === currentRenderSettingsStamp();
     const unrenderedIds = new Set(extracted.unrenderedIds);
+    const absentIds = new Set(extracted.absentIds);
+    if (keep && absentIds.size) {
+        dropTextCacheForBlocks(rootId, Array.from(absentIds));
+        // Do not repeatedly schedule background render jobs from stale SQL
+        // metadata. This snapshot expires normally and savedoc invalidates it
+        // on undo; remaining SQL candidates still take the checked DOM path.
+        if (metadataSnapshot === peekDocMeta(rootId)) {
+            for (const id of absentIds) metadataSnapshot?.byId.delete(id);
+        }
+    }
     for (const meta of metas) {
+        if (absentIds.has(meta.id)) continue;
         if (!embedCurrent(meta)) {
             // A discarded snapshot is incomplete, not a renderer failure to cache/back off.
             unrenderedIds.add(meta.id);
@@ -1345,6 +1402,7 @@ async function extractMetasImpl(
         unrendered: unrenderedIds.size,
         unrenderedIds: Array.from(unrenderedIds),
         failed: extracted.missingIds.length > 0,
+        absentIds: extracted.absentIds,
         inlineMathIds: extracted.inlineMathIds,
         mathRecoveries: extracted.mathRecoveries,
     };
@@ -1505,8 +1563,9 @@ async function loadPlainUnits(
                 byId.set(unit.blockId, list);
             }
             const failed = new Set(extracted.unrenderedIds);
+            const absent = new Set(extracted.absentIds);
             for (const [id, hash] of hashAtFetch) {
-                if ((!storeCache && !restored.has(id)) || failed.has(id) || after.get(id) !== hash) {
+                if ((!storeCache && !restored.has(id)) || failed.has(id) || absent.has(id) || after.get(id) !== hash) {
                     continue;
                 }
                 rememberPlain(

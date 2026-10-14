@@ -164,6 +164,26 @@ async function undoSavedocRegressions() {
         window.setTimeout = originalTimeout;
     }
     console.log("savedoc before/after search, zero-result undo DOM replay and no-DOM savedoc refresh OK");
+
+    const bar = pipelineFixture("in-flight-deletion");
+    let complete;
+    let signal;
+    let warnings = 0;
+    bar.runSearchPipeline = (_value, abortSignal) => {
+        signal = abortSignal;
+        return new Promise(resolve => complete = resolve);
+    };
+    bar.noteSearchCoverage = () => warnings++;
+    const pending = bar.highlightHitResult("foo", false);
+    bar.onEventBus({detail: {cmd: "savedoc", data: {sources: [{doOperations: [{action: "delete", id: "gone"}]}]}}});
+    window.clearTimeout(bar.typingTimer);
+    assert.equal(signal.aborted, true, "savedoc cancels searches containing stale deletion candidates");
+    complete({matches: [], error: "", degraded: true, unrendered: 1});
+    await pending;
+    assert.equal(warnings, 0, "an obsolete failure snapshot never produces coverage popups");
+    assert.equal(bar.resultCount, 1, "an obsolete search cannot replace the displayed results");
+    bar.destroy();
+    console.log("savedoc during an in-flight deletion read discards old warnings/results OK");
 }
 
 async function diagramRegressions() {

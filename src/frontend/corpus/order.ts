@@ -72,7 +72,7 @@ export async function fetchDocBlocksOrders(
     }
     const read = orderReads.begin(rootId);
     try {
-        const data = await postJson<unknown>("/api/block/getDocBlocksOrders", {id: rootId}, signal);
+        const data = await postJson<unknown>("/api/block/getDocBlocksOrders", {id: rootId}, signal, false);
         if (signal?.aborted || !read.current() || !Array.isArray(data) || data.some((id) => typeof id !== "string")) {
             return null;
         }
@@ -109,7 +109,8 @@ export async function fetchHeadingChildrenIds(
     }
     const read = orderReads.begin(rootId);
     try {
-        const data = await postJson<unknown>("/api/block/getHeadingChildrenIDs", {id: headingId}, signal);
+        // A folded heading can be deleted while its old SQL metadata is in flight.
+        const data = await postJson<unknown>("/api/block/getHeadingChildrenIDs", {id: headingId}, signal, false);
         if (signal?.aborted || !read.current() || !Array.isArray(data) || data.some((id) => typeof id !== "string")) {
             return null;
         }

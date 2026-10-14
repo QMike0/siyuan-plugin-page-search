@@ -2407,6 +2407,7 @@ export class SearchBar {
             const {matches, error, degraded, partial, unrendered, truncated} = result;
             const isCurrent = () =>
                 !this.destroyed && !abortController.signal.aborted && generation === this.searchGeneration &&
+                documentEpoch === this.documentEpoch &&
                 searchKey === this.searchResultKey() &&
                 selectionScope === (this.selectionOnly ? this.rememberedSelectionScope : null) &&
                 rootId === this.documentSearchIndices.activeRoot && this.rememberCurrentRootId() === rootId;
@@ -2812,9 +2813,12 @@ export class SearchBar {
         if (["savedoc", "rename"].includes(event.detail?.cmd)) {
             this.documentEpoch += 1;
             this.savedocDomEpoch = this.domEpoch;
+            // A search spanning a saved deletion may still hold old SQL IDs.
+            // Its coverage warnings/results belong to that obsolete snapshot.
+            this.searchAbortController?.abort();
             const rootId = this.rememberCurrentRootId();
             if (rootId) {
-                invalidateDocumentStructureCaches(rootId);
+                invalidateDocumentStructureCaches(rootId, event.detail?.data?.sources);
             }
             clearTimeout(this.typingTimer);
             if (this.replaceBusy) {

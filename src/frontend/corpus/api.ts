@@ -8,10 +8,10 @@ export function escSql(value: string): string {
 
 /**
  * 思源当前宿主的 fetchSyncPost 已支持第五个 AbortSignal 参数；插件 SDK 的旧声明仍
- * 只有两个参数。集中在这里兼容调用，未传 signal 时保持旧版本完全相同的调用方式。
+ * 只有两个参数。集中兼容 signal 和 process；普通调用保持旧版的两个参数。
  */
-function postWithSignal(url: string, body: Record<string, unknown>, signal?: AbortSignal) {
-    if (!signal) {
+function postWithSignal(url: string, body: Record<string, unknown>, signal?: AbortSignal, process = true) {
+    if (!signal && process) {
         return fetchSyncPost(url, body);
     }
     const post = fetchSyncPost as unknown as (
@@ -21,7 +21,7 @@ function postWithSignal(url: string, body: Record<string, unknown>, signal?: Abo
         process?: boolean,
         abortSignal?: AbortSignal,
     ) => ReturnType<typeof fetchSyncPost>;
-    return post(url, body, undefined, undefined, signal);
+    return post(url, body, undefined, process, signal);
 }
 
 export async function querySql<T>(stmt: string, signal?: AbortSignal): Promise<T[] | null> {
@@ -66,12 +66,17 @@ export async function querySqlAll<T extends {id?: string;}>(
     }
 }
 
-export async function postJson<T>(url: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<T | null> {
+export async function postJson<T>(
+    url: string,
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    process = true,
+): Promise<T | null> {
     if (signal?.aborted) {
         return null;
     }
     try {
-        const response = await postWithSignal(url, body, signal);
+        const response = await postWithSignal(url, body, signal, process);
         if (!response || response.code !== 0) {
             return null;
         }
@@ -79,4 +84,49 @@ export async function postJson<T>(url: string, body: Record<string, unknown>, si
     } catch {
         return null;
     }
+}
+
+/** Reconcile stale SQL IDs against the kernel tree; never infer deletion from viewport DOM. */
+export async function fetchSearchBlockDoms(
+    ids: string[],
+    notebookId = "",
+    signal?: AbortSignal,
+    shouldContinue: () => boolean = () => true,
+): Promise<{doms: Record<string, string>; absentIds: string[];} | null> {
+    if (!shouldContinue() || signal?.aborted) return null;
+    const body = notebookId ? {ids, notebook: notebookId} : {ids};
+    const path = "/api/block/getBlockDOMs";
+    // Search owns these errors. The default processMessage would show
+    // "block not found" before we can reconcile a normal deletion.
+    let doms = await postJson<Record<string, string>>(path, body, signal, false);
+    const absent = new Set<string>();
+    const confirmAbsent = async (missing: string[]) => {
+        if (!missing.length || !shouldContinue() || signal?.aborted) return;
+        const exists = await postJson<Record<string, boolean>>(
+            "/api/block/checkBlocksExist",
+            {...body, ids: missing},
+            signal,
+            false,
+        );
+        // Omitted IDs, unsupported APIs and permission/network failures are
+        // not evidence of deletion. Only explicit kernel false is accepted.
+        for (const id of missing) {
+            if (exists?.[id] === false) absent.add(id);
+        }
+    };
+    if (!doms || typeof doms !== "object") {
+        await confirmAbsent(ids);
+        if (!shouldContinue() || signal?.aborted || !absent.size) return null;
+        const remaining = ids.filter((id) => !absent.has(id));
+        // One deleted ID can reject a mixed batch. Read its surviving siblings
+        // once; genuine read failures still propagate for the remaining IDs.
+        doms = remaining.length ?
+            await postJson<Record<string, string>>(path, {...body, ids: remaining}, signal, false) :
+            {};
+        doms ??= {};
+    }
+    if (!shouldContinue() || signal?.aborted) return null;
+    await confirmAbsent(ids.filter((id) => !absent.has(id) && !doms[id]));
+    if (!shouldContinue() || signal?.aborted) return null;
+    return {doms, absentIds: Array.from(absent)};
 }

@@ -24,7 +24,7 @@ import {
     rendererAdapterKind,
     type DiagramSubtype,
 } from "../renderer-adapters";
-import {postJson} from "./api";
+import {fetchSearchBlockDoms} from "./api";
 import {readAvSearchQuery} from "./av";
 import {resolveEmbedQuery} from "./embed-query";
 import {
@@ -60,51 +60,35 @@ async function fetchBlockDoms(
     shouldContinue: () => boolean,
     signal?: AbortSignal,
     rootId = "",
-): Promise<{doms: Record<string, string>; unresolvedEmbedIds: string[];} | null> {
-    const body: Record<string, unknown> = {ids};
-    if (notebookId) {
-        body.notebook = notebookId;
-    }
-    const paths = ["/api/block/getBlockDOMs"];
-    for (const path of paths) {
-        if (!shouldContinue()) {
-            return null;
-        }
-        try {
-            const response = await postJson<Record<string, string>>(path, body, signal);
-            if (!shouldContinue()) {
-                return null;
-            }
-            if (response && typeof response === "object") {
-                if (!withEmbed) return {doms: response, unresolvedEmbedIds: []};
-                const doms: Record<string, string> = {};
-                const unresolvedEmbedIds: string[] = [];
-                // Bound native SQL queries separately from renderer waves.
-                for (let start = 0; start < ids.length; start += 2) {
-                    if (!shouldContinue() || signal?.aborted) return null;
-                    const resolved = await Promise.all(
-                        ids.slice(start, start + 2).map(async id => {
-                            const html = response[id];
-                            return {
-                                id,
-                                html: typeof html === "string" ?
-                                    await resolveEmbedQuery(id, html, rootId, notebookId, shouldContinue, signal) :
-                                    null,
-                            };
-                        }),
-                    );
-                    for (const item of resolved) {
-                        if (item.html !== null) doms[item.id] = item.html;
-                        else unresolvedEmbedIds.push(item.id);
-                    }
-                }
-                return {doms, unresolvedEmbedIds};
-            }
-        } catch {
-            // 下一种接口
+): Promise<{doms: Record<string, string>; unresolvedEmbedIds: string[]; absentIds: string[];} | null> {
+    const fetched = await fetchSearchBlockDoms(ids, notebookId, signal, shouldContinue);
+    if (!fetched) return null;
+    const {doms: response, absentIds} = fetched;
+    const absent = new Set(absentIds);
+    const activeIds = ids.filter((id) => !absent.has(id));
+    if (!withEmbed) return {doms: response, unresolvedEmbedIds: [], absentIds};
+    const doms: Record<string, string> = {};
+    const unresolvedEmbedIds: string[] = [];
+    // Bound native SQL queries separately from renderer waves.
+    for (let start = 0; start < activeIds.length; start += 2) {
+        if (!shouldContinue() || signal?.aborted) return null;
+        const resolved = await Promise.all(
+            activeIds.slice(start, start + 2).map(async id => {
+                const html = response[id];
+                return {
+                    id,
+                    html: typeof html === "string" ?
+                        await resolveEmbedQuery(id, html, rootId, notebookId, shouldContinue, signal) :
+                        null,
+                };
+            }),
+        );
+        for (const item of resolved) {
+            if (item.html !== null) doms[item.id] = item.html;
+            else unresolvedEmbedIds.push(item.id);
         }
     }
-    return null;
+    return {doms, unresolvedEmbedIds, absentIds};
 }
 function keepOwnedUnits(blocks: SearchableBlock[], ownerId: string, embed: boolean): SearchableBlock[] {
     if (!embed) {
@@ -530,6 +514,8 @@ export async function fetchAndExtractUnits(
         units: CachedUnit[];
         unrenderedIds: string[];
         missingIds: string[];
+        /** Explicit false from the kernel block tree, independent of SQL/viewport state. */
+        absentIds: string[];
         inlineMathIds: Set<string>;
         mathRecoveries: Map<string, OffscreenMathRecovery>;
     } | null
@@ -537,6 +523,7 @@ export async function fetchAndExtractUnits(
     const units: CachedUnit[] = [];
     const unrenderedIds: string[] = [];
     const missingIds: string[] = [];
+    const absentIds: string[] = [];
     const inlineMathIds = new Set<string>();
     const mathRecoveries = new Map<string, OffscreenMathRecovery>();
     const embedList = ids.filter((id) => embedIds.has(id));
@@ -567,7 +554,7 @@ export async function fetchAndExtractUnits(
                         return null;
                     }
                     const extracted = await extractUnitsFromDoms(
-                        batch,
+                        batch.filter((id) => !fetched.absentIds.includes(id)),
                         fetched.doms,
                         options,
                         embedIds,
@@ -580,7 +567,7 @@ export async function fetchAndExtractUnits(
                         new Set([...extracted.unrenderedIds, ...fetched.unresolvedEmbedIds]),
                     );
                     if (shouldContinue()) {
-                        return extracted;
+                        return {...extracted, absentIds: fetched.absentIds};
                     }
                     // 取消可能恰好落在离屏提取完成之后。此时结果不会进入 wave 的
                     // 统一释放分支，必须在这里归还宿主，避免遗留在 document.body。
@@ -607,6 +594,7 @@ export async function fetchAndExtractUnits(
                     units.push(...result.blocks.map((block) => freezeBlock(block)));
                     unrenderedIds.push(...result.unrenderedIds);
                     missingIds.push(...result.missingIds);
+                    absentIds.push(...result.absentIds);
                     result.inlineMathIds.forEach((id) => inlineMathIds.add(id));
                     const recovery = result.mathRecovery;
                     if (recovery) {
@@ -626,5 +614,5 @@ export async function fetchAndExtractUnits(
     if (!await run(embedList, true)) {
         return null;
     }
-    return {units, unrenderedIds, missingIds, inlineMathIds, mathRecoveries};
+    return {units, unrenderedIds, missingIds, absentIds, inlineMathIds, mathRecoveries};
 }

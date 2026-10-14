@@ -1226,6 +1226,182 @@ async function main() {
         assert.equal(errorText.matches.length, 0);
         assert.equal(errorText.unrendered, 1);
 
+        // A deletion updates the kernel block tree before SQL. Keep old SQL
+        // rows deliberately, and require explicit kernel false to discard them.
+        const originalApi = api;
+        try {
+            reset();
+            let mixedReads = 0;
+            let existenceReads = 0;
+            api = async (url, body, _headers, process) => {
+                assert.equal(process, false);
+                assert.equal(body.notebook, "notebook-scope", "reconciliation preserves the notebook scope");
+                if (url === "/api/block/checkBlocksExist") {
+                    existenceReads++;
+                    return {code: 0, data: {gone: false, healthy: true}};
+                }
+                mixedReads++;
+                if (body.ids.includes("gone")) return {code: -1, msg: "block not found v3.8.6"};
+                assert.deepEqual(body.ids, ["healthy"], "retry reads only the surviving target");
+                return {code: 0, data: {healthy: '<div data-node-id="healthy" data-av-id="av">foo</div>'}};
+            };
+            const read = await source("frontend/corpus/api").fetchSearchBlockDoms(["gone", "healthy"], "notebook-scope");
+            assert.deepEqual(read.absentIds, ["gone"]);
+            assert.ok(read.doms.healthy);
+            assert.equal(mixedReads, 2, "rejected mixed batch is retried only once");
+            assert.equal(existenceReads, 1);
+            await source("frontend/corpus/api").fetchSearchBlockDoms(["healthy"], "notebook-scope");
+            assert.equal(existenceReads, 1, "normal successful reads issue no existence request");
+            api = async (url, body, headers, process, signal) => {
+                if (url === "/api/block/checkBlocksExist") return {code: 0, data: {gone: false, healthy: true}};
+                if (url === "/api/block/getBlockDOMs") {
+                    assert.equal(process, false);
+                    return body.ids.includes("gone") ?
+                        {code: -1, msg: "block not found v3.8.6"} :
+                        {code: 0, data: {healthy: '<div data-node-id="healthy" data-av-id="av">foo</div>'}};
+                }
+                return originalApi(url, body, headers, process, signal);
+            };
+            const avRefs = await source("frontend/corpus/av").resolveMissingAvIds([{id: "gone"}, {id: "healthy"}]);
+            assert.equal(avRefs.cacheable, true, "deleted AV carrier is not a document API failure");
+            assert.deepEqual(avRefs.refs.map(ref => ref.blockId), ["healthy"]);
+            api = originalApi;
+            for (const placement of ["loaded", "unloaded", "folded", "container"]) {
+                for (const responseKind of ["omitted", "rejected-batch"]) {
+                    reset();
+                    const gone = "20260101000000-deleted";
+                    const healthy = "20260101000001-healthy";
+                    const parent = "20260101000002-parent0";
+                    const heading = "20251231000000-heading";
+                    if (placement === "container") add(parent, "l", "foo");
+                    if (placement === "folded") add(heading, "h", "heading", "", "r", '{: fold="1"}');
+                    add(gone, "p", "foo", "", placement === "container" ? parent : "r");
+                    add(healthy, "p", "foo foo");
+                    doms[gone] = `<div data-node-id="${gone}" data-type="NodeParagraph">foo</div>`;
+                    doms[healthy] = `<div data-node-id="${healthy}" data-type="NodeParagraph">foo foo</div>`;
+                    if (placement === "loaded") wysiwyg.innerHTML = doms[gone];
+                    if (placement === "folded") {
+                        wysiwyg.innerHTML = `<div data-node-id="${heading}" data-type="NodeHeading" fold="1">heading</div>`;
+                    }
+                    full(await search("foo")); // warm cache, including offscreen targets
+                    delete doms[gone];
+                    if (placement === "loaded") wysiwyg.innerHTML = "";
+                    const deleted = new Set([gone, ...(placement === "container" ? [parent] : [])]);
+                    let checks = 0;
+                    let nativeMessages = 0;
+                    api = async (url, body, headers, process, signal) => {
+                        if (url === "/api/block/checkBlocksExist") {
+                            checks++;
+                            assert.equal(process, false, "existence reconciliation does not emit native popups");
+                            return {code: 0, data: Object.fromEntries(body.ids.map(id => [id, !deleted.has(id)]))};
+                        }
+                        if (url === "/api/block/getBlockDOMs" && body.ids.some(id => deleted.has(id))) {
+                            assert.equal(process, false, "racy background DOM reads do not emit native popups");
+                            if (process !== false) nativeMessages++;
+                            if (responseKind === "rejected-batch") return {code: -1, msg: "block not found v3.8.6"};
+                        }
+                        return originalApi(url, body, headers, process, signal);
+                    };
+                    corpus.invalidateDocumentStructureCaches("r", [{doOperations: [{
+                        action: "delete", id: placement === "container" ? parent : gone,
+                    }]}]);
+                    const afterDelete = await search("foo");
+                    full(afterDelete);
+                    assert.equal(afterDelete.matches.length, 2, placement + ": only healthy matches remain");
+                    assert.ok(checks > 0, "deleted subtree cache is evicted even while SQL hashes remain stale");
+                    assert.equal(nativeMessages, 0);
+                    if (placement === "folded") {
+                        const foldedOff = await search("foo", {includeFoldedBlocks: false});
+                        full(foldedOff);
+                        assert.equal(foldedOff.matches.some(match => match.blockId === gone), false);
+                    }
+                    const beforeRepeat = checks;
+                    full(await search("foo"));
+                    assert.ok(checks > beforeRepeat, "absence never creates a negative/empty success cache");
+                    deleted.clear(); // Ctrl+Z restores the same ID, still with the same stale SQL hash
+                    doms[gone] = `<div data-node-id="${gone}" data-type="NodeParagraph">foo</div>`;
+                    corpus.invalidateDocumentStructureCaches("r");
+                    const restored = await search("foo");
+                    full(restored);
+                    assert.equal(restored.matches.length, 3, "undo has no deletion tombstone to overcome");
+                    api = originalApi;
+                }
+            }
+            for (const [type, language, html] of [
+                ["c", "graphviz", '<div data-node-id="b" data-type="NodeCodeBlock" data-content="foo"><div></div></div>'],
+                ["m", "", '<div data-node-id="b" data-type="NodeMathBlock" data-content="foo"></div>'],
+                ["query_embed", "", '<div data-node-id="b" data-type="NodeBlockQueryEmbed" data-content="select * from blocks"></div>'],
+            ]) {
+                reset();
+                add("b", type, "foo", language);
+                api = async (url, body, headers, process, signal) => url === "/api/block/checkBlocksExist" ?
+                    {code: 0, data: {b: false}} : originalApi(url, body, headers, process, signal);
+                full(await search("foo"));
+                doms.b = html;
+                corpus.invalidateDocumentStructureCaches("r"); // undo's savedoc refreshes metadata
+                const restored = await search("foo");
+                assert.ok(domCalls > 1, type + ": confirmed absence is not a renderer backoff entry");
+                assert.equal(restored.degraded, false);
+                api = originalApi;
+            }
+            reset();
+            add("b", "html", "foo");
+            api = async (url, body, headers, process, signal) => url === "/api/block/checkBlocksExist" ?
+                {code: 0, data: {b: false}} : originalApi(url, body, headers, process, signal);
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                full(await settle("foo"));
+                const settled = await search("foo");
+                full(settled);
+                assert.ok(domCalls <= 3, "absent renderer does not trigger a recurring background indexing loop");
+            } finally {
+                corpus.releaseBackgroundCorpusRoot("r");
+                api = originalApi;
+            }
+            reset();
+            add("b", "html", "foo");
+            let finishExistence;
+            let existenceStarted;
+            const started = new Promise(resolve => existenceStarted = resolve);
+            api = async (url, body, headers, process, signal) => {
+                if (url === "/api/block/checkBlocksExist") {
+                    existenceStarted();
+                    return new Promise(resolve => finishExistence = resolve);
+                }
+                return originalApi(url, body, headers, process, signal);
+            };
+            corpus.retainBackgroundCorpusRoot("r");
+            let unsubscribe;
+            try {
+                const oldSearch = search("foo");
+                await started;
+                corpus.invalidateDocumentStructureCaches("r"); // undo starts a newer metadata snapshot
+                const restoredMeta = await source("frontend/corpus/meta").loadDocMeta("r");
+                const finished = new Promise(resolve => unsubscribe = corpus.subscribeIndexSettled(resolve));
+                finishExistence({code: 0, data: {b: false}}); // old deletion check arrives after undo
+                await oldSearch;
+                await finished;
+                assert.ok(restoredMeta.byId.has("b"), "late absence cannot prune a newer undo metadata snapshot");
+            } finally {
+                unsubscribe?.();
+                corpus.releaseBackgroundCorpusRoot("r");
+                api = originalApi;
+            }
+            for (const existence of [null, {}, {b: true}, {b: "false"}]) {
+                reset();
+                add("b", "p", "foo");
+                api = async (url, body, headers, process, signal) => url === "/api/block/checkBlocksExist" ?
+                    {code: existence === null ? -1 : 0, data: existence} :
+                    originalApi(url, body, headers, process, signal);
+                const unavailable = await search("foo");
+                assert.equal(unavailable.degraded, true, "unknown/present target remains a real read failure");
+                assert.equal(unavailable.unrendered, 1);
+            }
+        } finally {
+            api = originalApi;
+        }
+        console.log("Deletion: loaded/unloaded/folded/subtree, rejected mixed batches, stale SQL/cache, undo and real failures OK");
+
         reset();
         add("b", "p", "foo");
         const missing = await search("foo");

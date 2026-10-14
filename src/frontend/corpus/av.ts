@@ -1,7 +1,10 @@
 import type {SearchableUnit} from "../../shared";
 import {avCellUnitId} from "../../shared/av-live";
 import {attributeViewHtmlTexts} from "../blocks";
-import {postJson} from "./api";
+import {
+    fetchSearchBlockDoms,
+    postJson,
+} from "./api";
 
 const PAGE_SIZE = 200;
 const MAX_PAGES = 500;
@@ -1081,14 +1084,17 @@ export async function resolveMissingAvIds(
         return {refs, cacheable: true};
     }
     try {
-        const doms = await postJson<Record<string, string>>("/api/block/getBlockDOMs", {ids: missing}, signal);
-        if (!doms) {
+        const fetched = await fetchSearchBlockDoms(missing, "", signal);
+        if (!fetched) {
             // 这一轮仍用已经解析出的引用；补全失败的结果不能写入缓存。
             return {refs, cacheable: false};
         }
+        const {doms, absentIds} = fetched;
+        const absent = new Set(absentIds);
         let complete = true;
         const rowsById = new Map(rows.map((row) => [row.id, row]));
         for (const id of missing) {
+            if (absent.has(id)) continue;
             const avId = readAvId(String(doms[id] ?? ""));
             if (!avId) {
                 complete = false;
