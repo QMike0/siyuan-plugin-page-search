@@ -254,8 +254,6 @@ export interface CollectSearchableBlocksOptions {
     includeSuperBlock?: boolean;
     /** 是否采集页签块（NodeTabs）及其内部、页签标题；默认 true */
     includeTabs?: boolean;
-    /** Replacement preparation also needs the hidden source title behind a tab label. */
-    includeTabSourceForReplace?: boolean;
     /** Collect native CSS-hidden mindmap source blocks when preparing writes. */
     includeMindmapSourceForReplace?: boolean;
     /**
@@ -466,7 +464,7 @@ export function collectSearchableBlocks(
         }
 
         // 页签标题的可见文字在导航标签上。有可见标签时不再采集被隐藏的原文，避免同一个词计两次。
-        if (includeTabs && !options.includeTabSourceForReplace && hiddenTabsTitleCoveredByLabel(element)) {
+        if (includeTabs && hiddenTabsTitleCoveredByLabel(element)) {
             return;
         }
 
@@ -1875,6 +1873,26 @@ export function isInactiveTabSourceElement(element: Element | null): boolean {
     return Boolean(element.closest('.tab-item[data-tabs-hidden="true"]'));
 }
 
+/**
+ * tabsRender 的页签标题源块与导航栏克隆都只允许搜索/跳转。
+ * 导航栏是展示副本，思源没有为它提供独立的标题事务；统一识别两种
+ * DOM 形态，避免替换路径把它误当成普通段落。
+ */
+export function isTabsTitleSearchUnit(block: Pick<SearchableBlock, "element">): boolean {
+    const element = block.element;
+    const source = element.closest<HTMLElement>("[tabs-title=\"true\"]");
+    if (source && source.closest(".tab-item-info")) {
+        return true;
+    }
+    const sourceParagraph = element.matches("[data-node-id][data-type]") &&
+        element.closest(".tab-item-info") &&
+        Boolean(element.querySelector(":scope > .tab-item-title"));
+    if (sourceParagraph) {
+        return true;
+    }
+    return Boolean(element.closest(".tabs-header .tabs-tab-label"));
+}
+
 function shouldKeepHiddenSourceText(node: Text): boolean {
     const parent = node.parentElement;
     if (!parent || !isInactiveTabSourceElement(parent)) {
@@ -1913,7 +1931,21 @@ function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
             const titleBlock = item?.querySelector<HTMLElement>(
                 ':scope > .tab-item-info [tabs-title="true"][data-node-id], :scope > .tab-item-info .tab-item-title',
             );
-            const blockEl = titleBlock?.closest<HTMLElement>("[data-node-id][data-type]") ?? null;
+            // The current renderer puts data-node-id/data-type/tabs-title on
+            // the source NodeParagraph. Keep a small compatibility fallback
+            // for older/variant DOM where tabs-title is absent from the
+            // wrapper but the wrapper still owns .tab-item-title. Do not use
+            // closest() on the inner title first: that can accidentally pick
+            // the NodeTabItem id and make the navigation clone appear to be
+            // the write target.
+            const directTitleBlock = Array.from(
+                item?.querySelectorAll<HTMLElement>(":scope > .tab-item-info > [data-node-id]") ?? [],
+            ).find((candidate) =>
+                candidate.hasAttribute("tabs-title") ||
+                Boolean(candidate.querySelector(":scope > .tab-item-title")),
+            );
+            const blockEl = directTitleBlock ??
+                titleBlock?.closest<HTMLElement>("[data-node-id][data-type]") ?? null;
             const blockId = blockEl?.getAttribute("data-node-id") || "";
             if (!item || !blockId) {
                 return;

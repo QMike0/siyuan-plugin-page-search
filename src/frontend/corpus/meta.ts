@@ -65,6 +65,11 @@ export interface BlockMeta {
     updated: string;
 }
 
+/** tabsRender 的页签标题是普通段落块，但 IAL 会保留 tabs-title 标记。 */
+export function isTabsTitleBlockMeta(item: Pick<BlockMeta, "ial">): boolean {
+    return /(?:["']?tabs-title["']?\s*[:=]\s*["']?true["']?)/i.test(item.ial || "");
+}
+
 export interface DocMeta {
     byId: Map<string, BlockMeta>;
     /** 含容器在内的父子关系，供聚焦时收窄范围。 */

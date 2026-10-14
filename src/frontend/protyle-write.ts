@@ -578,7 +578,6 @@ export async function replaceCurrentMatchInEditor(
         includeInlineMemo: true,
         includeImageTitle: true,
         includeDocTitle: false,
-        includeTabSourceForReplace: true,
         includeMindmapSourceForReplace: true,
         scopeRoots: [submit],
     })
@@ -947,7 +946,6 @@ async function prepareFetchedBlockUpdates(
                         includeInlineMemo: true,
                         includeImageTitle: true,
                         includeDocTitle: false,
-                        includeTabSourceForReplace: true,
                         includeMindmapSourceForReplace: true,
                     },
                     new Set(),
@@ -1074,7 +1072,6 @@ export async function replaceAllMatchesInEditor(
     const blocks = collectSearchableBlocks(edit, {
         includeInlineMemo: true,
         includeImageTitle: true,
-        includeTabSourceForReplace: true,
         includeMindmapSourceForReplace: true,
     })
         .filter((block) => !isPreviewSyntheticBlock(block));
@@ -1232,7 +1229,6 @@ export async function replaceAllMatchesInEditor(
                 includeInlineMemo: true,
                 includeImageTitle: true,
                 includeDocTitle: false,
-                includeTabSourceForReplace: true,
                 includeMindmapSourceForReplace: true,
                 scopeRoots: [selectedBlock],
             }).filter((block) => !isPreviewSyntheticBlock(block));

@@ -21,6 +21,7 @@ import {
     collectSearchableBlocks,
     isDocTitleSearchUnit,
     isInactiveTabSourceElement,
+    isTabsTitleSearchUnit,
     tableCellReplaceLock,
     inlineMathIdentityText,
     isInlineMathSearchUnit,
@@ -530,6 +531,7 @@ function attachRangesToHits(
                     ...hit,
                     embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
                     replaceable: !modeBlocked && !isDocTitleSearchUnit(block) &&
+                        !isTabsTitleSearchUnit(block) &&
                         !isInlineMathSearchUnit(block) && !isRendererUnitId(hit.unitId) &&
                         !hit.unitId?.startsWith("embed:") && hit.replaceable,
                     range: undefined,
@@ -543,6 +545,7 @@ function attachRangesToHits(
         const isMemo = isInlineMemoSearchUnit(block);
         const isMath = isInlineMathSearchUnit(block);
         const isDocTitle = isDocTitleSearchUnit(block);
+        const isTabsTitle = isTabsTitleSearchUnit(block);
         // 限制查找：块级采集之后，仅保留落在所选行内类型内的命中（OR）；与选区过滤独立叠加
         // 文档标题不是行内类型：限制激活时自然被滤掉
         if (
@@ -573,6 +576,7 @@ function attachRangesToHits(
             !isRendererUnitId(hit.unitId) &&
             !hit.unitId?.startsWith("embed:") &&
             !isDocTitle &&
+            !isTabsTitle &&
             !isMath &&
             !modeBlocked &&
             isDomReplaceable(range, hit.blockType, hit.blockId, projectionSourceBacked) &&

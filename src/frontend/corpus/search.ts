@@ -44,6 +44,7 @@ import {
     isDirectTableCell,
     inlineMathIdentityText,
     isInlineMathSearchUnit,
+    isTabsTitleSearchUnit,
     ownEmbeddedSearchUnit,
     resolveDocRoot,
 } from "../blocks";
@@ -129,6 +130,7 @@ import {
     invalidateDocMeta,
     isInMindmapBlock,
     isInTabsBlock,
+    isTabsTitleBlockMeta,
     loadDocMeta,
     noteLiveCodeLanguage,
     type BlockMeta,
@@ -3405,6 +3407,12 @@ async function searchCurrentDocumentImpl(
             projectionSourceBacked.add(unit.blockId);
         }
     }
+    const mountedTabsTitleIds = new Set(
+        liveAll.filter(isTabsTitleSearchUnit).map((unit) => unit.blockId),
+    );
+    const unloadedTabsTitleIds = new Set(
+        Array.from(meta.byId.values()).filter(isTabsTitleBlockMeta).map((item) => item.id),
+    );
     const matches: SearchMatch[] = [];
     let phaseStarted = performance.now();
     for (let hitIndex = 0; hitIndex < matched.hits.length; hitIndex += 1) {
@@ -3419,6 +3427,8 @@ async function searchCurrentDocumentImpl(
             continue;
         }
         const nonReplaceable = hit.blockId === "__doc-title__" ||
+            mountedTabsTitleIds.has(hit.blockId) ||
+            unloadedTabsTitleIds.has(hit.blockId) ||
             hit.unitId === "doc-title" ||
             hit.blockType === "doc-title" ||
             hit.blockType === "NodeAttributeView" ||
