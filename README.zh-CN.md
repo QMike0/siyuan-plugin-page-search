@@ -2,8 +2,6 @@
 
 [English](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.md)|[简体中文](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.zh-CN.md)
 
-> 插件会搜索已加载内容，也会尝试补充离屏、折叠和未加载区域的结果。索引尚未完成、部分内容未能读取或数据库分页受限时，结果可能暂不完整，界面会提示状态。
-
 ## 主要特性
 
 ### （1）匹配选项
@@ -18,7 +16,7 @@
 
 ### （2）搜索范围（齿轮菜单）
 
-![image-20260728110038465](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110038465.png)
+![image-20261016002022803](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261016002022803.png)
 
 * **是否搜索**：按类型开关是否纳入搜索——文档标题、图片标题、行内备注、段落块、标题块（一至六级）、列表块（无序 / 有序 / 任务）、公式块、代码块、表格、数据库、引述块、提示块、超级块、嵌入块、HTML、Mermaid 图等
 * **折叠块内容**：是否搜索非标题折叠块内的隐藏内容
@@ -27,7 +25,7 @@
 
 ### （3）页内搜索
 
-![image-20260728110005220](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110005220.png)
+![image-20261016002506695](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261016002506695.png)
 
 * 顶栏图标或快捷键打开搜索条（默认 `Ctrl+F` / macOS `⌘F`，可在思源快捷键中修改）
 * 黄标全部命中、橙标当前项；`Enter` 下一个、`Shift+Enter` 上一个、`Esc` 关闭
@@ -38,7 +36,7 @@
 
 ### （4）页内替换
 
-![image-20260728110019082](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110019082.png)
+![image-20261016002533227](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261016002533227.png)
 
 * 默认折叠替换行，点 ⌄ 展开，或者快捷键打开替换功能区域（默认 `Ctrl+H` / macOS `⌘H`，可在思源快捷键中修改）
 * 支持 替换 / 全部替换

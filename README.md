@@ -2,8 +2,6 @@
 
 [简体中文](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.zh-CN.md)|[English](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.md)
 
-> The plugin searches loaded content and also tries to include results from offscreen, folded, and unloaded areas. Results may be incomplete while indexing is in progress, some content cannot be read, or database pagination is limited; the interface shows the current status.
-
 ## Key Features
 
 ### (1) Match options
@@ -18,7 +16,7 @@
 
 ### (2) Search scope (gear menu)
 
-![image-20260728110038465](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110038465.png)
+![image-20261016002714516](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261016002714516.png)
 
 * **Include in search**: Toggle which types are searched — document title, image title, inline memos, paragraph blocks, heading blocks (H1–H6), list blocks (unordered / ordered / task), math blocks, code blocks, tables, databases, blockquotes, callouts, super blocks, embeds, HTML, Mermaid, and more. Embedded content can be searched and highlighted, but is not replaced
 * **Folded block content**: Whether to search hidden content inside non-heading folded blocks
@@ -27,7 +25,7 @@
 
 ### (3) In-page search
 
-![image-20260728110005220](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110005220.png)
+![image-20261016002747503](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261016002747503.png)
 
 * Open the search bar from the top-bar icon or hotkey (default `Ctrl+F` / macOS `⌘F`; changeable in SiYuan hotkeys)
 * Yellow = all hits, orange = current; `Enter` next, `Shift+Enter` previous, `Esc` close
@@ -38,7 +36,7 @@
 
 ### (4) In-page replace
 
-![image-20260728110019082](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110019082.png)
+![image-20261016002810292](C:\Users\Administrator.DESKTOP-J8MI5MJ\AppData\Roaming\Typora\typora-user-images\image-20261016002810292.png)
 
 * The replace row is collapsed by default; click ⌄ to expand, or open the replace area with a hotkey (default `Ctrl+H` / macOS `⌘H`; changeable in SiYuan hotkeys)
 * Supports Replace / Replace all
