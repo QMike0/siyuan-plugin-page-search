@@ -896,7 +896,7 @@ async function main() {
         const bar = Object.create(SearchBar.prototype);
         Object.assign(bar, {
             edit,
-            plugin: {},
+            plugin: {isLastHighlightComponent: () => false},
             searchText: "foo",
             replaceText: "zap",
             resultCount: 1,
@@ -1075,6 +1075,46 @@ async function main() {
         assert.equal(commits, before, "changed complete snapshot is rejected: " + change);
         assert.equal(refreshed, 1, "stale snapshot requests refresh");
     }
+    const recoverableAll = searchBarFixture();
+    let recoverableRefreshes = 0;
+    recoverableAll.highlightHitResult = async () => {
+        recoverableRefreshes++;
+        recoverableAll.searchGeneration++;
+        recoverableAll.resultSearchGeneration = recoverableAll.searchGeneration;
+        recoverableAll.resultDomEpoch = recoverableAll.domEpoch;
+        recoverableAll.resultDocumentEpoch = recoverableAll.documentEpoch;
+    };
+    const beforeRecoverable = commits;
+    confirmAction = (yes) => {
+        // A delayed savedoc for the edit made before opening the dialog.
+        recoverableAll.documentEpoch++;
+        yes();
+    };
+    await recoverableAll.clickReplaceAll();
+    assert.equal(recoverableRefreshes, 2, "delayed savedoc refreshes before writing and once after");
+    assert.equal(commits - beforeRecoverable, 1, "delayed savedoc does not reject an otherwise stable replacement");
+    const interruptedRecovery = searchBarFixture();
+    let interruptedRefreshes = 0;
+    interruptedRecovery.highlightHitResult = async () => {
+        interruptedRefreshes++;
+        if (interruptedRefreshes === 1) {
+            // The v3.8.7 index commit arrives while the recovery search is reading.
+            interruptedRecovery.documentEpoch++;
+            return;
+        }
+        interruptedRecovery.searchGeneration++;
+        interruptedRecovery.resultSearchGeneration = interruptedRecovery.searchGeneration;
+        interruptedRecovery.resultDomEpoch = interruptedRecovery.domEpoch;
+        interruptedRecovery.resultDocumentEpoch = interruptedRecovery.documentEpoch;
+    };
+    const beforeInterrupted = commits;
+    confirmAction = (yes) => {
+        interruptedRecovery.documentEpoch++;
+        yes();
+    };
+    await interruptedRecovery.clickReplaceAll();
+    assert.equal(interruptedRefreshes, 3, "an index event during recovery gets one bounded retry plus the final refresh");
+    assert.equal(commits - beforeInterrupted, 1, "recovery retry writes only after a stable snapshot");
     confirmAction = (yes) => yes();
     const renderedBeforeAll = searchBarFixture();
     renderedBeforeAll.domEpoch++;

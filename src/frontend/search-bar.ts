@@ -4735,7 +4735,11 @@ export class SearchBar {
                 return;
             }
         }
-        const searchGeneration = this.searchGeneration;
+        let searchGeneration = this.searchGeneration;
+        const initialSearchKey = this.searchResultKey();
+        const initialReplacementText = this.replaceText;
+        const initialSelectionScope = this.rememberedSelectionScope;
+        const confirmationDomEpoch = this.domEpoch;
         const writableCount = countWritableMatches(this.edit, this.resultMatches);
         if (!writableCount) {
             showMessage(this.i18n.replaceCurrentUnsupported, 3000, "info");
@@ -4759,15 +4763,81 @@ export class SearchBar {
         if (!confirmed || this.destroyed) {
             return;
         }
+        let refreshedAfterConfirm = false;
+        const sameReplaceIntent = () =>
+            this.searchResultKey() === initialSearchKey && this.replaceText === initialReplacementText &&
+            this.rememberedSelectionScope === initialSelectionScope;
+        const cancelQueuedSearchRefreshes = () => {
+            clearTimeout(this.typingTimer);
+            this.typingTimer = undefined;
+            clearTimeout(this.domRefreshTimer);
+            this.domRefreshTimer = undefined;
+            clearTimeout(this.foldRefreshTimer);
+            this.foldRefreshTimer = undefined;
+            clearTimeout(this.avRefreshTimer);
+            this.avRefreshTimer = undefined;
+            if (this.indexSettledTimer != null) {
+                clearTimeout(this.indexSettledTimer);
+                this.indexSettledTimer = null;
+            }
+        };
+        // The editor may deliver savedoc/DOM mutations while the confirmation
+        // dialog is open. A stale document epoch is retryable when the query
+        // itself is unchanged and no new DOM edit happened while the dialog
+        // was open: perform a bounded refresh before declaring failure.
+        // Coverage failures remain guarded by the stable snapshot check below,
+        // so this cannot turn an incomplete search into a write.
+        if (
+            !this.hasStableReplaceAllSnapshot() &&
+            sameReplaceIntent() &&
+            this.domEpoch === confirmationDomEpoch &&
+            !this.replaceBusy &&
+            !this.isRestrictEnumerateMode()
+        ) {
+            // An index/savedoc event can invalidate this refresh while its
+            // asynchronous reads are in flight. Retry that specific race once;
+            // do not turn a real coverage failure into a write or loop forever.
+            for (let attempt = 0; attempt < 2; attempt++) {
+                // Event handlers may already have queued the same refresh. Cancel
+                // those timers so a slow document cannot start a second search
+                // between this refresh and the write guard.
+                cancelQueuedSearchRefreshes();
+                const refreshDocumentEpoch = this.documentEpoch;
+                await this.highlightHitResult(this.searchText, false);
+                refreshedAfterConfirm = true;
+                if (this.hasStableReplaceAllSnapshot() && sameReplaceIntent()) {
+                    // calculateSearchResults advances the generation for every
+                    // refresh, including an event-driven refresh of the same
+                    // query. The refreshed snapshot is the one we are authorized
+                    // to submit after the user's confirmation.
+                    searchGeneration = this.searchGeneration;
+                    cancelQueuedSearchRefreshes();
+                    break;
+                }
+                if (
+                    this.searchCoverageIncomplete ||
+                    this.documentEpoch === refreshDocumentEpoch ||
+                    !sameReplaceIntent() ||
+                    this.domEpoch !== confirmationDomEpoch
+                ) {
+                    // Leave an event-scheduled refresh alive when the retry was
+                    // not safe; it can recover the display without writing.
+                    break;
+                }
+            }
+        }
         if (
             this.replaceBusy ||
             !this.hasStableReplaceAllSnapshot() ||
             searchGeneration !== this.searchGeneration ||
+            !sameReplaceIntent() ||
             this.resultCount === 0 ||
             this.isRestrictEnumerateMode()
         ) {
             showMessage(this.i18n.replaceAllIncomplete, 4000, "info");
-            if (!this.hasStableReplaceAllSnapshot()) await this.highlightHitResult(this.searchText, false);
+            if (!this.hasStableReplaceAllSnapshot() && !refreshedAfterConfirm) {
+                await this.highlightHitResult(this.searchText, false);
+            }
             return;
         }
         if (isEditorReplaceModeBlocked(this.edit)) {
