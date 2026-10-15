@@ -937,11 +937,13 @@ async function main() {
         {...writableMatch, id: "math", blockId: "math", blockType: "NodeMathBlock", replaceable: false},
         {...writableMatch, id: "rich", blockId: "rich", replaceable: false, replaceLock: "table-rich"},
         {...writableMatch, id: "editing", blockId: "editing", replaceable: false, replaceLock: "table-cell-editor"},
-        {...writableMatch, id: "embed", blockId: "embed", unitId: "embed:source", replaceable: false},
+        {...writableMatch, id: "embed", blockId: "embed", unitId: "embed:source", replaceable: true},
         {...writableMatch, id: "complex", blockId: "complex", replaceable: false},
     ];
     const mixedMatches = [writableMatch, ...nonWritableMatches];
     assert.equal(write.countWritableMatches(edit, mixedMatches), 1);
+    assert.equal(write.isMatchWritable(edit, mixedMatches.find(match => match.id === "embed")), false,
+        "embedded matches stay unwritable even if an upstream path marks them replaceable");
     assert.equal(
         write.countWritableMatches(edit, mixedMatches),
         mixedMatches.filter(match => write.isMatchWritable(edit, match)).length,
