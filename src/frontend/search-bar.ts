@@ -109,6 +109,7 @@ import {
 import {rpcSetPrefs} from "./kernel-client";
 import {
     resolveInitialMatchIndex,
+    resolveNextReplacementMatchIndex,
     resolveRetainedMatchIndexWithBudget,
 } from "./match-anchor";
 import {
@@ -4605,7 +4606,6 @@ export class SearchBar {
             return;
         }
 
-        const keepIndex = this.resultIndex;
         const searchKey = this.resultSearchKey;
         const selectionScope = this.resultSelectionScope;
         this.replaceBusy = true;
@@ -4644,6 +4644,9 @@ export class SearchBar {
             ) return;
             const generation = this.searchGeneration;
             const replacementText = this.replaceText;
+            const currentIndex = this.resultMatches.indexOf(current);
+            if (currentIndex < 0) return;
+            const successor = this.resultMatches[(currentIndex + 1) % this.resultMatches.length];
             const result = await replaceCurrentMatchInEditor(
                 this.edit,
                 current,
@@ -4713,12 +4716,23 @@ export class SearchBar {
                 return;
             }
 
-            this.clearHighlight();
-            // 替换后保持相对索引，不按光标重新锚定
-            await this.refreshReplacementResults();
-            if (this.destroyed) return;
+            if (!result.unchanged) {
+                this.clearHighlight();
+                await this.refreshReplacementResults();
+            }
+            if (
+                this.destroyed || !this.hasCurrentSearchResults() || this.resultSearchKey !== searchKey ||
+                this.resultSelectionScope !== selectionScope || this.replaceText !== replacementText ||
+                (result.unchanged && this.searchGeneration !== generation)
+            ) return;
             if (this.resultCount > 0) {
-                this.resultIndex = Math.min(keepIndex, this.resultCount);
+                this.resultIndex = result.unchanged ? (currentIndex + 1) % this.resultCount + 1 :
+                    resolveNextReplacementMatchIndex(
+                        this.resultMatches,
+                        current,
+                        successor === current ? undefined : successor,
+                        result.replacementEnd ?? current.end,
+                    );
                 this.updateCountLabel();
                 this.scrollIntoRanges(this.resultIndex - 1, false);
             }
@@ -4945,8 +4959,10 @@ export class SearchBar {
                 return;
             }
 
-            this.clearHighlight();
-            await this.refreshReplacementResults();
+            if (!result.unchanged) {
+                this.clearHighlight();
+                await this.refreshReplacementResults();
+            }
             if (this.destroyed) return;
             showMessage(
                 this.i18n.replaceAllResult

@@ -235,6 +235,149 @@ function makeDestroyable(bar) {
 }
 
 async function main() {
+    const expansionMatcher = {
+        expandReplacements: async (requests, pattern, template, options) => ({
+            expansions: source("shared/regex-replace").expandRegexReplacementUnits(
+                requests,
+                pattern,
+                template,
+                options,
+            ),
+            error: "",
+        }),
+    };
+    for (const all of [false, true]) {
+        for (const fetched of [false, true]) {
+            const f = fixture([
+                paragraph(
+                    id,
+                    '<span data-type="inline-memo" data-inline-memo-content="&lt;strong&gt;foo&lt;/strong&gt;">host</span>',
+                ),
+            ]);
+            const unit = blocks.collectSearchableBlocks(f.edit, {includeDocTitle: false, includeInlineMemo: true})
+                .find(unit => unit.matchSource === "inline-memo");
+            f.matches = f.matches.map(hit => ({
+                ...hit,
+                replaceable: true,
+                highlightKind: "inline-memo",
+                anchorOffset: unit.anchorOffset,
+            }));
+            const before = f.kernel.get(id);
+            if (fetched) f.wysiwyg.innerHTML = "";
+            const result = await run(f, all, {}, "foo");
+            assert.equal(result.unchanged, true);
+            assert.equal(result.replacedCount, 1);
+            assert.equal(f.calls.length, 0, "formatted memo no-op creates no history");
+            assert.equal(f.kernel.get(id), before, "memo no-op preserves raw HTML formatting");
+            assert.equal(f.requests.length, fetched ? 2 : 0, "authoritative no-op validation remains intact");
+        }
+    }
+    for (const all of [false, true]) {
+        for (const options of [{}, {preserveCase: true}, {regex: true, regexMatcher: expansionMatcher}]) {
+            const f = fixture([paragraph(id, "foo foo")]);
+            const bar = barFixture(f);
+            delete bar.getCurrentMatch;
+            Object.assign(bar, options, {replaceText: options.regex ? "$&" : "foo"});
+            let refreshes = 0;
+            bar.highlightHitResult = async () => {
+                refreshes++;
+            };
+            if (all) await bar.clickReplaceAll();
+            else await bar.clickReplace();
+            assert.equal(f.calls.length, 0);
+            assert.equal(refreshes, 0, "unchanged replacement skips redundant full search");
+            assert.equal(bar.resultIndex, all ? 1 : 2, "single no-op advances without modifying result data");
+            if (!all) {
+                await bar.clickReplace();
+                assert.equal(bar.resultIndex, 1, "no-op wraps to the first target");
+            }
+        }
+    }
+    const pendingNoop = barFixture(fixture());
+    pendingNoop.replaceText = "foo";
+    pendingNoop.replaceRefreshPending = true;
+    let externalRefreshes = 0;
+    pendingNoop.highlightHitResult = async () => {
+        externalRefreshes++;
+    };
+    await pendingNoop.clickReplace();
+    await delay(10);
+    assert.equal(externalRefreshes, 1, "no-op keeps refreshes requested by external document events");
+
+    for (const fetched of [false, true]) {
+        for (const [query, text, regex] of [["foo", "fooX", false], ["foo", "bar", false], ["(foo)", "$1XX", true]]) {
+            const f = fixture([paragraph(id, "foo foo"), paragraph(otherId, "foo")]);
+            const bar = barFixture(f);
+            delete bar.getCurrentMatch;
+            Object.assign(bar, {searchText: query, replaceText: text, regex, regexMatcher: expansionMatcher});
+            const refresh = () => {
+                const host = document.createElement("div");
+                host.setAttribute("data-page-search-offscreen", "true");
+                host.innerHTML = '<div class="protyle-wysiwyg">' + [...f.kernel.values()].join("") + "</div>";
+                document.body.append(host);
+                const units = blocks.collectSearchableBlocks(host, {includeDocTitle: false});
+                bar.resultMatches = matcher.matchTextUnitsDetailed(
+                    units.map(unit => ({
+                        ...unit,
+                        segmentLengths: unit.textNodes.map(node => node.length),
+                    })),
+                    query,
+                    {regex},
+                ).hits;
+                bar.resultCount = bar.resultMatches.length;
+                host.remove();
+            };
+            bar.highlightHitResult = async () => refresh();
+            refresh();
+            if (fetched) f.wysiwyg.innerHTML = "";
+            await bar.clickReplace();
+            assert.equal(bar.getCurrentMatch().blockId, id);
+            assert.equal(bar.getCurrentMatch().start, text === "bar" ? 4 : regex ? 6 : 5);
+            await bar.clickReplace();
+            assert.equal(bar.getCurrentMatch().blockId, otherId, "advance across blocks, including offscreen targets");
+            assert.equal(f.calls.length, 2);
+            assert.ok(
+                f.kernel.get(id).includes(text === "bar" ? "bar bar" : regex ? "fooXX fooXX" : "fooX fooX"),
+                "successive replacements process each original occurrence once",
+            );
+            await bar.clickReplace();
+            assert.equal(bar.resultCount, text === "bar" ? 0 : 3);
+            if (bar.resultCount) {
+                assert.equal(bar.getCurrentMatch().blockId, id);
+                assert.equal(bar.getCurrentMatch().start, 0, "last original target wraps to the first");
+            }
+            const firstWrite = f.calls[0];
+            f.protyle.transaction(firstWrite.undo, firstWrite.operations);
+            assert.ok(f.kernel.get(id).includes("foo foo"), "native undo payload remains unchanged");
+        }
+    }
+    const nextIndex = source("frontend/match-anchor").resolveNextReplacementMatchIndex;
+    const hit = (unitId, start, end = start + 3) => ({blockId: id, unitId, start, end, matchedText: "foo"});
+    const oldCurrent = hit("table-cell:0:0", 0);
+    const oldNext = hit("table-cell:0:1", 0);
+    assert.equal(
+        nextIndex([oldCurrent, oldNext], oldCurrent, oldNext, 4),
+        2,
+        "table cell identity beats numeric index",
+    );
+    const memo = {...hit("inline-memo:7", 0), highlightKind: "inline-memo", anchorOffset: 6};
+    assert.equal(
+        nextIndex([{...memo, unitId: "inline-memo:0", start: 4, end: 7}], memo, {...memo, start: 4, end: 7}, 3),
+        1,
+        "memo identity uses the owner anchor rather than global ordinal",
+    );
+    assert.equal(
+        nextIndex([hit(undefined, 0), {...memo, anchorOffset: 7}], hit(undefined, 0), memo, 4),
+        2,
+        "body length change moves the next memo's host anchor",
+    );
+    assert.equal(
+        nextIndex([hit(undefined, 0, 0), hit(undefined, 2, 2)], hit(undefined, 0, 0), hit(undefined, 2, 2), 0),
+        2,
+        "zero-width navigation advances to the original next boundary",
+    );
+    console.log("No-op memo/preserve-case/regex, no redundant refresh, identity advancement, offscreen and undo OK");
+
     const extract = source("frontend/corpus/extract");
     const originalExtract = extract.extractUnitsFromDoms;
     const originalCollect = blocks.collectSearchableBlocks;
@@ -762,6 +905,13 @@ async function main() {
             assert.equal(imageTitle.matches.length, 1);
             assert.equal(imageTitle.matches[0].unitId, "image-title:0");
             if (fetched) imageTitle.wysiwyg.innerHTML = "";
+            const mutations = new MutationObserver(() => {});
+            mutations.observe(imageTitle.wysiwyg, {subtree: true, attributes: true, childList: true, characterData: true});
+            const unchanged = await run(imageTitle, all, {}, "foo");
+            assert.equal(unchanged.unchanged, true);
+            assert.equal(imageTitle.calls.length, 0, "caption no-op has no write/history");
+            assert.equal(mutations.takeRecords().length, 0, "caption no-op does not rewrite img title or text");
+            mutations.disconnect();
             const result = await run(imageTitle, all);
             assert.equal(result.commitState, "confirmed", "image-title-only matches remain replaceable");
             assert.equal(result.replacedCount, 1);

@@ -7,6 +7,44 @@ interface RetainedAnchorOptions {
     edit?: Element;
 }
 
+/** 优先找回替换前的下一目标；不把替换文本中新产生的命中当成原目标。 */
+export function resolveNextReplacementMatchIndex(
+    matches: readonly SearchMatch[],
+    replaced: SearchMatch,
+    successor: SearchMatch | undefined,
+    replacementEnd: number,
+): number {
+    if (!matches.length) return 0;
+    const delta = replacementEnd - replaced.end;
+    let target = successor;
+    if (target && sameAnchorUnit(target, replaced) && target.start >= replaced.end) {
+        target = {...target, start: target.start + delta, end: target.end + delta};
+    }
+    // 普通正文 unit 的偏移也是备注宿主的块内偏移。其它单元（分段、
+    // 表格格内等）坐标不同，不能把它们的长度变化直接加到宿主偏移。
+    if (
+        target?.highlightKind === "inline-memo" && target.anchorOffset !== undefined &&
+        replaced.blockId === target.blockId && replaced.highlightKind !== "inline-memo" &&
+        replaced.highlightKind !== "inline-math" && target.anchorOffset >= replaced.end
+    ) target = {...target, anchorOffset: target.anchorOffset + delta};
+    let continuation = 0;
+    let followingBlock = 0;
+    for (let index = 0; index < matches.length; index++) {
+        const match = matches[index];
+        if (
+            target && sameAnchorUnit(match, target) && match.start === target.start &&
+            match.end === target.end && match.matchedText === target.matchedText
+        ) return index + 1;
+        if (!followingBlock && match.blockIndex > replaced.blockIndex) followingBlock = index + 1;
+        if (
+            !continuation && sameAnchorUnit(match, replaced) && match.start >= replacementEnd &&
+            // 零宽匹配在插入区间末尾仍可能匹配同一边界。
+            !(replaced.start === replaced.end && match.start === replacementEnd)
+        ) continuation = index + 1;
+    }
+    return continuation || followingBlock || 1;
+}
+
 /** 同步入口供小夹具使用；搜索栏使用下方可取消的分片入口。 */
 export function resolveRetainedMatchIndex(
     matches: SearchMatch[],

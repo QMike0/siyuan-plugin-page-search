@@ -42,6 +42,8 @@ export interface ApplyReplacementOptions {
 
 export interface ApplyReplacementOutcome {
     appliedCount: number;
+    /** 单个命中成功应用后的结束偏移，使用实际模板展开长度。 */
+    replacementEnd?: number;
     /** 定位失败 / 文本漂移 / 正则展开失败等跳过的条数 */
     skippedCount: number;
     /** 其中因正则模板展开失败而跳过的条数 */
@@ -234,6 +236,7 @@ export function applyReplacementsToString(
     let appliedCount = 0;
     let skippedCount = 0;
     let regexExpandFailedCount = 0;
+    let replacementEnd: number | undefined;
 
     for (const replacement of sorted) {
         if (
@@ -261,11 +264,14 @@ export function applyReplacementsToString(
         }
 
         // 从后往前改：高 offset 不受此前替换长度变化影响
-        text = text.slice(0, replacement.start) + nextText + text.slice(replacement.end);
+        if (nextText !== replacement.matchedText) {
+            text = text.slice(0, replacement.start) + nextText + text.slice(replacement.end);
+        }
         appliedCount += 1;
+        if (replacements.length === 1) replacementEnd = replacement.start + nextText.length;
     }
 
-    return {text, appliedCount, skippedCount, regexExpandFailedCount};
+    return {text, appliedCount, skippedCount, regexExpandFailedCount, replacementEnd};
 }
 
 /**
@@ -310,9 +316,10 @@ export function applyReplacementsToInlineMemoElement(
         };
     }
 
-    writeInlineMemoContent(host, outcome.text);
+    if (outcome.text !== haystack) writeInlineMemoContent(host, outcome.text);
     return {
         appliedCount: outcome.appliedCount,
+        replacementEnd: outcome.replacementEnd,
         skippedCount: outcome.skippedCount,
         regexExpandFailedCount: outcome.regexExpandFailedCount,
     };
@@ -382,6 +389,8 @@ function applyReplacementsToTextNodes(
     let appliedCount = 0;
     let skippedCount = 0;
     let regexExpandFailedCount = 0;
+    let replacementEnd: number | undefined;
+    let textChanged = false;
 
     for (const replacement of sorted) {
         const nextText = resolveReplacementText(
@@ -400,17 +409,19 @@ function applyReplacementsToTextNodes(
 
         if (applyReplacementToTextNodes(blockLike, textNodes, replacement, nextText)) {
             appliedCount += 1;
+            if (nextText !== replacement.matchedText) textChanged = true;
+            if (replacements.length === 1) replacementEnd = replacement.start + nextText.length;
         } else {
             skippedCount += 1;
         }
     }
 
     // 图片标题：可见字改完后同步 img[title]，对齐官方 imgMenu（menus/protyle.ts）
-    if (appliedCount > 0) {
+    if (textChanged) {
         syncImageTitleAttributeFromTextNodes(textNodes);
     }
 
-    return {appliedCount, skippedCount, regexExpandFailedCount};
+    return {appliedCount, skippedCount, regexExpandFailedCount, replacementEnd};
 }
 
 /**
@@ -576,6 +587,7 @@ export function applyMatchesToSubmitClone(
     let appliedCount = 0;
     let skippedCount = grouped.skippedCount;
     let regexExpandFailedCount = 0;
+    let replacementEnd: number | undefined;
     for (const [unit, specs] of grouped.byUnit) {
         if (liveSubmit !== unit.element && !liveSubmit.contains(unit.element)) {
             skippedCount += specs.length;
@@ -605,6 +617,7 @@ export function applyMatchesToSubmitClone(
                 replacementText,
                 options,
             );
+            if (matches.length === 1) replacementEnd = outcome.replacementEnd;
             appliedCount += outcome.appliedCount;
             skippedCount += outcome.skippedCount;
             regexExpandFailedCount += outcome.regexExpandFailedCount;
@@ -623,12 +636,13 @@ export function applyMatchesToSubmitClone(
             replacementText,
             options,
         );
+        if (matches.length === 1) replacementEnd = outcome.replacementEnd;
         appliedCount += outcome.appliedCount;
         skippedCount += outcome.skippedCount;
         regexExpandFailedCount += outcome.regexExpandFailedCount;
     }
 
-    return {appliedCount, skippedCount, regexExpandFailedCount};
+    return {appliedCount, skippedCount, regexExpandFailedCount, replacementEnd};
 }
 
 /**
@@ -646,6 +660,7 @@ export function applyMatchesToLiveUnits(
     let appliedCount = 0;
     let skippedCount = grouped.skippedCount;
     let regexExpandFailedCount = 0;
+    let replacementEnd: number | undefined;
     for (const [unit, specs] of grouped.byUnit) {
         if (isInlineMemoSearchUnit(unit)) {
             const outcome = applyReplacementsToInlineMemoElement(
@@ -654,6 +669,7 @@ export function applyMatchesToLiveUnits(
                 replacementText,
                 options,
             );
+            if (matches.length === 1) replacementEnd = outcome.replacementEnd;
             appliedCount += outcome.appliedCount;
             skippedCount += outcome.skippedCount;
             regexExpandFailedCount += outcome.regexExpandFailedCount;
@@ -665,9 +681,10 @@ export function applyMatchesToLiveUnits(
             replacementText,
             options,
         );
+        if (matches.length === 1) replacementEnd = outcome.replacementEnd;
         appliedCount += outcome.appliedCount;
         skippedCount += outcome.skippedCount;
         regexExpandFailedCount += outcome.regexExpandFailedCount;
     }
-    return {appliedCount, skippedCount, regexExpandFailedCount};
+    return {appliedCount, skippedCount, regexExpandFailedCount, replacementEnd};
 }

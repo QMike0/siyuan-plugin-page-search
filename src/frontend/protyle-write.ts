@@ -64,6 +64,10 @@ export interface ReplaceWriteOptions extends CommitObserver {
 export interface ReplaceWriteResult {
     replacedCount: number;
     skippedCount: number;
+    /** 已验证目标，但 HTML 无变化，未提交事务。 */
+    unchanged?: boolean;
+    /** 单处替换实际写入区间的终点，用于定位原来的下一目标。 */
+    replacementEnd?: number;
     /** Only confirmed content contributes to replacedCount after a submitted write. */
     commitState?: ReplaceCommitState;
     submittedCount?: number;
@@ -691,7 +695,13 @@ export async function replaceCurrentMatchInEditor(
     };
     // The replacement is already the same text. Native updateTransaction also skips this write.
     if (update.newHTML === oldHTML) {
-        return {replacedCount: outcome.appliedCount, skippedCount: outcome.skippedCount, commitState: "confirmed"};
+        return {
+            replacedCount: outcome.appliedCount,
+            skippedCount: outcome.skippedCount,
+            commitState: "confirmed",
+            unchanged: true,
+            replacementEnd: outcome.replacementEnd,
+        };
     }
     const rootId = editorRootId(edit);
     const rollback = captureLiveRollback(edit, protyle, [update], new Map([[submit, oldHTML]]));
@@ -709,6 +719,7 @@ export async function replaceCurrentMatchInEditor(
     return {
         ...confirmation,
         skippedCount: outcome.skippedCount,
+        replacementEnd: outcome.replacementEnd,
     };
 }
 
@@ -721,6 +732,7 @@ interface PreparedBlockUpdate {
     oldHTML: string;
     newHTML: string;
     appliedCount: number;
+    replacementEnd?: number;
     /** Reuse the exact plan if a fetched block mounts with the editor selection. */
     replaceOptions?: PreparedReplaceOptions;
     /** 获取时的内核底稿，可能与并入未落盘虚拟表格后的 oldHTML 不同。 */
@@ -828,6 +840,7 @@ function prepareBlockElementUpdate(
             oldHTML,
             newHTML: clone.outerHTML,
             appliedCount: outcome.appliedCount,
+            replacementEnd: outcome.replacementEnd,
             replaceOptions: replaceOpts,
         },
         skippedCount: outcome.skippedCount,
@@ -1292,7 +1305,7 @@ export async function replaceAllMatchesInEditor(
         0,
     );
     if (!changed.length) {
-        return {replacedCount: unchangedCount, skippedCount, commitState: "confirmed"};
+        return {replacedCount: unchangedCount, skippedCount, commitState: "confirmed", unchanged: true};
     }
     const rootId = editorRootId(edit);
     const submitIndexBeforeCommit = collectSubmitBlockIndex(edit);
@@ -1475,7 +1488,13 @@ async function replaceFetchedBlockMatches(
         return {replacedCount: 0, skippedCount: matches.length, error: conflict};
     }
     if (update.newHTML === update.oldHTML) {
-        return {replacedCount: update.appliedCount, skippedCount: prepared.skippedCount, commitState: "confirmed"};
+        return {
+            replacedCount: update.appliedCount,
+            skippedCount: prepared.skippedCount,
+            commitState: "confirmed",
+            unchanged: true,
+            replacementEnd: update.replacementEnd,
+        };
     }
     const rootId = protyle.protyle?.block?.rootID;
     const rollback = captureLiveRollback(liveRoot, protyle, [update]);
@@ -1492,5 +1511,5 @@ async function replaceFetchedBlockMatches(
     }
     const confirmation = await confirmBlockUpdates(protyle, [update], options);
     invalidateEditedDocument(rootId, [update.id]);
-    return {...confirmation, skippedCount: prepared.skippedCount};
+    return {...confirmation, skippedCount: prepared.skippedCount, replacementEnd: update.replacementEnd};
 }
