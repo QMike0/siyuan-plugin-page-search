@@ -5,6 +5,7 @@ import {
 } from "./constants";
 import {isRendererUnitId} from "./renderer-units";
 import {ATTRIBUTE_VIEW_TYPE} from "./replaceable";
+import {consumeRegexBudget, type RegexBudget} from "./regex-budget";
 
 /** 旧缓存/旧 RPC 单元兼容；新单元统一使用 renderer: 前缀。 */
 const MERMAID_UNIT_ID = "mermaid-source";
@@ -503,6 +504,7 @@ function findOffsetMatchesWithPattern(
     blockText: string,
     pattern: RegExp,
     options: MatchOptions,
+    budget?: RegexBudget,
 ): TextOffsetMatch[] {
     const allMatches: TextOffsetMatch[] = [];
     const unicode = pattern.unicode;
@@ -529,6 +531,7 @@ function findOffsetMatchesWithPattern(
                 options.wholeWord === true,
             )
         ) {
+            if (budget) consumeRegexBudget(budget, matchedText.length, 1);
             allMatches.push({startIndex, endIndex, searchStr: matchedText});
         }
         match = pattern.exec(blockText);
@@ -671,23 +674,26 @@ export function matchTextUnitsDetailed(
     units: SearchableUnit[],
     query: string,
     options: MatchTextUnitsOptions = {},
+    budget?: RegexBudget,
 ): MatchTextUnitsResult {
     if (!units.length) return {hits: [], error: ""};
-    return createTextUnitsMatcher(query, options)(units);
+    return createTextUnitsMatcher(query, options, budget)(units);
 }
 
 /** 分片匹配复用同一查询计划；单元之间仍保持独立偏移和去重规则。 */
 export function createTextUnitsMatcher(
     query: string,
     options: MatchTextUnitsOptions = {},
+    budget?: RegexBudget,
 ): (units: SearchableUnit[]) => MatchTextUnitsResult {
-    const iterate = createTextUnitsMatchIterator(query, options);
+    const iterate = createTextUnitsMatchIterator(query, options, budget);
     return (units) => finishIterator(iterate(units));
 }
 
 export function createTextUnitsMatchIterator(
     query: string,
     options: MatchTextUnitsOptions = {},
+    budget?: RegexBudget,
 ): (units: SearchableUnit[]) => Generator<void, MatchTextUnitsResult> {
     const effectiveQuery = effectiveSearchQuery(query);
     if (!effectiveQuery) {
@@ -727,7 +733,7 @@ export function createTextUnitsMatchIterator(
         for (const unit of units) {
             if ((++unitCount & 255) === 0) yield;
             const offsetMatches = regex ?
-                findOffsetMatchesWithPattern(unit.text, regexPattern as RegExp, options) :
+                findOffsetMatchesWithPattern(unit.text, regexPattern as RegExp, options, budget) :
                 yield* iterateLiteralMatches(
                     unit.text,
                     literalPlan as LiteralSearchPlan,
@@ -751,7 +757,12 @@ export function createTextUnitsMatchIterator(
                     acceptedEnd = match.endIndex;
                 }
 
-                result.push(offsetMatchToHit(unit, match, replaceable(match.startIndex, match.endIndex)));
+                const hit = offsetMatchToHit(unit, match, replaceable(match.startIndex, match.endIndex));
+                if (regex && budget) {
+                    consumeRegexBudget(budget, hit.id.length + hit.blockId.length + hit.blockType.length +
+                        (hit.unitId?.length ?? 0));
+                }
+                result.push(hit);
             }
             yield;
         }

@@ -6,6 +6,12 @@ import type {
     RegexReplacementExpansion,
     RegexReplacementUnitRequest,
 } from "../shared/regex-replace";
+import {
+    consumeRegexBudget,
+    createRegexBudget,
+    RegexBudgetExceeded,
+    type RegexBudget,
+} from "../shared/regex-budget";
 import type {
     MatchTextUnitsOptions,
     MatchTextUnitsResult,
@@ -30,7 +36,9 @@ export interface AsyncRegexReplacementResult {
 }
 
 type WorkerTaskKind = "match" | "expand";
-type WorkerTaskResult = AsyncMatchTextUnitsResult | AsyncRegexReplacementResult;
+type WireExpansion = Pick<RegexReplacementExpansion, "id" | "replacement">;
+type WireExpandResult = Omit<AsyncRegexReplacementResult, "expansions"> & {expansions: WireExpansion[]};
+type WorkerTaskResult = AsyncMatchTextUnitsResult | WireExpandResult;
 
 interface PendingRequest {
     id: number;
@@ -110,7 +118,7 @@ export class RegexTextMatcher {
 
     /**
      * 在同一 Worker 中准备正则替换模板。结果只含纯文本；DOM 和思源事务仍留在主线程。
-     * 每个单元带回原始 haystack，写回前会据此拒绝已被用户改动的快照。
+     * 原始 haystack 留在主线程，Worker 只回传命中 ID 和展开文本；写回仍校验完整快照。
      */
     async expandReplacements(
         units: RegexReplacementUnitRequest[],
@@ -118,12 +126,13 @@ export class RegexTextMatcher {
         template: string,
         options: Pick<MatchTextUnitsOptions, "caseSensitive">,
         signal?: AbortSignal,
+        budget: RegexBudget = createRegexBudget(),
     ): Promise<AsyncRegexReplacementResult> {
         this.matchGeneration += 1;
         if (signal?.aborted) {
             return {expansions: [], error: "", cancelled: true};
         }
-        return this.executeExpand(units, patternSource, template, options, signal);
+        return this.executeExpand(units, patternSource, template, options, signal, budget);
     }
 
     dispose() {
@@ -153,13 +162,39 @@ export class RegexTextMatcher {
         template: string,
         options: Pick<MatchTextUnitsOptions, "caseSensitive">,
         signal?: AbortSignal,
+        budget: RegexBudget = createRegexBudget(),
     ): Promise<AsyncRegexReplacementResult> {
         const result = await this.execute(
             "expand",
-            {units, patternSource, template, options},
+            {units, patternSource, template, options, budget: {...budget}},
             signal,
         );
-        return this.asExpandResult(result);
+        const expanded = this.asExpandResult(result);
+        if (expanded.error || expanded.cancelled) return {...expanded, expansions: []};
+        // 用发出请求时的原文还原校验快照，绝不在 await 后重读编辑器 DOM。
+        const snapshots = new Map<string, string>();
+        for (const unit of units) {
+            for (const replacement of unit.replacements) snapshots.set(replacement.id, unit.haystack);
+        }
+        if (expanded.expansions.length !== snapshots.size) {
+            return {expansions: [], error: "正则 Worker 返回了无效结果"};
+        }
+        const expansions: RegexReplacementExpansion[] = [];
+        try {
+            for (const item of expanded.expansions) {
+                const haystack = snapshots.get(item.id);
+                if (haystack === undefined || (item.replacement !== null && typeof item.replacement !== "string")) {
+                    return {expansions: [], error: "正则 Worker 返回了无效结果"};
+                }
+                consumeRegexBudget(budget, item.id.length + (item.replacement?.length ?? 0), 1);
+                snapshots.delete(item.id);
+                expansions.push({id: item.id, replacement: item.replacement, haystack});
+            }
+        } catch (error) {
+            if (!(error instanceof RegexBudgetExceeded)) throw error;
+            return {expansions: [], error: error.message};
+        }
+        return {expansions, error: ""};
     }
 
     private execute(
@@ -169,6 +204,33 @@ export class RegexTextMatcher {
     ): Promise<WorkerTaskResult> {
         // 新任务覆盖旧任务；terminate 是中断灾难性回溯的可靠边界。
         this.cancelPending();
+        // postMessage 的主线程序列化不能被 Worker 超时中断，先限制输入规模。
+        try {
+            const input = createRegexBudget();
+            if (kind === "match") {
+                const {units, query} = payload as unknown as {units: SearchableUnit[]; query: string};
+                consumeRegexBudget(input, query.length);
+                for (const unit of units) {
+                    consumeRegexBudget(input, unit.text.length + unit.blockId.length + unit.blockType.length +
+                        (unit.unitId?.length ?? 0) + (unit.segmentLengths?.length ?? 0) * 4, 1);
+                }
+            } else {
+                const {units, patternSource, template} = payload as unknown as {
+                    units: RegexReplacementUnitRequest[]; patternSource: string; template: string;
+                };
+                consumeRegexBudget(input, patternSource.length + template.length);
+                for (const unit of units) {
+                    consumeRegexBudget(input, unit.id.length + unit.haystack.length);
+                    for (const replacement of unit.replacements) {
+                        consumeRegexBudget(input, replacement.id.length + replacement.matchedText.length, 1);
+                    }
+                }
+            }
+        } catch (error) {
+            if (!(error instanceof RegexBudgetExceeded)) throw error;
+            return Promise.resolve(kind === "match" ?
+                {hits: [], error: error.message} : {expansions: [], error: error.message});
+        }
         const worker = this.ensureWorker();
         if (!worker) {
             return Promise.resolve(regexWorkerUnavailableResult(kind));
@@ -238,7 +300,7 @@ export class RegexTextMatcher {
         return "hits" in result ? result : {hits: [], error: "正则 Worker 返回了无效结果"};
     }
 
-    private asExpandResult(result: WorkerTaskResult): AsyncRegexReplacementResult {
+    private asExpandResult(result: WorkerTaskResult): WireExpandResult {
         return "expansions" in result ? result : {expansions: [], error: "正则 Worker 返回了无效结果"};
     }
 
@@ -274,7 +336,8 @@ export class RegexTextMatcher {
         event: MessageEvent<{
             id?: number;
             kind?: WorkerTaskKind | "ready";
-            result?: MatchTextUnitsResult | RegexReplacementExpansion[];
+            result?: MatchTextUnitsResult | WireExpansion[];
+            error?: string;
         }>,
     ) => {
         if (!this.worker || event.currentTarget !== this.worker) return;
@@ -298,7 +361,7 @@ export class RegexTextMatcher {
             return;
         }
         this.finishPending(
-            Array.isArray(result) ?
+            event.data.error ? {expansions: [], error: event.data.error} : Array.isArray(result) ?
                 {expansions: result, error: ""} :
                 {expansions: [], error: "正则 Worker 返回了无效结果"},
         );

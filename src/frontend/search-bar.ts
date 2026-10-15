@@ -37,6 +37,7 @@ import {
     isAttrViewWsTransaction,
     watchAttributeViewDom,
 } from "./av-watch";
+import {REGEX_BUDGET_ERROR} from "../shared/regex-budget";
 import {
     collectSearchableBlocks,
     collectMindmapPreviewUnits,
@@ -295,6 +296,7 @@ export interface SearchBarI18n {
     replaceStaleTarget?: string;
     /** 单次正则替换：模板展开失败并跳过 */
     replaceRegexExpandFailed: string;
+    replaceRegexBudgetExceeded?: string;
     replaceAttributeViewUnsupported: string;
     replaceMermaidUnsupported: string;
     replaceHtmlBlockUnsupported: string;
@@ -4679,6 +4681,10 @@ export class SearchBar {
                 await this.highlightHitResult(this.searchText, false);
                 return;
             }
+            if (result.error === "regex-budget-exceeded") {
+                showMessage(this.i18n.replaceRegexBudgetExceeded ?? REGEX_BUDGET_ERROR, 5000, "info");
+                return;
+            }
             if (result.error === "regex-expand-failed") {
                 showMessage(this.i18n.replaceRegexExpandFailed, 3000, "info");
                 this.clickNext();
@@ -4886,6 +4892,10 @@ export class SearchBar {
             }
             if (result.error === "protyle-missing") {
                 showMessage(this.i18n.replaceProtyleMissing, 4000, "error");
+                return;
+            }
+            if (result.error === "regex-budget-exceeded") {
+                showMessage(this.i18n.replaceRegexBudgetExceeded ?? REGEX_BUDGET_ERROR, 5000, "info");
                 return;
             }
             if (result.error === "regex-expand-failed") {

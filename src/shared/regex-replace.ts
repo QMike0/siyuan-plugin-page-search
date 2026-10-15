@@ -4,6 +4,7 @@
  */
 
 import {regexSearchFlags} from "./match-text";
+import {consumeRegexBudget, type RegexBudget} from "./regex-budget";
 
 export interface ExpandRegexReplacementOptions {
     haystack: string;
@@ -42,21 +43,24 @@ export function expandRegexReplacementUnits(
     patternSource: string,
     template: string,
     options: Pick<ExpandRegexReplacementOptions, "caseSensitive">,
+    budget?: RegexBudget,
 ): RegexReplacementExpansion[] {
     const expansions: RegexReplacementExpansion[] = [];
     for (const unit of units) {
+        const pattern = createExpansionPattern(patternSource, options.caseSensitive);
         for (const replacement of unit.replacements) {
+            if (budget) consumeRegexBudget(budget, replacement.id.length, 1);
             expansions.push({
                 id: replacement.id,
                 haystack: unit.haystack,
-                replacement: expandRegexReplacement({
+                replacement: expandRegexReplacementWithPattern({
                     haystack: unit.haystack,
                     start: replacement.start,
                     end: replacement.end,
                     patternSource,
                     template,
                     caseSensitive: options.caseSensitive === true,
-                }),
+                }, pattern, budget),
             });
         }
     }
@@ -68,15 +72,25 @@ export function expandRegexReplacementUnits(
  * @returns 展开后的文本；无法在偏移处还原捕获组时返回 null（调用方应跳过该命中）。
  */
 export function expandRegexReplacement(options: ExpandRegexReplacementOptions): string | null {
+    return expandRegexReplacementWithPattern(
+        options,
+        createExpansionPattern(options.patternSource, options.caseSensitive),
+    );
+}
+
+function expandRegexReplacementWithPattern(
+    options: ExpandRegexReplacementOptions,
+    pattern: RegExp | null,
+    budget?: RegexBudget,
+): string | null {
     const haystack = options.haystack;
     const start = options.start;
     const end = options.end;
     const template = options.template;
     const patternSource = options.patternSource;
-    const caseSensitive = options.caseSensitive === true;
 
     if (
-        !patternSource ||
+        !patternSource || !pattern ||
         start < 0 ||
         end < start ||
         end > haystack.length
@@ -87,7 +101,7 @@ export function expandRegexReplacement(options: ExpandRegexReplacementOptions): 
     // 搜索阶段已经记录了原始 haystack 上的 UTF-16 偏移。替换时必须能在同一
     // haystack、同一偏移处完整复现该命中；否则 lookaround、^/$ 等
     // 上下文语义会在切片中改变，不能安全地展开 $` / $' 或捕获组。
-    const match = execRegexAt(haystack, start, end, patternSource, options);
+    const match = execRegexAt(haystack, start, end, pattern);
 
     if (!match) {
         return null;
@@ -96,28 +110,33 @@ export function expandRegexReplacement(options: ExpandRegexReplacementOptions): 
     const before = haystack.slice(0, start);
     const after = haystack.slice(end);
 
-    return expandReplacementTemplate(template, match, match[0], before, after);
+    return expandReplacementTemplate(template, match, match[0], before, after, budget);
+}
+
+function createExpansionPattern(
+    patternSource: string,
+    caseSensitive?: boolean,
+): RegExp | null {
+    try {
+        return new RegExp(
+            patternSource,
+            regexSearchFlags({
+                regex: true,
+                caseSensitive,
+            }),
+        );
+    } catch {
+        return null;
+    }
 }
 
 function execRegexAt(
     haystack: string,
     start: number,
     end: number,
-    patternSource: string,
-    options: ExpandRegexReplacementOptions,
+    re: RegExp,
 ): RegExpExecArray | null {
-    let re: RegExp;
-    try {
-        re = new RegExp(
-            patternSource,
-            regexSearchFlags({
-                regex: true,
-                caseSensitive: options.caseSensitive,
-            }),
-        );
-    } catch {
-        return null;
-    }
+    // 同一单元复用对象，但每条命中都从原始偏移重新执行，失败后的 lastIndex 也不能沿用。
     re.lastIndex = start;
     const match = re.exec(haystack);
     if (!match || match.index !== start) {
@@ -140,11 +159,16 @@ export function expandReplacementTemplate(
     matchedText: string,
     before: string,
     after: string,
+    budget?: RegexBudget,
 ): string {
+    if (!template.includes("$")) {
+        if (budget) consumeRegexBudget(budget, template.length);
+        return template;
+    }
     const groups = (match as RegExpExecArray).groups;
     // 没有命名组时不能吞掉整个 $<...>，其中的 $1 等仍须正常展开。
     const tokens = groups ? /\$[$&`']|\$\d{1,2}|\$<[^>]*>/g : /\$[$&`']|\$\d{1,2}/g;
-    return template.replace(tokens, (token) => {
+    const substitute = (token: string): string => {
         if (token === "$$") {
             return "$";
         }
@@ -172,5 +196,18 @@ export function expandReplacementTemplate(
             return (match[first] ?? "") + digits[1];
         }
         return token;
-    });
+    };
+    if (budget) {
+        // 在 String.replace 分配完整输出之前计算精确展开长度。复用同一 token 规则，
+        // 不用 UTF-8 编码/复制结果，也不把 $1 等占位符的原始长度误计为输出。
+        let cursor = 0;
+        let token: RegExpExecArray | null;
+        while ((token = tokens.exec(template)) !== null) {
+            consumeRegexBudget(budget, token.index - cursor + substitute(token[0]).length);
+            cursor = token.index + token[0].length;
+        }
+        consumeRegexBudget(budget, template.length - cursor);
+        tokens.lastIndex = 0;
+    }
+    return template.replace(tokens, substitute);
 }

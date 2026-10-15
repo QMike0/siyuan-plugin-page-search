@@ -26,6 +26,7 @@
   "replaceStaleTarget": "The target changed. Replacement was cancelled and results refreshed. Review them and try again.",
   "searchRetryIncomplete": "{count} incomplete databases (click to retry)",
   "replaceRegexExpandFailed": "Regex replace expansion failed; skipped",
+  "replaceRegexBudgetExceeded": "Regex data or replacement output is too large. Narrow the search scope or reduce matches and replacement output.",
   "replaceAttributeViewUnsupported": "Database results support search and highlight only; replacement is not supported",
   "replaceMermaidUnsupported": "Mermaid diagrams support search and highlight only; replacement is not supported",
   "replaceHtmlBlockUnsupported": "HTML blocks support search and highlight of rendered text only; replacement is not supported",

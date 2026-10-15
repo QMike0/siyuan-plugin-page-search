@@ -95,6 +95,7 @@ class PackagedWorker {
         assert.ok(files.has(file), `worker URL resolves to a release asset: ${actual.pathname}`);
         this.listeners = new Map();
         this.sent = [];
+        this.received = [];
         this.thread = new ThreadWorker(threadBootstrap, {
             eval: true,
             workerData: {
@@ -103,7 +104,10 @@ class PackagedWorker {
                 startupDelay: PackagedWorker.startupDelay,
             },
         });
-        this.thread.on("message", data => this.emit("message", {data}));
+        this.thread.on("message", data => {
+            this.received.push(data);
+            this.emit("message", {data});
+        });
         this.thread.on(
             "error",
             error => this.emit("error", {message: error.message, filename: actual.href, lineno: 0}),
@@ -223,6 +227,33 @@ async function main() {
         assert.equal(expanded.error, "");
         assert.equal(expanded.expansions[0].replacement, "13-[800138000]-13800138000");
         assert.equal(expanded.expansions[0].haystack, text);
+        const wireExpansion = created.at(-1).received.filter(data => data.kind === "expand").at(-1);
+        assert.ok(wireExpansion.result.every(item => !Object.hasOwn(item, "haystack")),
+            "Worker wire results omit original text; main-thread snapshots are still restored");
+
+        const request = [{id: "u", haystack: "a", replacements: [{id: "h", start: 0, end: 1, matchedText: "a"}]}];
+        const cumulative = {remainingResults: 2, remainingBytes: 6};
+        assert.equal((await matcher.expandReplacements(request, "a", "x", {}, undefined, cumulative)).error, "");
+        assert.equal(cumulative.remainingBytes, 2);
+        const overBudget = await matcher.expandReplacements(request, "a", "x", {}, undefined, cumulative);
+        assert.ok(overBudget.error.includes("数据量过大"));
+        assert.deepEqual(plain(overBudget.expansions), [], "no partial expansion escapes on budget failure");
+        assert.equal((await matcher.expandReplacements(request, "a", "x", {})).error, "", "new operations get a fresh budget");
+
+        const hugeOutput = await matcher.expandReplacements(
+            [{id: "u", haystack: "a".repeat(10000), replacements: [{id: "h", start: 0, end: 1, matchedText: "a"}]}],
+            "^a", "$'".repeat(4000), {},
+        );
+        assert.ok(hugeOutput.error.includes("数据量过大"), "fast output expansion is limited independently of regex timeout");
+        const tooMany = await matcher.match([unit("a".repeat(250001))], "a", options);
+        assert.ok(tooMany.error.includes("数据量过大"));
+        assert.equal(tooMany.hits.length, 0, "oversized search never publishes truncated results");
+        const sendsBefore = created.reduce((sum, worker) => sum + worker.sent.length, 0);
+        const hugeInput = await matcher.match([unit("a".repeat(32 * 1024 * 1024 + 1))], "a", options);
+        assert.ok(hugeInput.error.includes("数据量过大"));
+        assert.equal(created.reduce((sum, worker) => sum + worker.sent.length, 0), sendsBefore,
+            "oversized input is rejected before postMessage serialization");
+        assert.equal((await matcher.match([unit("a")], "a", options)).hits.length, 1, "worker recovers after resource rejection");
 
         const substitutionTemplate =
             "$0|$00|$01|$001|$12|$100|$99|$<known>|$<missing>|$<>|$<missing$1>|$<unclosed$1|$&|$`|$'|$$";

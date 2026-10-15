@@ -235,6 +235,62 @@ function makeDestroyable(bar) {
 }
 
 async function main() {
+    const regexBudget = source("shared/regex-budget");
+    const expand = source("shared/regex-replace").expandRegexReplacementUnits;
+    const originalBudget = regexBudget.createRegexBudget;
+    try {
+        for (const layout of ["live", "fetched", "mixed", "folded-heading"]) {
+            for (const fits of [false, true]) {
+                const contents = Array.from({length: 65}, (_,index) =>
+                    paragraph(`20261013120000-${String(index).padStart(7, "0")}`, "foo"));
+                const f = fixture(contents);
+                if (layout === "fetched") f.wysiwyg.innerHTML = "";
+                if (layout === "folded-heading") {
+                    f.wysiwyg.innerHTML = `<div data-node-id="${id}" data-type="NodeHeading" fold="1">Section</div>`;
+                }
+                if (layout === "mixed") {
+                    for (const child of [...f.wysiwyg.children].slice(1)) child.remove();
+                }
+                const before = f.wysiwyg.innerHTML;
+                const budgets = new Set();
+                regexBudget.createRegexBudget = () => ({remainingResults: fits ? 65 : 64, remainingBytes: 100000});
+                const result = await run(f, true, {regex: true, searchQuery: "foo", regexMatcher: {
+                    expandReplacements: async (requests, pattern, template, options, _signal, budget) => {
+                        budgets.add(budget);
+                        try {return {expansions: expand(requests, pattern, template, options, budget), error: ""};}
+                        catch (error) {
+                            if (!(error instanceof regexBudget.RegexBudgetExceeded)) throw error;
+                            return {expansions: [], error: error.message};
+                        }
+                    },
+                }});
+                assert.equal(budgets.size, 1, "live and all offscreen batches share one budget");
+                assert.equal(f.calls.length, fits ? 1 : 0, "budget failure cannot partially submit: " + layout);
+                if (fits) {
+                    assert.equal(result.replacedCount, 65);
+                    assert.equal(f.calls[0].undo.length, 65, "one native transaction retains every undo operation");
+                } else {
+                    assert.equal(result.error, "regex-budget-exceeded");
+                    assert.equal(result.replacedCount, 0);
+                    assert.equal(f.wysiwyg.innerHTML, before, "no optimistic DOM writes on budget failure");
+                    assert.ok([...f.kernel.values()].every(html => html.includes("foo")), "kernel content untouched");
+                }
+            }
+        }
+    } finally {regexBudget.createRegexBudget = originalBudget;}
+    for (const all of [false, true]) {
+        const f = fixture();
+        const bar = barFixture(f);
+        bar.regex = true;
+        bar.regexMatcher = {expandReplacements: async () => ({expansions: [], error: regexBudget.REGEX_BUDGET_ERROR})};
+        messages.length = 0;
+        if (all) await bar.clickReplaceAll();
+        else await bar.clickReplace();
+        assert.equal(f.calls.length, 0);
+        assert.ok(messages.some(message => message.text === regexBudget.REGEX_BUDGET_ERROR), "resource failure is reported explicitly");
+        assert.ok(messages.every(message => !message.text?.includes("SUCCESS")), "resource rejection is never reported as success");
+    }
+    console.log("Regex resource limits: live/offscreen/mixed batches, atomic failure, native undo and explicit UI status OK");
     for (const all of [false, true]) {
         for (const fetched of [false, true]) {
             const f = fixture();

@@ -367,6 +367,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 "This match cannot be replaced directly",
             replaceRegexExpandFailed: t.replaceRegexExpandFailed ||
                 "Regex replace expansion failed; skipped",
+            replaceRegexBudgetExceeded: t.replaceRegexBudgetExceeded ||
+                "Regex data or replacement output is too large. Narrow the search scope or reduce matches and replacement output.",
             replaceAttributeViewUnsupported: t.replaceAttributeViewUnsupported ||
                 "Database results cannot be replaced",
             replaceMermaidUnsupported: t.replaceMermaidUnsupported ||

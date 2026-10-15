@@ -26,6 +26,7 @@
   "replaceStaleTarget": "目标内容已变化，已取消替换并刷新结果，请重新确认。",
   "searchRetryIncomplete": "{count} 个数据库未完成（点击重试）",
   "replaceRegexExpandFailed": "正则替换展开失败，已跳过",
+  "replaceRegexBudgetExceeded": "正则处理的数据量过大，请缩小搜索范围或减少匹配及替换输出。",
   "replaceAttributeViewUnsupported": "数据库结果仅支持搜索与高亮，不支持替换",
   "replaceMermaidUnsupported": "Mermaid 图仅支持搜索与高亮，不支持替换",
   "replaceHtmlBlockUnsupported": "HTML 块仅支持搜索与高亮渲染可见文字，不支持替换",

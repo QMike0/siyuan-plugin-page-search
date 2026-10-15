@@ -45,6 +45,7 @@ import {
     type ReplaceCommitState,
 } from "./replacement-commit";
 import {unitKey} from "./selection";
+import {createRegexBudget, REGEX_BUDGET_ERROR, type RegexBudget} from "../shared/regex-budget";
 
 const DOC_TITLE_BLOCK_ID = "__doc-title__";
 
@@ -510,6 +511,7 @@ async function prepareRegexReplaceOptions(
     matches: Array<Pick<SearchMatch, "id" | "blockId" | "unitId" | "start" | "end" | "matchedText">>,
     replacementText: string,
     options: ReplaceWriteOptions,
+    budget?: RegexBudget,
 ): Promise<{options: PreparedReplaceOptions; error?: string;}> {
     const base = replaceOptionsFrom(options);
     if (!options.regex) {
@@ -526,9 +528,11 @@ async function prepareRegexReplaceOptions(
         {
             caseSensitive: options.caseSensitive === true,
         },
+        undefined,
+        budget,
     );
     if (result.cancelled || result.error) {
-        return {options: base, error: "regex-expand-failed"};
+        return {options: base, error: result.error === REGEX_BUDGET_ERROR ? "regex-budget-exceeded" : "regex-expand-failed"};
     }
     return {
         options: {
@@ -892,6 +896,7 @@ async function prepareFetchedBlockUpdates(
     options: ReplaceWriteOptions,
     liveRoot: ParentNode | null,
     notebook = "",
+    budget: RegexBudget | undefined = options.regex ? createRegexBudget() : undefined,
 ): Promise<{updates: PreparedBlockUpdate[]; skippedCount: number; error?: string; fatal?: boolean;}> {
     const ids = Array.from(matchesById.keys());
     const totalMatches = Array.from(matchesById.values()).reduce((count, items) => count + items.length, 0);
@@ -968,6 +973,7 @@ async function prepareFetchedBlockUpdates(
                     batchMatches,
                     replacementText,
                     options,
+                    budget,
                 );
                 if (preparedOptions.error) {
                     return {
@@ -1069,6 +1075,24 @@ export async function replaceAllMatchesInEditor(
         fetchedMountContents,
     );
 
+    const grouped = new Map<string, SearchMatch[]>();
+    for (const match of bodyMatches) {
+        const list = grouped.get(match.blockId) ?? [];
+        list.push(match);
+        grouped.set(match.blockId, list);
+    }
+    const unloadedMatches = new Map<string, SearchMatch[]>();
+    const loadedMatches: SearchMatch[] = [];
+    for (const [blockId, blockMatches] of grouped) {
+        const submit = submitIndex.preferred.get(blockId);
+        // 折叠容器或缺行大表只准备内核底稿，避免同一命中重复展开、重复扣预算。
+        if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
+            unloadedMatches.set(blockId, blockMatches);
+        } else {
+            for (const match of blockMatches) loadedMatches.push(match);
+        }
+    }
+
     const blocks = collectSearchableBlocks(edit, {
         includeInlineMemo: true,
         includeImageTitle: true,
@@ -1076,11 +1100,14 @@ export async function replaceAllMatchesInEditor(
     })
         .filter((block) => !isPreviewSyntheticBlock(block));
     const unitsByKey = buildUnitMap(blocks, bodyMatches);
+    // 同一次全部替换共用输出预算，离屏/折叠区域的每个读取批次不能重新获得额度。
+    const regexBudget = options.regex ? createRegexBudget() : undefined;
     const loadedOptions = await prepareRegexReplaceOptions(
         unitsByKey,
-        bodyMatches,
+        loadedMatches,
         replacementText,
         options,
+        regexBudget,
     );
     if (loadedOptions.error) {
         return {
@@ -1100,25 +1127,13 @@ export async function replaceAllMatchesInEditor(
         return {replacedCount: 0, skippedCount: matches.length, error: loadedConflict};
     }
 
-    const grouped = new Map<string, SearchMatch[]>();
-    for (const match of bodyMatches) {
-        const list = grouped.get(match.blockId) ?? [];
-        list.push(match);
-        grouped.set(match.blockId, list);
-    }
-
     const skippedBeforeBody = skippedCount;
     const loadedUpdates: PreparedBlockUpdate[] = [];
-    const unloadedMatches = new Map<string, SearchMatch[]>();
     let bodySkipped = 0;
 
     for (const [blockId, blockMatches] of grouped) {
-        const submit = submitIndex.preferred.get(blockId) ?? null;
-        // 折叠容器或缺行大表不用界面上的残缺 HTML，改走 getBlockDOM。
-        if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
-            unloadedMatches.set(blockId, blockMatches);
-            continue;
-        }
+        if (unloadedMatches.has(blockId)) continue;
+        const submit = submitIndex.preferred.get(blockId)!;
         const prepared = prepareBlockElementUpdate(
             blockId,
             submit,
@@ -1142,6 +1157,7 @@ export async function replaceAllMatchesInEditor(
         options,
         edit,
         notebook,
+        regexBudget,
     );
     bodySkipped += fetched.skippedCount;
     if (fetched.fatal) {
