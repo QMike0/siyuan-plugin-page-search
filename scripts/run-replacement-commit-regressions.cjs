@@ -526,6 +526,36 @@ async function main() {
     }
     console.log("SearchBar replace-all tolerates unchanged block mounting and rejects mounted edits OK");
 
+    for (const loaded of [false, true]) {
+        const f = fixture();
+        if (!loaded) f.wysiwyg.innerHTML = "";
+        const bar = barFixture(f);
+        Object.assign(bar, {
+            documentEpoch: 0, domEpoch: 0,
+            rememberCurrentRootId: () => "r",
+            plugin: {isLastHighlightComponent: () => false},
+        });
+        const read = api;
+        let notified = false;
+        api = async (...args) => {
+            if (!notified) {
+                notified = true;
+                assert.equal(f.calls.length, 0, "index notification arrives during preparation");
+                bar.onEventBus({detail: {cmd: "databaseIndexCommit", data: {rootIDs: ["r"], backlinkFull: false}}});
+            }
+            return read(...args);
+        };
+        let refreshes = 0;
+        bar.highlightHitResult = async () => refreshes++;
+        await bar.clickReplaceAll();
+        assert.equal(notified, true);
+        assert.equal(f.calls.length, 1, "index catch-up alone does not cancel a validated replacement");
+        assert.equal(refreshes, 1, "index notification merges with the post-replacement search");
+        window.clearTimeout(bar.typingTimer);
+        api = read;
+    }
+    console.log("SQL index catch-up during loaded/fetched replace-all preparation preserves writes and merges refresh OK");
+
     for (const change of ["document-event", "query-generation", "replacement", "readonly", "root"]) {
         const stale = fixture();
         stale.wysiwyg.innerHTML = "";

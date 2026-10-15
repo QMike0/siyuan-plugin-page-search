@@ -127,6 +127,7 @@ import {
     effectiveCodeLanguage,
     ensureCodeBlockLanguages,
     isBlockTypeEnabled,
+    isContainerType,
     invalidateDocMeta,
     isInMindmapBlock,
     isInTabsBlock,
@@ -314,24 +315,41 @@ export function invalidateEditedDocument(rootId?: string, blockIds?: readonly st
     }
 }
 
-/** savedoc 后只作废结构信息。普通正文仍按块哈希复用；嵌入块的来源不在自身哈希里，必须丢掉。 */
+/** SQL 提交只更新查询索引。嵌入查询本身也会提交派生索引，不能因此反复清缓存并重查。 */
+export function invalidateDocumentIndexCaches(rootId: string): void {
+    cancelBackgroundCorpusJobs(rootId);
+    invalidateDocMeta(rootId);
+    invalidateDocOrder(rootId);
+    dropQueryMemo(rootId);
+}
+
+/** savedoc 后作废结构与改动块；其余正文仍按哈希复用，嵌入来源另行作废。 */
 export function invalidateDocumentStructureCaches(rootId?: string, sources?: unknown): void {
-    // savedoc precedes the SQL upsert. Evict only deleted subtrees from the
-    // text cache, so stale SQL hashes cannot resurrect their unloaded matches.
-    // Delete+insert transactions and undo remain safe: this only evicts, never
-    // stores a deletion tombstone or excludes a block from later searches.
+    // savedoc precedes the SQL upsert. Deleted/updated subtrees must not reuse
+    // text under stale hashes. Undo can restore an older hash that was paired
+    // with optimistic replacement text, so hash checks alone are insufficient.
     if (rootId && Array.isArray(sources)) {
-        const deleted = new Set<string>();
+        const changed = new Set<string>();
+        const links = peekDocMeta(rootId)?.links;
+        let subtreeChanged = false;
         for (const source of sources) {
             if (!Array.isArray(source?.doOperations)) continue;
             for (const operation of source.doOperations) {
-                if (operation?.action === "delete" && typeof operation.id === "string") deleted.add(operation.id);
+                if (
+                    (operation?.action === "delete" || operation?.action === "update") &&
+                    typeof operation.id === "string"
+                ) {
+                    changed.add(operation.id);
+                    subtreeChanged ||= operation.action === "delete" ||
+                        isContainerType(links?.get(operation.id)?.type ?? "");
+                }
             }
         }
-        if (deleted.size) {
-            const links = peekDocMeta(rootId)?.links;
-            const affected = new Map<string, boolean>(Array.from(deleted, (id) => [id, true]));
-            for (const id of links?.keys() ?? []) {
+        if (changed.size) {
+            // Older extraction jobs must not repopulate an evicted block.
+            cancelBackgroundCorpusJobs(rootId);
+            const affected = new Map<string, boolean>(Array.from(changed, (id) => [id, true]));
+            for (const id of subtreeChanged ? links?.keys() ?? [] : []) {
                 const path: string[] = [];
                 const visited = new Set<string>();
                 let current = id;
@@ -340,14 +358,14 @@ export function invalidateDocumentStructureCaches(rootId?: string, sources?: unk
                     path.push(current);
                     current = links.get(current)?.parentId ?? "";
                 }
-                const removed = affected.get(current) === true;
+                const modified = affected.get(current) === true;
                 for (const part of path) {
-                    affected.set(part, removed);
-                    if (removed) deleted.add(part);
+                    affected.set(part, modified);
+                    if (modified) changed.add(part);
                 }
             }
-            dropTextCacheForBlocks(rootId, Array.from(deleted));
-            invalidateAvCacheForBlocks(Array.from(deleted));
+            dropTextCacheForBlocks(rootId, Array.from(changed));
+            invalidateAvCacheForBlocks(Array.from(changed));
         }
     }
     invalidateDocMeta(rootId);

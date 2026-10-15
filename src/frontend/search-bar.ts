@@ -67,6 +67,7 @@ import {
     cancelBackgroundCorpusJobs,
     editorRootId,
     invalidateAttributeViewSearch,
+    invalidateDocumentIndexCaches,
     invalidateDocumentStructureCaches,
     releaseBackgroundCorpusRoot,
     releaseSpecialCacheOwner,
@@ -2810,15 +2811,30 @@ export class SearchBar {
             return;
         }
 
-        if (["savedoc", "rename"].includes(event.detail?.cmd)) {
-            this.documentEpoch += 1;
+        const indexCommit = event.detail?.cmd === "databaseIndexCommit";
+        if (indexCommit) {
+            const rootId = this.rememberCurrentRootId();
+            const data = event.detail?.data;
+            // v3.8.6 broadcasts this after SQL commits, whereas savedoc only
+            // confirms the tree write. Ignore other documents and empty commits.
+            if (
+                !rootId || !(data?.backlinkFull === true ||
+                    (Array.isArray(data?.rootIDs) && data.rootIDs.includes(rootId)))
+            ) return;
+        }
+        if (indexCommit || ["savedoc", "rename"].includes(event.detail?.cmd)) {
+            // SQL catch-up does not change the tree being validated by an
+            // ongoing replacement. Merge its refresh without cancelling that
+            // plan; actual savedoc/rename events still invalidate the plan.
+            if (!indexCommit || !this.replaceBusy) this.documentEpoch += 1;
             this.savedocDomEpoch = this.domEpoch;
-            // A search spanning a saved deletion may still hold old SQL IDs.
-            // Its coverage warnings/results belong to that obsolete snapshot.
+            // In-flight searches can still hold the pre-write SQL candidates.
+            // Re-read metadata and candidates after the index catches up as well.
             this.searchAbortController?.abort();
             const rootId = this.rememberCurrentRootId();
             if (rootId) {
-                invalidateDocumentStructureCaches(rootId, event.detail?.data?.sources);
+                if (indexCommit) invalidateDocumentIndexCaches(rootId);
+                else invalidateDocumentStructureCaches(rootId, event.detail?.data?.sources);
             }
             clearTimeout(this.typingTimer);
             if (this.replaceBusy) {
