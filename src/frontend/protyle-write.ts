@@ -389,6 +389,28 @@ function captureLiveRollback(
         }
     };
 }
+/** 合并父子目标的采集根，避免同一子树被重复遍历；缓存公共祖先以兼顾深层嵌套。 */
+function replacementScopeRoots(targets: HTMLElement[]): HTMLElement[] {
+    const roots = new Set(targets);
+    const covered = new Map<Element, boolean>();
+    return targets.filter((root) => {
+        const ancestors: Element[] = [];
+        let parent = root.parentElement;
+        let hasTargetAncestor = false;
+        while (parent) {
+            if (roots.has(parent) || covered.get(parent) === true) {
+                hasTargetAncestor = true;
+                break;
+            }
+            if (covered.has(parent)) break;
+            ancestors.push(parent);
+            parent = parent.parentElement;
+        }
+        for (const ancestor of ancestors) covered.set(ancestor, hasTargetAncestor);
+        return !hasTargetAncestor;
+    });
+}
+
 function buildUnitMap(
     blocks: SearchableBlock[],
     matches: readonly Pick<SearchMatch, "blockId" | "unitId">[],
@@ -447,6 +469,25 @@ type PreparedReplaceOptions = ReturnType<typeof replaceOptionsFrom> & {
     regexPlan?: RegexReplacementPlan;
 };
 
+/** 准备阶段的轻量检查：不扫描目标 DOM，也不序列化块内容。 */
+function createPreparationGuard(
+    edit: Element,
+    protyle: Protyle,
+    isCurrent?: () => boolean,
+): () => string | undefined {
+    const rootId = editorRootId(edit);
+    return () => {
+        if (isCurrent && !isCurrent()) return "stale-target";
+        if (isEditorReplaceModeBlocked(edit) || protyle.protyle?.disabled) {
+            return "readonly-or-preview";
+        }
+        if (!edit.isConnected || resolveProtyleFromEdit(edit) !== protyle || editorRootId(edit) !== rootId) {
+            return "stale-target";
+        }
+        return undefined;
+    };
+}
+
 /** 异步准备只能使用开始时的编辑器和目标；提交前同步复核，不能覆盖等待期间的新编辑。 */
 function createWriteGuard(
     edit: Element,
@@ -456,7 +497,7 @@ function createWriteGuard(
     submitIndex?: SubmitBlockIndex,
     allowMountContents?: ReadonlyMap<string, string>,
 ): (allowUnverifiedMount?: boolean) => string | undefined {
-    const rootId = editorRootId(edit);
+    const checkCurrent = createPreparationGuard(edit, protyle, isCurrent);
     const readMountContent = createCommitContentReader(protyle, {ignoreDynamicReferenceText: true});
     const snapshots = Array.from(blockIds, (id) => {
         const element = submitIndex ? submitIndex.preferred.get(id) ?? null : resolveSubmitBlockElement(edit, id);
@@ -464,13 +505,8 @@ function createWriteGuard(
         return {id, element, html};
     });
     return (allowUnverifiedMount = false) => {
-        if (isCurrent && !isCurrent()) return "stale-target";
-        if (isEditorReplaceModeBlocked(edit) || protyle.protyle?.disabled) {
-            return "readonly-or-preview";
-        }
-        if (!edit.isConnected || resolveProtyleFromEdit(edit) !== protyle || editorRootId(edit) !== rootId) {
-            return "stale-target";
-        }
+        const conflict = checkCurrent();
+        if (conflict) return conflict;
         // Re-index after each boundary; fetched targets may mount before their
         // kernel snapshot is read, but must match it at the final check.
         const currentIndex = submitIndex ? collectSubmitBlockIndex(edit) : undefined;
@@ -511,9 +547,12 @@ async function prepareRegexReplaceOptions(
     matches: Array<Pick<SearchMatch, "id" | "blockId" | "unitId" | "start" | "end" | "matchedText">>,
     replacementText: string,
     options: ReplaceWriteOptions,
+    checkCurrent: () => string | undefined,
     budget?: RegexBudget,
 ): Promise<{options: PreparedReplaceOptions; error?: string;}> {
     const base = replaceOptionsFrom(options);
+    const conflict = checkCurrent();
+    if (conflict) return {options: base, error: conflict};
     if (!options.regex) {
         return {options: base};
     }
@@ -531,6 +570,8 @@ async function prepareRegexReplaceOptions(
         undefined,
         budget,
     );
+    const afterExpandConflict = checkCurrent();
+    if (afterExpandConflict) return {options: base, error: afterExpandConflict};
     if (result.cancelled || result.error) {
         return {options: base, error: result.error === REGEX_BUDGET_ERROR ? "regex-budget-exceeded" : "regex-expand-failed"};
     }
@@ -572,10 +613,24 @@ export async function replaceCurrentMatchInEditor(
         return {replacedCount: 0, skippedCount: 1};
     }
 
+    const checkCurrent = createPreparationGuard(edit, protyle, options.isCurrent);
+    const preparationConflict = checkCurrent();
+    if (preparationConflict) {
+        return {replacedCount: 0, skippedCount: 1, error: preparationConflict};
+    }
     const submit = resolveSubmitBlockElement(edit, match.blockId);
     const guard = createWriteGuard(edit, protyle, [match.blockId], options.isCurrent);
     if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
-        return replaceFetchedBlockMatches(protyle, match.blockId, [match], replacementText, options, edit, guard);
+        return replaceFetchedBlockMatches(
+            protyle,
+            match.blockId,
+            [match],
+            replacementText,
+            options,
+            edit,
+            guard,
+            checkCurrent,
+        );
     }
 
     const blocks = collectSearchableBlocks(edit, {
@@ -596,6 +651,7 @@ export async function replaceCurrentMatchInEditor(
         [match],
         replacementText,
         options,
+        checkCurrent,
     );
     if (preparedOptions.error) {
         return {replacedCount: 0, skippedCount: 1, error: preparedOptions.error};
@@ -895,11 +951,13 @@ async function prepareFetchedBlockUpdates(
     replacementText: string,
     options: ReplaceWriteOptions,
     liveRoot: ParentNode | null,
+    checkCurrent: () => string | undefined,
     notebook = "",
     budget: RegexBudget | undefined = options.regex ? createRegexBudget() : undefined,
 ): Promise<{updates: PreparedBlockUpdate[]; skippedCount: number; error?: string; fatal?: boolean;}> {
     const ids = Array.from(matchesById.keys());
     const totalMatches = Array.from(matchesById.values()).reduce((count, items) => count + items.length, 0);
+    const cancelled = (error: string) => ({updates: [], skippedCount: totalMatches, error, fatal: true});
     const updates: PreparedBlockUpdate[] = [];
     let skippedCount = 0;
     let error: string | undefined;
@@ -914,9 +972,15 @@ async function prepareFetchedBlockUpdates(
     // Reads are independent and read-only. Keep the wave bounded so a large
     // document does not serialize dozens of kernel renders or flood the API.
     for (let waveStart = 0; waveStart < batches.length; waveStart += BLOCK_DOM_BATCH_CONCURRENCY) {
+        const conflict = checkCurrent();
+        if (conflict) return cancelled(conflict);
         const wave = batches.slice(waveStart, waveStart + BLOCK_DOM_BATCH_CONCURRENCY);
         const htmlResults = await Promise.all(wave.map((batch) => fetchBlockHtmlBatch(batch, notebook)));
+        const afterReadConflict = checkCurrent();
+        if (afterReadConflict) return cancelled(afterReadConflict);
         for (let waveIndex = 0; waveIndex < wave.length; waveIndex += 1) {
+            const batchConflict = checkCurrent();
+            if (batchConflict) return cancelled(batchConflict);
             const batch = wave[waveIndex];
             const htmlById = htmlResults[waveIndex];
             const present: string[] = [];
@@ -955,8 +1019,11 @@ async function prepareFetchedBlockUpdates(
                     },
                     new Set(),
                     "none",
+                    () => !checkCurrent(),
                 );
             } catch (extractError) {
+                const conflict = checkCurrent();
+                if (conflict) return cancelled(conflict);
                 console.warn("[page-search] prepare unloaded replace failed", extractError);
                 for (const id of present) {
                     skippedCount += matchesById.get(id)?.length ?? 0;
@@ -966,6 +1033,8 @@ async function prepareFetchedBlockUpdates(
             }
 
             try {
+                const conflict = checkCurrent();
+                if (conflict) return cancelled(conflict);
                 const batchMatches = present.flatMap((id) => matchesById.get(id) ?? []);
                 const unitsByKey = buildUnitMap(extracted.blocks, batchMatches);
                 const preparedOptions = await prepareRegexReplaceOptions(
@@ -973,16 +1042,11 @@ async function prepareFetchedBlockUpdates(
                     batchMatches,
                     replacementText,
                     options,
+                    checkCurrent,
                     budget,
                 );
-                if (preparedOptions.error) {
-                    return {
-                        updates: [],
-                        skippedCount: totalMatches,
-                        error: preparedOptions.error,
-                        fatal: true,
-                    };
-                }
+                const preparationError = checkCurrent() ?? preparedOptions.error;
+                if (preparationError) return cancelled(preparationError);
                 for (const id of present) {
                     const blockMatches = matchesById.get(id) ?? [];
                     const unit = extracted.blocks.find((block) => block.blockId === id);
@@ -1063,6 +1127,11 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
+    const checkCurrent = createPreparationGuard(edit, protyle, options.isCurrent);
+    const preparationConflict = checkCurrent();
+    if (preparationConflict) {
+        return {replacedCount: 0, skippedCount: matches.length, error: preparationConflict};
+    }
     const submitIndex = collectSubmitBlockIndex(edit);
     const fetchedMountContents = new Map<string, string>();
 
@@ -1083,23 +1152,30 @@ export async function replaceAllMatchesInEditor(
     }
     const unloadedMatches = new Map<string, SearchMatch[]>();
     const loadedMatches: SearchMatch[] = [];
+    const loadedRoots: HTMLElement[] = [];
     for (const [blockId, blockMatches] of grouped) {
         const submit = submitIndex.preferred.get(blockId);
         // 折叠容器或缺行大表只准备内核底稿，避免同一命中重复展开、重复扣预算。
         if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
             unloadedMatches.set(blockId, blockMatches);
         } else {
+            loadedRoots.push(submit);
             for (const match of blockMatches) loadedMatches.push(match);
         }
     }
 
-    const blocks = collectSearchableBlocks(edit, {
-        includeInlineMemo: true,
-        includeImageTitle: true,
-        includeMindmapSourceForReplace: true,
-    })
-        .filter((block) => !isPreviewSyntheticBlock(block));
-    const unitsByKey = buildUnitMap(blocks, bodyMatches);
+    // 空 scopeRoots 会回退到整篇采集；全部离屏时必须直接跳过 live 文本采集。
+    const blocks = loadedRoots.length ?
+        collectSearchableBlocks(edit, {
+            includeInlineMemo: true,
+            includeImageTitle: true,
+            includeDocTitle: false,
+            includeMindmapSourceForReplace: true,
+            scopeRoots: replacementScopeRoots(loadedRoots),
+        })
+            .filter((block) => !isPreviewSyntheticBlock(block)) :
+        [];
+    const unitsByKey = buildUnitMap(blocks, loadedMatches);
     // 同一次全部替换共用输出预算，离屏/折叠区域的每个读取批次不能重新获得额度。
     const regexBudget = options.regex ? createRegexBudget() : undefined;
     const loadedOptions = await prepareRegexReplaceOptions(
@@ -1107,6 +1183,7 @@ export async function replaceAllMatchesInEditor(
         loadedMatches,
         replacementText,
         options,
+        checkCurrent,
         regexBudget,
     );
     if (loadedOptions.error) {
@@ -1156,15 +1233,17 @@ export async function replaceAllMatchesInEditor(
         replacementText,
         options,
         edit,
+        checkCurrent,
         notebook,
         regexBudget,
     );
     bodySkipped += fetched.skippedCount;
-    if (fetched.fatal) {
+    const fetchedConflict = checkCurrent();
+    if (fetchedConflict || fetched.fatal) {
         return {
             replacedCount: 0,
             skippedCount: skippedBeforeBody + bodyMatches.length,
-            error: fetched.error,
+            error: fetchedConflict ?? fetched.error,
         };
     }
     if (fetched.error) {
@@ -1195,7 +1274,7 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
-    const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, notebook, protyle);
+    const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, checkCurrent, notebook, protyle);
     const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
     if (conflict) {
         console.warn("[page-search] replace-all cancelled", {
@@ -1325,6 +1404,7 @@ export async function replaceAllMatchesInEditor(
 /** getBlockDOMs 是 cleanRenderNode 底稿；无法再次确认或底稿改变时保守拒绝写回。 */
 async function fetchedUpdatesUnchanged(
     updates: readonly PreparedBlockUpdate[],
+    checkCurrent: () => string | undefined,
     notebook = "",
     protyle?: Protyle,
 ): Promise<boolean> {
@@ -1344,10 +1424,12 @@ async function fetchedUpdatesUnchanged(
         batches.push([...updates.slice(index, index + BLOCK_DOM_BATCH_SIZE)]);
     }
     for (let waveStart = 0; waveStart < batches.length; waveStart += BLOCK_DOM_BATCH_CONCURRENCY) {
+        if (checkCurrent()) return false;
         const wave = batches.slice(waveStart, waveStart + BLOCK_DOM_BATCH_CONCURRENCY);
         const currentResults = await Promise.all(
             wave.map((batch) => fetchBlockHtmlBatch(batch.map((update) => update.id), notebook)),
         );
+        if (checkCurrent()) return false;
         for (let waveIndex = 0; waveIndex < wave.length; waveIndex += 1) {
             const batch = wave[waveIndex];
             const current = currentResults[waveIndex];
@@ -1368,6 +1450,7 @@ async function replaceFetchedBlockMatches(
     options: ReplaceWriteOptions,
     liveRoot: Element,
     guard: () => string | undefined,
+    checkCurrent: () => string | undefined,
 ): Promise<ReplaceWriteResult> {
     const notebook = protyle.protyle?.notebookId ?? "";
     const prepared = await prepareFetchedBlockUpdates(
@@ -1375,6 +1458,7 @@ async function replaceFetchedBlockMatches(
         replacementText,
         options,
         liveRoot,
+        checkCurrent,
         notebook,
     );
     const update = prepared.updates[0];
@@ -1385,7 +1469,7 @@ async function replaceFetchedBlockMatches(
             error: prepared.error ?? "apply-failed",
         };
     }
-    const kernelCurrent = await fetchedUpdatesUnchanged(prepared.updates, notebook, protyle);
+    const kernelCurrent = await fetchedUpdatesUnchanged(prepared.updates, checkCurrent, notebook, protyle);
     const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
     if (conflict) {
         return {replacedCount: 0, skippedCount: matches.length, error: conflict};

@@ -235,6 +235,262 @@ function makeDestroyable(bar) {
 }
 
 async function main() {
+    const extract = source("frontend/corpus/extract");
+    const originalExtract = extract.extractUnitsFromDoms;
+    const originalCollect = blocks.collectSearchableBlocks;
+    const originalClone = Node.prototype.cloneNode;
+
+    for (const all of [false, true]) {
+        for (const fetched of [false, true]) {
+            const f = fixture();
+            if (fetched) f.wysiwyg.innerHTML = "";
+            let collections = 0;
+            blocks.collectSearchableBlocks = (...args) => {
+                collections++;
+                return originalCollect(...args);
+            };
+            try {
+                const result = await run(f, all, {isCurrent: () => false});
+                assert.equal(result.error, "stale-target");
+                assert.equal(collections, 0, "an already invalid operation never collects replacement text");
+                assert.equal(f.requests.length, 0, "an already invalid operation never starts a read");
+                assert.equal(f.calls.length, 0);
+            } finally {
+                blocks.collectSearchableBlocks = originalCollect;
+            }
+        }
+    }
+
+    // A cancelled wave may finish its existing requests, but must not parse,
+    // clone or start the next wave. Revalidation follows the same rule.
+    for (const phase of ["prepare-read", "revalidate-read"]) {
+        for (const change of ["query", "readonly", "root", "owner", "detach"]) {
+            const f = fixture(
+                Array.from(
+                    {length: 257},
+                    (_, index) => paragraph("20261015120000-" + index.toString(36).padStart(7, "0"), "foo"),
+                ),
+            );
+            f.wysiwyg.innerHTML = "";
+            let current = true;
+            let extracted = 0;
+            let cloned = 0;
+            const read = api;
+            const invalidateAt = phase === "prepare-read" ? 1 : 6;
+            api = async (...args) => {
+                const response = await read(...args);
+                if (f.requests.length >= invalidateAt) {
+                    if (change === "query") current = false;
+                    if (change === "readonly") f.protyle.protyle.disabled = true;
+                    if (change === "root") f.protyle.protyle.block.rootID = "other-doc";
+                    if (change === "owner") editors = [];
+                    if (change === "detach") f.edit.remove();
+                }
+                return response;
+            };
+            extract.extractUnitsFromDoms = (...args) => {
+                extracted++;
+                return originalExtract(...args);
+            };
+            Node.prototype.cloneNode = function(...args) {
+                if (this instanceof Element && this.hasAttribute("data-node-id")) cloned++;
+                return originalClone.apply(this, args);
+            };
+            try {
+                const result = await run(f, true, {isCurrent: () => current});
+                assert.equal(result.error, change === "readonly" ? "readonly-or-preview" : "stale-target");
+                assert.equal(result.replacedCount, 0);
+                assert.equal(f.calls.length, 0, "cancelled preparations never submit partial updates");
+                assert.equal(
+                    f.requests.length,
+                    phase === "prepare-read" ? 4 : 9,
+                    "cancellation stops subsequent read waves, including snapshot revalidation",
+                );
+                assert.equal(extracted, phase === "prepare-read" ? 0 : 5);
+                assert.equal(cloned, phase === "prepare-read" ? 0 : 257);
+                assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
+            } finally {
+                api = read;
+                extract.extractUnitsFromDoms = originalExtract;
+                Node.prototype.cloneNode = originalClone;
+            }
+        }
+    }
+
+    // Extraction and Worker awaits are separate cancellation boundaries. In
+    // either case the offscreen host must be disposed before returning.
+    for (const all of [false, true]) {
+        for (const phase of ["extracted", "worker"]) {
+            const f = fixture(
+                Array.from(
+                    {length: all ? 65 : 1},
+                    (_, index) => paragraph("20261015130000-" + index.toString(36).padStart(7, "0"), "foo"),
+                ),
+            );
+            f.wysiwyg.innerHTML = "";
+            let current = true;
+            let extracted = 0;
+            let cloned = 0;
+            let workerCalls = 0;
+            extract.extractUnitsFromDoms = async (...args) => {
+                const result = await originalExtract(...args);
+                extracted++;
+                if (phase === "extracted") current = false;
+                return result;
+            };
+            Node.prototype.cloneNode = function(...args) {
+                if (this instanceof Element && this.hasAttribute("data-node-id")) cloned++;
+                return originalClone.apply(this, args);
+            };
+            try {
+                const result = await run(f, all, {
+                    regex: true,
+                    searchQuery: "foo",
+                    isCurrent: () => current,
+                    regexMatcher: {
+                        expandReplacements: async requests => {
+                            // replace-all also prepares an empty loaded plan first.
+                            if (requests.length) {
+                                workerCalls++;
+                                current = false;
+                            }
+                            return {expansions: [], cancelled: !current, error: ""};
+                        },
+                    },
+                });
+                assert.equal(result.error, "stale-target", "cancellation is not reported as an expansion failure");
+                assert.equal(extracted, 1, "later fetched batches are not extracted");
+                assert.equal(workerCalls, phase === "extracted" ? 0 : 1);
+                assert.equal(cloned, 0, "cancelled extraction/expansion never clones a target");
+                assert.equal(f.calls.length, 0);
+                assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
+            } finally {
+                extract.extractUnitsFromDoms = originalExtract;
+                Node.prototype.cloneNode = originalClone;
+            }
+        }
+    }
+    console.log(
+        "Preparation cancellation: current/all, initial/read/extract/Worker/revalidation boundaries and host cleanup OK",
+    );
+
+    const sparse = fixture([
+        paragraph(id, '<span data-type="inline-memo" data-inline-memo-content="unrelated memo">other</span>'),
+        ...Array.from(
+            {length: 96},
+            (_, index) => paragraph("20261015140000-" + index.toString(36).padStart(7, "0"), "unrelated text"),
+        ),
+        paragraph(otherId, 'foo <span data-type="inline-memo" data-inline-memo-content="memo foo">anchor</span>'),
+    ]);
+    // MatchHit is DOM-free. Mirror the frontend's memo hydration so the
+    // global memo ordinal and stable owner anchor both reach the write layer.
+    const sparseUnits = originalCollect(sparse.edit, {includeDocTitle: false, includeInlineMemo: true});
+    sparse.matches = sparse.matches.map(hit => {
+        if (!hit.unitId?.startsWith("inline-memo:")) return hit;
+        const unit = sparseUnits.find(unit => unit.blockId === hit.blockId && unit.unitId === hit.unitId);
+        return {...hit, replaceable: true, highlightKind: "inline-memo", anchorOffset: unit.anchorOffset};
+    });
+    assert.ok(sparse.matches.some(hit => hit.unitId === "inline-memo:1"));
+    const unrelatedHtml = sparse.kernel.get(id);
+    let liveCollections = 0;
+    blocks.collectSearchableBlocks = (edit, options) => {
+        const result = originalCollect(edit, options);
+        if (edit === sparse.edit) {
+            liveCollections++;
+            assert.deepEqual(options.scopeRoots.map(root => root.dataset.nodeId), [otherId]);
+            assert.ok(result.every(unit => unit.blockId === otherId), "unrelated text units are never collected");
+        }
+        return result;
+    };
+    try {
+        const result = await run(sparse, true);
+        assert.equal(result.commitState, "confirmed");
+        assert.equal(result.replacedCount, 2, "memo identity/anchor offsets survive narrower collection");
+        assert.equal(liveCollections, 1);
+        assert.equal(sparse.calls.length, 1);
+        assert.equal(sparse.calls[0].operations.length, 1);
+        assert.equal(sparse.kernel.get(id), unrelatedHtml);
+        assert.ok(sparse.kernel.get(otherId).includes('data-inline-memo-content="memo bar"'));
+        sparse.protyle.transaction(sparse.calls[0].undo, sparse.calls[0].operations);
+        assert.ok(sparse.kernel.get(otherId).includes('data-inline-memo-content="memo foo"'));
+    } finally {
+        blocks.collectSearchableBlocks = originalCollect;
+    }
+    console.log(
+        "Sparse loaded replacement: affected roots only, scoped memo offsets, unchanged neighbors and native undo OK",
+    );
+
+    for (const layout of ["mindmap", "tabs", "folded-list"]) {
+        const child = paragraph(otherId, "foo");
+        const contents = layout === "mindmap" ?
+            `<div data-node-id="${id}" data-type="NodeMindmap" class="mindmap" data-mindmap-view-rendered="true">` +
+            '<div class="mindmap-item" data-type="NodeMindmapItem" data-node-id="item">' + child + "</div>" +
+            `<div class="mindmap-view"><div data-mindmap-source-id="${otherId}">foo</div></div></div>` :
+            layout === "tabs" ?
+            `<div data-node-id="${id}" data-type="NodeTabs" class="tabs"><div class="tab-item" data-tabs-hidden="true">` +
+            '<div class="tab-item-info">' + child + "</div></div></div>" :
+            `<div data-node-id="${id}" data-type="NodeListItem" class="li" fold="1"><div></div><div></div>` + child +
+            "</div>";
+        const f = fixture([contents]);
+        const style = document.createElement("style");
+        style.textContent = '.mindmap > .mindmap-item, .tabs > .tab-item[data-tabs-hidden="true"], ' +
+            '.li[fold="1"] > div:nth-child(n+3) {display:none}';
+        document.head.append(style);
+        const units = originalCollect(f.edit, {includeDocTitle: false, includeMindmapSourceForReplace: true})
+            .filter(unit => unit.blockId === otherId && unit.matchSource !== "projection");
+        f.matches = matcher.matchTextUnitsDetailed(
+            units.map(unit => ({
+                ...unit,
+                segmentLengths: unit.textNodes.map(node => node.length),
+            })),
+            "foo",
+        ).hits;
+        assert.equal(f.matches.length, 1, layout + " retains one authoritative source match");
+        f.kernel.set(otherId, child);
+        try {
+            const result = await run(f, true);
+            assert.equal(
+                result.commitState,
+                "confirmed",
+                layout + " source remains writable after narrowing collection",
+            );
+            assert.equal(result.replacedCount, 1);
+            assert.equal(f.calls.length, 1);
+            assert.equal(f.calls[0].undo.length, 1);
+            assert.ok(f.kernel.get(otherId).includes(">bar</div>"));
+            f.protyle.transaction(f.calls[0].undo, f.calls[0].operations);
+            assert.ok(f.kernel.get(otherId).includes(">foo</div>"));
+        } finally {
+            style.remove();
+        }
+    }
+
+    const virtual = fixture([
+        `<div data-node-id="${id}" data-type="NodeTable" class="table"><div><table>` +
+        "<thead><tr><th>foo</th></tr></thead><tbody><tr><td>foo</td></tr><tr><td>keep</td></tr></tbody>" +
+        '</table></div><div class="protyle-attr"></div></div>',
+    ]);
+    const hiddenRow = virtual.wysiwyg.querySelector("tbody tr");
+    hiddenRow.setAttribute("data-sy-table-virtual-rows", hiddenRow.outerHTML);
+    hiddenRow.innerHTML = "<td></td>";
+    blocks.collectSearchableBlocks = (edit, options) => {
+        assert.notEqual(edit, virtual.edit, "a virtual table uses full kernel DOM, not partial live collection");
+        return originalCollect(edit, options);
+    };
+    try {
+        const result = await run(virtual, true);
+        assert.equal(result.commitState, "confirmed");
+        assert.equal(result.replacedCount, 2, "mounted and virtualized cells both enter the replacement");
+        assert.equal(virtual.calls.length, 1);
+        assert.ok(virtual.kernel.get(id).includes("keep"));
+        assert.ok(!virtual.calls[0].undo[0].data.includes("data-sy-table-virtual-rows"));
+        virtual.protyle.transaction(virtual.calls[0].undo, virtual.calls[0].operations);
+        assert.equal((virtual.kernel.get(id).match(/>foo</g) ?? []).length, 2);
+    } finally {
+        blocks.collectSearchableBlocks = originalCollect;
+    }
+    console.log("Scoped mindmap/inactive-tab/folded source writes and virtual-table full-DOM replace/undo OK");
+
     const regexBudget = source("shared/regex-budget");
     const expand = source("shared/regex-replace").expandRegexReplacementUnits;
     const originalBudget = regexBudget.createRegexBudget;
@@ -331,7 +587,18 @@ async function main() {
         const nestedRange = document.createRange();
         nestedRange.selectNodeContents(selectedContainer.wysiwyg.querySelector('[contenteditable="true"]'));
         window.getSelection().addRange(nestedRange);
-        const containerResult = await run(selectedContainer, true);
+        blocks.collectSearchableBlocks = (edit, options) => {
+            if (edit === selectedContainer.edit && options.scopeRoots.length > 1) {
+                assert.fail("overlapping parent/child targets must share a single collection root");
+            }
+            return originalCollect(edit, options);
+        };
+        let containerResult;
+        try {
+            containerResult = await run(selectedContainer, true);
+        } finally {
+            blocks.collectSearchableBlocks = originalCollect;
+        }
         assert.equal(containerResult.commitState, "confirmed");
         assert.equal(containerResult.replacedCount, 2);
         assert.equal(selectedContainer.wysiwyg.textContent.match(/bar/g)?.length ?? 0, 2,
@@ -404,7 +671,16 @@ async function main() {
         inflightReads--;
         return {code: 0, data};
     };
-    const fetchedLargeResult = await run(fetchedLarge, true);
+    blocks.collectSearchableBlocks = (edit, options) => {
+        assert.notEqual(edit, fetchedLarge.edit, "entirely offscreen replacement skips live text collection");
+        return originalCollect(edit, options);
+    };
+    let fetchedLargeResult;
+    try {
+        fetchedLargeResult = await run(fetchedLarge, true);
+    } finally {
+        blocks.collectSearchableBlocks = originalCollect;
+    }
     api = originalApi;
     assert.equal(fetchedLargeResult.commitState, "confirmed");
     assert.equal(fetchedLargeResult.replacedCount, 256);
