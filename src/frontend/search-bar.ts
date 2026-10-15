@@ -29,6 +29,7 @@ import {
     tableCellPosition,
     type RestrictInlineType,
 } from "../shared";
+import {REGEX_BUDGET_ERROR} from "../shared/regex-budget";
 import {
     AV_REFRESH_DEBOUNCE_MS,
     attributeViewTransactionIds,
@@ -37,7 +38,6 @@ import {
     isAttrViewWsTransaction,
     watchAttributeViewDom,
 } from "./av-watch";
-import {REGEX_BUDGET_ERROR} from "../shared/regex-budget";
 import {
     collectSearchableBlocks,
     collectMindmapPreviewUnits,
@@ -345,7 +345,6 @@ export interface SearchBarI18n {
     settingsIncludeScope: string;
     settingsIncludeScopeHint: string;
     settingsIncludeDocTitle: string;
-    settingsIncludeDocTitleHint: string;
     settingsIncludeImageTitle: string;
     settingsIncludeAttributeView: string;
     settingsIncludeTable: string;
@@ -371,7 +370,9 @@ export interface SearchBarI18n {
     settingsIncludeCodeBlock: string;
     settingsIncludePlainCodeBlock: string;
     settingsIncludeMermaid: string;
+    settingsIncludeMermaidHint: string;
     settingsIncludeFlowchart: string;
+    settingsIncludeFlowchartHint: string;
     settingsIncludeHtmlBlock: string;
     settingsIncludeHtmlBlockHint: string;
     settingsIncludeFoldedBlocks: string;
@@ -4726,7 +4727,8 @@ export class SearchBar {
                 (result.unchanged && this.searchGeneration !== generation)
             ) return;
             if (this.resultCount > 0) {
-                this.resultIndex = result.unchanged ? (currentIndex + 1) % this.resultCount + 1 :
+                this.resultIndex = result.unchanged ?
+                    (currentIndex + 1) % this.resultCount + 1 :
                     resolveNextReplacementMatchIndex(
                         this.resultMatches,
                         current,
@@ -5011,7 +5013,6 @@ export class SearchBar {
                     icon: "iconFile",
                     label: this.i18n.settingsIncludeDocTitle,
                     checked: this.includeDocTitle,
-                    helpTip: this.i18n.settingsIncludeDocTitleHint,
                     onChange: (checked) => {
                         void this.setIncludeDocTitle(checked);
                     },
@@ -5431,6 +5432,7 @@ export class SearchBar {
                     icon: "iconCode",
                     label: this.i18n.settingsIncludeMermaid,
                     checked: this.includeMermaid,
+                    helpTip: this.i18n.settingsIncludeMermaidHint,
                     onChange: (checked) => {
                         void this.setIncludeMermaid(checked);
                     },
@@ -5440,6 +5442,7 @@ export class SearchBar {
                     icon: "iconGraph",
                     label: this.i18n.settingsIncludeFlowchart,
                     checked: this.includeFlowchart,
+                    helpTip: this.i18n.settingsIncludeFlowchartHint,
                     onChange: (checked) => {
                         void this.setIncludeFlowchart(checked);
                     },

@@ -122,12 +122,24 @@ function textStyle(element: Element): TextStyle {
     return style;
 }
 
-/** SiYuan v3.8.6 _wysiwyg.scss: only these boundaries hide later folded blocks. */
+/**
+ * SiYuan's native folded-block CSS boundaries.
+ *
+ * These elements are `display:none` only because their owning block has
+ * `fold="1"`; when the search option allows folded content, they must not be
+ * treated as author-hidden text.  Keep real hidden shells (`.fn__none`,
+ * `hidden`, `aria-hidden`) outside this list.
+ *
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.7/app/src/assets/scss/protyle/_wysiwyg.scss
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.7/app/src/assets/scss/protyle/_tabs.scss
+ */
 function isSiyuanFoldDisplayBoundary(element: Element): boolean {
     return element.matches(
         '.li[fold="1"] > div:nth-child(n+3):not(.protyle-attr), ' +
             '.bq[fold="1"] > [data-node-id] ~ [data-node-id], ' +
-            '.callout[fold="1"] > .callout-content > [data-node-id] ~ [data-node-id]',
+            '.callout[fold="1"] > .callout-content, ' +
+            '.callout[fold="1"] > .callout-content > [data-node-id] ~ [data-node-id], ' +
+            '.tabs[fold="1"] > .tab-item',
     );
 }
 

@@ -425,8 +425,6 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeScopeHint: t.settingsIncludeScopeHint ||
                 "Controls which block-level types (and inline memos) may be searched",
             settingsIncludeDocTitle: t.settingsIncludeDocTitle || "Document title",
-            settingsIncludeDocTitleHint: t.settingsIncludeDocTitleHint ||
-                "Replacing the document title cannot be undone with Ctrl+Z",
             settingsIncludeImageTitle: t.settingsIncludeImageTitle || "Image title",
             settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database block",
             settingsIncludeTable: t.settingsIncludeTable || "Table block",
@@ -452,7 +450,11 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
             settingsIncludePlainCodeBlock: t.settingsIncludePlainCodeBlock || "Plain code blocks",
             settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
+            settingsIncludeMermaidHint: t.settingsIncludeMermaidHint ||
+                "Match visible text rendered in Mermaid diagrams; fall back to source when not rendered",
             settingsIncludeFlowchart: t.settingsIncludeFlowchart || "flowchart",
+            settingsIncludeFlowchartHint: t.settingsIncludeFlowchartHint ||
+                "Match visible text rendered in flowchart diagrams; fall back to source when not rendered",
             settingsIncludeHtmlBlock: t.settingsIncludeHtmlBlock || "HTML block",
             settingsIncludeHtmlBlockHint: t.settingsIncludeHtmlBlockHint ||
                 "Match visible rendered text inside HTML blocks, not the HTML source",

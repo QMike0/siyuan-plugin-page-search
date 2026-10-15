@@ -2,19 +2,17 @@
 
 [简体中文](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.zh-CN.md)|[English](https://github.com/QMike0/siyuan-plugin-page-search/blob/main/README.md)
 
-> Due to underlying design constraints, the plugin currently only supports matching against content that has already been loaded in the document. Therefore, when used with long documents, it may miss some keywords during search/replace operations.
->
-> You can use the plugin 「[highlight-search](https://github.com/TCOTC/highlight-search)」 for a more comprehensive search experience.
+> The plugin searches loaded content and also tries to include results from offscreen, folded, and unloaded areas. Results may be incomplete while indexing is in progress, some content cannot be read, or database pagination is limited; the interface shows the current status.
 
 ## Key Features
 
 ### (1) Match options
 
 * **Aa**: Match case
-* **Whole word**: boundaries based on whitespace, English punctuation and common Chinese punctuation, not Chinese segmentation
+* **Whole word**: boundaries based on whitespace, English punctuation, and common Chinese punctuation
 * **Match mode**: Keyword / Regular expression. Regex replace supports `$1`, `$&`, etc.
 * **Keyword matching**: Uses loose matching: queries containing text trim edge whitespace and also match a whitespace-stripped query variant; whitespace-only queries keep their original value. Retains SiYuan internal-marker handling and the Aa option, without NFC, width or simplified/traditional Chinese conversion
-* **Regular expressions**: Search and replacement use JavaScript regex rules with the external `u/m/s` flags fixed off; there are no separate flag controls. Old flag preferences are ignored. Zero-length matches are skipped; matches do not cross independent text units
+* **Regular expressions**: Search and replacement use JavaScript regex rules
 * **In selection**: Search only within the current selection or block selection
 * **Aa\***: Preserve the match’s letter case when replacing (unavailable in regex mode)
 
@@ -22,10 +20,10 @@
 
 ![image-20260728110038465](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20260728110038465.png)
 
-* **Include in search**: Toggle which types are searched — document title, image title, inline memos, paragraph blocks, heading blocks (H1–H6), list blocks (unordered / ordered / task), math blocks, code blocks, tables, databases, blockquotes, callouts, super blocks, embeds, HTML, Mermaid, and more
+* **Include in search**: Toggle which types are searched — document title, image title, inline memos, paragraph blocks, heading blocks (H1–H6), list blocks (unordered / ordered / task), math blocks, code blocks, tables, databases, blockquotes, callouts, super blocks, embeds, HTML, Mermaid, and more. Embedded content can be searched and highlighted, but is not replaced
 * **Folded block content**: Whether to search hidden content inside non-heading folded blocks
-* **Mermaid / flowchart**: Search visible text in displayed diagrams; search source when folded, unloaded, or not successfully rendered, without offscreen diagram rendering. Source hits navigate to the block and do not support word-level highlighting or replacement
-* **Limit search**: Search only within selected inline types (multi-select). An empty query previews those hosts. Limit choices reset when the search UI closes
+* **Mermaid / flowchart**: Search visible text in displayed diagrams; search source when folded, unloaded, or not successfully rendered, without offscreen diagram rendering. Source hits only navigate to the diagram block
+* **Limit search**: Search only within selected inline types (multi-select). With an empty query, preview all keywords in the selected types. Limit switches reset when the search UI closes
 
 ### (3) In-page search
 
@@ -33,6 +31,8 @@
 
 * Open the search bar from the top-bar icon or hotkey (default `Ctrl+F` / macOS `⌘F`; changeable in SiYuan hotkeys)
 * Yellow = all hits, orange = current; `Enter` next, `Shift+Enter` previous, `Esc` close
+* Search history is kept per document; use `↑` / `↓` in the search box to browse previous queries
+* When the match count flashes, it indicates that it is in the search match state. Click the match count to open the search results list, then click an item to jump to that match
 * On desktop, drag the count area to move the panel; click the top-bar icon again to reset position
 * A selection on open only prefills the query; it does **not** turn on “In selection”
 
@@ -44,7 +44,7 @@
 * Supports Replace / Replace all
 * Write-back prefers the document’s Protyle transaction, so `Ctrl+Z` / `Ctrl+Y` usually work for undo/redo
 
-Some hits are searchable/highlightable but not auto-replaceable, e.g. databases, Mermaid, rendered HTML-block text, inline/block math, and words spanning complex marks. **Replace** tips and advances; **Replace all** counts them as skipped.
+Some hits are searchable/highlightable but not auto-replaceable, e.g. document titles, embedded content, databases, Mermaid, rendered HTML-block text, inline/block math, and words spanning complex marks. **Replace** tips and advances; **Replace all** shows the replaceable count and explains what will be skipped.
 
 ### (5) Publish & read-only
 
