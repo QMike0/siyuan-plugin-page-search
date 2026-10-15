@@ -1,3 +1,8 @@
+## v2.0.0 2026-10-16
+
+- 🇨🇳 对插件进行了完全重构
+- 🇺🇸 The plugin has been completely refactored.
+
 ## v1.0.4 2026-07-30
 
 - 🇨🇳 更换顶栏图标
