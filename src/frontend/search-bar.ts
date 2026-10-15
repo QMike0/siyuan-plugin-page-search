@@ -2834,7 +2834,13 @@ export class SearchBar {
             const rootId = this.rememberCurrentRootId();
             if (rootId) {
                 if (indexCommit) invalidateDocumentIndexCaches(rootId);
-                else invalidateDocumentStructureCaches(rootId, event.detail?.data?.sources);
+                else {
+                    const data = event.detail?.data;
+                    invalidateDocumentStructureCaches(
+                        rootId,
+                        !data?.rootID || data.rootID === rootId ? data?.sources : undefined,
+                    );
+                }
             }
             clearTimeout(this.typingTimer);
             if (this.replaceBusy) {

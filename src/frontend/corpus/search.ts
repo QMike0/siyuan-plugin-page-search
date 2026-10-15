@@ -206,6 +206,8 @@ let specialCacheTrimBlocked = false;
 /** 普通正文缓存也使用跨文档全局 LRU，避免每篇文档各存一份而无限增长。 */
 const PLAIN_CACHE_LIMIT = 2000;
 const plainCacheKeys = new Map<string, true>();
+/** savedoc 已更新内核树、但 SQL 候选尚未提交的块；仅保留到索引提交或查找框离开文档。 */
+const pendingIndexBlockIds = new Map<string, Set<string>>();
 interface CorpusJob {
     task: Promise<void>;
     epoch: number;
@@ -270,6 +272,7 @@ export function invalidateDocumentSearchCaches(): void {
     invalidateAvCache();
     dropQueryMemo();
     jobFailures.clear();
+    pendingIndexBlockIds.clear();
 }
 
 function dropTextCacheForBlocks(rootId: string, blockIds: readonly string[]): void {
@@ -318,9 +321,17 @@ export function invalidateEditedDocument(rootId?: string, blockIds?: readonly st
 /** SQL 提交只更新查询索引。嵌入查询本身也会提交派生索引，不能因此反复清缓存并重查。 */
 export function invalidateDocumentIndexCaches(rootId: string): void {
     cancelBackgroundCorpusJobs(rootId);
+    clearPendingIndexBlocks(rootId);
     invalidateDocMeta(rootId);
     invalidateDocOrder(rootId);
     dropQueryMemo(rootId);
+}
+
+function clearPendingIndexBlocks(rootId: string): void {
+    const ids = pendingIndexBlockIds.get(rootId);
+    // SQL hash 在 savedoc 之后仍可能是旧值，不能留下与新 DOM 配错版本的缓存。
+    if (ids) dropTextCacheForBlocks(rootId, Array.from(ids));
+    pendingIndexBlockIds.delete(rootId);
 }
 
 /** savedoc 后作废结构与改动块；其余正文仍按哈希复用，嵌入来源另行作废。 */
@@ -366,6 +377,7 @@ export function invalidateDocumentStructureCaches(rootId?: string, sources?: unk
             }
             dropTextCacheForBlocks(rootId, Array.from(changed));
             invalidateAvCacheForBlocks(Array.from(changed));
+            pendingIndexBlockIds.set(rootId, new Set([...(pendingIndexBlockIds.get(rootId) ?? []), ...changed]));
         }
     }
     invalidateDocMeta(rootId);
@@ -1734,6 +1746,7 @@ export function releaseBackgroundCorpusRoot(rootId: string): void {
     if (users <= 1) {
         backgroundRootUsers.delete(rootId);
         cancelRootBackgroundCorpusJobs(rootId);
+        clearPendingIndexBlocks(rootId);
         return;
     }
     backgroundRootUsers.set(rootId, users - 1);
@@ -2120,6 +2133,9 @@ async function searchCurrentDocumentImpl(
     if (!keyword) {
         return null;
     }
+    const pendingIndexIds = pendingIndexBlockIds.get(context.rootId);
+    // 索引提交前的哈希无法证明缓存对应当前树。只重取受影响块，其余缓存继续复用。
+    if (pendingIndexIds) dropTextCacheForBlocks(context.rootId, Array.from(pendingIndexIds));
     // 异步的全文查询可能在查找框关闭或切换文档后才走到后台补全分支。
     // 这时保留本次前台结果即可，不能重新启动已经取消的后台任务。
     const allowBackgroundJobs = hasBackgroundCorpusUser(context.rootId);
@@ -2894,9 +2910,10 @@ async function searchCurrentDocumentImpl(
     let degraded = languageQueryFailed;
     const plainTargets: BlockMeta[] = [];
     const specialTargets: BlockMeta[] = [];
+    const queuedIds = new Set<string>();
 
     const queueUnloaded = (id: string) => {
-        if (liveIds.has(id) || !inFocus(id)) {
+        if (queuedIds.has(id) || liveIds.has(id) || !inFocus(id)) {
             return;
         }
         const item = meta.byId.get(id) ?? {
@@ -2911,6 +2928,7 @@ async function searchCurrentDocumentImpl(
         if (meta.byId.has(id) && (!enabled(item) || isAttributeViewType(item.type))) {
             return;
         }
+        queuedIds.add(id);
         if (isSpecialRenderMeta(item)) {
             specialTargets.push(item);
         } else {
@@ -3005,6 +3023,41 @@ async function searchCurrentDocumentImpl(
             for (const id of new Set<string>([...contentIds, ...memoIds, ...titleIds])) {
                 queueUnloaded(id);
             }
+        }
+    }
+
+    // 普通查询和带字面量预筛的正则都不能只依赖尚未追上 savedoc 的 SQL。
+    // 补充现有叶子块，并按当前元数据扩展被整体 update 的列表等容器；仍走原有范围过滤。
+    if (pendingIndexIds?.size) {
+        // 部分分支直接填充 targets，也要防止重复抽取。
+        for (const item of [...plainTargets, ...specialTargets]) queuedIds.add(item.id);
+        for (const id of pendingIndexIds) {
+            if (meta.byId.has(id)) queueUnloaded(id);
+        }
+    }
+    if (pendingIndexIds && Array.from(pendingIndexIds).some((id) => isContainerType(meta.links.get(id)?.type ?? ""))) {
+        const affected = new Map<string, boolean>(Array.from(pendingIndexIds, (id) => [id, true]));
+        const expandedIds: string[] = [];
+        for (const item of meta.byId.values()) {
+            const path: string[] = [];
+            const visited = new Set<string>();
+            let current = item.id;
+            while (current && !affected.has(current) && !visited.has(current)) {
+                visited.add(current);
+                path.push(current);
+                current = meta.links.get(current)?.parentId ?? "";
+            }
+            const modified = affected.get(current) === true;
+            for (const id of path) affected.set(id, modified);
+            if (modified) {
+                if (!pendingIndexIds.has(item.id)) expandedIds.push(item.id);
+                queueUnloaded(item.id);
+            }
+        }
+        // savedoc 到达时元数据可能已过期/被其它面板作废，后代只能在本轮补齐。
+        dropTextCacheForBlocks(context.rootId, expandedIds);
+        if (expandedIds.length && pendingIndexBlockIds.get(context.rootId) === pendingIndexIds) {
+            pendingIndexBlockIds.set(context.rootId, new Set([...pendingIndexIds, ...expandedIds]));
         }
     }
 
