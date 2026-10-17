@@ -3209,8 +3209,7 @@ export class SearchBar {
         const blockId = av.dataset.nodeId?.trim() || match.blockId;
         const viewId = av.getAttribute("custom-sy-av-view")?.trim() ||
             av.querySelector<HTMLElement>(".av__views .item--focus")?.dataset.id?.trim();
-        if (!validSiYuanNodeId(blockId) || (viewId && !validSiYuanNodeId(viewId)) ||
-            (target.groupId && !validSiYuanNodeId(target.groupId))) {
+        if (!validSiYuanNodeId(blockId) || (viewId && !validSiYuanNodeId(viewId))) {
             return false;
         }
         const openFileByURL = (window as unknown as {
@@ -3220,7 +3219,10 @@ export class SearchBar {
 
         const query = new URLSearchParams({avItemID: target.itemId});
         if (viewId) query.set("avViewID", viewId);
-        if (target.groupId) query.set("avGroupID", target.groupId);
+        // Older/current kernels require protocol node IDs for avGroupID. If a
+        // rendered group uses another stable spelling, omit the hint: the
+        // kernel can still resolve the target row and its group by item ID.
+        if (target.groupId && validSiYuanNodeId(target.groupId)) query.set("avGroupID", target.groupId);
         this.pauseAvWatch(1400);
         const generation = this.searchGeneration;
         try {
@@ -3236,6 +3238,31 @@ export class SearchBar {
             void this.scrollIntoRangesAsync(index, true, false, false, false);
         });
         return true;
+    }
+
+    /** A live Range can still be outside every relevant viewport. Grouped AV
+     * tables keep such rows in a virtual window, so native AV locate is more
+     * reliable than guessing which scroll container owns the row. */
+    private attributeViewRangeNeedsReveal(range: Range, match: SearchMatch): boolean {
+        if (match.blockType !== ATTRIBUTE_VIEW_TYPE && !match.unitId?.startsWith("embed:")) {
+            return false;
+        }
+        const common = range.commonAncestorContainer;
+        const ancestor = common.nodeType === Node.TEXT_NODE ? common.parentElement : common as Element;
+        if (!ancestor) return true;
+        const rect = range.getBoundingClientRect();
+        if (rect.bottom <= rect.top) return true;
+        const containers = findScrollContainers(ancestor);
+        if (containers.some((container) => {
+            const box = container.getBoundingClientRect();
+            return rect.bottom < box.top || rect.top > box.bottom || rect.right < box.left || rect.left > box.right;
+        })) {
+            return true;
+        }
+        const viewportHeight = typeof window !== "undefined" ? window.innerHeight : 0;
+        const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 0;
+        return viewportHeight > 0 && viewportWidth > 0 &&
+            (rect.bottom < 0 || rect.top > viewportHeight || rect.right < 0 || rect.left > viewportWidth);
     }
 
     private revealUnloadedMatch(index: number, match: SearchMatch | undefined, scroll: boolean) {
@@ -4325,6 +4352,14 @@ export class SearchBar {
         }
         if (immediate && match.highlightKind !== "inline-memo") {
             this.applyFocusHighlight(range);
+        }
+
+        // A grouped AV may still have a valid Range for a row that is outside
+        // the computer viewport. Let SiYuan rebuild/center its native AV
+        // virtual window before the generic Range scrolling fallback.
+        if (scroll && match && this.attributeViewRangeNeedsReveal(range, match) &&
+            this.revealNativeAttributeViewMatch(index, match)) {
+            return;
         }
 
         let backgroundFoldIds: string[] = [];
