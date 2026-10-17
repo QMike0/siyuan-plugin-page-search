@@ -1,6 +1,6 @@
 {
   "name": "siyuan-plugin-page-search",
-  "version": "0.9.1",
+  "version": "2.0.1",
   "description": "Search and replace in the current SiYuan document with highlight",
   "main": ".src/index.js",
   "scripts": {

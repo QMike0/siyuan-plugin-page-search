@@ -1,3 +1,18 @@
+## v2.0.1 2026-10-17
+
+- 🇨🇳 按数据库已加载行数限制搜索范围，而非强行搜索数据库所有内容
+- 🇨🇳 根据数据库显示行数限制只加载并索引当前页数内的行，点击`加载更多`后，自动刷新对应数据库缓存并纳入新增行
+- 🇨🇳 修复数据库块导致的文档首块内容搜索出现无法屏外跳转的问题
+- 🇨🇳 修复大数据库后邻近内容块中的关键词跳转问题
+- 🇨🇳 去除跳转至数据库屏外关键词时会显示的右上角提示文本
+- 🇨🇳 支持输入关键词后立刻跳转当前索引对应命中
+- 🇺🇸 Limit search scope by the number of rows loaded in the database, rather than forcing a search across all database content
+- 🇺🇸 Load and index only the rows within the current page based on the number of rows displayed in the database; after clicking `Load more`, automatically refresh the corresponding database cache and include the newly added rows
+- 🇺🇸 Fix the issue where the first block of a document cannot jump off-screen when searching content caused by a database block
+- 🇺🇸 Fix the keyword jump issue in adjacent content blocks after a large database
+- 🇺🇸 Remove the top-right notification text that appears when jumping to an off-screen keyword in a database
+- 🇺🇸 Support immediately jumping to the current index's corresponding hit after entering a keyword
+
 ## v2.0.0 2026-10-16
 
 - 🇨🇳 对插件进行了完全重构
