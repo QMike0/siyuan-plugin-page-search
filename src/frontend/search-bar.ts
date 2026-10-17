@@ -3212,9 +3212,24 @@ export class SearchBar {
         if (!validSiYuanNodeId(blockId) || (viewId && !validSiYuanNodeId(viewId))) {
             return false;
         }
-        const openFileByURL = (window as unknown as {
-            openFileByURL?: (url: string) => unknown;
-        }).openFileByURL;
+        // In the desktop plugin runtime the protocol bridge is exposed on the
+        // top-level SiYuan window.  A plugin may itself run in a nested frame,
+        // while the web/browser runtime may expose it directly (or not at all).
+        // Resolve both locations without assuming either one exists.
+        let openFileByURL: ((url: string) => unknown) | undefined;
+        try {
+            const topWindow = window.top as unknown as {
+                openFileByURL?: (url: string) => unknown;
+            } | null;
+            openFileByURL = topWindow?.openFileByURL;
+        } catch {
+            // Cross-window access can be denied in an embedded preview.
+        }
+        if (!openFileByURL) {
+            openFileByURL = (window as unknown as {
+                openFileByURL?: (url: string) => unknown;
+            }).openFileByURL;
+        }
         if (typeof openFileByURL !== "function") return false;
 
         const query = new URLSearchParams({avItemID: target.itemId});
@@ -3237,6 +3252,48 @@ export class SearchBar {
             if (!bound || generation !== this.searchGeneration || this.getCurrentMatch()?.id !== match.id) return;
             void this.scrollIntoRangesAsync(index, true, false, false, false);
         });
+        return true;
+    }
+
+    /**
+     * If SiYuan has already mounted the target row, scrolling that row is a
+     * safe fallback when the protocol bridge is unavailable (for example in
+     * the web runtime).  It deliberately does not force-render a virtualized
+     * row; unmounted rows still take the native locator path above.
+     */
+    private revealMountedAttributeViewMatch(match: SearchMatch | undefined): boolean {
+        if (!match || (match.blockType !== ATTRIBUTE_VIEW_TYPE && !match.unitId?.startsWith("embed:"))) {
+            return false;
+        }
+        const target = attributeViewLocateTarget(match.unitId);
+        if (!target || !validSiYuanNodeId(target.itemId)) {
+            return false;
+        }
+        const host = this.edit.querySelector<HTMLElement>(
+            `[data-node-id="${CSS.escape(match.blockId)}"]`,
+        );
+        if (!host) return false;
+
+        let sourceId = "";
+        const local = match.unitId?.startsWith("embed:") ? match.unitId.slice(6) : "";
+        if (local) {
+            const end = local.indexOf(":");
+            sourceId = end > 0 ? local.slice(0, end) : "";
+        }
+        const sourceOf = createEmbeddedSourceReader();
+        const av = host.matches('[data-type="NodeAttributeView"]') ?
+            host :
+            Array.from(host.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]'))
+                .find(element => !sourceId || sourceOf(element) === sourceId || element.dataset.avId === sourceId);
+        if (!av) return false;
+
+        const row = av.querySelector<HTMLElement>(
+            `.av__row[data-id="${CSS.escape(target.itemId)}"]`,
+        );
+        if (!row || row.closest(".fn__none")) {
+            return false;
+        }
+        row.scrollIntoView({block: "center", inline: "nearest"});
         return true;
     }
 
@@ -3306,6 +3363,9 @@ export class SearchBar {
         }
         if (shown) {
             if (this.revealNativeAttributeViewMatch(index, match)) {
+                return;
+            }
+            if (this.revealMountedAttributeViewMatch(match)) {
                 return;
             }
             const group = this.attributeViewGroupBody(match);
@@ -4357,9 +4417,16 @@ export class SearchBar {
         // A grouped AV may still have a valid Range for a row that is outside
         // the computer viewport. Let SiYuan rebuild/center its native AV
         // virtual window before the generic Range scrolling fallback.
-        if (scroll && match && this.attributeViewRangeNeedsReveal(range, match) &&
-            this.revealNativeAttributeViewMatch(index, match)) {
-            return;
+        if (scroll && match && this.attributeViewRangeNeedsReveal(range, match)) {
+            if (this.revealNativeAttributeViewMatch(index, match)) {
+                return;
+            }
+            // A mounted row can be centered without rebuilding the AV
+            // virtual window. This also covers web mode, where the desktop
+            // protocol bridge is intentionally absent.
+            if (this.revealMountedAttributeViewMatch(match)) {
+                return;
+            }
         }
 
         let backgroundFoldIds: string[] = [];
