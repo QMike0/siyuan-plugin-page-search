@@ -18,7 +18,7 @@
 
 ![image-20261016002714516](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261016002714516.png)
 
-* **Include in search**: Toggle which types are searched — document title, image title, inline memos, paragraph blocks, heading blocks (H1–H6), list blocks (unordered / ordered / task), math blocks, code blocks, tables, databases, blockquotes, callouts, super blocks, embeds, HTML, Mermaid, and more. Embedded content can be searched and highlighted, but is not replaced
+* **Include in search**: Toggle which types are searched — document title, image title, inline memos, paragraph blocks, heading blocks (H1–H6), list blocks (unordered / ordered / task), math blocks, code blocks, tables, databases, blockquotes, callouts, super blocks, embeds, custom blocks, HTML, Mermaid, and more. Embedded content can be searched and highlighted, but is not replaced
 * **Folded block content**: Whether to search hidden content inside non-heading folded blocks
 * **Mermaid / flowchart**: Search visible text in displayed diagrams; search source when folded, unloaded, or not successfully rendered, without offscreen diagram rendering. Source hits only navigate to the diagram block
 * **Limit search**: Search only within selected inline types (multi-select). With an empty query, preview all keywords in the selected types. Limit switches reset when the search UI closes
@@ -42,7 +42,7 @@
 * Supports Replace / Replace all
 * Write-back prefers the document’s Protyle transaction, so `Ctrl+Z` / `Ctrl+Y` usually work for undo/redo
 
-Some hits are searchable/highlightable but not auto-replaceable, e.g. document titles, embedded content, databases, Mermaid, rendered HTML-block text, inline/block math, and words spanning complex marks. **Replace** tips and advances; **Replace all** shows the replaceable count and explains what will be skipped.
+Some hits are searchable/highlightable but not auto-replaceable, e.g. document titles, embedded content, custom blocks, databases, Mermaid, rendered HTML-block text, inline/block math, and words spanning complex marks. **Replace** tips and advances; **Replace all** shows the replaceable count and explains what will be skipped.
 
 ### (5) Publish & read-only
 

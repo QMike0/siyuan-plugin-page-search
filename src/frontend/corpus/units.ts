@@ -55,6 +55,8 @@ export interface CachedUnit {
 function nonReplaceable(block: SearchableBlock): boolean {
     return block.blockType === "NodeMathBlock" ||
         block.blockType === "NodeHTMLBlock" ||
+        block.blockType === "NodeCustomBlock" ||
+        Boolean(block.element.closest('[data-type="NodeCustomBlock"]')) ||
         block.blockType === "NodeAttributeView" ||
         isRendererUnitId(block.unitId) ||
         block.unitId === "mermaid-source" ||

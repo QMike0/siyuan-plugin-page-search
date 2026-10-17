@@ -91,7 +91,7 @@ export function isHitReplaceableByUnit(
     start: number,
     end: number,
 ): boolean {
-    if (unit.blockType === ATTRIBUTE_VIEW_TYPE) {
+    if (unit.blockType === ATTRIBUTE_VIEW_TYPE || unit.blockType === "NodeCustomBlock") {
         return false;
     }
     if (
@@ -111,7 +111,8 @@ export function isHitReplaceableByUnit(
 /** 每轮匹配的单元快照只累计一次，密集命中随后二分定位；不缓存可被调用方修改的长度数组。 */
 function* iterateUnitReplaceability(unit: SearchableUnit): Generator<void, (start: number, end: number) => boolean> {
     if (
-        unit.blockType === ATTRIBUTE_VIEW_TYPE || isRendererUnitId(unit.unitId) ||
+        unit.blockType === ATTRIBUTE_VIEW_TYPE || unit.blockType === "NodeCustomBlock" ||
+        isRendererUnitId(unit.unitId) ||
         unit.unitId === MERMAID_UNIT_ID || unit.unitId === HTML_BLOCK_UNIT_ID || !unit.segmentLengths?.length
     ) return () => false;
     const ends: number[] = [];

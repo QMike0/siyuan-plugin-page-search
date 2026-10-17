@@ -263,7 +263,7 @@ function isMatchContentWritable(
     if (!match.replaceable || match.unitId?.startsWith("embed:") || isDocTitleMatch(match)) {
         return false;
     }
-    if (match.blockType === ATTRIBUTE_VIEW_TYPE) {
+    if (match.blockType === ATTRIBUTE_VIEW_TYPE || match.blockType === "NodeCustomBlock") {
         return false;
     }
     if (isPreviewSyntheticBlockId(match.blockId)) {

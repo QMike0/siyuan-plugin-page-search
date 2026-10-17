@@ -226,6 +226,7 @@ function createRangeProjection(
         includeMermaid: options.includeMermaid !== false,
         includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeCustomBlock: options.includeCustomBlock !== false,
         includeFoldedBlocks: options.includeFoldedBlocks === true,
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,

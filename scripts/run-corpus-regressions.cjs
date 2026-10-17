@@ -313,6 +313,88 @@ async function main() {
     };
     try {
         {
+            // v3.8.7 custom blocks persist data-content, not arbitrary renderer DOM.
+            const custom = '<div data-node-id="b" data-type="NodeCustomBlock" class="custom-block" ' +
+                'data-info="fixture" data-content="needle" contenteditable="false">' +
+                '<div class="custom-block__content"><pre>needle</pre></div></div>';
+            const paragraph = '<div data-node-id="c" data-type="NodeParagraph">' +
+                '<div contenteditable="true">needle</div></div>';
+            const prepare = () => {
+                reset();
+                add("b", "custom", "needle");
+                add("c", "p", "needle");
+                doms.b = custom;
+                doms.c = paragraph;
+            };
+            prepare();
+            const cold = await search("needle");
+            full(cold);
+            assert.equal(cold.matches.length, 2, "unloaded custom text keeps existing search coverage");
+            assert.equal(cold.matches.find(match => match.blockId === "b").replaceable, false);
+            assert.equal(cold.matches.find(match => match.blockId === "c").replaceable, true);
+            const disabled = await search("needle", {includeCustomBlock: false});
+            full(disabled);
+            assert.deepEqual(disabled.matches.map(match => match.blockId), ["c"]);
+            assert.equal((await search("needle", {includeCustomBlock: true})).matches.length, 2,
+                "re-enabling restores coverage across cached searches");
+            prepare();
+            full(await search("needle", {includeCustomBlock: false}));
+            assert.ok(!domReadIds.includes("b"), "disabled unloaded custom blocks issue no DOM read");
+
+            prepare();
+            add("a", "h", "heading", "", "r", 'fold="1"');
+            wysiwyg.innerHTML = '<div data-node-id="a" data-type="NodeHeading" data-subtype="h1" fold="1">heading</div>';
+            doms.b = custom.replace('class="custom-block"', 'class="custom-block" parent-heading="a"');
+            assert.equal((await search("needle")).matches.length, 2, "folded heading retains custom coverage");
+            assert.deepEqual((await search("needle", {includeCustomBlock: false})).matches.map(match => match.blockId), ["c"]);
+            assert.deepEqual((await search("needle", {includeFoldedBlocks: false})).matches.map(match => match.blockId), [],
+                "the folded heading also hides the following paragraph");
+
+            prepare();
+            wysiwyg.innerHTML = custom.replace("<pre>needle</pre>",
+                '<div contenteditable="true"><span data-type="strong">needle</span>' +
+                '<span data-type="inline-memo" data-inline-memo-content="memoOnly">memoHost</span></div>') + paragraph;
+            const live = await search("needle");
+            full(live);
+            assert.equal(live.matches.length, 2);
+            assert.equal(live.matches.find(match => match.blockId === "b").replaceable, false,
+                "a custom renderer editable child cannot opt into HTML replacement");
+            assert.equal((await search("needle", {includeCustomBlock: false})).matches.length, 1);
+            assert.equal((await search("memoOnly", {includeInlineMemo: true})).matches.length, 1);
+            assert.equal((await search("memoOnly", {includeInlineMemo: true, includeCustomBlock: false})).matches.length, 0);
+
+            const {collectSearchableBlocks} = source("frontend/blocks");
+            const {calculateSearchMatches} = source("frontend/pipeline");
+            const {unitKeyOf} = source("frontend/selection");
+            const options = {includeDocTitle: false, includeInlineMemo: true};
+            const units = collectSearchableBlocks(edit, options);
+            const scope = new Map(units.map(unit => [unitKeyOf(unit), [{start: 0, end: unit.text.length}]]));
+            const selection = {...options, selectionOnly: true, selectionScope: scope};
+            const selected = await calculateSearchMatches({}, edit, "needle", selection);
+            assert.equal(selected.matches.length, 2);
+            assert.equal(selected.matches.find(match => match.blockId === "b").replaceable, false);
+            const selectedOff = await calculateSearchMatches({}, edit, "needle", {...selection, includeCustomBlock: false});
+            assert.deepEqual(selectedOff.matches.map(match => match.blockId), ["c"]);
+            for (const query of ["", "needle"]) {
+                const limited = {...options, restrictInlineTypes: ["strong"]};
+                assert.equal((await calculateSearchMatches({}, edit, query, limited)).matches.length, 1);
+                assert.equal((await calculateSearchMatches({}, edit, query, {...limited, includeCustomBlock: false})).matches.length, 0);
+            }
+
+            // Renderers may also contain block-like descendants; the ancestor gate must win.
+            wysiwyg.querySelector(".custom-block__content").innerHTML =
+                '<div data-node-id="nested" data-type="NodeParagraph"><div contenteditable="true">needle' +
+                '<span data-type="inline-memo" data-inline-memo-content="memoOnly">memoHost</span></div></div>';
+            const nested = await calculateSearchMatches({}, edit, "needle", {...options, selectionOnly: true,
+                selectionScope: new Map(collectSearchableBlocks(edit, options).map(unit =>
+                    [unitKeyOf(unit), [{start: 0, end: unit.text.length}]]))});
+            assert.equal(nested.matches.find(match => match.blockId === "nested").replaceable, false);
+            assert.ok(collectSearchableBlocks(edit, {...options, includeCustomBlock: false})
+                .every(unit => unit.blockId === "c"), "custom descendants and independent memo units cannot leak through");
+            assert.equal(document.querySelectorAll(".page-search-offscreen").length, 0);
+            console.log("custom block switches: cold/live, folds, cache, selection, inline restrictions and read-only renderer DOM OK");
+        }
+        {
             const inlineFormula =
                 '<span data-type="inline-math" data-subtype="math" data-content="\\delta" contenteditable="false" class="render-node"><span></span></span>';
             const blockFormula =

@@ -416,6 +416,7 @@ function collectionScope(options: SearchPipelineOptions): string {
         options.includeMermaid !== false,
         options.includeFlowchart !== false,
         options.includeHtmlBlock !== false,
+        options.includeCustomBlock !== false,
         options.includeTabs !== false,
         options.includeMindmap !== false,
         options.includeInlineMemo === true,
@@ -863,6 +864,7 @@ function collectOptions(options: SearchPipelineOptions) {
         includeMermaid: options.includeMermaid !== false,
         includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeCustomBlock: options.includeCustomBlock !== false,
         includeFoldedBlocks: options.includeFoldedBlocks === true,
         includeTabs: options.includeTabs !== false,
         includeMindmap: options.includeMindmap !== false,
@@ -3570,6 +3572,7 @@ async function searchCurrentDocumentImpl(
             hit.blockType === "NodeAttributeView" ||
             hit.blockType === "NodeMathBlock" ||
             hit.blockType === "NodeHTMLBlock" ||
+            hit.blockType === "NodeCustomBlock" ||
             isRendererUnitId(hit.unitId) ||
             hit.unitId === "mermaid-source" ||
             hit.unitId === "html-block-rendered" ||

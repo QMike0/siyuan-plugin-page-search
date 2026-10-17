@@ -59,6 +59,7 @@ const EMBED_BLOCK_TYPE = "NodeBlockQueryEmbed";
 const WIDGET_TYPE = "NodeWidget";
 /** HTML 块：可见字在 protyle-html open Shadow，非 light DOM */
 const HTML_BLOCK_TYPE = "NodeHTMLBlock";
+const CUSTOM_BLOCK_TYPE = "NodeCustomBlock";
 const TABLE_TYPE = "NodeTable";
 const CODE_BLOCK_TYPE = "NodeCodeBlock";
 
@@ -318,6 +319,8 @@ export interface CollectSearchableBlocksOptions {
      * 不搜 data-content 源码；不可替换。
      */
     includeHtmlBlock?: boolean;
+    /** 是否采集自定义块（NodeCustomBlock）及其渲染内容；默认 true；不可替换。 */
+    includeCustomBlock?: boolean;
     /** 是否采集非标题折叠块中的内容；省略时保持低层采集器的历史行为（采集）。 */
     includeFoldedBlocks?: boolean;
     /** 是否采集行内备注（data-inline-memo-content）；默认 false */
@@ -363,6 +366,7 @@ export function collectSearchableBlocks(
     const includeMermaid = options.includeMermaid !== false;
     const includeFlowchart = options.includeFlowchart !== false;
     const includeHtmlBlock = options.includeHtmlBlock !== false;
+    const includeCustomBlock = options.includeCustomBlock !== false;
     // 这是被替换、选区可视化等低层路径共用的采集器。省略选项时保留它们
     // 原有的“完整 DOM”语义；搜索管线始终显式传入用户开关。
     const includeFoldedBlocks = options.includeFoldedBlocks !== false;
@@ -408,6 +412,7 @@ export function collectSearchableBlocks(
         includeMermaid,
         includeFlowchart,
         includeHtmlBlock,
+        includeCustomBlock,
         includeMindmap,
     };
 
@@ -460,6 +465,11 @@ export function collectSearchableBlocks(
         const blockId = element.dataset.nodeId?.trim();
         const blockType = element.dataset.type?.trim() || "unknown";
         if (!blockId) {
+            return;
+        }
+
+        // 自定义块的渲染器可生成带块/行内标记的 DOM；关掉时连同这些内容一起排除。
+        if (!includeCustomBlock && element.closest(`[data-type="${CUSTOM_BLOCK_TYPE}"]`)) {
             return;
         }
 
@@ -676,7 +686,8 @@ export function collectSearchableBlocks(
     // 备注、行内公式、页签标题等独立单元不会经过上面的 blockElements 循环，
     // 因而在统一出口按其实际元素再过滤一次。
     return finishSearchableBlocks(
-        blocks,
+        includeCustomBlock ? blocks : blocks.filter((block) =>
+            !block.element.closest(`[data-type="${CUSTOM_BLOCK_TYPE}"]`)),
         includeFoldedBlocks,
         options.preserveEmbedSourceIds === true,
         blockElements,
@@ -786,6 +797,7 @@ interface IncludeGates {
     includeFlowchart: boolean;
     includeHtmlBlock: boolean;
     includeMindmap: boolean;
+    includeCustomBlock: boolean;
 }
 
 type HeadingIncludeGates = Pick<
@@ -824,6 +836,7 @@ export function createRendererElementFilter(
         includeMermaid: options.includeMermaid !== false,
         includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeCustomBlock: options.includeCustomBlock !== false,
         includeMindmap: options.includeMindmap !== false,
     };
     const body = shouldCollectBodyTextForRestrict(options.restrictInlineTypes);
@@ -957,6 +970,9 @@ export function shouldSkipElementByListInclude(
  * 关表格 / 引述 / 提示 / 嵌入 / 数据库等时，须在此过滤其内部的属性 unit。
  */
 function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeGates): boolean {
+    if (!gates.includeCustomBlock && element.closest(`[data-type="${CUSTOM_BLOCK_TYPE}"]`)) {
+        return true;
+    }
     if (
         !gates.includeAttributeView &&
         Boolean(element.closest(`[data-type="${ATTRIBUTE_VIEW_TYPE}"], .av`))

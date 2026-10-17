@@ -15,4 +15,5 @@ export const NON_REPLACEABLE_DOM_CLOSEST = [
     '[data-subtype="math"]',
     MERMAID_DOM_CLOSEST,
     HTML_BLOCK_DOM_CLOSEST,
+    '[data-type="NodeCustomBlock"]',
 ].join(", ");

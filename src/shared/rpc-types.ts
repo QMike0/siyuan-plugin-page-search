@@ -112,6 +112,8 @@ export interface PluginPrefs {
      * 匹配渲染结果而非 data-content 源码；不可替换。
      */
     includeHtmlBlock: boolean;
+    /** 是否匹配自定义块（NodeCustomBlock）；默认 true；不可替换。 */
+    includeCustomBlock: boolean;
     /**
      * 是否匹配折叠块内隐藏内容；默认 true。
      * 包含非标题 CSS 折叠和折叠标题的未加载后代。
@@ -178,6 +180,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeMermaid: true,
     includeFlowchart: true,
     includeHtmlBlock: true,
+    includeCustomBlock: true,
     includeFoldedBlocks: true,
     includeInlineMemo: false,
     restrictInlineTypes: [],
@@ -221,6 +224,7 @@ export function coercePluginPrefs(
         includeMermaid: base.includeMermaid !== false,
         includeFlowchart: base.includeFlowchart !== false,
         includeHtmlBlock: base.includeHtmlBlock !== false,
+        includeCustomBlock: base.includeCustomBlock !== false,
         includeFoldedBlocks: base.includeFoldedBlocks === true,
         includeInlineMemo,
         restrictInlineTypes: normalizeRestrictInlineTypes(base.restrictInlineTypes, {
@@ -316,6 +320,9 @@ export function mergePrefs(
         includeHtmlBlock: patch.includeHtmlBlock !== undefined ?
             patch.includeHtmlBlock :
             base.includeHtmlBlock,
+        includeCustomBlock: patch.includeCustomBlock !== undefined ?
+            patch.includeCustomBlock :
+            base.includeCustomBlock,
         includeFoldedBlocks: patch.includeFoldedBlocks !== undefined ?
             patch.includeFoldedBlocks :
             base.includeFoldedBlocks,

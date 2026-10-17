@@ -375,6 +375,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 "Mermaid diagrams support search and highlight only, not replace",
             replaceHtmlBlockUnsupported: t.replaceHtmlBlockUnsupported ||
                 "HTML blocks support search and highlight of rendered text only; replacement is not supported",
+            replaceCustomBlockUnsupported: t.replaceCustomBlockUnsupported ||
+                "Custom blocks are rendered by plugins and cannot be replaced directly",
             replaceTableRichUnsupported: t.replaceTableRichUnsupported ||
                 "Rich-text table cells support search and highlight only; replacement is not supported",
             replaceTableCellEditingUnsupported: t.replaceTableCellEditingUnsupported ||
@@ -458,6 +460,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeHtmlBlock: t.settingsIncludeHtmlBlock || "HTML block",
             settingsIncludeHtmlBlockHint: t.settingsIncludeHtmlBlockHint ||
                 "Match visible rendered text inside HTML blocks, not the HTML source",
+            settingsIncludeCustomBlock: t.settingsIncludeCustomBlock || "Custom block",
             settingsIncludeFoldedBlocks: t.settingsIncludeFoldedBlocks || "Folded block content",
             settingsIncludeFoldedBlocksHint: t.settingsIncludeFoldedBlocksHint ||
                 "Controls whether to search hidden content inside folded blocks",
@@ -685,6 +688,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeHtmlBlock(value);
+        });
+    }
+
+    /** 将自定义块匹配开关同步到其它已打开面板 */
+    syncIncludeCustomBlock(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeCustomBlock(value);
         });
     }
 
@@ -995,6 +1008,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeMermaid: prefs.includeMermaid !== false,
                     includeFlowchart: prefs.includeFlowchart !== false,
                     includeHtmlBlock: prefs.includeHtmlBlock !== false,
+                    includeCustomBlock: prefs.includeCustomBlock !== false,
                     includeFoldedBlocks: prefs.includeFoldedBlocks === true,
                     includeInlineMemo: prefs.includeInlineMemo === true,
                     useRegex: prefs.useRegex === true,

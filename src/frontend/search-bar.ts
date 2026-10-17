@@ -342,6 +342,7 @@ export interface SearchBarI18n {
     replaceAttributeViewUnsupported: string;
     replaceMermaidUnsupported: string;
     replaceHtmlBlockUnsupported: string;
+    replaceCustomBlockUnsupported: string;
     /** 富文本单元格：源码在属性里，改画面文字不会被保存 */
     replaceTableRichUnsupported: string;
     /** 单元格编辑器还开着 */
@@ -416,6 +417,7 @@ export interface SearchBarI18n {
     settingsIncludeFlowchartHint: string;
     settingsIncludeHtmlBlock: string;
     settingsIncludeHtmlBlockHint: string;
+    settingsIncludeCustomBlock: string;
     settingsIncludeFoldedBlocks: string;
     settingsIncludeFoldedBlocksHint: string;
     settingsIncludeInlineMemo: string;
@@ -489,6 +491,8 @@ export interface SearchBarHost {
     syncIncludeFlowchart?(value: boolean, source?: SearchBar): void;
     /** 将 HTML 块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeHtmlBlock?(value: boolean, source?: SearchBar): void;
+    /** 将自定义块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
+    syncIncludeCustomBlock?(value: boolean, source?: SearchBar): void;
     /** 将折叠块内容匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeFoldedBlocks?(value: boolean, source?: SearchBar): void;
     /** 将行内备注匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -702,6 +706,7 @@ export class SearchBar {
     private includeFlowchart = true;
     /** 是否匹配 HTML 块渲染可见文字；全局 prefs，默认 true */
     private includeHtmlBlock = true;
+    private includeCustomBlock = true;
     /** 是否匹配折叠块内隐藏内容；全局 prefs，默认 true */
     private includeFoldedBlocks = true;
     /** 是否匹配行内备注；全局 prefs，默认 false */
@@ -876,6 +881,7 @@ export class SearchBar {
         includeFlowchart?: boolean;
         /** 是否匹配 HTML 块渲染可见文字（来自全局 prefs） */
         includeHtmlBlock?: boolean;
+        includeCustomBlock?: boolean;
         /** 是否匹配折叠块内容（来自全局 prefs） */
         includeFoldedBlocks?: boolean;
         /** 是否匹配行内备注（来自全局 prefs） */
@@ -922,6 +928,7 @@ export class SearchBar {
         this.includeMermaid = options.includeMermaid !== false;
         this.includeFlowchart = options.includeFlowchart !== false;
         this.includeHtmlBlock = options.includeHtmlBlock !== false;
+        this.includeCustomBlock = options.includeCustomBlock !== false;
         this.includeFoldedBlocks = options.includeFoldedBlocks !== false;
         this.includeInlineMemo = options.includeInlineMemo === true;
         this.restrictInlineTypes = normalizeRestrictInlineTypes(
@@ -1850,6 +1857,7 @@ export class SearchBar {
                 includeMermaid: this.includeMermaid,
                 includeFlowchart: this.includeFlowchart,
                 includeHtmlBlock: this.includeHtmlBlock,
+                includeCustomBlock: this.includeCustomBlock,
                 includeInlineMemo: this.includeInlineMemo,
                 restrictInlineTypes: this.restrictInlineTypes,
             },
@@ -1894,6 +1902,7 @@ export class SearchBar {
             includeMermaid: this.includeMermaid,
             includeFlowchart: this.includeFlowchart,
             includeHtmlBlock: this.includeHtmlBlock,
+            includeCustomBlock: this.includeCustomBlock,
             includeFoldedBlocks: this.includeFoldedBlocks,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
@@ -1944,6 +1953,7 @@ export class SearchBar {
                     includeMermaid: this.includeMermaid,
                     includeFlowchart: this.includeFlowchart,
                     includeHtmlBlock: this.includeHtmlBlock,
+                    includeCustomBlock: this.includeCustomBlock,
                     includeInlineMemo: this.includeInlineMemo,
                     restrictInlineTypes: this.restrictInlineTypes,
                 },
@@ -2640,6 +2650,7 @@ export class SearchBar {
             includeMermaid: this.includeMermaid,
             includeFlowchart: this.includeFlowchart,
             includeHtmlBlock: this.includeHtmlBlock,
+            includeCustomBlock: this.includeCustomBlock,
             includeFoldedBlocks: this.includeFoldedBlocks,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
@@ -3859,6 +3870,7 @@ export class SearchBar {
             includeMermaid: this.includeMermaid,
             includeFlowchart: this.includeFlowchart,
             includeHtmlBlock: this.includeHtmlBlock,
+            includeCustomBlock: this.includeCustomBlock,
             includeFoldedBlocks: this.includeFoldedBlocks,
             includeInlineMemo: this.includeInlineMemo,
             restrictInlineTypes: this.restrictInlineTypes,
@@ -4781,6 +4793,9 @@ export class SearchBar {
         if (isRendererUnitFor(match.unitId, "html") || match.unitId === "html-block-rendered") {
             return this.i18n.replaceHtmlBlockUnsupported;
         }
+        if (match.blockType === "NodeCustomBlock") {
+            return this.i18n.replaceCustomBlockUnsupported;
+        }
         if (match.replaceLock === "table-rich") {
             return this.i18n.replaceTableRichUnsupported;
         }
@@ -5500,6 +5515,15 @@ export class SearchBar {
                         void this.setIncludeHtmlBlock(checked);
                     },
                 }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-custom-block",
+                    icon: "iconCode",
+                    label: this.i18n.settingsIncludeCustomBlock,
+                    checked: this.includeCustomBlock,
+                    onChange: (checked) => {
+                        void this.setIncludeCustomBlock(checked);
+                    },
+                }),
             ],
             bind: (element) => {
                 this.attachMenuHelpTip(element, this.i18n.settingsIncludeScopeHint);
@@ -6093,6 +6117,16 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setIncludeCustomBlock(value: boolean) {
+        if (this.includeCustomBlock === value) {
+            return;
+        }
+        this.includeCustomBlock = value;
+        await rpcSetPrefs(this.plugin, {includeCustomBlock: value});
+        this.plugin.syncIncludeCustomBlock?.(value, this);
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeFoldedBlocks(value: boolean) {
         if (this.includeFoldedBlocks === value) {
             return;
@@ -6305,6 +6339,14 @@ export class SearchBar {
             return;
         }
         this.includeHtmlBlock = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeCustomBlock(value: boolean) {
+        if (this.includeCustomBlock === value) {
+            return;
+        }
+        this.includeCustomBlock = value;
         void this.highlightHitResult(this.searchText, true);
     }
 

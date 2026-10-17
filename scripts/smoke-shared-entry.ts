@@ -869,6 +869,15 @@ assert(htmlHits.length === 1 && htmlHits[0].replaceable === false, "HTML hit rep
 assert(DEFAULT_PREFS.includeHtmlBlock === true, "includeHtmlBlock defaults on");
 assert(coercePluginPrefs({}).includeHtmlBlock === true, "coerce includeHtmlBlock default on");
 assert(coercePluginPrefs({includeHtmlBlock: false}).includeHtmlBlock === false, "coerce includeHtmlBlock off");
+assert(DEFAULT_PREFS.includeCustomBlock === true, "custom blocks default on");
+assert(coercePluginPrefs({}).includeCustomBlock === true, "existing prefs keep custom blocks on");
+assert(coercePluginPrefs({includeCustomBlock: false}).includeCustomBlock === false, "custom blocks can be disabled");
+assert(!mergePrefs(DEFAULT_PREFS, {includeCustomBlock: false}).includeCustomBlock, "persist custom blocks off");
+assert(!mergePrefs({...DEFAULT_PREFS, includeCustomBlock: false}, {includeTable: false}).includeCustomBlock,
+    "unrelated changes preserve the custom block switch");
+const customUnit = {...htmlUnit, blockType: "NodeCustomBlock", unitId: undefined};
+assert(!isHitReplaceableByUnit(customUnit, 0, 5), "custom rendered text is never replaceable");
+assert(matchTextUnits([customUnit], "hello")[0]?.replaceable === false, "custom matches are read-only");
 assert(DEFAULT_PREFS.includeDocTitle === true, "includeDocTitle defaults on");
 assert(DEFAULT_PREFS.includeImageTitle === true, "includeImageTitle defaults on");
 assert(coercePluginPrefs({}).includeDocTitle === true, "coerce includeDocTitle default on");

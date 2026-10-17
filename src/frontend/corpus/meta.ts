@@ -36,6 +36,7 @@ export interface BlockIncludeFlags extends BlockAncestorIncludeFlags {
     includeMermaid?: boolean;
     includeFlowchart?: boolean;
     includeHtmlBlock?: boolean;
+    includeCustomBlock?: boolean;
     includeTabs?: boolean;
     includeMindmap?: boolean;
 }
@@ -445,6 +446,9 @@ export function isBlockTypeEnabled(meta: BlockMeta, options: BlockIncludeFlags):
         return false;
     }
     if (type === "html" && options.includeHtmlBlock === false) {
+        return false;
+    }
+    if (type === "custom" && options.includeCustomBlock === false) {
         return false;
     }
     if (type === "av" && options.includeAttributeView === false) {

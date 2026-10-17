@@ -114,6 +114,7 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeFlowchart?: boolean;
     /** 是否匹配 HTML 块渲染可见文字；默认 true；不可替换 */
     includeHtmlBlock?: boolean;
+    includeCustomBlock?: boolean;
     /**
      * 是否匹配折叠块内的隐藏内容；默认 false（与历史行为一致）。
      * 非标题 CSS 折叠与折叠标题后代都受此控制；匹配时不展开，跳转时再展开。
@@ -159,7 +160,8 @@ function toSearchableUnit(block: SearchableBlock): SearchableUnit {
     // spans. Its offsets are validated against the source block before commit,
     // so those visual boundaries must not make an otherwise source-backed hit
     // look non-replaceable.
-    const segmentLengths = block.matchSource === "projection" ?
+    const segmentLengths = block.element.closest('[data-type="NodeCustomBlock"]') ?
+        undefined : block.matchSource === "projection" ?
         (block.text.length > 0 ? [block.text.length] : undefined) :
         block.textNodes.map((node) => node.nodeValue?.length ?? 0);
     return {
@@ -238,7 +240,7 @@ function isDomReplaceable(
     if (blockType === ATTRIBUTE_VIEW_TYPE) {
         return false;
     }
-    if (blockType === "NodeHTMLBlock") {
+    if (blockType === "NodeHTMLBlock" || blockType === "NodeCustomBlock") {
         return false;
     }
     if (
@@ -260,6 +262,10 @@ function isDomReplaceable(
         node as Element :
         node.parentElement;
     if (!element) {
+        return false;
+    }
+    // Custom renderers must write through setContent, never through their rendered DOM.
+    if (element.closest('[data-type="NodeCustomBlock"]')) {
         return false;
     }
     // Tab labels and mindmap canvas nodes are renderer copies. Their source
@@ -382,6 +388,7 @@ async function calculateLoadedDomMatches(
                 includeMermaid: options.includeMermaid,
                 includeFlowchart: options.includeFlowchart,
                 includeHtmlBlock: options.includeHtmlBlock,
+                includeCustomBlock: options.includeCustomBlock,
                 includeFoldedBlocks: options.includeFoldedBlocks,
                 includeInlineMemo: options.includeInlineMemo,
                 restrictInlineTypes,
@@ -416,6 +423,7 @@ async function calculateLoadedDomMatches(
         includeMermaid: options.includeMermaid !== false,
         includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
+        includeCustomBlock: options.includeCustomBlock !== false,
         includeFoldedBlocks: options.includeFoldedBlocks === true,
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,

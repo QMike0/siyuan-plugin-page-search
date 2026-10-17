@@ -2120,6 +2120,38 @@ async function lifecycleRegressions() {
     assert.equal(unexpected, 0);
 }
 async function main() {
+    {
+        const client = source("frontend/kernel-client");
+        const original = client.rpcSetPrefs;
+        const a = fixture("custom-switch-a");
+        const b = fixture("custom-switch-b");
+        const writes = [];
+        const refreshes = [];
+        a.includeCustomBlock = b.includeCustomBlock = true;
+        a.highlightHitResult = async (query, scroll) => refreshes.push(["a", query, scroll]);
+        b.highlightHitResult = async (query, scroll) => refreshes.push(["b", query, scroll]);
+        a.plugin = {...host, syncIncludeCustomBlock: (value, source) => {
+            assert.equal(source, a);
+            b.applyIncludeCustomBlock(value);
+        }};
+        client.rpcSetPrefs = async (_plugin, patch) => writes.push(patch);
+        try {
+            await a.setIncludeCustomBlock(false);
+            assert.equal(a.includeCustomBlock, false);
+            assert.equal(b.includeCustomBlock, false);
+            assert.deepEqual(writes, [{includeCustomBlock: false}]);
+            assert.deepEqual(refreshes, [["b", "foo", true], ["a", "foo", true]]);
+            await a.setIncludeCustomBlock(false);
+            b.applyIncludeCustomBlock(false);
+            assert.equal(writes.length, 1);
+            assert.equal(refreshes.length, 2, "unchanged switches do not trigger repeated searches");
+        } finally {
+            client.rpcSetPrefs = original;
+            a.destroy();
+            b.destroy();
+        }
+        console.log("Custom block switch persistence and pane synchronization OK");
+    }
     await inputNavigationRegressions();
     await undoSavedocRegressions();
     for (const unitId of ["renderer:source-fallback:mermaid:0", "embed:source:renderer:source-fallback:flowchart:0"]) {

@@ -1068,6 +1068,7 @@ export function captureSelectionScopeWithKind(
         includeMermaid?: boolean;
         includeFlowchart?: boolean;
         includeHtmlBlock?: boolean;
+        includeCustomBlock?: boolean;
         includeInlineMemo?: boolean;
         restrictInlineTypes?: RestrictInlineType[];
     },
@@ -1107,6 +1108,7 @@ export function captureSelectionScopeWithKind(
         includeMermaid: options?.includeMermaid !== false,
         includeFlowchart: options?.includeFlowchart !== false,
         includeHtmlBlock: options?.includeHtmlBlock !== false,
+        includeCustomBlock: options?.includeCustomBlock !== false,
         includeInlineMemo: options?.includeInlineMemo === true,
         restrictInlineTypes: options?.restrictInlineTypes,
     });

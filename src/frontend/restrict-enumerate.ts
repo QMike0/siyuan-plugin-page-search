@@ -112,6 +112,7 @@ export function enumerateRestrictInlineMatches(
     const includeMermaid = options.includeMermaid !== false;
     const includeFlowchart = options.includeFlowchart !== false;
     const includeHtmlBlock = options.includeHtmlBlock !== false;
+    const includeCustomBlock = options.includeCustomBlock !== false;
     const allowFoldedHidden = options.includeFoldedBlocks === true;
     const selectionOnly = options.selectionOnly === true;
 
@@ -142,6 +143,7 @@ export function enumerateRestrictInlineMatches(
         includeMermaid,
         includeFlowchart,
         includeHtmlBlock,
+        includeCustomBlock,
         includeFoldedBlocks: allowFoldedHidden,
         includeInlineMemo,
         restrictInlineTypes: [],
@@ -208,6 +210,7 @@ export function enumerateRestrictInlineMatches(
                         includeMermaid,
                         includeFlowchart,
                         includeHtmlBlock,
+                        includeCustomBlock,
                     })
                 ) {
                     continue;
@@ -446,8 +449,12 @@ function shouldSkipHostByIncludeGates(
         includeMermaid: boolean;
         includeFlowchart: boolean;
         includeHtmlBlock: boolean;
+        includeCustomBlock: boolean;
     },
 ): boolean {
+    if (!options.includeCustomBlock && host.closest('[data-type="NodeCustomBlock"]')) {
+        return true;
+    }
     const owner = searchOwnerBlock(host);
     if (!owner) {
         return false;
