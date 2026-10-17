@@ -3262,7 +3262,7 @@ export class SearchBar {
      * row; unmounted rows still take the native locator path above.
      */
     private revealMountedAttributeViewMatch(match: SearchMatch | undefined): boolean {
-        if (!match || (match.blockType !== ATTRIBUTE_VIEW_TYPE && !match.unitId?.startsWith("embed:"))) {
+        if (!match) {
             return false;
         }
         const target = attributeViewLocateTarget(match.unitId);
@@ -3272,7 +3272,6 @@ export class SearchBar {
         const host = this.edit.querySelector<HTMLElement>(
             `[data-node-id="${CSS.escape(match.blockId)}"]`,
         );
-        if (!host) return false;
 
         let sourceId = "";
         const local = match.unitId?.startsWith("embed:") ? match.unitId.slice(6) : "";
@@ -3281,20 +3280,25 @@ export class SearchBar {
             sourceId = end > 0 ? local.slice(0, end) : "";
         }
         const sourceOf = createEmbeddedSourceReader();
-        const av = host.matches('[data-type="NodeAttributeView"]') ?
-            host :
-            Array.from(host.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]'))
-                .find(element => !sourceId || sourceOf(element) === sourceId || element.dataset.avId === sourceId);
-        if (!av) return false;
-
-        const row = av.querySelector<HTMLElement>(
-            `.av__row[data-id="${CSS.escape(target.itemId)}"]`,
-        );
-        if (!row || row.closest(".fn__none")) {
-            return false;
+        const candidates = host?.matches('[data-type="NodeAttributeView"]') ?
+            [host] :
+            host ?
+                Array.from(host.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]')) :
+                Array.from(this.edit.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]'));
+        for (const av of candidates) {
+            if (sourceId && sourceOf(av) !== sourceId && av.dataset.avId !== sourceId) {
+                continue;
+            }
+            const row = av.querySelector<HTMLElement>(
+                `.av__row[data-id="${CSS.escape(target.itemId)}"]`,
+            );
+            if (!row || row.closest(".fn__none")) {
+                continue;
+            }
+            row.scrollIntoView({block: "center", inline: "nearest"});
+            return true;
         }
-        row.scrollIntoView({block: "center", inline: "nearest"});
-        return true;
+        return false;
     }
 
     /** A live Range can still be outside every relevant viewport. Grouped AV
@@ -3324,6 +3328,12 @@ export class SearchBar {
 
     private revealUnloadedMatch(index: number, match: SearchMatch | undefined, scroll: boolean) {
         if (!match || match.blockId === "__doc-title__") {
+            return;
+        }
+        // AV API hits may have no live Range and, for embedded/cold carriers,
+        // may not carry the rendered AV block as their blockId. Resolve a
+        // mounted row by its stable item ID before falling back to block open.
+        if (scroll && this.revealMountedAttributeViewMatch(match)) {
             return;
         }
         if (scroll && match.snippet) {
