@@ -86,9 +86,9 @@ export interface SearchMatch {
     mathOrdinal?: number;
     /** 行内公式整段可见文字（去掉零宽字符），与采集 mathOrdinal 时的口径一致。 */
     mathUnitText?: string;
-    /** 数据库命中无法做词级高亮时，展示视图、列和单元格文字。跳转时可能弹出提示。 */
+    /** 数据库来源摘要，包含视图、列和单元格文字；跳转时不弹出。 */
     snippet?: string;
-    /** 结果列表的单行摘要。与 snippet 分开，避免每次跳转都弹提示。 */
+    /** 结果列表的单行摘要，独立于数据库来源摘要。 */
     listText?: string;
     /** listText 里需要标出的命中区间。 */
     listMark?: {start: number; end: number;};

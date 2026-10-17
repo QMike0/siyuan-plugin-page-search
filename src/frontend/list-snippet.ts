@@ -12,7 +12,7 @@ export interface ListSnippet {
 
 /**
  * 从已经拿到的单元文本切一行摘要。
- * 不写入 SearchMatch.snippet：那个字段会在跳转时弹出提示。
+ * 不写入 SearchMatch.snippet：保留数据库来源摘要，列表使用独立的短摘要。
  */
 export function buildListSnippet(content: string, start: number, end: number, fallback = ""): ListSnippet {
     const made = sliceListSnippet(content ?? "", start, end);

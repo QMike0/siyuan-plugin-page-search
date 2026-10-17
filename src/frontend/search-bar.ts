@@ -3367,9 +3367,6 @@ export class SearchBar {
             }
             return;
         }
-        if (scroll && match.snippet) {
-            showMessage(match.snippet, 4000, "info");
-        }
         const existing = findDocumentBlock(this.edit, match.blockId);
         if (existing && revealHiddenTabs(existing)) {
             void existing.offsetHeight;
