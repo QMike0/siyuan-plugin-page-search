@@ -6,9 +6,17 @@ const Module = require("node:module");
 const ts = require("typescript");
 const {JSDOM} = require("../../analysis/node_modules/jsdom");
 const repo = path.resolve(__dirname, "..");
+let lastOpenTabOptions;
 const originalLoad = Module._load;
 Module._load = function(request, parent, main) {
-    if (request === "siyuan") return {getAllEditor: () => [], showMessage: () => {}};
+    if (request === "siyuan") return {
+        getAllEditor: () => [],
+        showMessage: () => {},
+        openTab: async options => {
+            lastOpenTabOptions = options;
+            options.afterOpen?.();
+        },
+    };
     return originalLoad.call(this, request, parent, main);
 };
 require.extensions[".ts"] = (mod, file) => {
@@ -122,6 +130,174 @@ function pipelineFixture(name) {
         noteSearchCoverage: () => {},
     });
     return bar;
+}
+
+async function inputNavigationRegressions() {
+    const originalTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (callback, ms, ...args) => originalTimeout(callback, ms === 400 ? 1 : ms, ...args);
+    const wait = ms => new Promise(resolve => originalTimeout(resolve, ms));
+    try {
+        for (const kind of ["loaded", "unloaded", "folded", "database"]) {
+            const bar = pipelineFixture("input-" + kind);
+            last = bar.root;
+            bar.isFindInputFocused = () => true;
+            const content = bar.edit.querySelector('[contenteditable="true"]');
+            content.textContent = "foo foo";
+            const loadedMatches = textMatches("foo foo", "input-" + kind).map(match => {
+                const range = document.createRange();
+                range.setStart(content.firstChild, match.start);
+                range.setEnd(content.firstChild, match.end);
+                return {...match, range};
+            });
+            const target = kind === "loaded" ? loadedMatches[1] : {
+                ...textMatches("foo", "offscreen")[0],
+                ...(kind === "database" ? {blockType: "NodeAttributeView", unitId: "cell:group:row:column"} : {}),
+            };
+            bar.runSearchPipeline = async () => ({matches: kind === "loaded" ? loadedMatches : [target], error: ""});
+            // A selected loaded match remains the current item rather than jumping to item 1.
+            bar.getSearchAnchorRange = () => kind === "loaded" ? target.range : null;
+            const navigation = [];
+            bar.scrollIntoRanges = (index, scroll) => navigation.push({match: bar.resultMatches[index], scroll});
+            bar.commitSearchHistory = () => {};
+            let pending;
+            const highlight = bar.highlightHitResult.bind(bar);
+            bar.highlightHitResult = (...args) => pending = highlight(...args);
+            bar.scheduleFindFromInput();
+            while (!pending) await wait(1);
+            await pending;
+            assert.equal(navigation.length, 1, "typing reveals one current match: " + kind);
+            assert.equal(navigation[0].scroll, true, "typing must scroll rather than only repaint: " + kind);
+            assert.equal(navigation[0].match, bar.resultMatches[bar.resultIndex - 1]);
+            assert.equal(bar.resultIndex, kind === "loaded" ? 2 : 1, "scroll follows the selected index");
+            navigation.length = 0;
+            await bar.highlightHitResult("foo", false);
+            assert.equal(navigation.some(item => item.scroll), false, "background refresh does not move the editor");
+            await bar.highlightHitResult("foo", true);
+            assert.equal(navigation.some(item => item.scroll), false, "option synchronization does not move other panes");
+            bar.destroy();
+        }
+
+        const cold = pipelineFixture("input-cold");
+        last = cold.root;
+        cold.isFindInputFocused = () => true;
+        cold.runSearchPipeline = async () => ({matches: [], error: "", partial: true});
+        cold.noteSearchCoverage = (_degraded, partial) => cold.backgroundIndexing = Boolean(partial);
+        const navigation = [];
+        cold.scrollIntoRanges = (index, scroll) => navigation.push({index, scroll});
+        await cold.highlightHitResult("foo", true, false, true);
+        assert.equal(navigation.length, 0, "an empty partial index has no target to reveal yet");
+        cold.runSearchPipeline = async () => ({matches: textMatches("foo", "cold-target"), error: ""});
+        await cold.highlightHitResult("foo", false);
+        assert.deepEqual(navigation, [{index: 0, scroll: true}], "first cold-index result fulfills the pending input navigation");
+        navigation.length = 0;
+        await cold.highlightHitResult("foo", false);
+        assert.equal(navigation.length, 0, "later index completion does not repeat automatic navigation");
+        for (const reason of ["focus", "pane", "query", "no-results"]) {
+            last = cold.root;
+            cold.isFindInputFocused = () => true;
+            cold.searchText = "foo";
+            cold.runSearchPipeline = async () => ({matches: [], error: "", partial: reason !== "no-results"});
+            await cold.highlightHitResult("foo", true, false, true);
+            if (reason === "focus") cold.isFindInputFocused = () => false;
+            if (reason === "pane") last = null;
+            if (reason === "query") cold.setSearchText("bar");
+            cold.runSearchPipeline = async () => ({matches: textMatches("foo", "late-target"), error: ""});
+            await cold.highlightHitResult(cold.searchText, false);
+            assert.equal(navigation.some(item => item.scroll), false, "pending navigation is cancelled: " + reason);
+        }
+        cold.destroy();
+
+        const cancelled = pipelineFixture("input-cancelled");
+        last = cancelled.root;
+        cancelled.isFindInputFocused = () => true;
+        let completePaint;
+        let inputNavigations = 0;
+        cancelled.applyResultHighlightsWithBudget = () => new Promise(resolve => completePaint = resolve);
+        cancelled.runSearchPipeline = async () => ({matches: cancelled.resultMatches, error: ""});
+        cancelled.scrollIntoRanges = () => inputNavigations++;
+        const pending = cancelled.highlightHitResult("foo", true, false, true);
+        while (!completePaint) await wait(1);
+        assert.equal(inputNavigations, 1, "current match is revealed without waiting for all highlights to paint");
+        cancelled.setSearchText("bar");
+        completePaint(false);
+        await pending;
+        assert.equal(inputNavigations, 1, "cancelled painting does not repeat obsolete input navigation");
+        cancelled.destroy();
+
+        const blurred = pipelineFixture("input-blurred");
+        last = blurred.root;
+        blurred.isFindInputFocused = () => true;
+        let completeSearch;
+        blurred.runSearchPipeline = () => new Promise(resolve => completeSearch = resolve);
+        blurred.scrollIntoRanges = (_index, scroll) => assert.equal(scroll, false, "leaving the input cancels automatic scrolling");
+        const blurSearch = blurred.highlightHitResult("foo", true, false, true);
+        blurred.isFindInputFocused = () => false;
+        completeSearch({matches: blurred.resultMatches, error: ""});
+        await blurSearch;
+        blurred.destroy();
+
+        const locating = fixture("input-focus");
+        const input = document.createElement("input");
+        locating.root.appendChild(input);
+        const fold = source("frontend/fold");
+        const locate = source("frontend/corpus/locate");
+        const unfold = fold.unfoldPathToBlock;
+        fold.unfoldPathToBlock = async () => false;
+        try {
+            for (const preserveFocus of [true, false]) {
+                input.focus();
+                await new Promise(resolve => locate.openBlockInEditor({}, "remote", resolve, locating.edit, preserveFocus));
+                const action = lastOpenTabOptions.doc.action;
+                assert.equal(action.includes("cb-get-focus"), !preserveFocus, "only ordinary navigation requests editor focus");
+                assert.equal(action.includes("cb-get-scroll"), preserveFocus, "find-input navigation requests scrolling without focus");
+                assert.equal(document.activeElement, input);
+                assert.ok(action.includes("cb-get-context") && action.includes("cb-get-rootscroll"));
+                assert.equal(lastOpenTabOptions.doc.zoomIn, false, "focus preservation does not enter zoom mode");
+            }
+        } finally {
+            fold.unfoldPathToBlock = unfold;
+            locating.destroy();
+        }
+
+        const queued = pipelineFixture("input-queued");
+        last = queued.root;
+        queued.plugin = {...host, app: {}};
+        queued.isFindInputFocused = () => true;
+        queued.repairHighlightRanges = () => {};
+        queued.finishLocatedMatch = async () => assert.fail("an obsolete block-open callback must not finish a new query");
+        delete queued.scrollIntoRanges;
+        const originalOpen = locate.openBlockInEditor;
+        const opens = [];
+        locate.openBlockInEditor = (_app, blockId, done, _edit, preserveFocus) => opens.push({blockId, done, preserveFocus});
+        try {
+            queued.runSearchPipeline = async () => ({matches: textMatches("foo", "first-unloaded"), error: ""});
+            await queued.highlightHitResult("foo", true, false, true);
+            assert.equal(opens.length, 1);
+            assert.equal(opens[0].preserveFocus, true, "automatic unloaded navigation preserves the actual find input");
+            queued.setSearchText("bar");
+            queued.runSearchPipeline = async () => ({
+                matches: [{...textMatches("foo", "second-unloaded")[0], matchedText: "bar"}], error: "",
+            });
+            await queued.highlightHitResult("bar", true, false, true);
+            assert.equal(opens.length, 1, "new input waits for the previous block-open operation");
+            opens[0].done();
+            await wait(1);
+            assert.equal(opens.length, 2, "releasing the old navigation reveals the latest input target");
+            assert.equal(opens[1].blockId, "second-unloaded");
+            let finished = 0;
+            queued.finishLocatedMatch = async () => finished++;
+            await queued.highlightHitResult("bar", false);
+            opens[1].done();
+            await wait(1);
+            assert.equal(finished, 1, "same-query background refresh still finishes the current target");
+        } finally {
+            locate.openBlockInEditor = originalOpen;
+            queued.destroy();
+        }
+    } finally {
+        window.setTimeout = originalTimeout;
+    }
+    console.log("Input navigation: loaded/offscreen/cold targets, one-shot reveal and background/cancellation boundaries OK");
 }
 
 async function undoSavedocRegressions() {
@@ -1944,6 +2120,7 @@ async function lifecycleRegressions() {
     assert.equal(unexpected, 0);
 }
 async function main() {
+    await inputNavigationRegressions();
     await undoSavedocRegressions();
     for (const unitId of ["renderer:source-fallback:mermaid:0", "embed:source:renderer:source-fallback:flowchart:0"]) {
         const sourceBar = fixture("source-owner");

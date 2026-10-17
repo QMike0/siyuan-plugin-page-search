@@ -48,7 +48,7 @@ function waitForUnfoldedBlock(editor: ParentNode, blockId: string, timeoutMs: nu
     });
 }
 
-function openTabToBlock(app: App, blockId: string): Promise<void> {
+function openTabToBlock(app: App, blockId: string, preserveFocus: boolean): Promise<void> {
     return new Promise((resolve) => {
         let settled = false;
         const done = () => {
@@ -58,7 +58,12 @@ function openTabToBlock(app: App, blockId: string): Promise<void> {
             settled = true;
             resolve();
         };
-        const action: TProtyleAction[] = ["cb-get-focus", "cb-get-context", "cb-get-rootscroll"];
+        // 自动查找时只滚动；cb-get-focus 会让宿主异步抢走查找框焦点。
+        const action: TProtyleAction[] = [
+            preserveFocus ? "cb-get-scroll" : "cb-get-focus",
+            "cb-get-context",
+            "cb-get-rootscroll",
+        ];
         if (isMobile()) {
             openMobileFileById(app, blockId, action);
             window.setTimeout(done, 300);
@@ -87,6 +92,7 @@ export function openBlockInEditor(
     blockId: string,
     afterOpen?: () => void,
     editor?: ParentNode,
+    preserveFocus = false,
 ): void {
     const root = editor ?? document;
     const finish = () => {
@@ -99,7 +105,7 @@ export function openBlockInEditor(
             finish();
             return;
         }
-        return openTabToBlock(app, blockId).then(finish, finish);
+        return openTabToBlock(app, blockId, preserveFocus).then(finish, finish);
     };
     void unfoldPathToBlock(blockId, root, rootId).then((unfolded) => {
         if (!unfolded) {

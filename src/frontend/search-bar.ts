@@ -536,6 +536,8 @@ export class SearchBar {
     private tableRevealSerial = 0;
     private staleRefreshPending = false;
     private typingTimer: number | undefined;
+    /** 主动输入的首次定位可等后台索引补出命中；执行一次后不随重搜滚动。 */
+    private pendingSearchRevealKey: string | null = null;
     /** switch-protyle 后等待可见编辑器稳定的帧任务。 */
     private documentSwitchRaf = 0;
     private searchGeneration = 0;
@@ -1022,7 +1024,7 @@ export class SearchBar {
             if (options.selectSearchOnOpen !== false) {
                 this.input.select();
             }
-            void this.highlightHitResult(options.presetText, true);
+            void this.highlightHitResult(options.presetText, true, false, true);
         } else {
             this.input.focus();
             this.input.select();
@@ -1094,6 +1096,7 @@ export class SearchBar {
         ) {
             return false;
         }
+        this.pendingSearchRevealKey = null;
         this.searchGeneration += 1;
         this.searchAbortController?.abort();
         this.searchAbortController = null;
@@ -1160,6 +1163,7 @@ export class SearchBar {
 
     private setSearchText(text: string): void {
         if (text !== this.searchText) {
+            this.pendingSearchRevealKey = null;
             this.viewportRangeAbort?.abort();
             this.repairRangeAbort?.abort();
             this.searchGeneration += 1;
@@ -1209,7 +1213,7 @@ export class SearchBar {
                 return;
             }
             const text = this.searchText;
-            void this.highlightHitResult(text, true);
+            void this.highlightHitResult(text, true, false, true);
             this.commitSearchHistory(text);
         }, DONE_TYPING_MS);
     }
@@ -1230,7 +1234,7 @@ export class SearchBar {
         this.typingTimer = undefined;
         this.setSearchText(text);
         this.input.value = text;
-        void this.highlightHitResult(text, true);
+        void this.highlightHitResult(text, true, false, true);
         this.input.focus();
         this.input.select();
     }
@@ -1410,7 +1414,7 @@ export class SearchBar {
         this.typingTimer = undefined;
         this.setSearchText(text);
         this.input.value = text;
-        void this.highlightHitResult(text, true);
+        void this.highlightHitResult(text, true, false, true);
         this.commitSearchHistory(text);
         if (options?.focusFind !== false) {
             this.input.focus();
@@ -1420,6 +1424,7 @@ export class SearchBar {
 
     /** 仅清空高亮（跨窗口 clear） */
     clearHighlightsOnly() {
+        this.pendingSearchRevealKey = null;
         this.clearHighlight();
         clearViewportProjection(this.edit);
         if (this.backgroundCorpusRootId) releaseAvCacheOwner(this.backgroundCorpusRootId, this.edit);
@@ -2266,6 +2271,7 @@ export class SearchBar {
         if (index < 0 || index >= this.resultMatches.length) {
             return;
         }
+        this.pendingSearchRevealKey = null;
         const previous = this.getCurrentMatch();
         this.resultIndex = index + 1;
         this.updateCountLabel(false);
@@ -2691,11 +2697,24 @@ export class SearchBar {
         }, 80);
     }
 
-    async highlightHitResult(value: string, change: boolean, retainDisplayedResults = false) {
+    async highlightHitResult(
+        value: string,
+        change: boolean,
+        retainDisplayedResults = false,
+        scrollToCurrent = false,
+    ) {
         const epoch = this.domEpoch;
-        const matches = await this.calculateSearchResults(value, change, retainDisplayedResults);
+        const pending = this.calculateSearchResults(value, change, retainDisplayedResults);
+        const generation = this.searchGeneration;
+        // 只有主动输入/预填/历史查找请求滚动；选项同步和保存/撤销重搜不请求。
+        if (scrollToCurrent) {
+            this.pendingSearchRevealKey = this.effectiveQuery(value) ? this.searchResultKey(value) : null;
+        } else if (change) {
+            this.pendingSearchRevealKey = null;
+        }
+        const matches = await pending;
         // 已被后续输入或页签切换作废的搜索不能清理/重画后来搜索的高亮。
-        if (matches !== this.resultMatches) {
+        if (generation !== this.searchGeneration || matches !== this.resultMatches || !this.canPaintHighlights()) {
             return;
         }
         const keyword = this.effectiveQuery(value);
@@ -2708,24 +2727,22 @@ export class SearchBar {
         }
 
         const hasAnyRange = matches.some((match) => Boolean(match.range));
-        if (!hasAnyRange) {
-            this.clearHighlight();
-            this.repairAfterSearchIfNeeded(epoch);
-            return;
-        }
-
         this.clearHighlight();
-        if (
-            !await this.applyResultHighlightsWithBudget(
-                matches,
-                () => this.canPaintHighlights(),
-            )
-        ) return;
-
-        this.syncMemoUnderlineVisual();
+        // 先定位当前项，不等整批高亮分帧完成；滚动造成的 DOM 变化仍走原有补绑流程。
+        const revealCurrent = this.revealPendingSearchMatch();
+        if (hasAnyRange) {
+            if (
+                !await this.applyResultHighlightsWithBudget(
+                    matches,
+                    () => this.canPaintHighlights(),
+                )
+            ) return;
+            this.syncMemoUnderlineVisual();
+        }
+        if (generation !== this.searchGeneration || matches !== this.resultMatches || !this.canPaintHighlights()) return;
         this.repairAfterSearchIfNeeded(epoch);
 
-        if (change && this.resultIndex >= 1) {
+        if (change && !revealCurrent && this.resultIndex >= 1) {
             this.scrollIntoRanges(this.resultIndex - 1, false);
         } else if (Date.now() < this.indexResetPausedUntil) {
             const current = this.getCurrentMatch();
@@ -2735,6 +2752,34 @@ export class SearchBar {
                 this.clearSearchFocus();
             }
         }
+    }
+
+    /** 等待索引或上一次未加载块定位结束；只消费仍属于本查询的一次主动定位。 */
+    private revealPendingSearchMatch(): boolean {
+        if (!this.pendingSearchRevealKey) return false;
+        if (
+            !this.canPaintHighlights() || !this.plugin.isLastHighlightComponent(this.root) ||
+            (!this.isFindInputFocused() && !this.isReplaceInputFocused())
+        ) {
+            this.pendingSearchRevealKey = null;
+            return false;
+        }
+        if (!this.resultSearchKey || this.locatePending) return false;
+        if (this.pendingSearchRevealKey !== this.resultSearchKey) {
+            this.pendingSearchRevealKey = null;
+            return false;
+        }
+        if (!this.resultMatches.length) {
+            if (!this.backgroundIndexing) this.pendingSearchRevealKey = null;
+            return false;
+        }
+        this.pendingSearchRevealKey = null;
+        if (this.resultIndex < 1) {
+            this.resultIndex = 1;
+            this.updateCountLabel(true);
+        }
+        this.scrollIntoRanges(this.resultIndex - 1, true);
+        return true;
     }
 
     private clearHighlight() {
@@ -3417,10 +3462,13 @@ export class SearchBar {
             return;
         }
         this.locatePending = true;
+        const searchKey = this.searchResultKey();
         const keepIndex = this.resultIndex >= 1 ? this.resultIndex : index + 1;
         this.pauseIndexReset(4000);
         openBlockInEditor(app, match.blockId, () => {
-            const finish = this.finishLocatedMatch(keepIndex, scroll, allowNativeAvLocate);
+            const finish = searchKey === this.searchResultKey() && this.getCurrentMatch()?.id === match.id &&
+                    this.canPaintHighlights() ?
+                this.finishLocatedMatch(keepIndex, scroll, allowNativeAvLocate) : Promise.resolve();
             const release = () => {
                 this.locatePending = false;
                 this.pauseIndexReset(800);
@@ -3431,9 +3479,10 @@ export class SearchBar {
                 // 定位期间的渲染突变不能丢掉。目标块若在超时后才填入正文，
                 // 这里立即走既有的按块补 Range 流程；之后的突变仍由观察器处理。
                 this.repairHighlightRanges();
+                this.revealPendingSearchMatch();
             };
             finish.then(release, release);
-        }, this.edit);
+        }, this.edit, this.isFindInputFocused() || this.isReplaceInputFocused());
     }
 
     /**
@@ -4557,6 +4606,7 @@ export class SearchBar {
     }
 
     private clickLast() {
+        this.pendingSearchRevealKey = null;
         const prevMatch = this.getCurrentMatch();
         if (this.resultCount === 0) {
             this.resultIndex = 0;
@@ -4575,6 +4625,7 @@ export class SearchBar {
     }
 
     private clickNext() {
+        this.pendingSearchRevealKey = null;
         const prevMatch = this.getCurrentMatch();
         if (this.resultCount === 0) {
             this.resultIndex = 0;
