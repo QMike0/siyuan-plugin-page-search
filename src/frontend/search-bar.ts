@@ -97,6 +97,7 @@ import {
 import {isEditorReplaceModeBlocked} from "./editor-mode";
 import {EmbedSearchState} from "./embed-search-state";
 import {createEmbeddedSourceReader} from "./embedded-order";
+import {avApiCellPosition} from "../shared/av-live";
 import {
     clearNonHeadingFoldLocally,
     collectNonHeadingFoldedAncestorIds,
@@ -261,6 +262,45 @@ const RESULTS_ITEM_HEIGHT = 26;
 const RESULTS_LIST_PADDING = 4;
 const RESULTS_MAX_HEIGHT = 240;
 const RESULTS_OVERSCAN = 5;
+
+interface AttributeViewLocateTarget {
+    itemId: string;
+    groupId?: string;
+}
+
+/**
+ * Search units use two spellings for an AV cell: the live DOM form
+ * (`cell:group:row:column`) and the API form (`av-group:group:row:column` /
+ * `av:row:column`).  The native SiYuan locate protocol needs the row ID and,
+ * for grouped views, the group ID.  Keep this parser deliberately narrow so
+ * titles, counters and other AV chrome never trigger a row locate request.
+ */
+function attributeViewLocateTarget(unitId: string | undefined): AttributeViewLocateTarget | null {
+    if (!unitId) return null;
+    const embedded = unitId.startsWith("embed:");
+    const embeddedLocal = embedded ? unitId.slice(6) : unitId;
+    const sourceEnd = embeddedLocal.indexOf(":");
+    const local = embedded ?
+        (sourceEnd >= 0 ? embeddedLocal.slice(sourceEnd + 1) : "") :
+        embeddedLocal;
+    if (local.startsWith("cell:")) {
+        const parts = local.split(":");
+        if (parts.length !== 4 || !parts[2] || parts[2].startsWith("header:")) return null;
+        return parts[1] === "nogroup" ? {itemId: parts[2]} : {itemId: parts[2], groupId: parts[1]};
+    }
+    const position = avApiCellPosition(local);
+    if (!position || position.row.startsWith("header:")) return null;
+    if (position.row.startsWith("group:")) {
+        const parts = position.row.split(":");
+        if (parts.length !== 3 || !parts[1] || !parts[2]) return null;
+        return {itemId: parts[2], groupId: parts[1]};
+    }
+    return position.row ? {itemId: position.row} : null;
+}
+
+function validSiYuanNodeId(value: string | undefined): value is string {
+    return Boolean(value && /^\d{14}-\w{7}$/.test(value));
+}
 
 /** 「是否搜索 · 标题」级别 1–6（对应 data-subtype h1–h6） */
 export type HeadingIncludeLevel = 1 | 2 | 3 | 4 | 5 | 6;
@@ -3132,6 +3172,72 @@ export class SearchBar {
         return true;
     }
 
+    /**
+     * Ask SiYuan's own AV locator to mount an off-screen row before trying to
+     * build a DOM Range.  AV values are searchable from the paged API even when
+     * virtualScroll.ts has removed their row from the DOM; scrolling the AV
+     * block itself cannot make that row appear.  The native URI path carries
+     * the row/view/group identity and lets SiYuan calculate the correct
+     * virtual window for table, list, gallery and kanban layouts.
+     */
+    private revealNativeAttributeViewMatch(index: number, match: SearchMatch): boolean {
+        if (match.blockType !== ATTRIBUTE_VIEW_TYPE && !match.unitId?.startsWith("embed:")) {
+            return false;
+        }
+        const target = attributeViewLocateTarget(match.unitId);
+        if (!target || !validSiYuanNodeId(target.itemId)) {
+            return false;
+        }
+        const host = this.edit.querySelector<HTMLElement>(
+            `[data-node-id="${CSS.escape(match.blockId)}"]`,
+        );
+        if (!host) return false;
+
+        let sourceId = "";
+        const local = match.unitId?.startsWith("embed:") ? match.unitId.slice(6) : "";
+        if (local) {
+            const end = local.indexOf(":");
+            sourceId = end > 0 ? local.slice(0, end) : "";
+        }
+        const sourceOf = createEmbeddedSourceReader();
+        const av = host.matches('[data-type="NodeAttributeView"]') ?
+            host :
+            Array.from(host.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]'))
+                .find(element => !sourceId || sourceOf(element) === sourceId || element.dataset.avId === sourceId);
+        if (!av) return false;
+
+        const blockId = av.dataset.nodeId?.trim() || match.blockId;
+        const viewId = av.getAttribute("custom-sy-av-view")?.trim() ||
+            av.querySelector<HTMLElement>(".av__views .item--focus")?.dataset.id?.trim();
+        if (!validSiYuanNodeId(blockId) || (viewId && !validSiYuanNodeId(viewId)) ||
+            (target.groupId && !validSiYuanNodeId(target.groupId))) {
+            return false;
+        }
+        const openFileByURL = (window as unknown as {
+            openFileByURL?: (url: string) => unknown;
+        }).openFileByURL;
+        if (typeof openFileByURL !== "function") return false;
+
+        const query = new URLSearchParams({avItemID: target.itemId});
+        if (viewId) query.set("avViewID", viewId);
+        if (target.groupId) query.set("avGroupID", target.groupId);
+        this.pauseAvWatch(1400);
+        const generation = this.searchGeneration;
+        try {
+            openFileByURL(`siyuan://blocks/${blockId}?${query.toString()}`);
+        } catch {
+            return false;
+        }
+        // Native locating rebuilds the virtual window asynchronously.  Reuse
+        // the existing bounded observer so the current result is rebound as
+        // soon as its row is mounted, then perform the normal Range centering.
+        void this.waitForLocatedMatchRange(index + 1, match.id, true).then(bound => {
+            if (!bound || generation !== this.searchGeneration || this.getCurrentMatch()?.id !== match.id) return;
+            void this.scrollIntoRangesAsync(index, true, false, false, false);
+        });
+        return true;
+    }
+
     private revealUnloadedMatch(index: number, match: SearchMatch | undefined, scroll: boolean) {
         if (!match || match.blockId === "__doc-title__") {
             return;
@@ -3172,6 +3278,9 @@ export class SearchBar {
             return;
         }
         if (shown) {
+            if (this.revealNativeAttributeViewMatch(index, match)) {
+                return;
+            }
             const group = this.attributeViewGroupBody(match);
             if (group) this.clearSearchFocus();
             (group?.previousElementSibling ?? existing)?.scrollIntoView({block: "center", inline: "nearest"});
