@@ -206,6 +206,13 @@ export function watchAttributeViewDom(
                 invalidateValues = changed = true;
                 if (!ids?.length) unknownAv = true;
                 ids?.forEach(id => changedIds.add(id));
+            } else if (isAttributeViewPageSizeMutation(mutation)) {
+                // "Load more" expands the API page window. Drop the previous
+                // bounded cache so the newly exposed rows are fetched too.
+                const ids = mutatedAttributeViewIds(mutation);
+                invalidateValues = changed = true;
+                if (!ids?.length) unknownAv = true;
+                ids?.forEach(id => changedIds.add(id));
             }
         }
         if (changed) schedule();
@@ -216,8 +223,9 @@ export function watchAttributeViewDom(
         subtree: true,
         characterData: false,
         attributes: true,
-        // 仅根级渲染标记；不要监听 data-page-size（滚动加载会改）
-        attributeFilter: ["data-render", "data-av-id", "data-av-type"],
+        // data-page-size changes when the user clicks "Load more". The bounded
+        // AV cache must be refreshed so the newly exposed page is fetched.
+        attributeFilter: ["data-render", "data-av-id", "data-av-type", "data-page-size"],
         attributeOldValue: true,
     });
 
@@ -260,6 +268,9 @@ function mutatedAttributeViewIds(mutation: MutationRecord): string[] {
 function isStructuralAttributeViewMutation(mutation: MutationRecord): boolean {
     if (mutation.type === "attributes") {
         const el = mutation.target as Element;
+        if (mutation.attributeName === "data-page-size") {
+            return false;
+        }
         // 只关心 AV 根节点的渲染标记，避免 body 上属性抖动
         return Boolean(el.matches?.(AV_BLOCK_SELECTOR));
     }
@@ -319,4 +330,12 @@ function isStructuralAttributeViewMutation(mutation: MutationRecord): boolean {
     }
 
     return false;
+}
+
+function isAttributeViewPageSizeMutation(mutation: MutationRecord): boolean {
+    if (mutation.type !== "attributes" || mutation.attributeName !== "data-page-size") {
+        return false;
+    }
+    const target = mutation.target as Element;
+    return Boolean(target.matches?.(".av__body[data-page-size]") && target.closest(AV_BLOCK_SELECTOR));
 }

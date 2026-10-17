@@ -91,6 +91,7 @@ import {
 import {
     AttributeViewTruncatedError,
     AttributeViewLoadError,
+    avDisplayPageSizes,
     invalidateAvCache,
     invalidateAvCacheForBlocks,
     invalidateAvCacheForIds,
@@ -3267,7 +3268,11 @@ async function searchCurrentDocumentImpl(
             return (!item || enabled(item)) && inFocus(ref.blockId);
         }).map(ref => {
             const element = mountedAvs.get(ref.blockId);
-            return element ? {...ref, query: readAvSearchQuery(element)} : ref;
+            return element ? {
+                ...ref,
+                query: readAvSearchQuery(element),
+                ...avDisplayPageSizes(element),
+            } : ref;
         });
         const avDom = collectAvDomCoverage(liveAll.filter((unit) => mountedAvIds.has(unit.blockId)));
         const usedRowLabels = new Map<string, Set<string>>();
@@ -3286,7 +3291,14 @@ async function searchCurrentDocumentImpl(
             const sourceId = carrier.unitId?.startsWith("embed:") ? carrier.unitId.split(":")[1] : "";
             const element = mountedEmbeddedAvs.get(`${carrier.blockId}\0${sourceId}`);
             if (!element) return carrier;
-            return {...carrier, embeddedAvRef: {...carrier.embeddedAvRef!, query: readAvSearchQuery(element)}};
+            return {
+                ...carrier,
+                embeddedAvRef: {
+                    ...carrier.embeddedAvRef!,
+                    query: readAvSearchQuery(element),
+                    ...avDisplayPageSizes(element),
+                },
+            };
         });
         // Coverage is scoped to the displayed source copy, not merely the source
         // block ID: another embed (or another view) may mount different rows.

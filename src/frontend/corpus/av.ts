@@ -1,5 +1,5 @@
 import type {SearchableUnit} from "../../shared";
-import {avCellUnitId} from "../../shared/av-live";
+import {avApiCellPosition, avCellUnitId} from "../../shared/av-live";
 import {attributeViewHtmlTexts} from "../blocks";
 import {
     fetchSearchBlockDoms,
@@ -41,6 +41,30 @@ export interface AvBlockRef {
     carrierViewId: string;
     /** Native AV search is transient DOM state, not a persisted field filter. */
     query?: string;
+    /** Current rows exposed by the mounted view. These are UI state, not AV data. */
+    pageSize?: number;
+    groupPageSizes?: Record<string, number>;
+}
+
+interface AvDisplayLimits {
+    pageSize?: number;
+}
+
+/** Read the row window that the native AV renderer currently exposes. */
+export function avDisplayPageSizes(element: HTMLElement): Pick<AvBlockRef, "pageSize" | "groupPageSizes"> {
+    let pageSize: number | undefined;
+    const groupPageSizes: Record<string, number> = {};
+    element.querySelectorAll<HTMLElement>(".av__body[data-page-size]").forEach((body) => {
+        const size = Number(body.dataset.pageSize);
+        if (!Number.isSafeInteger(size) || size <= 0) return;
+        const group = body.dataset.groupId?.trim();
+        if (group) groupPageSizes[group] = size;
+        else if (pageSize === undefined) pageSize = size;
+    });
+    return {
+        pageSize,
+        groupPageSizes: Object.keys(groupPageSizes).length ? groupPageSizes : undefined,
+    };
 }
 
 interface AvCell {
@@ -56,6 +80,7 @@ interface AvUnitDraft {
 }
 
 const cache = new Map<string, SearchableUnit[]>();
+const displayLimits = new Map<string, AvDisplayLimits>();
 /** Actual view after the kernel's default/stale-ID fallback; dies with its cached array. */
 const resolvedViews = new WeakMap<SearchableUnit[], string>();
 const cachedBytes = new Map<string, number>();
@@ -68,6 +93,7 @@ function dropAvCache(key: string): void {
     retainedBytes -= cachedBytes.get(key) ?? 0;
     cachedBytes.delete(key);
     cache.delete(key);
+    displayLimits.delete(key);
     unpinnedAvKeys.delete(key);
     const prefix = key.split(":").slice(0, 2).join(":") + ":";
     const keys = cacheKeysByCarrier.get(prefix);
@@ -652,16 +678,27 @@ interface PageProgress {
     page: number;
     seen: Set<string>;
     total?: number;
+    limit?: number;
     done: boolean;
 }
 
-function observePage(view: Record<string, unknown>, progress: PageProgress): void {
+function pageWindow(view: Record<string, unknown>, progress: PageProgress): Record<string, unknown> {
+    if (progress.limit === undefined) return view;
+    const rows = rowList(view);
+    const remaining = Math.max(0, progress.limit - progress.seen.size);
+    if (rows.length <= remaining) return view;
+    const key = view.rows !== undefined ? "rows" : "cards";
+    return {...view, [key]: rows.slice(0, remaining)};
+}
+
+function observePage(view: Record<string, unknown>, progress: PageProgress): Record<string, unknown> {
+    const page = pageWindow(view, progress);
     const value = view.rowCount ?? view.cardCount;
     const total = value === undefined ? undefined : Number(value);
     if (total !== undefined && (!Number.isSafeInteger(total) || total < 0)) throw new AttributeViewPageError();
     if (progress.total !== undefined && total !== progress.total) throw new AttributeViewPageError();
     progress.total = total;
-    const rows = rowList(view);
+    const rows = rowList(page);
     for (const row of rows) {
         const id = String(asRecord(row)?.id ?? "");
         // 一页内和同一组跨页都不应重复。跨组的合法重复由各组独立 seen 接受。
@@ -669,12 +706,15 @@ function observePage(view: Record<string, unknown>, progress: PageProgress): voi
         progress.seen.add(id);
     }
     if (total !== undefined && progress.seen.size > total) throw new AttributeViewPageError();
-    progress.done = total === undefined ? rows.length < PAGE_SIZE : progress.seen.size === total;
+    progress.done = progress.limit !== undefined && progress.seen.size >= progress.limit ?
+        true :
+        total === undefined ? rows.length < PAGE_SIZE : progress.seen.size === total;
     if (!progress.done && rows.length < PAGE_SIZE) throw new AttributeViewPageError();
+    return page;
 }
 
-function firstProgress(view: Record<string, unknown>): PageProgress {
-    const progress: PageProgress = {page: 1, seen: new Set(), done: false};
+function firstProgress(view: Record<string, unknown>, limit?: number): PageProgress {
+    const progress: PageProgress = {page: 1, seen: new Set(), limit, done: false};
     observePage(view, progress);
     return progress;
 }
@@ -688,7 +728,8 @@ async function renderView(
     target: Map<string, AvCell>,
     shouldContinue: () => boolean,
     signal?: AbortSignal,
-): Promise<{hideAttrViewName: boolean;} | null> {
+    display?: Pick<AvBlockRef, "pageSize" | "groupPageSizes">,
+): Promise<{hideAttrViewName: boolean; pageSize?: number;} | null> {
     if (!shouldContinue()) {
         return null;
     }
@@ -712,7 +753,10 @@ async function renderView(
     if (!firstView) {
         throw new AttributeViewPageError();
     }
-    const visibility = {hideAttrViewName: firstView.hideAttrViewName === true};
+    const visibility = {
+        hideAttrViewName: firstView.hideAttrViewName === true,
+        pageSize: validPageSize(firstView.pageSize),
+    };
     const columns = columnInfo(firstView);
     const groups = groupSnapshots(firstView);
     if (groups.length > 0) {
@@ -723,12 +767,19 @@ async function renderView(
             // separate: their rows still belong to the searchable view.
             if (group.view.groupHidden !== undefined && group.view.groupHidden !== 0) continue;
             if (!group.id || progressByGroup.has(group.id)) throw new AttributeViewPageError();
-            progressByGroup.set(group.id, firstProgress(group.view));
+            const groupLimit = validPageSize(display?.groupPageSizes?.[group.id]) ??
+                validPageSize(display?.pageSize) ?? validPageSize(group.view.pageSize);
+            progressByGroup.set(group.id, firstProgress(group.view, groupLimit));
             const cells = new Map<string, AvCell>();
             const name = groupNameText(group.view);
             if (name) cells.set(`group-title:${group.id}`, {text: name, snippet: name});
             // Native responses omit group columns/fields; metadata lives on the parent view.
-            absorbRows(cells, group.view, viewName, columns, group.id);
+            absorbRows(cells, pageWindow(group.view, {
+                page: 1,
+                seen: new Set(),
+                limit: groupLimit,
+                done: false,
+            }), viewName, columns, group.id);
             cellsByGroup.set(group.id, cells);
         }
         for (let round = 0; round < MAX_PAGES; round += 1) {
@@ -785,8 +836,8 @@ async function renderView(
                     throw new AttributeViewPageError();
                 }
                 if (requested.has(group.id)) {
-                    observePage(group.view, progress);
-                    absorbRows(cellsByGroup.get(group.id)!, group.view, viewName, columns, group.id);
+                    const page = observePage(group.view, progress);
+                    absorbRows(cellsByGroup.get(group.id)!, page, viewName, columns, group.id);
                 }
             }
             if (returned.size !== progressByGroup.size) throw new AttributeViewPageError();
@@ -794,8 +845,14 @@ async function renderView(
         throw new AttributeViewTruncatedError();
     }
 
-    absorbRows(target, firstView, viewName, columns);
-    const progress = firstProgress(firstView);
+    const limit = validPageSize(display?.pageSize) ?? validPageSize(firstView.pageSize);
+    const progress = firstProgress(firstView, limit);
+    absorbRows(target, pageWindow(firstView, {
+        page: 1,
+        seen: new Set(),
+        limit,
+        done: false,
+    }), viewName, columns);
     const pageCount = Number(firstView.pageCount ?? 0) || 0;
     while (!progress.done) {
         if (progress.page >= MAX_PAGES) throw new AttributeViewTruncatedError();
@@ -824,8 +881,8 @@ async function renderView(
         if (!view) {
             throw new AttributeViewPageError();
         }
-        observePage(view, progress);
-        absorbRows(target, view, viewName, columns);
+        const page = observePage(view, progress);
+        absorbRows(target, page, viewName, columns);
     }
     return visibility;
 }
@@ -867,7 +924,7 @@ function selectedViewId(ref: AvBlockRef, viewIds: ReadonlyMap<string, string>): 
     return viewIds.get(ref.blockId) ?? ref.carrierViewId;
 }
 
-function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUnit[]): void {
+function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUnit[], limits?: AvDisplayLimits): void {
     // updated 变了也要清掉同一数据库的旧视图，避免长会话留下过期单元格文字。
     const prefix = `${ref.blockId}:${ref.avId}:`;
     for (const key of cacheKeysByCarrier.get(prefix) ?? []) {
@@ -878,6 +935,7 @@ function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUn
     const key = cacheKey(ref, viewId);
     dropAvCache(key);
     cache.set(key, units);
+    if (limits?.pageSize !== undefined) displayLimits.set(key, limits);
     const keys = cacheKeysByCarrier.get(prefix) ?? new Set<string>();
     keys.add(key);
     cacheKeysByCarrier.set(prefix, keys);
@@ -886,6 +944,48 @@ function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUn
     cachedBytes.set(key, bytes);
     retainedBytes += bytes;
     trimAvCache();
+}
+
+function validPageSize(value: unknown): number | undefined {
+    const pageSize = Number(value);
+    return Number.isSafeInteger(pageSize) && pageSize > 0 ? pageSize : undefined;
+}
+
+/** Keep only rows currently exposed by the native AV page window. */
+function filterDisplayUnits(
+    units: Array<SearchableUnit & {snippet?: string;}>,
+    ref: AvBlockRef,
+    fallback?: AvDisplayLimits,
+): Array<SearchableUnit & {snippet?: string;}> {
+    const pageSize = validPageSize(ref.pageSize) ?? fallback?.pageSize;
+    const groupSizes = ref.groupPageSizes;
+    if (pageSize === undefined && !groupSizes) return units;
+    const seenRows = new Map<string, number>();
+    const nextRowByGroup = new Map<string, number>();
+    const kept: Array<SearchableUnit & {snippet?: string;}> = [];
+    for (const unit of units) {
+        const position = avApiCellPosition(unit.unitId?.replace(/#run-\d+$/, ""));
+        if (!position) {
+            kept.push(unit);
+            continue;
+        }
+        const group = position.row.startsWith("group:") ? position.row.split(":")[1] : "nogroup";
+        const rowId = position.row.startsWith("group:") ? position.row.split(":").slice(2).join(":") : position.row;
+        if (!rowId) {
+            kept.push(unit);
+            continue;
+        }
+        const key = `${group}\u0000${rowId}`;
+        let rowIndex = seenRows.get(key);
+        if (rowIndex === undefined) {
+            rowIndex = nextRowByGroup.get(group) ?? 0;
+            nextRowByGroup.set(group, rowIndex + 1);
+            seenRows.set(key, rowIndex);
+        }
+        const limit = validPageSize(groupSizes?.[group]) ?? pageSize;
+        if (limit === undefined || rowIndex < limit) kept.push(unit);
+    }
+    return kept;
 }
 
 export function peekAvUnits(
@@ -900,7 +1000,9 @@ export function peekAvUnits(
         if (cached) {
             resolvedViewIds.set(ref.blockId, resolvedViews.get(cached) ?? ref.carrierViewId);
             touchAvCache(cacheKey(ref, selectedViewId(ref, viewIds)));
-            for (const unit of cached) units.push(unit);
+            for (const unit of filterDisplayUnits(cached, ref, displayLimits.get(cacheKey(ref, selectedViewId(ref, viewIds))))) {
+                units.push(unit);
+            }
         } else {
             missing.push(ref);
         }
@@ -933,7 +1035,9 @@ export async function loadAvUnits(
                 const cached = cache.get(key);
                 if (cached) {
                     touchAvCache(key);
-                    for (const unit of cached) units.push(unit);
+                    for (const unit of filterDisplayUnits(cached, ref, displayLimits.get(key))) {
+                        units.push(unit);
+                    }
                     continue;
                 }
                 const built = await consumeAvCarrier(ref, viewId, canContinue, signal);
@@ -941,7 +1045,9 @@ export async function loadAvUnits(
                     return units;
                 }
                 if (!built) return units;
-                for (const unit of built) units.push(unit);
+                for (const unit of filterDisplayUnits(built, ref, displayLimits.get(key))) {
+                    units.push(unit);
+                }
             } catch (error) {
                 if (!canContinue()) return units;
                 // 一个失败数据库不能阻止其后的独立载体完成；成功缓存仍可供重试复用。
@@ -1040,6 +1146,7 @@ async function loadAvCarrier(
         cells,
         canContinue,
         signal,
+        ref,
     );
     if (!visibility) return null;
     if (info.name && !visibility.hideAttrViewName) {
@@ -1054,7 +1161,7 @@ async function loadAvCarrier(
     const built = toUnits(ref.blockId, drafts);
     if (!canContinue()) return null;
     resolvedViews.set(built, view?.id ?? "");
-    replaceCachedUnits(ref, viewId, built);
+    replaceCachedUnits(ref, viewId, built, {pageSize: visibility.pageSize});
     return built;
 }
 
