@@ -4,6 +4,7 @@ import {peekDocMeta} from "./corpus/meta";
 import {peekDocOrder} from "./corpus/order";
 import {parentElementCrossingShadow} from "./dom-parent";
 import {isUnderNonHeadingCssFold} from "./fold-dom";
+import {findDocumentBlock} from "./blocks";
 
 export {isUnderNonHeadingCssFold} from "./fold-dom";
 
@@ -139,7 +140,7 @@ function foldedHeadingChain(rootId: string, blockId: string): string[] | null {
 
 function headingNeedsUnfold(editor: ParentNode | undefined, headingId: string): boolean {
     const root = editor ?? document;
-    const node = root.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(headingId)}"]`);
+    const node = findDocumentBlock(root, headingId);
     if (!node || node.closest("[data-page-search-offscreen]")) {
         return true;
     }
@@ -208,7 +209,7 @@ async function unfoldBlockById(blockId: string): Promise<void> {
 /** 目标块已经在编辑器里且没被列表/提示等挡住时，不必再请求折叠状态 */
 function blockShownInEditor(editor: ParentNode | undefined, blockId: string): boolean {
     const root = editor ?? document;
-    const node = root.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"]`);
+    const node = findDocumentBlock(root, blockId);
     if (!node || node.closest("[data-page-search-offscreen]")) {
         return false;
     }

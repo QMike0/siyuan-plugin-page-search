@@ -751,6 +751,526 @@ async function embeddedAvMountRegressions() {
     );
 }
 
+async function attributeViewLocateRegressions() {
+    const originalRect = window.Range.prototype.getBoundingClientRect;
+    const originalBridge = window.openFileByURL;
+    const blockId = "20260101000000-aaaaaaa";
+    const rowId = "20260101000001-aaaaaaa";
+    const viewId = "20260101000002-aaaaaaa";
+    const setup = (itemClass = "av__row") => {
+        const bar = fixture("av-locate");
+        last = bar.root;
+        bar.includeAttributeView = true;
+        bar.syncReplaceButtons = () => {};
+        const root = bar.edit.querySelector(".protyle-wysiwyg");
+        const calendar = itemClass === "av__calendar-item";
+        root.innerHTML = '<div class="av" data-node-id="' + blockId +
+            '" data-type="NodeAttributeView" custom-sy-av-view="' + viewId + '">' +
+            '<div class="av__body"><div class="' + itemClass + '" data-id="' + rowId + '">' +
+            '<div class="' + (calendar ? 'av__calendar-field' : 'av__cell') + '" data-col-id="col">foo</div></div></div></div>';
+        const av = root.firstElementChild;
+        const gutter = document.createElement("div");
+        gutter.className = "protyle-gutters";
+        gutter.innerHTML = '<button data-node-id="' + blockId + '" data-type="NodeAttributeView"><svg></svg></button>';
+        root.closest(".protyle").prepend(gutter);
+        Object.defineProperty(gutter.firstElementChild, "clientHeight", {value: 24});
+        gutter.firstElementChild.scrollIntoView = () => assert.fail("native and local database locate must ignore the gutter");
+        Object.defineProperty(av, "clientHeight", {value: 100});
+        const range = document.createRange();
+        range.selectNodeContents(av.querySelector(".av__cell, .av__calendar-field"));
+        const unitId = calendar ? "av:" + rowId + ":col" : "cell:nogroup:" + rowId + ":col";
+        bar.resultMatches = [{...textMatches("foo", blockId, unitId)[0],
+            blockType: "NodeAttributeView", range}];
+        return {bar, av, range};
+    };
+    const drain = async () => {
+        for (let step = 0; step < 20; step++) await Promise.resolve();
+    };
+    try {
+        // Keep layout off-screen until the browser can run another frame.
+        // Bound the old infinite loop inside the mock so a regression fails without hanging Node.
+        window.Range.prototype.getBoundingClientRect = () => ({top: 1500, bottom: 1520, left: 0, right: 100});
+        const repeated = setup();
+        let nativeCalls = 0;
+        repeated.bar.revealMountedAttributeViewMatch = () => false;
+        repeated.bar.waitForLocatedMatchRange = async () => true;
+        window.openFileByURL = () => {
+            nativeCalls++;
+            if (nativeCalls > 4) throw new Error("test stopped repeated native locating");
+            return true;
+        };
+        await repeated.bar.scrollIntoRangesAsync(0, true);
+        await drain();
+        repeated.bar.destroy();
+        assert.equal(nativeCalls, 1, "one navigation cannot re-enter native locating before layout catches up");
+
+        for (const itemClass of ["av__row", "av__gallery-item", "av__calendar-item"]) {
+            for (const bridge of [true, false]) {
+                const {bar, av} = setup(itemClass);
+                const body = av.querySelector(".av__body");
+                if (itemClass !== "av__calendar-item") {
+                    body.dataset.groupId = "target";
+                    bar.resultMatches[0].unitId = "cell:target:" + rowId + ":col";
+                    const otherGroup = body.cloneNode(true);
+                    otherGroup.dataset.groupId = "other";
+                    body.before(otherGroup);
+                    otherGroup.firstElementChild.scrollIntoView = () => assert.fail("same row in another group must not scroll");
+                }
+                const content = bar.edit.querySelector(".protyle-content");
+                content.style.overflowY = "auto";
+                Object.defineProperties(content, {scrollHeight: {value: 3000}, clientHeight: {value: 400}});
+                content.getBoundingClientRect = () => ({top: 100, bottom: 500, left: 0, right: 800});
+                window.Range.prototype.getBoundingClientRect = () => ({
+                    top: 1500 - content.scrollTop, bottom: 1520 - content.scrollTop, left: 0, right: 100,
+                });
+                let rowScrolls = 0;
+                body.querySelector("." + itemClass).scrollIntoView = () => {
+                    rowScrolls++;
+                    content.scrollTop = 1000;
+                };
+                let mountedNativeCalls = 0;
+                window.openFileByURL = bridge ? () => { mountedNativeCalls++; return false; } : undefined;
+                await bar.scrollIntoRangesAsync(0, true);
+                assert.equal(rowScrolls, 1, "off-screen mounted " + itemClass + " is revealed directly");
+                assert.equal(content.scrollTop, 1210, "Range centering follows row reveal in the editor scroller");
+                assert.equal(CSS.highlights.get(bar.getComponentHighlights().focusName)?.size, 1);
+                bar.resultMatches[0].range = undefined;
+                await bar.scrollIntoRangesAsync(0, true);
+                assert.equal(rowScrolls, 2, "a mounted item without a Range can still be revealed");
+                assert.equal(bar.resultMatches[0].range?.toString(), "foo", itemClass + " binds its text without native rerender");
+                assert.equal(content.scrollTop, 1210, "newly bound text receives exact centering too");
+                assert.equal(mountedNativeCalls, 0, "a mounted item never asks the native bridge to rebuild the database");
+                bar.destroy();
+            }
+        }
+
+        // A row absent from the virtual window still needs SiYuan's locator.
+        for (const completion of ["mounted", "pending", "query", "navigate"]) {
+            const {bar, av} = setup();
+            const body = av.querySelector(".av__body");
+            const row = body.firstElementChild;
+            row.remove();
+            bar.resultMatches[0].range = undefined;
+            window.Range.prototype.getBoundingClientRect = () => ({top: 1500, bottom: 1520, left: 0, right: 100});
+            let requests = 0;
+            let release;
+            let centered = 0;
+            const applyFocus = bar.applyFocusHighlight.bind(bar);
+            bar.applyFocusHighlight = range => { centered++; applyFocus(range); };
+            row.scrollIntoView = () => {};
+            bar.waitForLocatedMatchRange = () => new Promise(resolve => { release = resolve; });
+            window.openFileByURL = url => {
+                requests++;
+                if (requests > 4) throw new Error("test stopped repeated virtual locating");
+                assert.equal(url, "siyuan://blocks/" + blockId + "?avItemID=" + rowId + "&avViewID=" + viewId);
+                return true;
+            };
+            await bar.scrollIntoRangesAsync(0, true);
+            assert.equal(requests, 1, "unmounted item starts one native locate request");
+            if (completion !== "pending") {
+                body.append(row);
+                const rebound = document.createRange();
+                rebound.selectNodeContents(row.querySelector(".av__cell"));
+                bar.resultMatches[0].range = rebound;
+            }
+            if (completion === "query") bar.searchGeneration++;
+            if (completion === "navigate") bar.resultIndex = 2;
+            release(completion !== "pending");
+            await drain();
+            assert.equal(requests, 1, "native completion/timeout never starts another locate request");
+            assert.equal(centered > 0, completion === "mounted", "only the still-current mounted target is centered");
+            bar.destroy();
+        }
+
+        const delayed = setup();
+        const body = delayed.av.querySelector(".av__body");
+        const row = body.firstElementChild;
+        row.remove();
+        row.scrollIntoView = () => {};
+        delayed.bar.resultMatches[0].range = undefined;
+        delayed.bar.highlightHitResult = () => assert.fail("mounting the target must not reindex the database");
+        let requests = 0;
+        window.openFileByURL = () => {
+            requests++;
+            window.setTimeout(() => body.append(row), 10);
+            return true;
+        };
+        await delayed.bar.scrollIntoRangesAsync(0, true);
+        await new Promise(resolve => window.setTimeout(resolve, 50));
+        assert.equal(requests, 1, "real observer waits for the virtual item without repeated native requests");
+        assert.equal(delayed.bar.resultMatches[0].range?.toString(), "foo");
+        assert.equal(delayed.bar.resultIndex, 1);
+        assert.equal(delayed.bar.resultCount, 1);
+        delayed.bar.destroy();
+
+        const rejected = setup();
+        rejected.bar.waitForLocatedMatchRange = () => assert.fail("rejected bridge must not start waiting");
+        window.openFileByURL = () => false;
+        assert.equal(rejected.bar.revealNativeAttributeViewMatch(0, rejected.bar.resultMatches[0]), false);
+        rejected.bar.destroy();
+
+        for (const grouped of [false, true]) {
+            for (const allowNative of [false, true]) {
+                const cold = setup();
+                const body = cold.av.querySelector(".av__body");
+                body.replaceChildren();
+                cold.bar.resultMatches[0].range = undefined;
+                if (grouped) {
+                    body.dataset.groupId = "g";
+                    body.insertAdjacentHTML("beforebegin", '<div class="av__group-title">group</div>');
+                    cold.bar.resultMatches[0].unitId = "av-group:g:" + rowId + ":col";
+                    body.previousElementSibling.scrollIntoView = () => {};
+                }
+                cold.av.scrollIntoView = () => {};
+                cold.bar.bindUnfoldedHeadingSection = () => {};
+                cold.bar.highlightHitResult = async () => {};
+                cold.bar.waitForLocatedMatchRange = async () => false;
+                let requests = 0;
+                window.openFileByURL = () => { requests++; return true; };
+                await cold.bar.finishLocatedMatch(1, true, allowNative);
+                await drain();
+                assert.equal(requests, allowNative ? 1 : 0, "cold carrier continues to its virtual row exactly once, respecting re-entry protection");
+                cold.bar.destroy();
+            }
+        }
+
+        const wrongCarrier = setup();
+        wrongCarrier.av.dataset.nodeId = "20260101000000-bbbbbbb";
+        wrongCarrier.bar.resultMatches[0].range = undefined;
+        wrongCarrier.av.querySelector(".av__row").scrollIntoView = () => assert.fail("another carrier with the same row ID must never scroll");
+        assert.equal(wrongCarrier.bar.revealMountedAttributeViewMatch(wrongCarrier.bar.resultMatches[0]), false);
+        wrongCarrier.bar.destroy();
+
+        const staleView = setup();
+        const owner = document.createElement("div");
+        owner.dataset.nodeId = "embed";
+        owner.dataset.type = "NodeBlockQueryEmbed";
+        staleView.av.replaceWith(owner);
+        owner.append(staleView.av);
+        Object.assign(staleView.bar.resultMatches[0], {
+            blockId: "embed", blockType: "NodeBlockQueryEmbed", range: undefined,
+            unitId: "embed:" + blockId + ":av:" + rowId + ":col",
+            embeddedAvViewId: "20260101000000-ccccccc",
+        });
+        window.openFileByURL = () => assert.fail("a stale embedded view cannot activate native locating");
+        assert.equal(staleView.bar.revealMountedAttributeViewMatch(staleView.bar.resultMatches[0]), false);
+        assert.equal(staleView.bar.revealNativeAttributeViewMatch(0, staleView.bar.resultMatches[0]), false);
+        staleView.bar.destroy();
+    } finally {
+        window.Range.prototype.getBoundingClientRect = originalRect;
+        window.openFileByURL = originalBridge;
+    }
+    console.log("AV off-screen navigation: bounded native locate, mounted layouts, fallback and cancellation OK");
+}
+
+async function firstBlockNavigationRegressions() {
+    const {collectSearchableBlocks, findDocumentBlock} = source("frontend/blocks");
+    const {blockIsInEditor} = source("frontend/corpus/locate");
+    const {projectRanges} = source("frontend/corpus/project");
+    const originalRect = window.Range.prototype.getBoundingClientRect;
+    const originalBridge = window.openFileByURL;
+    const blockId = "20260101000000-firstaa";
+    const rowId = "20260101000001-rowaaaa";
+    const viewId = "20260101000002-viewaaa";
+    try {
+        for (const database of [false, true]) {
+            for (const leading of [false, true]) {
+                for (const gutterHidden of [false, true]) {
+                    const bar = pipelineFixture("first-block-navigation"); last = bar.root;
+                    bar.includeAttributeView = true;
+                    const root = bar.edit.querySelector(".protyle-wysiwyg");
+                    const av = '<div class="av" data-node-id="' + (database ? blockId : "another-av") +
+                        '" data-type="NodeAttributeView" custom-sy-av-view="' + viewId + '"><div class="av__body">' +
+                        '<div class="av__row" data-id="' + rowId + '"><div class="av__cell" data-col-id="col">foo</div></div></div></div>';
+                    root.innerHTML = (leading ? '<div data-node-id="leading" data-type="NodeParagraph"><div contenteditable="true"></div></div>' : "") +
+                        (database ? av : '<div data-node-id="' + blockId + '" data-type="NodeParagraph"><div contenteditable="true">foo</div></div>' + av);
+                    const protyle = root.closest(".protyle");
+                    const gutter = document.createElement("div");
+                    gutter.className = "protyle-gutters" + (gutterHidden ? " fn__none" : "");
+                    gutter.innerHTML = '<button data-node-id="' + blockId + '" data-type="' +
+                        (database ? "NodeAttributeView" : "NodeParagraph") + '"><svg></svg></button>';
+                    protyle.prepend(gutter);
+                    const button = gutter.firstElementChild;
+                    Object.defineProperty(button, "clientHeight", {value: gutterHidden ? 0 : 24});
+                    button.scrollIntoView = () => assert.fail("navigation must not scroll a gutter carrying the same block ID");
+                    const owner = root.querySelector('[data-node-id="' + blockId + '"]');
+                    Object.defineProperty(owner, "clientHeight", {value: 1800});
+                    const content = root.closest(".protyle-content");
+                    content.style.overflowY = "auto";
+                    Object.defineProperties(content, {scrollHeight: {value: 3000}, clientHeight: {value: 400}});
+                    content.getBoundingClientRect = () => ({top: 100, bottom: 500, left: 0, right: 800, width: 800, height: 400});
+                    window.Range.prototype.getBoundingClientRect = () => ({
+                        top: 1500 - content.scrollTop, bottom: 1520 - content.scrollTop, left: 0, right: 100, width: 100, height: 20,
+                    });
+                    window.openFileByURL = () => assert.fail("mounted content must not need a native database rebuild");
+                    if (database) owner.querySelector(".av__row").scrollIntoView = () => { content.scrollTop = 1000; };
+                    const live = collectSearchableBlocks(bar.edit, {includeAttributeView: true});
+                    const unit = live.find(block => block.blockId === blockId && block.text === "foo");
+                    assert.ok(unit, "the live collector indexes the screen-external target");
+                    unit.element.getBoundingClientRect = () => ({
+                        top: 1500 - content.scrollTop, bottom: 1520 - content.scrollTop, left: 0, right: 100, width: 100, height: 20,
+                    });
+                    bar.resultMatches = projectRanges(bar.edit,
+                        textMatches(unit.text, unit.blockId, unit.unitId).map(match => ({...match, blockType: unit.blockType})),
+                        {includeAttributeView: true}, live);
+                    assert.equal(bar.resultMatches[0].range, undefined, "off-screen viewport projection leaves no live Range");
+                    let navigation;
+                    bar.scrollIntoRanges = (...args) => navigation = bar.scrollIntoRangesAsync(...args);
+                    bar.resultIndex = 0;
+                    if (gutterHidden) bar.clickLast();
+                    else bar.clickNext();
+                    await navigation;
+                    for (let i = 0; i < 15; i++) await Promise.resolve();
+                    assert.equal(bar.resultMatches[0].range?.toString(), "foo", "off-screen target binds inside the real first block");
+                    assert.equal(content.scrollTop, 1210, "first and later blocks center the same matched text");
+                    assert.equal(bar.resultCount, 1, "navigation never changes the search count");
+                    owner.remove();
+                    assert.equal(findDocumentBlock(bar.edit, blockId), null, "a retained gutter is not an unloaded/folded target");
+                    assert.equal(blockIsInEditor(bar.edit, blockId), false, "gutter dimensions cannot suppress native load/unfold");
+                    bar.destroy();
+                }
+            }
+        }
+        const bar = pipelineFixture("block-lookup-boundaries"); last = bar.root;
+        const {edit} = bar;
+        const protyle = edit.querySelector(".protyle");
+        const root = edit.querySelector(".protyle-wysiwyg");
+        const block = '<div data-node-id="' + blockId + '" data-type="NodeParagraph"><div contenteditable="true">foo</div></div>';
+        root.innerHTML = '<div data-node-id="embed" data-type="NodeBlockQueryEmbed">' + block + '</div>' + block;
+        const actual = root.lastElementChild;
+        const inactive = protyle.cloneNode(true);
+        inactive.classList.add("fn__none");
+        edit.prepend(inactive);
+        const parser = protyle.cloneNode(true);
+        parser.setAttribute("data-page-search-offscreen", "true");
+        edit.prepend(parser);
+        assert.equal(findDocumentBlock(edit, blockId), actual, "skip inactive panes, parser DOM and embedded source copies");
+        assert.equal(findDocumentBlock(protyle, blockId), actual, "a direct Protyle root remains supported");
+        assert.equal(findDocumentBlock(root, blockId), actual, "a direct document root remains supported");
+        assert.equal(findDocumentBlock(edit, "embed"), root.firstElementChild, "embedded matches still locate their owner");
+        actual.remove();
+        assert.equal(findDocumentBlock(edit, blockId), null, "an embedded source is not the unloaded main-document block");
+        root.innerHTML = '<div data-node-id="heading" data-type="NodeHeading" fold="1">heading</div>' +
+            '<div data-type="NodeList" fold="1">' + block + '</div>';
+        const folded = root.querySelector('[data-node-id="' + blockId + '"]');
+        assert.equal(findDocumentBlock(edit, blockId), folded, "folded descendants must remain available for unfold checks");
+        assert.equal(findDocumentBlock(edit, "heading"), root.firstElementChild);
+        protyle.querySelector(".protyle-content").classList.add("fn__none");
+        const preview = document.createElement("div");
+        preview.className = "protyle-preview";
+        preview.innerHTML = '<div class="b3-typography">' + block + '</div>';
+        protyle.append(preview);
+        assert.equal(findDocumentBlock(edit, blockId), preview.firstElementChild.firstElementChild, "preview uses its active document root");
+        preview.classList.add("fn__none");
+        assert.equal(findDocumentBlock(edit, blockId), null, "hidden editor surfaces are not navigation targets");
+        bar.destroy();
+        for (const late of ["insert-block", "fill-text"]) {
+            const pendingBar = pipelineFixture("late-first-block"); last = pendingBar.root;
+            const body = pendingBar.edit.querySelector(".protyle-wysiwyg");
+            const shell = document.createElement("div");
+            shell.innerHTML = block;
+            const target = shell.firstElementChild;
+            body.innerHTML = "";
+            const gutter = document.createElement("button");
+            gutter.dataset.nodeId = blockId;
+            pendingBar.edit.querySelector(".protyle").prepend(gutter);
+            pendingBar.resultMatches = textMatches("foo", blockId);
+            pendingBar.repairHighlightRanges = () => {};
+            if (late === "fill-text") {
+                target.firstElementChild.textContent = "";
+                body.append(target);
+            }
+            const waiting = pendingBar.waitForLocatedMatchRange(1, pendingBar.resultMatches[0].id);
+            if (late === "insert-block") body.append(target);
+            else target.firstElementChild.textContent = "foo";
+            for (let i = 0; i < 4; i++) await Promise.resolve();
+            assert.equal(pendingBar.resultMatches[0].range?.toString(), "foo", "late body mutations bind without waiting for fallback polling: " + late);
+            assert.equal(await waiting, true);
+            pendingBar.destroy();
+        }
+    } finally {
+        window.Range.prototype.getBoundingClientRect = originalRect;
+        window.openFileByURL = originalBridge;
+    }
+    console.log("First-block navigation: ordinary/database, no live Range, leading paragraph and hidden/visible gutter IDs OK");
+}
+
+async function afterVirtualDatabaseNavigationRegressions() {
+    const originalRect = window.Range.prototype.getBoundingClientRect;
+    const originalBridge = window.openFileByURL;
+    const rect = (top, height) => ({top, bottom: top + height, height, left: 0, right: 800, width: 800});
+    try {
+        for (const distance of [10, 150, 1000]) {
+            for (const noRange of [false, true]) {
+                for (const backwards of [false, true]) {
+                    const bar = pipelineFixture("after-virtual-database"); last = bar.root;
+                    const root = bar.edit.querySelector(".protyle-wysiwyg");
+                    root.innerHTML = '<div class="av" data-node-id="database" data-type="NodeAttributeView" data-render="true" data-av-type="table" data-v-scroll="true">' +
+                        '<div class="av__body" data-page-size="1000"><div class="av__row" data-id="row">row</div></div></div>' +
+                        '<div data-node-id="target" data-type="NodeParagraph"><div contenteditable="true">foo</div></div>';
+                    const av = root.firstElementChild, target = root.lastElementChild;
+                    const content = root.closest(".protyle-content");
+                    content.style.overflowY = "auto";
+                    let height = 3600, scrollTop = backwards ? 5000 : 0;
+                    let fills = 0, scheduled;
+                    Object.defineProperties(content, {
+                        scrollHeight: {get: () => height + distance + 1000}, clientHeight: {value: 400},
+                        scrollTop: {get: () => scrollTop, set: value => {
+                            scrollTop = value;
+                            // v3.8.7 doTrim: an ungrouped virtual body near the viewport
+                            // appends up to one viewport of rows; there is no bottom spacer.
+                            if (!scheduled) scheduled = window.requestAnimationFrame(() => {
+                                scheduled = 0;
+                                const avRect = av.getBoundingClientRect();
+                                if (avRect.bottom >= 100 && avRect.top <= 500) {
+                                    height += 432;
+                                    fills++;
+                                }
+                            });
+                        }},
+                    });
+                    content.getBoundingClientRect = () => rect(100, 400);
+                    av.getBoundingClientRect = () => rect(100 - scrollTop, height);
+                    const targetRect = () => rect(100 - scrollTop + height + distance, 20);
+                    target.getBoundingClientRect = target.firstElementChild.getBoundingClientRect = targetRect;
+                    Object.defineProperty(target, "clientHeight", {value: 20});
+                    window.Range.prototype.getBoundingClientRect = targetRect;
+                    window.openFileByURL = () => assert.fail("a following paragraph never starts native database locating");
+                    const range = document.createRange(); range.selectNodeContents(target.firstElementChild);
+                    bar.resultMatches = [{...textMatches("foo", "target")[0], range: noRange ? undefined : range}];
+                    let navigation;
+                    bar.scrollIntoRanges = (...args) => navigation = bar.scrollIntoRangesAsync(...args);
+                    bar.resultIndex = 0;
+                    if (backwards) bar.clickLast(); else bar.clickNext();
+                    await navigation;
+                    await new Promise(resolve => window.requestAnimationFrame(resolve));
+                    assert.equal(fills, 0, "one navigation must not pull more database rows in front of the target");
+                    const finalRect = bar.resultMatches[0].range.getBoundingClientRect();
+                    assert.ok(finalRect.top >= 100 && finalRect.bottom <= 500, "following text stays visible after native layout");
+                    assert.equal(scrollTop, distance < 200 ? 3601 : 4410, "nearby targets clear the virtual database; distant targets still center");
+                    assert.equal(bar.resultCount, 1, "the navigation does not alter search coverage");
+                    assert.equal(av.dataset.vScroll, "true", "native virtualization remains enabled");
+                    bar.destroy();
+                }
+            }
+        }
+        for (const boundary of ["ordinary", "reserved-height", "inside-database", "another-scroller", "no-space", "no-scroll", "preceding-target"]) {
+            const bar = pipelineFixture("after-av-boundary"); last = bar.root;
+            const root = bar.edit.querySelector(".protyle-wysiwyg");
+            root.innerHTML = '<div class="av" data-node-id="database" data-type="NodeAttributeView" data-render="true" data-v-scroll="true">' +
+                '<div class="av__body"><div class="av__cell">foo</div></div></div>' +
+                '<div data-node-id="target" data-type="NodeParagraph"><div contenteditable="true">foo</div></div>';
+            const av = root.firstElementChild, target = root.lastElementChild;
+            const content = root.closest(".protyle-content");
+            content.style.overflowY = "auto";
+            content.style.overflowX = "auto";
+            Object.defineProperties(content, {
+                scrollHeight: {value: boundary === "no-space" ? 3900 : 5000}, clientHeight: {value: 400},
+                scrollWidth: {value: 2000}, clientWidth: {value: 800},
+            });
+            content.getBoundingClientRect = () => rect(100, 400);
+            av.getBoundingClientRect = () => rect(100 - content.scrollTop, 3600);
+            window.Range.prototype.getBoundingClientRect = () => ({
+                ...rect(3710 - content.scrollTop, 20), left: 1000 - content.scrollLeft, right: 1100 - content.scrollLeft,
+            });
+            if (boundary === "ordinary") av.removeAttribute("data-v-scroll");
+            if (boundary === "reserved-height") av.firstElementChild.insertAdjacentHTML("beforeend", '<div class="av__spacer--bottom"></div>');
+            if (boundary === "another-scroller") {
+                const nested = document.createElement("div"); nested.className = "protyle-content";
+                av.before(nested); nested.append(av);
+            }
+            if (boundary === "preceding-target") av.before(target);
+            const range = document.createRange();
+            range.selectNodeContents(boundary === "inside-database" ? av.querySelector(".av__cell") : target.firstElementChild);
+            bar.resultMatches = [{...textMatches("foo", boundary === "inside-database" ? "database" : "target")[0], range}];
+            bar.attributeViewRangeNeedsReveal = () => false;
+            await bar.scrollIntoRangesAsync(0, boundary !== "no-scroll");
+            assert.equal(content.scrollTop, boundary === "no-scroll" ? 0 : 3420, "existing centering/refresh is retained at boundary: " + boundary);
+            assert.equal(content.scrollLeft, boundary === "no-scroll" ? 0 : 650, "horizontal positioning is retained: " + boundary);
+            assert.equal(root.querySelectorAll("[data-node-id]").length, 2, "navigation adds no placeholder blocks");
+            bar.destroy();
+        }
+    } finally {
+        window.Range.prototype.getBoundingClientRect = originalRect;
+        window.openFileByURL = originalBridge;
+    }
+    console.log("After-AV navigation: near/far, next/previous and live/rebound targets stay visible without growing the database OK");
+}
+
+async function avDeferredRefreshRegressions() {
+    const {watchAttributeViewDom} = source("frontend/av-watch");
+    const originalTimeout = window.setTimeout;
+    window.setTimeout = (callback, delay, ...args) => originalTimeout(callback, delay === 280 ? 15 : delay, ...args);
+    const settle = () => new Promise(resolve => originalTimeout(resolve, 180));
+    try {
+        for (const embedded of [false, true]) {
+            const bar = pipelineFixture("av-deferred-refresh"); last = bar.root;
+            Object.assign(bar, {includeAttributeView: true, includeEmbedBlock: true, includeFoldedBlocks: false, avWatchPausedUntil: 0});
+            const root = bar.edit.querySelector(".protyle-wysiwyg");
+            const row = id => '<div class="av__row" data-id="row' + id + '"><div class="av__cell" data-col-id="col">foo</div></div>';
+            const avMarkup = '<div class="av" data-node-id="carrier" data-av-id="database" data-type="NodeAttributeView"><div class="av__body" data-page-size="1">' + row(1) + '</div></div>';
+            root.innerHTML = embedded ? '<div data-node-id="embed" data-type="NodeBlockQueryEmbed">' + avMarkup + '</div>' : avMarkup;
+            const collect = source("frontend/blocks").collectSearchableBlocks;
+            const projection = source("frontend/corpus/project");
+            let searches = 0;
+            bar.runSearchPipeline = async () => {
+                searches++;
+                const live = collect(bar.edit, {includeAttributeView: true, includeEmbedBlock: true});
+                bar.embedSearchState.capture(live);
+                return {matches: projection.projectRanges(bar.edit, live.filter(block => block.text === "foo").flatMap(block =>
+                    textMatches(block.text, block.blockId, block.unitId).map(match => ({...match, blockType: block.blockType}))
+                ), {}, live), error: "", degraded: false};
+            };
+            await bar.highlightHitResult("foo", true);
+            assert.equal(bar.resultCount, 1);
+            bar.stopEditorDomWatch = watchEditorDom(bar.edit, {
+                onMutate: () => bar.domEpoch++, onSettled: change => bar.onEditorDomSettled(change),
+            }, 1);
+            const changes = [];
+            bar.stopAvDomWatch = watchAttributeViewDom(bar.edit, (ids, invalidate, displayChanged) => {
+                changes.push(displayChanged);
+                bar.scheduleAttrViewResearch(ids, invalidate, displayChanged);
+            }, 5);
+            let body = root.querySelector(".av__body");
+            bar.pauseAvWatch(80);
+            body.dataset.pageSize = "2";
+            body.insertAdjacentHTML("beforeend", row(2));
+            await settle();
+            assert.equal(searches, 2, "load more during navigation refreshes once after the pause");
+            assert.equal(bar.resultCount, 2);
+            assert.equal(changes.at(-1), true);
+            const beforePaint = searches;
+            bar.pauseAvWatch(80);
+            const replacement = body.cloneNode(true);
+            body.replaceWith(replacement);
+            body = replacement;
+            await settle();
+            assert.equal(changes.at(-1), false, "native repaint preserves the display window identity");
+            assert.equal(searches, beforePaint, "native repaint during navigation only repairs ranges");
+            bar.scheduleAttrViewResearch(["database"], true);
+            bar.pauseAvWatch(80);
+            await settle();
+            assert.equal(searches, beforePaint + 1, "pausing cannot discard an already queued real change");
+            bar.pauseAvWatch(80);
+            bar.scheduleAttrViewResearch(["database"], true);
+            bar.scheduleAttrViewResearch(["database"], true);
+            await settle();
+            assert.equal(searches, beforePaint + 2, "multiple paused edits coalesce into one refresh");
+            bar.scheduleAttrViewResearch(["database"], true);
+            bar.searchText = "different";
+            await settle();
+            assert.equal(searches, beforePaint + 2, "changing the query discards an old deferred refresh");
+            bar.scheduleAttrViewResearch(["database"], true);
+            bar.destroy();
+            await settle();
+            assert.equal(searches, beforePaint + 2, "destroy cancels deferred refreshes and observers");
+        }
+    } finally {
+        window.setTimeout = originalTimeout;
+    }
+    console.log("AV deferred refresh: load more, queued/merged edits, repaint isolation and lifecycle cancellation OK");
+}
+
 async function galleryNavigationRegressions() {
     const originalRect = window.Range.prototype.getBoundingClientRect;
     window.Range.prototype.getBoundingClientRect = () => ({top: 0, bottom: 20, left: 0, right: 100});
@@ -1665,6 +2185,10 @@ async function main() {
     await embedRefreshRegressions();
     await embeddedAvMountRegressions();
     await avFoldCacheRegressions();
+    await avDeferredRefreshRegressions();
+    await attributeViewLocateRegressions();
+    await firstBlockNavigationRegressions();
+    await afterVirtualDatabaseNavigationRegressions();
     await galleryNavigationRegressions();
     console.log(
         "p3-regressions OK (component isolation, prompt pane lifecycle, unchanged-unit/live anchors, budget/cancellation/races and existing initial position)",

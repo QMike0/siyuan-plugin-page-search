@@ -76,7 +76,109 @@ const row = (id, text = id) => ({id, cells: [{value: {keyID: "k", text: {content
 const view = (rows, total = rows.length) => ({rows, rowCount: total, columns: [{id: "k", name: "column"}]});
 const raw = {name: "database", views: [{id: "v", name: "view"}]};
 
+async function avDisplayWindowRegressions() {
+    let requests = 0;
+    let grouped = false;
+    let rows = [row("r1"), row("r2"), row("r3")];
+    api = async url => {
+        if (url.endsWith("getAttributeView")) return {code: 0, data: raw};
+        requests++;
+        return {code: 0, data: {view: grouped ? {
+            columns: [{id: "k"}], pageSize: 3,
+            groups: [{id: "g", ...view(rows), pageSize: 3, columns: null}],
+        } : {...view(rows), pageSize: 3}}};
+    };
+    const texts = values => values.filter(unit => /^av:|^av-group:/.test(unit.unitId)).map(unit => unit.text);
+    const sized = n => ({...ref(), ...(grouped ? {groupPageSizes: {g: n}} : {pageSize: n})});
+    for (grouped of [false, true]) {
+        av.invalidateAvCache(); requests = 0;
+        rows = [row("r1"), row("r2"), row("r3")];
+        assert.deepEqual(texts(await av.loadAvUnits([sized(1)])), ["r1"]);
+        assert.equal(av.peekAvUnits([sized(3)]).missing.length, 1, "a smaller window cannot satisfy a larger one");
+        assert.deepEqual(texts(await av.loadAvUnits([sized(3)])), ["r1", "r2", "r3"]);
+        assert.equal(requests, 2);
+        await av.loadAvUnits([sized(3)]);
+        assert.equal(requests, 2, "the same window still reuses its cached result");
+        av.invalidateAvCache(); requests = 0;
+        rows = [row("r1", ""), row("r2"), row("r3")];
+        await av.loadAvUnits([sized(3)]);
+        assert.deepEqual(texts(await av.loadAvUnits([sized(1)])), [], "empty rows retain their original window position");
+        av.invalidateAvCache(); requests = 0;
+        rows = [row("r1"), row("r2"), row("r3")];
+        const values = await Promise.all([av.loadAvUnits([sized(1)]), av.loadAvUnits([sized(3)])]);
+        assert.deepEqual(values.map(texts), [["r1"], ["r1", "r2", "r3"]], "different windows never share a truncated flight");
+        assert.equal(requests, 2);
+        av.invalidateAvCacheForIds(["a"]);
+        assert.equal(av.peekAvUnits([sized(1), sized(3)]).missing.length, 2, "invalidation covers all window variants");
+    }
+    assert.equal(
+        av.avSearchRefKey({...ref(), groupPageSizes: {b: 3, a: 1}}),
+        av.avSearchRefKey({...ref(), groupPageSizes: {a: 1, b: 3}}),
+        "group property order cannot create a duplicate request identity",
+    );
+    av.invalidateAvCache();
+    console.log("AV display windows: sequential/concurrent copies, empty rows, reuse and invalidation OK");
+}
+
+async function avCalendarWindowRegressions() {
+    const beforeTz = process.env.TZ;
+    let range;
+    try {
+        process.env.TZ = "America/New_York";
+        const element = document.createElement("div");
+        element.dataset.avType = "calendar";
+        const dates = [new Date(2026, 2, 7).valueOf(), new Date(2026, 2, 8).valueOf()];
+        element.innerHTML = '<div class="av__body av__calendar-grid">' + dates.map(date =>
+            '<div class="av__calendar-day" data-calendar-day="' + date + '"></div>'
+        ).join("") + '</div>';
+        range = av.avDisplayPageSizes(element).calendarRange;
+        assert.deepEqual(range, {start: dates[0], end: new Date(2026, 2, 9).valueOf(), timeZone: "America/New_York"});
+        assert.equal(range.end - range.start, 47 * 3600000, "the calendar end is local midnight across DST");
+    } finally {
+        if (beforeTz === undefined) delete process.env.TZ;
+        else process.env.TZ = beforeTz;
+    }
+    let requests = 0;
+    let count = 201;
+    let rows;
+    api = async (url, body) => {
+        if (url.endsWith("getAttributeView")) return {code: 0, data: raw};
+        requests++;
+        assert.equal(body.page, 1, "calendar rows never request a duplicate table page");
+        return {code: 0, data: {viewType: "calendar", view: {
+            ...view(rows ?? Array.from({length: count}, (_, i) => row("r" + i, (body.calendarRange?.start ?? "cold") + ":" + i))),
+            type: "table", pageSize: 50,
+        }}};
+    };
+    av.invalidateAvCache();
+    const cellUnits = values => values.filter(unit => unit.unitId.startsWith("av:"));
+    assert.equal(cellUnits(await av.loadAvUnits([ref()])).length, 201, "calendar's inherited table pageSize cannot truncate dated rows");
+    assert.equal(requests, 1);
+    const first = {...ref(), calendarRange: range};
+    const second = {...ref(), calendarRange: {...range, start: range.start + 86400000, end: range.end + 86400000}};
+    assert.ok(cellUnits(await av.loadAvUnits([first])).every(unit => unit.text.startsWith(range.start + ":")));
+    assert.equal(av.peekAvUnits([second]).missing.length, 1, "each month/week range has independent cache and work identity");
+    assert.ok(cellUnits(await av.loadAvUnits([second])).every(unit => unit.text.startsWith(second.calendarRange.start + ":")));
+    const beforeCached = requests;
+    await av.loadAvUnits([first]);
+    assert.equal(requests, beforeCached);
+    av.invalidateAvCache();
+    rows = Array(100001).fill({id: "too-many", cells: []});
+    await assert.rejects(av.loadAvUnits([ref()]), error => error.truncatedBlockIds?.includes("b"));
+    assert.equal(av.peekAvUnits([ref()]).missing.length, 1, "oversized calendars remain explicitly incomplete");
+    rows = Array.from({length: 501}, (_, i) => row("r" + i));
+    const controller = new AbortController();
+    const cells = rows[250].cells;
+    Object.defineProperty(rows[250], "cells", {get: () => { controller.abort(); return cells; }});
+    assert.deepEqual(await av.loadAvUnits([ref()], () => true, new Map(), controller.signal), []);
+    assert.equal(av.peekAvUnits([ref()]).missing.length, 1, "cancelled calendar preparation never writes a complete cache");
+    av.invalidateAvCache();
+    console.log("AV calendar: native range/DST, row counts beyond table pageSize, range identity, limits and cancellation OK");
+}
+
 async function main() {
+    await avDisplayWindowRegressions();
+    await avCalendarWindowRegressions();
     // Native renderCell formats number/date text before painting. Cold matching
     // must use that same text, not stored timestamps or unformatted numbers.
     const stamp = new Date(2026, 9, 12, 9, 5).valueOf();

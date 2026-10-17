@@ -168,6 +168,24 @@ export function resolveDocRoot(edit: Element): HTMLElement | null {
     return docRoot;
 }
 
+/** 块标按钮也带 data-node-id；导航只认当前正文，不能把界面控件或嵌入源副本当成目标块。 */
+export function findDocumentBlock(edit: ParentNode, blockId: string): HTMLElement | null {
+    const root = edit instanceof Element ? resolveDocRoot(edit) : null;
+    const selector = `[data-node-id="${CSS.escape(blockId)}"]`;
+    for (const node of (root ?? edit).querySelectorAll<HTMLElement>(selector)) {
+        if (
+            !node.closest(".protyle-wysiwyg, .protyle-preview .b3-typography") ||
+            node.closest(
+                "[data-page-search-offscreen], .protyle.fn__none, .protyle-content.fn__none, .protyle-preview.fn__none",
+            )
+        ) continue;
+        const embed = node.closest('[data-type="NodeBlockQueryEmbed"]');
+        if (embed && embed !== node) continue;
+        return node;
+    }
+    return null;
+}
+
 /**
  * 解析文档标题输入区。
  * 思源标题在 .protyle-wysiwyg 之外：.protyle-title > .protyle-title__input

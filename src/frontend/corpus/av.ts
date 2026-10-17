@@ -1,5 +1,5 @@
 import type {SearchableUnit} from "../../shared";
-import {avApiCellPosition, avCellUnitId} from "../../shared/av-live";
+import {avCellUnitId} from "../../shared/av-live";
 import {attributeViewHtmlTexts} from "../blocks";
 import {
     fetchSearchBlockDoms,
@@ -44,14 +44,14 @@ export interface AvBlockRef {
     /** Current rows exposed by the mounted view. These are UI state, not AV data. */
     pageSize?: number;
     groupPageSizes?: Record<string, number>;
-}
-
-interface AvDisplayLimits {
-    pageSize?: number;
+    /** Mounted calendars expose a date grid, not a table row window. */
+    calendarRange?: {start: number; end: number; timeZone: string;};
 }
 
 /** Read the row window that the native AV renderer currently exposes. */
-export function avDisplayPageSizes(element: HTMLElement): Pick<AvBlockRef, "pageSize" | "groupPageSizes"> {
+export function avDisplayPageSizes(
+    element: HTMLElement,
+): Pick<AvBlockRef, "pageSize" | "groupPageSizes" | "calendarRange"> {
     let pageSize: number | undefined;
     const groupPageSizes: Record<string, number> = {};
     element.querySelectorAll<HTMLElement>(".av__body[data-page-size]").forEach((body) => {
@@ -61,9 +61,28 @@ export function avDisplayPageSizes(element: HTMLElement): Pick<AvBlockRef, "page
         if (group) groupPageSizes[group] = size;
         else if (pageSize === undefined) pageSize = size;
     });
+    let calendarRange: AvBlockRef["calendarRange"];
+    if (element.dataset.avType === "calendar") {
+        const days = Array.from(
+            element.querySelectorAll<HTMLElement>(".av__calendar-grid .av__calendar-day[data-calendar-day]"),
+        )
+            .map(day => Number(day.dataset.calendarDay)).filter(Number.isFinite);
+        if (days.length) {
+            const start = Math.min(...days);
+            const end = new Date(Math.max(...days));
+            // Native grid days are local midnight; adding a calendar day also
+            // preserves the half-open interval across daylight-saving changes.
+            end.setDate(end.getDate() + 1);
+            const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            if (timeZone && end.valueOf() > start && end.valueOf() - start <= 63 * 86400000) {
+                calendarRange = {start, end: end.valueOf(), timeZone};
+            }
+        }
+    }
     return {
         pageSize,
         groupPageSizes: Object.keys(groupPageSizes).length ? groupPageSizes : undefined,
+        calendarRange,
     };
 }
 
@@ -80,7 +99,6 @@ interface AvUnitDraft {
 }
 
 const cache = new Map<string, SearchableUnit[]>();
-const displayLimits = new Map<string, AvDisplayLimits>();
 /** Actual view after the kernel's default/stale-ID fallback; dies with its cached array. */
 const resolvedViews = new WeakMap<SearchableUnit[], string>();
 const cachedBytes = new Map<string, number>();
@@ -93,7 +111,6 @@ function dropAvCache(key: string): void {
     retainedBytes -= cachedBytes.get(key) ?? 0;
     cachedBytes.delete(key);
     cache.delete(key);
-    displayLimits.delete(key);
     unpinnedAvKeys.delete(key);
     const prefix = key.split(":").slice(0, 2).join(":") + ":";
     const keys = cacheKeysByCarrier.get(prefix);
@@ -140,7 +157,7 @@ export function pinAvCache(
     owner: object | string = rootId,
 ): void {
     const owners = activeOwnersByRoot.get(rootId) ?? new Map<object | string, Set<string>>();
-    owners.set(owner, new Set(refs.map((ref) => cacheKey(ref, selectedViewId(ref, viewIds)))));
+    owners.set(owner, new Set(refs.map((ref) => avSearchRefKey(ref, selectedViewId(ref, viewIds)))));
     activeOwnersByRoot.set(rootId, owners);
     const owned = new Set<string>();
     for (const keys of owners.values()) for (const key of keys) owned.add(key);
@@ -728,8 +745,8 @@ async function renderView(
     target: Map<string, AvCell>,
     shouldContinue: () => boolean,
     signal?: AbortSignal,
-    display?: Pick<AvBlockRef, "pageSize" | "groupPageSizes">,
-): Promise<{hideAttrViewName: boolean; pageSize?: number;} | null> {
+    display?: Pick<AvBlockRef, "pageSize" | "groupPageSizes" | "calendarRange">,
+): Promise<{hideAttrViewName: boolean;} | null> {
     if (!shouldContinue()) {
         return null;
     }
@@ -742,6 +759,7 @@ async function renderView(
         query,
         groupPaging: {},
         createIfNotExist: false,
+        ...(display?.calendarRange ? {calendarRange: display.calendarRange} : {}),
     }, signal);
     if (!shouldContinue()) {
         return null;
@@ -755,9 +773,26 @@ async function renderView(
     }
     const visibility = {
         hideAttrViewName: firstView.hideAttrViewName === true,
-        pageSize: validPageSize(firstView.pageSize),
     };
     const columns = columnInfo(firstView);
+    if (first.viewType === "calendar" || firstView.type === "calendar") {
+        // v3.8.7 returns all dated rows in the requested interval; the inherited
+        // pageSize is table metadata and must never truncate this response.
+        const rows = rowList(firstView);
+        if (rows.length > PAGE_SIZE * MAX_PAGES) throw new AttributeViewTruncatedError();
+        if (!firstProgress(firstView).done) throw new AttributeViewPageError();
+        let started = performance.now();
+        for (let offset = 0; offset < rows.length; offset += PAGE_SIZE) {
+            if (!shouldContinue()) return null;
+            absorbRows(target, {...firstView, rows: rows.slice(offset, offset + PAGE_SIZE)}, viewName, columns);
+            if (performance.now() - started >= 8) {
+                await new Promise<void>(resolve => setTimeout(resolve, 0));
+                if (!shouldContinue()) return null;
+                started = performance.now();
+            }
+        }
+        return visibility;
+    }
     const groups = groupSnapshots(firstView);
     if (groups.length > 0) {
         const progressByGroup = new Map<string, PageProgress>();
@@ -915,16 +950,24 @@ function toUnits(blockId: string, drafts: AvUnitDraft[]): Array<SearchableUnit &
     }));
 }
 
-/** 打开中的数据库按载体 viewID 缓存；未挂载时按内核规则使用默认首个可用视图。 */
-function cacheKey(ref: AvBlockRef, viewId = ""): string {
-    return `${ref.blockId}:${ref.avId}:${ref.updated}:${viewId ? `view:${viewId}` : "default"}:query:${JSON.stringify(ref.query ?? "")}`;
+/** A displayed row window belongs to its carrier copy, just like its view/query. */
+export function avSearchRefKey(ref: AvBlockRef, viewId = ref.carrierViewId): string {
+    const groups = Object.keys(ref.groupPageSizes ?? {}).sort()
+        .filter(id => validPageSize(ref.groupPageSizes![id]) !== undefined)
+        .map(id => [id, validPageSize(ref.groupPageSizes![id])]);
+    const range = ref.calendarRange;
+    return `${ref.blockId}:${ref.avId}:${ref.updated}:${viewId ? `view:${viewId}` : "default"}:query:${
+        JSON.stringify(ref.query ?? "")
+    }:window:${
+        JSON.stringify([validPageSize(ref.pageSize), groups, range ? [range.start, range.end, range.timeZone] : null])
+    }`;
 }
 
 function selectedViewId(ref: AvBlockRef, viewIds: ReadonlyMap<string, string>): string {
     return viewIds.get(ref.blockId) ?? ref.carrierViewId;
 }
 
-function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUnit[], limits?: AvDisplayLimits): void {
+function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUnit[]): void {
     // updated 变了也要清掉同一数据库的旧视图，避免长会话留下过期单元格文字。
     const prefix = `${ref.blockId}:${ref.avId}:`;
     for (const key of cacheKeysByCarrier.get(prefix) ?? []) {
@@ -932,10 +975,9 @@ function replaceCachedUnits(ref: AvBlockRef, viewId: string, units: SearchableUn
             dropAvCache(key);
         }
     }
-    const key = cacheKey(ref, viewId);
+    const key = avSearchRefKey(ref, viewId);
     dropAvCache(key);
     cache.set(key, units);
-    if (limits?.pageSize !== undefined) displayLimits.set(key, limits);
     const keys = cacheKeysByCarrier.get(prefix) ?? new Set<string>();
     keys.add(key);
     cacheKeysByCarrier.set(prefix, keys);
@@ -951,43 +993,6 @@ function validPageSize(value: unknown): number | undefined {
     return Number.isSafeInteger(pageSize) && pageSize > 0 ? pageSize : undefined;
 }
 
-/** Keep only rows currently exposed by the native AV page window. */
-function filterDisplayUnits(
-    units: Array<SearchableUnit & {snippet?: string;}>,
-    ref: AvBlockRef,
-    fallback?: AvDisplayLimits,
-): Array<SearchableUnit & {snippet?: string;}> {
-    const pageSize = validPageSize(ref.pageSize) ?? fallback?.pageSize;
-    const groupSizes = ref.groupPageSizes;
-    if (pageSize === undefined && !groupSizes) return units;
-    const seenRows = new Map<string, number>();
-    const nextRowByGroup = new Map<string, number>();
-    const kept: Array<SearchableUnit & {snippet?: string;}> = [];
-    for (const unit of units) {
-        const position = avApiCellPosition(unit.unitId?.replace(/#run-\d+$/, ""));
-        if (!position) {
-            kept.push(unit);
-            continue;
-        }
-        const group = position.row.startsWith("group:") ? position.row.split(":")[1] : "nogroup";
-        const rowId = position.row.startsWith("group:") ? position.row.split(":").slice(2).join(":") : position.row;
-        if (!rowId) {
-            kept.push(unit);
-            continue;
-        }
-        const key = `${group}\u0000${rowId}`;
-        let rowIndex = seenRows.get(key);
-        if (rowIndex === undefined) {
-            rowIndex = nextRowByGroup.get(group) ?? 0;
-            nextRowByGroup.set(group, rowIndex + 1);
-            seenRows.set(key, rowIndex);
-        }
-        const limit = validPageSize(groupSizes?.[group]) ?? pageSize;
-        if (limit === undefined || rowIndex < limit) kept.push(unit);
-    }
-    return kept;
-}
-
 export function peekAvUnits(
     refs: AvBlockRef[],
     viewIds: ReadonlyMap<string, string> = new Map(),
@@ -996,11 +1001,11 @@ export function peekAvUnits(
     const missing: AvBlockRef[] = [];
     const resolvedViewIds = new Map<string, string>();
     for (const ref of refs) {
-        const cached = cache.get(cacheKey(ref, selectedViewId(ref, viewIds)));
+        const cached = cache.get(avSearchRefKey(ref, selectedViewId(ref, viewIds)));
         if (cached) {
             resolvedViewIds.set(ref.blockId, resolvedViews.get(cached) ?? ref.carrierViewId);
-            touchAvCache(cacheKey(ref, selectedViewId(ref, viewIds)));
-            for (const unit of filterDisplayUnits(cached, ref, displayLimits.get(cacheKey(ref, selectedViewId(ref, viewIds))))) {
+            touchAvCache(avSearchRefKey(ref, selectedViewId(ref, viewIds)));
+            for (const unit of cached) {
                 units.push(unit);
             }
         } else {
@@ -1031,11 +1036,11 @@ export async function loadAvUnits(
                     return units;
                 }
                 const viewId = selectedViewId(ref, viewIds);
-                const key = cacheKey(ref, viewId);
+                const key = avSearchRefKey(ref, viewId);
                 const cached = cache.get(key);
                 if (cached) {
                     touchAvCache(key);
-                    for (const unit of filterDisplayUnits(cached, ref, displayLimits.get(key))) {
+                    for (const unit of cached) {
                         units.push(unit);
                     }
                     continue;
@@ -1045,7 +1050,7 @@ export async function loadAvUnits(
                     return units;
                 }
                 if (!built) return units;
-                for (const unit of filterDisplayUnits(built, ref, displayLimits.get(key))) {
+                for (const unit of built) {
                     units.push(unit);
                 }
             } catch (error) {
@@ -1069,7 +1074,7 @@ async function consumeAvCarrier(
     current: () => boolean,
     signal?: AbortSignal,
 ): Promise<SearchableUnit[] | null> {
-    const key = cacheKey(ref, viewId);
+    const key = avSearchRefKey(ref, viewId);
     let flight = carrierFlights.get(key);
     if (flight && !Array.from(flight.consumers).some((consumer) => consumer())) {
         carrierFlights.delete(key);
@@ -1161,7 +1166,7 @@ async function loadAvCarrier(
     const built = toUnits(ref.blockId, drafts);
     if (!canContinue()) return null;
     resolvedViews.set(built, view?.id ?? "");
-    replaceCachedUnits(ref, viewId, built, {pageSize: visibility.pageSize});
+    replaceCachedUnits(ref, viewId, built);
     return built;
 }
 

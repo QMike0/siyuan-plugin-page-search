@@ -2700,6 +2700,86 @@ async function main() {
             '<div data-node-id="' + id +
             '" data-type="NodeBlockQueryEmbed" data-content="select * from blocks"></div>';
         const avRaw = {name: "database", views: [{id: "v", name: "table"}, {id: "v2", name: "other"}]};
+        for (const sizes of [[1, 3], [3, 1]]) {
+            reset();
+            const owners = ["b", "c"];
+            for (const id of owners) {
+                add(id, "query_embed", "select * from blocks");
+                doms[id] = embedShell(id);
+            }
+            embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: avShell()}}]}});
+            let requests = 0;
+            avResponder = async url => {
+                if (url.endsWith("getAttributeView")) return {code: 0, data: avRaw};
+                requests++;
+                return {code: 0, data: {view: {type: "table", pageSize: 3, rowCount: 3,
+                    columns: [{id: "col", type: "text"}],
+                    rows: [0, 1, 2].map(i => ({id: "row" + i, cells: [{value: {
+                        keyID: "col", type: "text", text: {content: "windowKeyword"},
+                    }}]})),
+                }}};
+            };
+            wysiwyg.innerHTML = owners.map((id, index) => '<div data-node-id="' + id +
+                '" data-type="NodeBlockQueryEmbed">' + avShell().replace("<div></div>",
+                    '<div class="av__body" data-page-size="' + sizes[index] + '">' +
+                    '<div class="av__row" data-id="row0"><div class="av__cell" data-col-id="col">windowKeyword</div></div></div>') + '</div>').join("");
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                const result = await settle("windowKeyword", {includeAttributeView: true});
+                full(result);
+                assert.deepEqual(owners.map(id => result.matches.filter(match => match.blockId === id).length), sizes,
+                    "same-source embedded copies retain their own row windows in either traversal order");
+                assert.equal(requests, 2, "the upper workset must not merge different display windows");
+                full(await search("windowKeyword", {includeAttributeView: true}));
+                assert.equal(requests, 2, "both window caches remain reusable");
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        for (const embedded of [false, true]) {
+            reset();
+            const shell = (embedded ? avShell() : avShell().replace('data-node-id="source-av"', 'data-node-id="b"'))
+                .replace('data-av-type="table"', 'data-av-type="calendar"');
+            add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell);
+            doms.b = embedded ? embedShell("b") : shell;
+            if (embedded) embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]}});
+            const requests = [];
+            avResponder = async (url, body) => {
+                if (url.endsWith("getAttributeView")) return {code: 0, data: avRaw};
+                requests.push(body);
+                return {code: 0, data: {viewType: "calendar", view: {type: "table", pageSize: 50, rowCount: 201,
+                    columns: [{id: "col", type: "text"}],
+                    rows: Array.from({length: 201}, (_, i) => ({id: "row" + i, cells: [{value: {
+                        keyID: "col", type: "text", text: {content: "calendarKeyword"},
+                    }}]})),
+                }}};
+            };
+            const mount = start => {
+                const days = [start, new Date(new Date(start).setDate(new Date(start).getDate() + 1)).valueOf()];
+                const content = '<div class="av__body av__calendar-grid">' + days.map(date =>
+                    '<div class="av__calendar-day" data-calendar-day="' + date + '"></div>').join("") +
+                    '<div class="av__calendar-item" data-id="row0"><div class="av__calendar-field" data-col-id="col">calendarKeyword</div></div></div>';
+                wysiwyg.innerHTML = (embedded ? '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' : "") +
+                    shell.replace("<div></div>", content) + (embedded ? "</div>" : "");
+                return source("frontend/corpus/av").avDisplayPageSizes(wysiwyg.querySelector('[data-type="NodeAttributeView"]')).calendarRange;
+            };
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                for (const month of [0, 1]) {
+                    const range = mount(new Date(2026, month, 1).valueOf());
+                    const result = await settle("calendarKeyword", {includeAttributeView: true});
+                    full(result);
+                    assert.equal(result.matches.length, 201, "calendar API completion retains rows beyond table metadata pageSize");
+                    assert.deepEqual(requests.at(-1).calendarRange, range, "the displayed date grid reaches the request and workset");
+                }
+                assert.equal(requests.length, 2, "each displayed calendar interval is fetched once");
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        console.log("embedded AV display-window worksets and ordinary/embedded calendar ranges/counts OK");
         // Default AV search uses cell runs; inline restrictions use independent
         // math units. Neither path should duplicate glyphs or expose MathML.
         const avFormula = '<span data-type="inline-math" data-subtype="math" data-content="\\alpha" data-render="true">' +

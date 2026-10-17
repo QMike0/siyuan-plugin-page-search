@@ -143,22 +143,50 @@ export function isAttrViewRelevantToEdit(edit: Element, detail?: unknown): boole
  */
 export function watchAttributeViewDom(
     edit: Element,
-    onChange: (avIds?: readonly string[], invalidateValues?: boolean) => void,
+    onChange: (avIds?: readonly string[], invalidateValues?: boolean, displayChanged?: boolean) => void,
     debounceMs: number = 50,
 ): () => void {
     let timer: number | undefined;
     let invalidateValues = false;
     let unknownAv = false;
     const changedIds = new Set<string>();
+    const changedCarriers = new Set<Element>();
+    const displayStates = new WeakMap<Element, string>();
+    const displayState = (av: Element) =>
+        JSON.stringify([
+            av.getAttribute("data-av-id"),
+            av.getAttribute("data-av-type"),
+            av.getAttribute("custom-sy-av-view"),
+            av.querySelector(".av__views .item--focus")?.getAttribute("data-id"),
+            av.querySelector('[data-type="av-search"]')?.textContent?.trim() ?? "",
+            Array.from(av.querySelectorAll(".av__body")).map(body => [
+                body.getAttribute("data-group-id"),
+                body.getAttribute("data-page-size"),
+            ]),
+            Array.from(av.querySelectorAll(".av__calendar-day")).map(day => day.getAttribute("data-calendar-day")),
+        ]);
+    edit.querySelectorAll(AV_BLOCK_SELECTOR).forEach(av => displayStates.set(av, displayState(av)));
+    const noteCarrier = (target: Node | EventTarget | null) => {
+        const element = target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
+        const av = element?.closest(AV_BLOCK_SELECTOR);
+        if (av) changedCarriers.add(av);
+    };
     const composing = new WeakSet<Element>();
     const schedule = () => {
         window.clearTimeout(timer);
         timer = window.setTimeout(() => {
             const ids = unknownAv || !changedIds.size ? undefined : [...changedIds];
             const invalidate = invalidateValues;
+            let displayChanged = false;
+            for (const av of changedCarriers) {
+                const state = displayState(av);
+                if (state !== displayStates.get(av)) displayChanged = true;
+                displayStates.set(av, state);
+            }
+            changedCarriers.clear();
             changedIds.clear();
             unknownAv = invalidateValues = false;
-            onChange(ids, invalidate);
+            onChange(ids, invalidate, displayChanged);
         }, debounceMs);
     };
     const queryInput = (target: EventTarget | Node | null) =>
@@ -167,6 +195,7 @@ export function watchAttributeViewDom(
     const onInput = (event: Event) => {
         const input = queryInput(event.target);
         if (!input) return;
+        noteCarrier(input);
         if ((event as InputEvent).isComposing) {
             composing.add(input);
             if (!invalidateValues) window.clearTimeout(timer);
@@ -184,6 +213,7 @@ export function watchAttributeViewDom(
         const input = queryInput(event.target);
         if (!input) return;
         composing.delete(input);
+        noteCarrier(input);
         schedule();
     };
     edit.addEventListener("input", onInput, true);
@@ -198,15 +228,25 @@ export function watchAttributeViewDom(
         for (const mutation of mutations) {
             const input = mutation.type === "childList" ? queryInput(mutation.target) : null;
             if (input) {
-                if (!composing.has(input)) changed = true;
+                if (!composing.has(input)) {
+                    changed = true;
+                    noteCarrier(input);
+                }
                 continue;
             }
             if (isStructuralAttributeViewMutation(mutation)) {
+                noteCarrier(mutation.target);
+                for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
+                    if (!(node instanceof Element)) continue;
+                    if (node.matches(AV_BLOCK_SELECTOR)) changedCarriers.add(node);
+                    node.querySelectorAll(AV_BLOCK_SELECTOR).forEach(av => changedCarriers.add(av));
+                }
                 const ids = mutatedAttributeViewIds(mutation);
                 invalidateValues = changed = true;
                 if (!ids?.length) unknownAv = true;
                 ids?.forEach(id => changedIds.add(id));
             } else if (isAttributeViewPageSizeMutation(mutation)) {
+                noteCarrier(mutation.target);
                 // "Load more" expands the API page window. Drop the previous
                 // bounded cache so the newly exposed rows are fetched too.
                 const ids = mutatedAttributeViewIds(mutation);

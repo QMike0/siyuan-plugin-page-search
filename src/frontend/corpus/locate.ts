@@ -4,6 +4,7 @@ import {editorRootId} from "./search";
 import {isEditorZoomed} from "./focus";
 import {isUnderNonHeadingCssFold, unfoldPathToBlock} from "../fold";
 import {revealHiddenTabs} from "../tabs-reveal";
+import {findDocumentBlock} from "../blocks";
 
 /** 展开后等块插回当前编辑器的上限；常见情况在前几帧就出现 */
 const UNFOLD_APPEAR_TIMEOUT_MS = 1500;
@@ -16,7 +17,7 @@ function isMobile(): boolean {
 }
 
 function blockInEditor(editor: ParentNode, blockId: string): HTMLElement | null {
-    const node = editor.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(blockId)}"]`);
+    const node = findDocumentBlock(editor, blockId);
     if (!node || node.closest("[data-page-search-offscreen]")) {
         return null;
     }
@@ -131,6 +132,6 @@ export function blockIsInEditor(edit: Element, blockId: string): boolean {
     if (!blockId || blockId === "__doc-title__") {
         return true;
     }
-    const node = edit.querySelector(`[data-node-id="${CSS.escape(blockId)}"]`);
+    const node = findDocumentBlock(edit, blockId);
     return Boolean(node && (node as HTMLElement).clientHeight > 0);
 }

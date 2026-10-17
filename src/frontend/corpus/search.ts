@@ -92,6 +92,7 @@ import {
     AttributeViewTruncatedError,
     AttributeViewLoadError,
     avDisplayPageSizes,
+    avSearchRefKey,
     invalidateAvCache,
     invalidateAvCacheForBlocks,
     invalidateAvCacheForIds,
@@ -3314,14 +3315,7 @@ async function searchCurrentDocumentImpl(
         }
         const workRefs = new Map<string, AvBlockRef>();
         const ownersByRef = new Map<string, Set<string>>();
-        const refKey = (ref: AvBlockRef) =>
-            JSON.stringify([
-                ref.blockId,
-                ref.avId,
-                ref.updated,
-                ref.carrierViewId,
-                ref.query ?? "",
-            ]);
+        const refKey = avSearchRefKey;
         const addRef = (ref: AvBlockRef, ownerId: string) => {
             const key = refKey(ref);
             workRefs.set(key, ref);

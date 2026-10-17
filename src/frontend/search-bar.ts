@@ -42,6 +42,7 @@ import {
     collectSearchableBlocks,
     collectMindmapPreviewUnits,
     resolveDocRoot,
+    findDocumentBlock,
     TABLE_TYPE,
     type CollectSearchableBlocksOptions,
 } from "./blocks";
@@ -987,8 +988,8 @@ export class SearchBar {
                 }
             },
         });
-        this.stopAvDomWatch = watchAttributeViewDom(this.edit, (avIds, invalidateValues) => {
-            this.scheduleAttrViewResearch(avIds, invalidateValues);
+        this.stopAvDomWatch = watchAttributeViewDom(this.edit, (avIds, invalidateValues, displayChanged) => {
+            this.scheduleAttrViewResearch(avIds, invalidateValues, displayChanged);
         });
         this.stopEditorDomWatch = watchEditorDom(this.edit, {
             knownDiagram: (element) => this.diagramSearchState.knows(element),
@@ -2848,9 +2849,11 @@ export class SearchBar {
                 rootUsesAttributeViews(this.rememberCurrentRootId(), attributeViewTransactionIds(event.detail)))
         ) {
             this.documentEpoch += 1;
+            const contentChanged = !isAttrViewFoldOnlyTransaction(event.detail);
             this.scheduleAttrViewResearch(
                 attributeViewTransactionIds(event.detail),
-                !isAttrViewFoldOnlyTransaction(event.detail),
+                contentChanged,
+                contentChanged,
             );
             return;
         }
@@ -2958,24 +2961,35 @@ export class SearchBar {
 
     /**
      * 数据库结构性重建后重新匹配并画高亮。
-     * 使用 change=false 保留当前跳转索引；跳转滚动期间不响应，避免误重置到第一项。
+     * 使用 change=false 保留当前跳转索引；真实范围/内容变更在跳转暂停结束后合并刷新。
      */
-    private scheduleAttrViewResearch(avIds?: readonly string[], invalidateValues = true) {
-        // 变更一到就丢掉引用缓存。跳转暂停或搜索框为空时不会重搜，
-        // 但下一次手动搜索也不能继续用旧单元格。
+    private scheduleAttrViewResearch(avIds?: readonly string[], invalidateValues = true, deferDuringPause = true) {
+        // 变更一到就丢掉引用缓存。跳转期间延后真实变更的重搜；
+        // 搜索框为空时，下一次手动搜索也不能继续用旧单元格。
         if (invalidateValues) invalidateAttributeViewSearch(this.rememberCurrentRootId(), avIds);
-        if (!this.includeAttributeView) {
+        if (this.destroyed || !this.includeAttributeView) {
             return;
         }
         if (!this.effectiveQuery()) {
             return;
         }
-        if (Date.now() < this.avWatchPausedUntil) {
+        // Native locate rebuilds the same display window. It needs Range repair,
+        // not another full search. Actual edits and display changes must survive.
+        if (Date.now() < this.avWatchPausedUntil && !deferDuringPause) {
             return;
         }
         window.clearTimeout(this.avRefreshTimer);
-        this.avRefreshTimer = window.setTimeout(() => {
-            if (Date.now() < this.avWatchPausedUntil) {
+        const key = this.searchResultKey();
+        const refresh = () => {
+            this.avRefreshTimer = undefined;
+            if (
+                this.destroyed || !this.includeAttributeView || !this.effectiveQuery() || key !== this.searchResultKey()
+            ) {
+                return;
+            }
+            const remaining = this.avWatchPausedUntil - Date.now();
+            if (remaining > 0) {
+                this.avRefreshTimer = window.setTimeout(refresh, remaining);
                 return;
             }
             if (this.replaceBusy) {
@@ -2993,12 +3007,15 @@ export class SearchBar {
             } else {
                 void this.highlightHitResult(this.searchText, false);
             }
-        }, AV_REFRESH_DEBOUNCE_MS);
+        };
+        this.avRefreshTimer = window.setTimeout(
+            refresh,
+            Math.max(AV_REFRESH_DEBOUNCE_MS, this.avWatchPausedUntil - Date.now()),
+        );
     }
 
     private pauseAvWatch(ms: number = 600) {
         this.avWatchPausedUntil = Math.max(this.avWatchPausedUntil, Date.now() + ms);
-        window.clearTimeout(this.avRefreshTimer);
     }
 
     private pauseIndexReset(ms: number) {
@@ -3083,9 +3100,7 @@ export class SearchBar {
         if (logicalRow === null || !match.blockId) {
             return false;
         }
-        const table = this.edit.querySelector<HTMLElement>(
-            `[data-node-id="${CSS.escape(match.blockId)}"]`,
-        );
+        const table = findDocumentBlock(this.edit, match.blockId);
         if (!table) {
             return false;
         }
@@ -3143,7 +3158,7 @@ export class SearchBar {
     private bindShownTableMatch(index: number, match: SearchMatch, table: HTMLElement): boolean {
         const host = table.isConnected ?
             table :
-            this.edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(match.blockId)}"]`);
+            findDocumentBlock(this.edit, match.blockId);
         if (!host?.isConnected) {
             return false;
         }
@@ -3188,9 +3203,7 @@ export class SearchBar {
         if (!target || !validSiYuanNodeId(target.itemId)) {
             return false;
         }
-        const host = this.edit.querySelector<HTMLElement>(
-            `[data-node-id="${CSS.escape(match.blockId)}"]`,
-        );
+        const host = findDocumentBlock(this.edit, match.blockId);
         if (!host) return false;
 
         let sourceId = "";
@@ -3209,6 +3222,7 @@ export class SearchBar {
         const blockId = av.dataset.nodeId?.trim() || match.blockId;
         const viewId = av.getAttribute("custom-sy-av-view")?.trim() ||
             av.querySelector<HTMLElement>(".av__views .item--focus")?.dataset.id?.trim();
+        if (match.embeddedAvViewId && viewId !== match.embeddedAvViewId) return false;
         if (!validSiYuanNodeId(blockId) || (viewId && !validSiYuanNodeId(viewId))) {
             return false;
         }
@@ -3241,7 +3255,7 @@ export class SearchBar {
         this.pauseAvWatch(1400);
         const generation = this.searchGeneration;
         try {
-            openFileByURL(`siyuan://blocks/${blockId}?${query.toString()}`);
+            if (openFileByURL(`siyuan://blocks/${blockId}?${query.toString()}`) === false) return false;
         } catch {
             return false;
         }
@@ -3250,16 +3264,17 @@ export class SearchBar {
         // soon as its row is mounted, then perform the normal Range centering.
         void this.waitForLocatedMatchRange(index + 1, match.id, true).then(bound => {
             if (!bound || generation !== this.searchGeneration || this.getCurrentMatch()?.id !== match.id) return;
-            void this.scrollIntoRangesAsync(index, true, false, false, false);
+            // Binding a Range does not mean native scrolling/layout has finished.
+            // Only center locally here: re-entering native locate can starve the
+            // browser's next frame with an unbounded chain of resolved promises.
+            void this.scrollIntoRangesAsync(index, true, false, false, false, false);
         });
         return true;
     }
 
     /**
-     * If SiYuan has already mounted the target row, scrolling that row is a
-     * safe fallback when the protocol bridge is unavailable (for example in
-     * the web runtime).  It deliberately does not force-render a virtualized
-     * row; unmounted rows still take the native locator path above.
+     * If SiYuan has already mounted the target row, scroll it locally instead
+     * of rebuilding the database. Unmounted rows still take the native path.
      */
     private revealMountedAttributeViewMatch(match: SearchMatch | undefined): boolean {
         if (!match) {
@@ -3269,9 +3284,8 @@ export class SearchBar {
         if (!target || !validSiYuanNodeId(target.itemId)) {
             return false;
         }
-        const host = this.edit.querySelector<HTMLElement>(
-            `[data-node-id="${CSS.escape(match.blockId)}"]`,
-        );
+        const host = findDocumentBlock(this.edit, match.blockId);
+        if (!host) return false;
 
         let sourceId = "";
         const local = match.unitId?.startsWith("embed:") ? match.unitId.slice(6) : "";
@@ -3282,15 +3296,21 @@ export class SearchBar {
         const sourceOf = createEmbeddedSourceReader();
         const candidates = host?.matches('[data-type="NodeAttributeView"]') ?
             [host] :
-            host ?
-                Array.from(host.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]')) :
-                Array.from(this.edit.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]'));
+            Array.from(host.querySelectorAll<HTMLElement>('[data-type="NodeAttributeView"][data-node-id]'));
         for (const av of candidates) {
             if (sourceId && sourceOf(av) !== sourceId && av.dataset.avId !== sourceId) {
                 continue;
             }
-            const row = av.querySelector<HTMLElement>(
-                `.av__row[data-id="${CSS.escape(target.itemId)}"]`,
+            const viewId = av.getAttribute("custom-sy-av-view")?.trim() ||
+                av.querySelector<HTMLElement>(".av__views .item--focus")?.dataset.id?.trim();
+            if (match.embeddedAvViewId && viewId !== match.embeddedAvViewId) continue;
+            const body = target.groupId ?
+                av.querySelector<HTMLElement>(`.av__body[data-group-id="${CSS.escape(target.groupId)}"]`) :
+                av;
+            const row = body?.querySelector<HTMLElement>(
+                `.av__row[data-id="${CSS.escape(target.itemId)}"], ` +
+                    `.av__gallery-item[data-id="${CSS.escape(target.itemId)}"], ` +
+                    `.av__calendar-item[data-id="${CSS.escape(target.itemId)}"]`,
             );
             if (!row || row.closest(".fn__none")) {
                 continue;
@@ -3326,7 +3346,12 @@ export class SearchBar {
             (rect.bottom < 0 || rect.top > viewportHeight || rect.right < 0 || rect.left > viewportWidth);
     }
 
-    private revealUnloadedMatch(index: number, match: SearchMatch | undefined, scroll: boolean) {
+    private revealUnloadedMatch(
+        index: number,
+        match: SearchMatch | undefined,
+        scroll: boolean,
+        allowNativeAvLocate = true,
+    ) {
         if (!match || match.blockId === "__doc-title__") {
             return;
         }
@@ -3334,19 +3359,23 @@ export class SearchBar {
         // may not carry the rendered AV block as their blockId. Resolve a
         // mounted row by its stable item ID before falling back to block open.
         if (scroll && this.revealMountedAttributeViewMatch(match)) {
+            // API matches may not yet have a Range even though the row is
+            // mounted. Bind just this hit so its column is centered as well.
+            if (this.tryBindUnfoldedMatch(index + 1, true)) {
+                if (!this.appendResultHighlight(this.resultMatches[index])) this.applyResultHighlights();
+                void this.scrollIntoRangesAsync(index, true, false, false, false, false);
+            }
             return;
         }
         if (scroll && match.snippet) {
             showMessage(match.snippet, 4000, "info");
         }
-        const existing = this.edit.querySelector<HTMLElement>(
-            `[data-node-id="${CSS.escape(match.blockId)}"]`,
-        );
+        const existing = findDocumentBlock(this.edit, match.blockId);
         if (existing && revealHiddenTabs(existing)) {
             void existing.offsetHeight;
         }
         if (!match.range && this.bindMindmapPreview(index)) {
-            void this.scrollIntoRangesAsync(index, scroll, false, false, false).then(() => {
+            void this.scrollIntoRangesAsync(index, scroll, false, false, false, allowNativeAvLocate).then(() => {
                 window.requestAnimationFrame(() => this.applyResultHighlights());
             });
             return;
@@ -3355,7 +3384,7 @@ export class SearchBar {
             existing.clientHeight > 0 &&
             !isUnderNonHeadingCssFold(existing);
         if (shown && !match.range && this.tryBindUnfoldedMatch(index + 1)) {
-            void this.scrollIntoRangesAsync(index, scroll, false, false, false).then(() => {
+            void this.scrollIntoRangesAsync(index, scroll, false, false, false, allowNativeAvLocate).then(() => {
                 window.requestAnimationFrame(() => this.applyResultHighlights());
             });
             return;
@@ -3372,7 +3401,7 @@ export class SearchBar {
             return;
         }
         if (shown) {
-            if (this.revealNativeAttributeViewMatch(index, match)) {
+            if (allowNativeAvLocate && this.revealNativeAttributeViewMatch(index, match)) {
                 return;
             }
             if (this.revealMountedAttributeViewMatch(match)) {
@@ -3394,7 +3423,7 @@ export class SearchBar {
         const keepIndex = this.resultIndex >= 1 ? this.resultIndex : index + 1;
         this.pauseIndexReset(4000);
         openBlockInEditor(app, match.blockId, () => {
-            const finish = this.finishLocatedMatch(keepIndex, scroll);
+            const finish = this.finishLocatedMatch(keepIndex, scroll, allowNativeAvLocate);
             const release = () => {
                 this.locatePending = false;
                 this.pauseIndexReset(800);
@@ -3414,7 +3443,7 @@ export class SearchBar {
      * 折叠块插回当前文档后停在原来的那一条。
      * 先给当前命中补高亮并滚动；标题下其余命中下一帧再补，对不上才整篇重搜。
      */
-    private async finishLocatedMatch(keepIndex: number, scroll: boolean) {
+    private async finishLocatedMatch(keepIndex: number, scroll: boolean, allowNativeAvLocate = true) {
         const generation = this.searchGeneration;
         const index = this.resultIndex >= 1 && this.resultIndex <= this.resultMatches.length ?
             this.resultIndex :
@@ -3429,9 +3458,29 @@ export class SearchBar {
             }
             this.clearSearchFocus();
             if (scroll) {
-                this.edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(target.blockId)}"]`)
+                findDocumentBlock(this.edit, target.blockId)
                     ?.scrollIntoView({block: "center", inline: "nearest"});
             }
+            return;
+        }
+        // Opening/unfolding the carrier does not mount an arbitrary virtual row.
+        // Start one native locate as soon as its shell exists, without spending
+        // the Range timeout waiting for a row that cannot appear on its own.
+        const locateAvRow = () => {
+            if (!scroll || !allowNativeAvLocate || !target || !attributeViewLocateTarget(target.unitId)) return false;
+            if (this.resultIndex < 1) {
+                this.resultIndex = index;
+                this.updateCountLabel();
+            }
+            if (!this.revealNativeAttributeViewMatch(index - 1, target)) return false;
+            consumeUnfoldedOuterHeadingId();
+            this.bindUnfoldedHeadingSection();
+            return true;
+        };
+        if (
+            target && attributeViewLocateTarget(target.unitId) && !this.tryBindUnfoldedMatch(index, true) &&
+            locateAvRow()
+        ) {
             return;
         }
         const bound = target && await this.waitForLocatedMatchRange(index, target.id, scroll);
@@ -3446,7 +3495,7 @@ export class SearchBar {
                 this.updateCountLabel();
             }
             if (scroll) {
-                await this.scrollIntoRangesAsync(index - 1, true, false, true, false);
+                await this.scrollIntoRangesAsync(index - 1, true, false, true, false, allowNativeAvLocate);
             }
             await new Promise<void>((resolve) => {
                 window.requestAnimationFrame(() => resolve());
@@ -3454,6 +3503,8 @@ export class SearchBar {
             this.bindUnfoldedHeadingSection();
             return;
         }
+        // The carrier may itself have finished rendering during the bounded wait.
+        if (locateAvRow()) return;
         const group = this.attributeViewGroupBody(target);
         if (group) {
             // 分组中的虚拟卡片未必已挂载，保留完整匹配，不用重搜反复等待不存在的 Range。
@@ -3477,15 +3528,13 @@ export class SearchBar {
         }
         const current = this.resultMatches[this.resultIndex - 1];
         if (current?.range) {
-            await this.scrollIntoRangesAsync(this.resultIndex - 1, true, false, false, false);
+            await this.scrollIntoRangesAsync(this.resultIndex - 1, true, false, false, false, allowNativeAvLocate);
             return;
         }
         if (!current?.blockId) {
             return;
         }
-        this.edit.querySelector<HTMLElement>(
-            `[data-node-id="${CSS.escape(current.blockId)}"]`,
-        )?.scrollIntoView({block: "center", inline: "nearest"});
+        findDocumentBlock(this.edit, current.blockId)?.scrollIntoView({block: "center", inline: "nearest"});
     }
 
     /**
@@ -3555,7 +3604,7 @@ export class SearchBar {
             };
             const currentOwner = (): HTMLElement | null => {
                 if (!owner || !owner.isConnected) {
-                    owner = this.edit.querySelector<HTMLElement>(selector);
+                    owner = findDocumentBlock(this.edit, blockId);
                 }
                 return owner;
             };
@@ -3659,9 +3708,7 @@ export class SearchBar {
         if (!match || match.blockId === "__doc-title__") {
             return false;
         }
-        const owner = this.edit.querySelector<HTMLElement>(
-            `[data-node-id="${CSS.escape(match.blockId)}"]`,
-        );
+        const owner = findDocumentBlock(this.edit, match.blockId);
         if (!owner) {
             return false;
         }
@@ -3702,9 +3749,7 @@ export class SearchBar {
         if (!headingId) {
             return;
         }
-        const heading = this.edit.querySelector<HTMLElement>(
-            `[data-node-id="${CSS.escape(headingId)}"]`,
-        );
+        const heading = findDocumentBlock(this.edit, headingId);
         if (!heading) {
             return;
         }
@@ -4261,9 +4306,7 @@ export class SearchBar {
         if (!match.blockId || match.blockId === "__doc-title__") {
             return false;
         }
-        const block = this.edit.querySelector<HTMLElement>(
-            `[data-node-id="${CSS.escape(match.blockId)}"]`,
-        );
+        const block = findDocumentBlock(this.edit, match.blockId);
         return Boolean(block && block.clientHeight > 0 && !isUnderNonHeadingCssFold(block));
     }
 
@@ -4331,7 +4374,7 @@ export class SearchBar {
             local.slice(14) :
             "";
         if (!group || group === "nogroup" || group.startsWith("idx-")) return null;
-        const owner = this.edit.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(match.blockId)}"]`);
+        const owner = findDocumentBlock(this.edit, match.blockId);
         const readSource = createEmbeddedSourceReader();
         const av = owner?.matches('[data-type="NodeAttributeView"]') ?
             owner :
@@ -4363,6 +4406,7 @@ export class SearchBar {
      * 折叠标题下的命中不在 DOM 里，展开后仍停在当前序号，不进入聚焦。
      * immediate：标题刚展开时先上橙色并立刻滚动，折叠持久化放到后台。
      * scroll 为 false 时只刷新高亮，不展开用户刚刚折叠的块。
+     * allowNativeAvLocate：原生数据库定位完成后只做本地滚动，禁止重复发起定位。
      */
     private async scrollIntoRangesAsync(
         index: number,
@@ -4370,6 +4414,7 @@ export class SearchBar {
         pulseMemoFocus = false,
         immediate = false,
         refreshStale = true,
+        allowNativeAvLocate = true,
     ) {
         // 滚动可能触发 AV 虚拟滚动 DOM 突变；短暂暂停观察，防止重搜重置索引
         if (scroll) {
@@ -4417,24 +4462,21 @@ export class SearchBar {
             if (!scroll) {
                 return;
             }
-            this.revealUnloadedMatch(index, match, scroll);
+            this.revealUnloadedMatch(index, match, scroll, allowNativeAvLocate);
             return;
         }
         if (immediate && match.highlightKind !== "inline-memo") {
             this.applyFocusHighlight(range);
         }
 
-        // A grouped AV may still have a valid Range for a row that is outside
-        // the computer viewport. Let SiYuan rebuild/center its native AV
-        // virtual window before the generic Range scrolling fallback.
+        // Reveal mounted AV items directly, then center the exact text below.
+        // Native locate rebuilds the virtual window and is only needed when
+        // the item itself is absent; never re-enter it from its own completion.
         if (scroll && match && this.attributeViewRangeNeedsReveal(range, match)) {
-            if (this.revealNativeAttributeViewMatch(index, match)) {
-                return;
-            }
-            // A mounted row can be centered without rebuilding the AV
-            // virtual window. This also covers web mode, where the desktop
-            // protocol bridge is intentionally absent.
-            if (this.revealMountedAttributeViewMatch(match)) {
+            if (
+                !this.revealMountedAttributeViewMatch(match) && allowNativeAvLocate &&
+                this.revealNativeAttributeViewMatch(index, match)
+            ) {
                 return;
             }
         }
@@ -4511,9 +4553,7 @@ export class SearchBar {
         if (!match?.blockId || match.blockId === "__doc-title__") {
             return;
         }
-        const host = this.edit.querySelector<HTMLElement>(
-            `[data-node-id="${CSS.escape(match.blockId)}"]`,
-        );
+        const host = findDocumentBlock(this.edit, match.blockId);
         if (host && revealHiddenTabs(host)) {
             void host.offsetHeight;
         }
@@ -6425,8 +6465,28 @@ function scrollContainerToRange(range: Range, container: HTMLElement) {
     if (canScrollY) {
         const rangeCenterY = (rangeRect.top + rangeRect.bottom) / 2;
         const rangeCenterYInContent = rangeCenterY - containerRect.top + container.scrollTop;
-        const targetScrollTop = rangeCenterYInContent - container.clientHeight / 2;
+        let targetScrollTop = rangeCenterYInContent - container.clientHeight / 2;
         const maxScrollTop = container.scrollHeight - container.clientHeight;
+        // 思源未分组虚拟数据库没有完整底部占位。把紧随其后的文字居中，会在下一帧
+        // 触发补行，再把目标推到屏外。空间足够时，让前面的数据库先离开视口；不追赶补行。
+        if (container.classList.contains("protyle-content") && rangeRect.bottom > rangeRect.top) {
+            for (const av of container.querySelectorAll<HTMLElement>('.av[data-v-scroll="true"][data-render="true"]')) {
+                const position = av.compareDocumentPosition(range.startContainer);
+                if (
+                    !(position & Node.DOCUMENT_POSITION_FOLLOWING) ||
+                    position & (Node.DOCUMENT_POSITION_DISCONNECTED | Node.DOCUMENT_POSITION_CONTAINED_BY) ||
+                    av.closest(".protyle-content") !== container
+                ) continue;
+                const avRect = av.getBoundingClientRect();
+                const clearAvTop = avRect.bottom - containerRect.top + container.scrollTop + 1;
+                if (
+                    avRect.height > 0 && rangeRect.top - avRect.bottom >= 2 &&
+                    rangeRect.bottom - avRect.bottom <= container.clientHeight &&
+                    clearAvTop > targetScrollTop && clearAvTop <= maxScrollTop &&
+                    !av.querySelector(".av__spacer--bottom")
+                ) targetScrollTop = clearAvTop;
+            }
+        }
         container.scrollTop = Math.max(0, Math.min(targetScrollTop, maxScrollTop));
     }
 
