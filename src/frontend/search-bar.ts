@@ -5072,18 +5072,21 @@ export class SearchBar {
         this.replacePendingMessageId = undefined;
     }
 
-    private logReplacementResult(operation: "single" | "all", result: ReplaceWriteResult): void {
+    private logReplacementResult(
+        operation: "single" | "all", result: ReplaceWriteResult, startedAt: number | undefined,
+    ): void {
         const details = {
             operation, replaced: result.replacedCount, skipped: result.skippedCount,
             submitted: result.submittedCount, state: result.commitState, reason: result.error,
             unchanged: Boolean(result.unchanged),
+            elapsedMs: startedAt === undefined ? undefined : Math.round(performance.now() - startedAt),
         };
         if (result.commitState === "failed" || result.error === "transaction-failed") {
-            logError("replacement failed", details);
+            logError(`replace ${operation} failed`, details);
         } else if (result.error || result.commitState === "unknown") {
-            logWarning("replacement incomplete or cancelled", details);
+            logWarning(`replace ${operation} incomplete or cancelled`, details);
         } else {
-            logDebug("replacement completed", details);
+            logDebug(`replace ${operation} completed`, details);
         }
     }
 
@@ -5231,6 +5234,7 @@ export class SearchBar {
             const currentIndex = this.resultMatches.indexOf(current);
             if (currentIndex < 0) return;
             const successor = this.resultMatches[(currentIndex + 1) % this.resultMatches.length];
+            const replacementStarted = isDebugLoggingEnabled() ? performance.now() : undefined;
             logDebug("replace single started", {blockId: current.blockId, regex: this.regex});
             const result = await replaceCurrentMatchInEditor(
                 this.edit,
@@ -5250,7 +5254,7 @@ export class SearchBar {
                         this.replaceText === replacementText,
                 },
             );
-            this.logReplacementResult("single", result);
+            this.logReplacementResult("single", result, replacementStarted);
             if (this.destroyed) return;
             if (await this.handleUnconfirmedReplacement(result) || this.destroyed) return;
             if (result.error === "readonly-or-preview") {
@@ -5473,6 +5477,8 @@ export class SearchBar {
             const searchKey = this.resultSearchKey;
             const documentEpoch = this.documentEpoch;
             const replacementText = this.replaceText;
+            // Exclude time spent waiting for the confirmation dialog.
+            const replacementStarted = isDebugLoggingEnabled() ? performance.now() : undefined;
             logDebug("replace all started", {matches: this.resultMatches.length, writable: writableCount, regex: this.regex});
             const result = await replaceAllMatchesInEditor(
                 this.edit,
@@ -5496,7 +5502,7 @@ export class SearchBar {
                         this.replaceText === replacementText,
                 },
             );
-            this.logReplacementResult("all", result);
+            this.logReplacementResult("all", result, replacementStarted);
             if (this.destroyed) return;
             if (await this.handleUnconfirmedReplacement(result) || this.destroyed) return;
             if (result.error === "readonly-or-preview") {

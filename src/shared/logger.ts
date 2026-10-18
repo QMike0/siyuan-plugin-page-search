@@ -15,7 +15,8 @@ export function isDebugLoggingEnabled(): boolean {
 function output(level: "debug" | "warn" | "error", event: string, details?: LogDetails): void {
     // Diagnostics must never interrupt search, navigation, writes or cleanup.
     try {
-        if (details) console[level](`[page-search] ${event}`, details);
+        const duration = typeof details?.elapsedMs === "number" ? ` (${details.elapsedMs} ms)` : "";
+        if (details) console[level](`[page-search] ${event}${duration}`, details);
         else console[level](`[page-search] ${event}`);
     } catch {
         // Some console integrations can throw.
