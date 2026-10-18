@@ -47,7 +47,7 @@ export interface PluginPrefs {
     includeDocTitle: boolean;
     /**
      * 是否匹配图片标题（`.img .protyle-action__title` 可见字，对应官方 imgTitle）；默认 true。
-     * 可替换：写回可见标题并同步 img[title]，走块 transaction，可 Ctrl+Z。
+     * 可替换：写回可见标题并同步思源的 img[data-title]，走块 transaction，可 Ctrl+Z。
      */
     includeImageTitle: boolean;
     /** 是否匹配文档内数据库（Attribute View）；默认 true */

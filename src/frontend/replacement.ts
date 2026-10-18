@@ -416,19 +416,22 @@ function applyReplacementsToTextNodes(
         }
     }
 
-    // 图片标题：可见字改完后同步 img[title]，对齐官方 imgMenu（menus/protyle.ts）
+    // 图片标题：可见字改完后同步思源的持久化字段 img[data-title]，对齐官方 imgMenu。
+    // `title` 只是浏览器的原生提示属性；思源渲染/序列化图片标题读取的是
+    // `data-title`，官方 helper 也会在同步时移除 `title`。
     if (textChanged) {
-        syncImageTitleAttributeFromTextNodes(textNodes);
+        syncImageTitleDataAttributeFromTextNodes(textNodes);
     }
 
     return {appliedCount, skippedCount, regexExpandFailedCount, replacementEnd};
 }
 
 /**
- * 若本次替换落在图片标题区，把 `.protyle-action__title > span` 的全文写回 `img[title]`。
+ * 若本次替换落在图片标题区，把 `.protyle-action__title > span` 的全文写回
+ * 思源使用的 `img[data-title]`，并清理浏览器提示属性 `title`。
  * 仅改已在 mutation 中的节点所属子树，不另开编辑器 API。
  */
-function syncImageTitleAttributeFromTextNodes(textNodes: Text[]): void {
+function syncImageTitleDataAttributeFromTextNodes(textNodes: Text[]): void {
     const seen = new Set<HTMLElement>();
     for (const node of textNodes) {
         const titleInner = node.parentElement
@@ -442,7 +445,16 @@ function syncImageTitleAttributeFromTextNodes(textNodes: Text[]): void {
         if (!(img instanceof HTMLImageElement)) {
             continue;
         }
-        img.setAttribute("title", titleInner.innerText);
+        const title = titleInner.textContent ?? "";
+        if (title) {
+            img.setAttribute("data-title", title);
+        } else {
+            img.removeAttribute("data-title");
+        }
+        // SiYuan's image-title helper normalizes this in the same way. Keeping
+        // the browser-only attribute out of the submitted DOM is important:
+        // Lute/SiYuan serializes data-title as the image title in source.
+        img.removeAttribute("title");
     }
 }
 

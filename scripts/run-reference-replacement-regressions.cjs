@@ -248,7 +248,9 @@ async function main() {
         const image = fixture(
             '<span class="img"><img title="foo"><span class="protyle-action__title"><span>foo</span></span></span>',
         );
-        assert.equal(apply(image, clone, "bar").target.querySelector("img").getAttribute("title"), "bar");
+        const imageResult = apply(image, clone, "bar");
+        assert.equal(imageResult.target.querySelector("img").getAttribute("data-title"), "bar");
+        assert.equal(imageResult.target.querySelector("img").getAttribute("title"), null);
     }
     console.log(
         "Dynamic-reference common-layer, composite marks, no-op, split Text, stale/structure, memo and image contracts OK",

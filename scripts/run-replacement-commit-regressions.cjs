@@ -896,7 +896,7 @@ async function main() {
         for (const fetched of [false, true]) {
             const imageTitle = fixture([paragraph(id,
                 'before <span class="img" data-type="img" contenteditable="false"><span> </span><span>' +
-                '<img src="assets/example.png" data-src="assets/example.png" title="foo">' +
+                '<img src="assets/example.png" data-src="assets/example.png" data-title="foo">' +
                 '<span class="protyle-action__title"><span>foo</span></span></span><span> </span></span> after')]);
             imageTitle.matches = matcher.matchTextUnitsDetailed(
                 blocks.collectSearchableBlocks(imageTitle.edit, {includeDocTitle: false, includeParagraph: false})
@@ -917,7 +917,12 @@ async function main() {
             assert.equal(result.commitState, "confirmed", "image-title-only matches remain replaceable");
             assert.equal(result.replacedCount, 1);
             const committed = imageTitle.kernel.get(id);
-            assert.ok(committed.includes('title="bar"'), "caption writes back to img title");
+            const persisted = lute ? lute.BlockDOM2StdMd(committed) : committed;
+            assert.ok(
+                lute ? persisted.includes('assets/example.png "bar"') : committed.includes('data-title="bar"'),
+                "caption writes the replacement into the persisted image title",
+            );
+            assert.ok(!committed.includes('data-title="foo"'), "caption does not leave the old data-title");
             assert.ok(committed.includes("before") && committed.includes("after"), "paragraph body is preserved");
         }
     }
@@ -1446,7 +1451,7 @@ async function main() {
             id,
             `<span data-type="strong em block-ref" data-subtype="s" data-id="${referenceId}">bar</span>` +
                 '<span data-type="inline-memo" data-inline-memo-content="memo bar">body</span>' +
-                '<span class="img" data-type="img" contenteditable="false"><span> </span><span><img src="assets/x.png" data-src="assets/x.png" title="bar"><span class="protyle-action__title"><span>bar</span></span></span><span> </span></span>',
+                '<span class="img" data-type="img" contenteditable="false"><span> </span><span><img src="assets/x.png" data-src="assets/x.png" data-title="bar"><span class="protyle-action__title"><span>bar</span></span></span><span> </span></span>',
         );
         assert.equal(
             reader(content),
@@ -1457,7 +1462,7 @@ async function main() {
             const changed of [
                 content.replace('data-subtype="s"', 'data-subtype="d"'),
                 content.replace("memo bar", "old memo"),
-                content.replace('title="bar"', 'title="old"'),
+                content.replace('data-title="bar"', 'data-title="old"'),
                 content.replace(referenceId, otherId),
             ]
         ) {
