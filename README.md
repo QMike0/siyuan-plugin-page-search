@@ -30,8 +30,8 @@
 * Open the search bar from the top-bar icon or hotkey (default `Ctrl+F` / macOS `⌘F`; changeable in SiYuan hotkeys)
 * Yellow = all hits, orange = current; `Enter` next, `Shift+Enter` previous, `Esc` close
 * Search history is kept per document; use `↑` / `↓` in the search box to browse previous queries
-* When the match count flashes, it indicates that it is in the search match state. Click the match count to open the search results list, then click an item to jump to that match
-* Block icons on the right run from the innermost block to the outermost, with each type shown once. Heading, list and code blocks use category icons; right-click them to select subtypes. Click icons to filter temporarily; results must match all selected types. Click a blue icon again or choose “Clear filters” to remove filters. Counts, navigation and replacement follow the filter. Filters reset when the search panel closes and are not saved
+* When the match count flashes, it indicates that it is in the search match state. Click it to open the search results list. Each item shows a short context around the match and follows the current match; click an item to jump to that position
+* In the search results list, display the icons of the blocks where each item is located on the right side, from inner to outer. Show each icon type only once, with a maximum of three icons. When there are more, a floating ellipsis can be expanded to show all icons. For heading blocks, list blocks, and code blocks, display only the major category icon; right-clicking allows selecting from the actual subcategories present in the current result. Clicking an icon temporarily filters by that type, and multiple types can be combined. Clicking a blue icon again or clicking "Clear filters" cancels the filter. Counts, jumps, and replace scope update with the filter, are cleared after closing the search panel, and are not saved as settings
 * On desktop, drag the count area to move the panel; click the top-bar icon again to reset position
 * A selection on open only prefills the query; it does **not** turn on “In selection”
 

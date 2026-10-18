@@ -1,3 +1,14 @@
+## v2.0.2 2026-10-18
+
+- 🇨🇳 在“是否搜索”菜单中添加自定义块的开关项
+- 🇨🇳 优化搜索结果列表的展示，支持显示特定搜索结果所在内容块的类型，并可通过点击类型icon临时限定筛选对应内容块类型下的搜索结果
+- 🇨🇳 添加插件日志输出
+- 🇨🇳 优化内容块名称描述和icon
+- 🇺🇸 Add a toggle option for custom blocks in the "Whether to search" menu
+- 🇺🇸 Optimize the display of the search results list: support showing the content block type where a specific search result is located, and allow clicking the type icon to temporarily filter search results under the corresponding content block type
+- 🇺🇸 Add plugin log output
+- 🇺🇸 Optimize content block name descriptions and icons
+
 ## v2.0.1 2026-10-17
 
 - 🇨🇳 按数据库已加载行数限制搜索范围，而非强行搜索数据库所有内容
