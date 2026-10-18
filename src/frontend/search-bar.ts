@@ -5662,7 +5662,7 @@ export class SearchBar {
                         const labelKey = `settingsIncludeHeadingH${level}` as const;
                         return this.buildMatchSwitchMenuItem({
                             id: `page-search-include-heading-h${level}`,
-                            icon: "iconHeadings",
+                            icon: RESULT_BLOCK_TYPES[`h${level}`].icon,
                             label: this.i18n[labelKey],
                             checked: this[key],
                             onChange: (checked) => {

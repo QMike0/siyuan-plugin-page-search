@@ -373,8 +373,8 @@ listButton.querySelector("use").dispatchEvent(context);
 assert.equal(context.defaultPrevented, true);
 assert.deepEqual(lastMenu.position, {x: 42, y: 73, isLeft: true});
 assert.deepEqual(lastMenu.items.map(({label, icon}) => ({label, icon})), [
-    {label: "无序列表", icon: "iconList"},
-    {label: "有序列表", icon: "iconOrderedList"},
+    {label: "无序列表块", icon: "iconList"},
+    {label: "有序列表块", icon: "iconOrderedList"},
 ], "only subtypes present in this result are offered, with scope-menu labels and icons");
 lastMenu.items[1].click();
 assert.deepEqual(bar.resultBlockTypes, ["ordered"], "an exact subtype replaces its redundant broad family filter");
@@ -393,10 +393,10 @@ row[1].click();
 assert.deepEqual(bar.resultBlockTypes, [], "clicking a blue family icon clears its subtype filters");
 
 for (const [family, leaves, labels] of [
-    ["heading", coldHeadings(headingBlock("h2")), ["一级标题", "二级标题"]],
+    ["heading", coldHeadings(headingBlock("h2")), ["一级标题块", "二级标题块"]],
     ["codeBlock", ["mermaid", "code", "flowchart"], ["普通代码块", "Mermaid", "flowchart"]],
     ["codeBlock", ["mermaid", "mermaid"], ["Mermaid"]],
-    ["list", ["task"], ["任务列表"]],
+    ["list", ["task"], ["任务列表块"]],
 ]) {
     const [button] = renderRow(leaves);
     assert.equal(button.dataset.resultBlockType, family);
