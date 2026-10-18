@@ -95,11 +95,49 @@ function parentElement(element: Element): Element | null {
         (element.getRootNode() as ShadowRoot).host : null);
 }
 
+function domTypeOf(node: Element): ResultBlockType | undefined {
+    // SQL abbreviations are not DOM block names: inline data-type="s" is strikethrough.
+    const type = node.getAttribute("data-type") ?? "";
+    return type.startsWith("Node") ? typeOf(type, node.getAttribute("data-subtype") ?? "",
+        node.getAttribute("custom-sy-list-mindmap") === "1" ? 'custom-sy-list-mindmap="1"' : "") : undefined;
+}
+
+function headingLevel(type: ResultBlockType | undefined): number {
+    return type && /^h[1-6]$/.test(type) ? Number(type[1]) : 0;
+}
+
 /** One walk per DOM element, shared by all cells/text runs in a collection. */
 export function createDomBlockTypeReader(
     outsideMountedRoot?: (id: string) => readonly ResultBlockType[],
+    precedingHeadings?: (element: Element) => readonly ResultBlockType[],
 ): (block: SearchableBlock) => readonly ResultBlockType[] {
     const paths = new WeakMap<Element, readonly ResultBlockType[]>();
+    const sections = new WeakMap<Element, readonly ResultBlockType[]>();
+    const scanned = new WeakSet<Node>();
+    const sectionOf = (node: Element): readonly ResultBlockType[] => {
+        const parent = node.parentNode;
+        if (!(parent instanceof Element || parent instanceof ShadowRoot)) return precedingHeadings?.(node) ?? [];
+        if (!scanned.has(parent)) {
+            scanned.add(parent);
+            let active: readonly ResultBlockType[] = [];
+            // Top-level embed results are independently queried blocks, not source siblings.
+            const independent = parent instanceof Element &&
+                (parent.getAttribute("data-type") === "NodeBlockQueryEmbed" ||
+                    parent.classList.contains("protyle-wysiwyg__embed"));
+            let first = true;
+            for (const child of parent.children) {
+                if (!(child.getAttribute("data-type") ?? "").startsWith("Node")) continue;
+                if (first && !independent) active = precedingHeadings?.(child) ?? [];
+                first = false;
+                const key = domTypeOf(child);
+                const level = headingLevel(key);
+                if (level) active = active.filter((type) => headingLevel(type) < level);
+                sections.set(child, active);
+                if (level && !independent) active = [key!, ...active];
+            }
+        }
+        return sections.get(node) ?? [];
+    };
     const read = (element: Element | null): readonly ResultBlockType[] => {
         const chain: Element[] = [];
         while (element && !paths.has(element)) {
@@ -112,11 +150,11 @@ export function createDomBlockTypeReader(
             const id = node.getAttribute("data-node-id");
             // A focused editor can mount a child without its enclosing containers.
             if (!path.length && id && outsideMountedRoot) path = outsideMountedRoot(id);
-            // SQL abbreviations are not DOM block names: inline data-type="s" is strikethrough.
-            const domType = node.getAttribute("data-type") ?? "";
-            const key = domType.startsWith("Node") ?
-                typeOf(domType, node.getAttribute("data-subtype") ?? "",
-                    node.getAttribute("custom-sy-list-mindmap") === "1" ? 'custom-sy-list-mindmap="1"' : "") : undefined;
+            const key = domTypeOf(node);
+            if ((node.getAttribute("data-type") ?? "").startsWith("Node")) {
+                const headings = sectionOf(node);
+                if (headings.length) path = [...headings, ...path];
+            }
             if (key) path = [key, ...path];
             paths.set(node, path);
         }
@@ -142,7 +180,30 @@ export function createResultBlockTypeReader(
     live: readonly SearchableBlock[],
     links: ReadonlyMap<string, BlockTreeLink>,
     codeLanguages: ReadonlyMap<string, {codeLanguage?: string;}>,
+    order: readonly string[] = [],
 ): (unit: {blockId: string; blockType: string; blockTypes?: readonly ResultBlockType[];}) => readonly ResultBlockType[] {
+    // HeadingParent uses a preceding, lower-level heading in the SAME container.
+    // Only kernel document order is trustworthy; SQL map/id order is not.
+    let headingParents: Map<string, string> | undefined;
+    const headingParent = (id: string): string | undefined => {
+        if (!headingParents) {
+            headingParents = new Map();
+            const stacks = new Map<string, Array<{id: string; level: number;}>>();
+            for (const blockId of order) {
+                const link = links.get(blockId);
+                if (!link) continue;
+                let stack = stacks.get(link.parentId);
+                const level = link.type === "h" ? headingLevel(typeOf(link.type, link.subtype)) : 0;
+                if (level) {
+                    if (!stack) { stack = []; stacks.set(link.parentId, stack); }
+                    while (stack.length && stack[stack.length - 1].level >= level) stack.pop();
+                }
+                if (stack?.length) headingParents.set(blockId, stack[stack.length - 1].id);
+                if (level) stack!.push({id: blockId, level});
+            }
+        }
+        return headingParents.get(id);
+    };
     const paths = new Map<string, readonly ResultBlockType[]>();
     const read = (id: string): readonly ResultBlockType[] => {
         const cached = paths.get(id);
@@ -163,7 +224,7 @@ export function createResultBlockTypeReader(
                     link.subtype,
                     codeLanguages.get(current)?.codeLanguage,
                 ) : link.subtype, link.ial)});
-            current = link.parentId;
+            current = headingParent(current) ?? link.parentId;
         }
         for (let index = chain.length - 1; index >= 0; index--) {
             const node = chain[index];
@@ -176,7 +237,19 @@ export function createResultBlockTypeReader(
     // when a hit actually needs its type path. This avoids a second full DOM walk
     // for searches whose matches are entirely off-screen or empty.
     const mounted = new Map<string, SearchableBlock>();
-    const domTypes = createDomBlockTypeReader((id) => read(links.get(id)?.parentId ?? ""));
+    const domTypes = createDomBlockTypeReader((id) => read(links.get(id)?.parentId ?? ""), (element) => {
+        const embed = element.closest('[data-type="NodeBlockQueryEmbed"]');
+        if (embed && embed !== element) return [];
+        const headings: ResultBlockType[] = [];
+        let id = headingParent(element.getAttribute("data-node-id") ?? "");
+        while (id) {
+            const link = links.get(id)!;
+            const key = typeOf(link.type, link.subtype);
+            if (key) headings.push(key);
+            id = headingParent(id);
+        }
+        return headings;
+    });
     for (const block of live) {
         if (block.unitId?.startsWith("embed:")) continue;
         if (!mounted.has(block.blockId)) mounted.set(block.blockId, block);

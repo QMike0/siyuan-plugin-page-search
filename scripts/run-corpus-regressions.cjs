@@ -211,6 +211,7 @@ async function main() {
     let domReadIds = [];
     let renderCalls = 0;
     let failSql = () => false;
+    let failOrder = false;
     let domResponder;
     let embedResponder;
     let embedRequests = [];
@@ -222,6 +223,7 @@ async function main() {
                 {code: 0, data: db.prepare(body.stmt).all()};
         }
         if (url === "/api/block/getDocBlocksOrders") {
+            if (failOrder) return {code: 1};
             return {
                 code: 0,
                 data: db.prepare("SELECT id FROM blocks ORDER BY id").all().map((row) => row.id),
@@ -283,6 +285,7 @@ async function main() {
         domReadIds = [];
         renderCalls = 0;
         failSql = () => false;
+        failOrder = false;
         domResponder = null;
         embedResponder = null;
         embedRequests = [];
@@ -312,6 +315,61 @@ async function main() {
         return result;
     };
     try {
+        for (const mounted of ["none", "partial", "full", "folded"]) {
+            reset();
+            add("a", "h", "A", "", "r", mounted === "folded" ? 'fold="1"' : "");
+            add("b", "h", "B");
+            add("c", "p", "needle");
+            add("d", "callout", "");
+            add("e", "h", "E", "", "d");
+            add("f", "p", "needle", "", "d");
+            add("g", "p", "needle");
+            add("h", "h", "H");
+            add("i", "p", "needle");
+            db.exec("UPDATE blocks SET subtype = CASE id WHEN 'a' THEN 'h1' WHEN 'b' THEN 'h2' WHEN 'e' THEN 'h3' WHEN 'h' THEN 'h1' ELSE subtype END");
+            const headingDom = (id, level) => '<div data-node-id="' + id + '" data-type="NodeHeading" data-subtype="h' + level +
+                '"' + (mounted === "folded" && id === "a" ? ' fold="1"' : '') + '><div contenteditable="true">title</div></div>';
+            for (const id of ["c", "f", "g", "i"]) {
+                doms[id] = '<div data-node-id="' + id + '" data-type="NodeParagraph"><div contenteditable="true">needle</div></div>';
+            }
+            if (mounted === "full") {
+                wysiwyg.innerHTML = headingDom("a", 1) + headingDom("b", 2) + doms.c +
+                    '<div data-node-id="d" data-type="NodeCallout">' + headingDom("e", 3) + doms.f + '</div>' +
+                    doms.g + headingDom("h", 1) + doms.i;
+            } else if (mounted === "partial") {
+                wysiwyg.innerHTML = doms.c + doms.g;
+            } else if (mounted === "folded") {
+                wysiwyg.innerHTML = headingDom("a", 1);
+            }
+            const all = await search("needle");
+            full(all);
+            assert.deepEqual(all.matches.map(match => [match.blockId, match.blockTypes]), [
+                ["c", ["paragraph", "h2", "h1"]],
+                ["f", ["paragraph", "h3", "callout", "h2", "h1"]],
+                ["g", ["paragraph", "h2", "h1"]],
+                ["i", ["paragraph", "h1"]],
+            ], "full-document heading sections: " + mounted);
+            const readsBeforeFilter = domCalls;
+            const selected = await search("needle", {resultBlockTypes: ["paragraph", "h1", "h2"]});
+            full(selected);
+            assert.deepEqual(selected.matches.map(match => match.blockId), ["c", "f", "g"], "heading AND filters: " + mounted);
+            const nested = await search("needle", {resultBlockTypes: ["h1", "h2", "h3", "callout"]});
+            full(nested);
+            assert.deepEqual(nested.matches.map(match => match.blockId), ["f"], "container boundaries: " + mounted);
+            assert.equal(domCalls, readsBeforeFilter, "heading filters require no additional block DOM requests: " + mounted);
+        }
+        reset();
+        add("a", "h", "title");
+        add("b", "p", "needle");
+        db.exec("UPDATE blocks SET subtype = 'h1' WHERE id = 'a'");
+        doms.b = '<div data-node-id="b" data-type="NodeParagraph"><div contenteditable="true">needle</div></div>';
+        failOrder = true;
+        const unknownHeadingScope = await search("needle", {resultBlockTypes: ["h1"]});
+        assert.equal(unknownHeadingScope.degraded, true, "missing kernel order cannot certify a complete heading filter");
+        const orderIndependentSearch = await search("needle");
+        full(orderIndependentSearch);
+        assert.equal(orderIndependentSearch.matches.length, 1, "order-independent searches retain the existing fallback");
+        console.log("heading type filters: full/unloaded/partial/folded scope, semantic containers, exact AND, missing-order guards and no extra DOM reads OK");
         {
             // v3.8.7 custom blocks persist data-content, not arbitrary renderer DOM.
             const custom = '<div data-node-id="b" data-type="NodeCustomBlock" class="custom-block" ' +

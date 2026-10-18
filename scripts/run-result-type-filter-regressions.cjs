@@ -163,6 +163,103 @@ const embeddedLinks = new Map([
 assert.deepEqual(types.createResultBlockTypeReader([], embeddedLinks, new Map())(embeddedUnit), embeddedTypes,
     "cached/fetched embed paths retain the same source-to-owner order");
 
+// HeadingParent in SiYuan walks previous siblings, then the physical container.
+// SQL parent_id and DOM parents alone cannot express these section boundaries.
+const headingEdit = document.createElement("div");
+headingEdit.innerHTML = '<div data-node-id="h1" data-type="NodeHeading" data-subtype="h1" fold="1">A</div>' +
+    '<div data-node-id="h2" data-type="NodeHeading" data-subtype="h2">B</div>' +
+    '<div data-node-id="section-p" data-type="NodeParagraph">foo</div>' +
+    '<div data-node-id="section-callout" data-type="NodeCallout">' +
+    '<div data-node-id="h3" data-type="NodeHeading" data-subtype="h3">C</div>' +
+    '<div data-node-id="inner-p" data-type="NodeParagraph">foo</div></div>' +
+    '<div data-node-id="after-callout" data-type="NodeParagraph">foo</div>' +
+    '<div data-node-id="next-h2" data-type="NodeHeading" data-subtype="h2">D</div>' +
+    '<div data-node-id="next-p" data-type="NodeParagraph">foo</div>' +
+    '<div data-node-id="next-h1" data-type="NodeHeading" data-subtype="h1">E</div>' +
+    '<div data-node-id="last-p" data-type="NodeParagraph">foo</div>';
+const headingNodes = Array.from(headingEdit.querySelectorAll("[data-node-id]"));
+const headingOrder = headingNodes.map(node => node.dataset.nodeId);
+const headingLinks = new Map(headingNodes.slice().reverse().map(node => [node.dataset.nodeId, {
+    parentId: node.parentElement.dataset.nodeId || "doc",
+    type: node.dataset.type === "NodeHeading" ? "h" : node.dataset.type === "NodeCallout" ? "callout" : "p",
+    subtype: node.dataset.subtype || "", ial: node.hasAttribute("fold") ? 'fold="1"' : "",
+}]));
+const headingBlock = (id, element = headingEdit.querySelector('[data-node-id="' + id + '"]')) => ({
+    blockId: id, blockType: element.dataset.type, element,
+});
+const coldHeadings = types.createResultBlockTypeReader([], headingLinks, new Map(), headingOrder);
+const liveHeadings = types.createDomBlockTypeReader();
+for (const [id, expected] of [
+    ["h2", ["h2", "h1"]],
+    ["section-p", ["paragraph", "h2", "h1"]],
+    ["inner-p", ["paragraph", "h3", "callout", "h2", "h1"]],
+    ["after-callout", ["paragraph", "h2", "h1"]],
+    ["next-h2", ["h2", "h1"]],
+    ["next-p", ["paragraph", "h2", "h1"]],
+    ["next-h1", ["h1"]],
+    ["last-p", ["paragraph", "h1"]],
+]) {
+    assert.deepEqual(liveHeadings(headingBlock(id)), expected, "mounted heading section: " + id);
+    assert.deepEqual(coldHeadings(headingBlock(id)), expected, "unloaded/folded heading section: " + id);
+}
+assert.equal(types.passesResultTypeFilter(coldHeadings(headingBlock("inner-p")), ["paragraph", "h1", "h2", "callout"]), true);
+assert.equal(types.passesResultTypeFilter(coldHeadings(headingBlock("last-p")), ["h1", "h2"]), false,
+    "a later top-level heading ends the earlier section");
+assert.deepEqual(types.createResultBlockTypeReader([], headingLinks, new Map())(headingBlock("section-p")), ["paragraph"],
+    "SQL map/id order is never guessed to be document order");
+for (const id of ["section-p", "inner-p", "h2"]) {
+    const detached = headingBlock(id).element.cloneNode(true);
+    const block = headingBlock(id, detached);
+    assert.deepEqual(types.createResultBlockTypeReader([block], headingLinks, new Map(), headingOrder)(block), coldHeadings(block),
+        "focused/partly mounted source recovers missing headings and containers: " + id);
+}
+const partialHeadingEdit = document.createElement("div");
+partialHeadingEdit.append(headingBlock("h2").element.cloneNode(true), headingBlock("section-p").element.cloneNode(true));
+const partialBlock = headingBlock("section-p", partialHeadingEdit.lastElementChild);
+assert.deepEqual(types.createResultBlockTypeReader([partialBlock], headingLinks, new Map(), headingOrder)(partialBlock),
+    ["paragraph", "h2", "h1"], "mounted sibling headings retain an unloaded outer heading");
+partialHeadingEdit.firstElementChild.dataset.subtype = "h3";
+assert.deepEqual(types.createResultBlockTypeReader([partialBlock], headingLinks, new Map(), headingOrder)(partialBlock),
+    ["paragraph", "h3", "h1"], "mounted heading levels override an older SQL level");
+const separateEmbedResults = document.createElement("div");
+separateEmbedResults.innerHTML = '<div data-type="NodeBlockQueryEmbed"><div class="protyle-wysiwyg__embed">' +
+    '<div data-type="NodeHeading" data-subtype="h1">Unrelated query result</div>' +
+    '<div data-type="NodeParagraph">foo</div></div></div>';
+assert.deepEqual(types.createDomBlockTypeReader()({blockType: "NodeParagraph", element: separateEmbedResults.querySelector('[data-type="NodeParagraph"]')}),
+    ["paragraph", "embed"], "separate embedded query results do not create source heading ancestry");
+const denseHeadingEdit = document.createElement("div");
+denseHeadingEdit.innerHTML = '<div data-type="NodeHeading" data-subtype="h1"></div>' +
+    Array.from({length: 2000}, () => '<div data-type="NodeParagraph"></div>').join("");
+let siblingReads = 0;
+for (const node of denseHeadingEdit.children) {
+    const original = node.getAttribute.bind(node);
+    node.getAttribute = (...args) => { siblingReads++; return original(...args); };
+}
+const denseTypes = types.createDomBlockTypeReader();
+for (const element of denseHeadingEdit.children) {
+    denseTypes({blockType: element.dataset.type, element});
+}
+assert.ok(siblingReads < denseHeadingEdit.childElementCount * 15,
+    "shared sibling contexts must not rescan earlier headings for each result");
+const readsAfterCollection = siblingReads;
+for (let i = 0; i < 1000; i++) {
+    denseTypes({blockType: "NodeParagraph", element: denseHeadingEdit.lastElementChild});
+}
+assert.ok(siblingReads - readsAfterCollection < 4000, "repeated hits reuse the same heading context");
+const denseOrder = ["title", ...Array.from({length: 2000}, (_, index) => "p-" + index)];
+const denseLinks = new Map(denseOrder.map(id => [id, {
+    parentId: "doc", type: id === "title" ? "h" : "p", subtype: id === "title" ? "h1" : "", ial: "",
+}]));
+let linkReads = 0;
+const originalLinkGet = denseLinks.get.bind(denseLinks);
+denseLinks.get = id => { linkReads++; return originalLinkGet(id); };
+const denseColdTypes = types.createResultBlockTypeReader([], denseLinks, new Map(), denseOrder);
+assert.equal(linkReads, 0, "zero-hit searches do not build a heading index");
+for (const blockId of denseOrder.slice(1)) {
+    assert.deepEqual(denseColdTypes({blockId, blockType: "NodeParagraph"}), ["paragraph", "h1"]);
+}
+assert.ok(linkReads < denseOrder.length * 6, "unloaded heading paths share one document-order scan and cached parent paths");
+
 const panel = document.createElement("div");
 panel.innerHTML = '<div class="search-results-panel__filters"></div><div class="search-results-panel__list"></div>';
 const root = document.createElement("div");
@@ -296,7 +393,7 @@ row[1].click();
 assert.deepEqual(bar.resultBlockTypes, [], "clicking a blue family icon clears its subtype filters");
 
 for (const [family, leaves, labels] of [
-    ["heading", ["h3", "h1"], ["一级标题", "三级标题"]],
+    ["heading", coldHeadings(headingBlock("h2")), ["一级标题", "二级标题"]],
     ["codeBlock", ["mermaid", "code", "flowchart"], ["普通代码块", "Mermaid", "flowchart"]],
     ["codeBlock", ["mermaid", "mermaid"], ["Mermaid"]],
     ["list", ["task"], ["任务列表"]],
@@ -452,6 +549,29 @@ async function pipelineRegressions() {
     editor.remove();
 
     editor.innerHTML = '<div class="protyle"><div class="protyle-content"><div class="protyle-wysiwyg">' +
+        '<div data-node-id="title-one" data-type="NodeHeading" data-subtype="h1"><div contenteditable="true">A</div></div>' +
+        '<div data-node-id="title-two" data-type="NodeHeading" data-subtype="h2"><div contenteditable="true">B</div></div>' +
+        '<div data-node-id="under-both" data-type="NodeParagraph"><div contenteditable="true"><span data-type="s">foo</span></div></div>' +
+        '<div data-node-id="next-one" data-type="NodeHeading" data-subtype="h1"><div contenteditable="true">C</div></div>' +
+        '<div data-node-id="under-one" data-type="NodeParagraph"><div contenteditable="true"><span data-type="s">foo</span></div></div>' +
+        '</div></div></div>';
+    document.body.append(editor);
+    const headerScope = {includeDocTitle: false, includeHeadingH1: false, includeHeadingH2: false};
+    const headerMatches = await calculateSearchMatches({}, editor, "foo", headerScope);
+    assert.deepEqual(headerMatches.matches.map(match => match.blockTypes), [["paragraph", "h2", "h1"], ["paragraph", "h1"]],
+        "heading context is retained even when heading text is excluded by the scope menu");
+    const sectionMatches = await calculateSearchMatches({}, editor, "foo", {...headerScope, resultBlockTypes: ["paragraph", "h1", "h2"]});
+    assert.deepEqual(sectionMatches.matches.map(match => match.blockId), ["under-both"], "keyword filtering uses real nested heading sections");
+    assert.equal(sectionMatches.matches[0].range.toString(), "foo", "section filtering preserves the navigation Range");
+    assert.equal(sectionMatches.matches[0].replaceable, headerMatches.matches[0].replaceable,
+        "section filtering never changes target write eligibility");
+    const sectionEnumeration = await calculateSearchMatches({}, editor, "", {
+        ...headerScope, restrictInlineTypes: ["s"], resultBlockTypes: ["h1", "h2"],
+    });
+    assert.deepEqual(sectionEnumeration.matches.map(match => match.blockId), ["under-both"], "inline enumeration uses the same heading sections");
+    editor.remove();
+
+    editor.innerHTML = '<div class="protyle"><div class="protyle-content"><div class="protyle-wysiwyg">' +
         '<div data-node-id="outer" data-type="NodeCallout"><div data-node-id="embed" data-type="NodeBlockQueryEmbed">' +
         '<div class="protyle-wysiwyg__embed"><div data-node-id="list" data-type="NodeList" data-subtype="o">' +
         '<div data-node-id="item" data-type="NodeListItem"><div data-node-id="source" data-type="NodeParagraph">' +
@@ -484,5 +604,5 @@ async function pipelineRegressions() {
     editor.remove();
 }
 pipelineRegressions().then(() => {
-    console.log("result type filters: DOM/SQL identity, unloaded/embedded ancestry, grouped icons, right-click subtypes, AND, input focus/keyboard and menu cleanup OK");
+    console.log("result type filters: DOM/SQL heading sections, focused/folded/embedded boundaries, linear sibling reads, grouped icons, right-click subtypes, AND, input focus/keyboard and menu cleanup OK");
 }).catch(error => { console.error(error); process.exitCode = 1; });

@@ -67,7 +67,7 @@ import {
     isUnderNonHeadingCssFold,
 } from "../fold-dom";
 import {buildListSnippet} from "../list-snippet";
-import {createResultBlockTypeReader, passesResultTypeFilter} from "../result-block-types";
+import {createResultBlockTypeReader, passesResultTypeFilter, resultBlockTypeGroup} from "../result-block-types";
 import type {
     SearchPipelineOptions,
     SearchPipelineResult,
@@ -2913,7 +2913,10 @@ async function searchCurrentDocumentImpl(
         }
     }
     let truncated = 0;
-    let degraded = languageQueryFailed;
+    // Without true sibling order, unloaded heading membership cannot be certified.
+    let degraded = languageQueryFailed || (!reliableOrder && Boolean(
+        options.resultBlockTypes?.some((type) => resultBlockTypeGroup(type) === "heading"),
+    ));
     const plainTargets: BlockMeta[] = [];
     const specialTargets: BlockMeta[] = [];
     const queuedIds = new Set<string>();
@@ -3555,7 +3558,7 @@ async function searchCurrentDocumentImpl(
         Array.from(meta.byId.values()).filter(isTabsTitleBlockMeta).map((item) => item.id),
     );
     const matches: SearchMatch[] = [];
-    const readBlockTypes = createResultBlockTypeReader(liveAll, meta.links, meta.byId);
+    const readBlockTypes = createResultBlockTypeReader(liveAll, meta.links, meta.byId, reliableOrder ?? []);
     const typesByUnit = new Map<CachedUnit, ReturnType<typeof readBlockTypes>>();
     let phaseStarted = performance.now();
     for (let hitIndex = 0; hitIndex < matched.hits.length; hitIndex += 1) {
