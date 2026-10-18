@@ -31,6 +31,7 @@
 * Yellow = all hits, orange = current; `Enter` next, `Shift+Enter` previous, `Esc` close
 * Search history is kept per document; use `↑` / `↓` in the search box to browse previous queries
 * When the match count flashes, it indicates that it is in the search match state. Click the match count to open the search results list, then click an item to jump to that match
+* Block icons on the right run from the innermost block to the outermost, with each type shown once. Heading, list and code blocks use category icons; right-click them to select subtypes. Click icons to filter temporarily; results must match all selected types. Click a blue icon again or choose “Clear filters” to remove filters. Counts, navigation and replacement follow the filter. Filters reset when the search panel closes and are not saved
 * On desktop, drag the count area to move the panel; click the top-bar icon again to reset position
 * A selection on open only prefills the query; it does **not** turn on “In selection”
 

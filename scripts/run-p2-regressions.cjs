@@ -1004,6 +1004,7 @@ async function main() {
             resultCount: 1,
             resultIndex: 1,
             resultMatches: liveMatches(),
+            resultBlockTypes: [],
             resultSelectionScope: null,
             searchGeneration: 1,
             resultSearchGeneration: 1,

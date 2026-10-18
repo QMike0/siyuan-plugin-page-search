@@ -29,6 +29,7 @@ import type {
     SearchMatch,
 } from "./dom-types";
 import {buildListSnippet} from "./list-snippet";
+import {createDomBlockTypeReader} from "./result-block-types";
 import {
     cloneSelectionScope,
     getSelectionScope,
@@ -335,6 +336,7 @@ export function enumerateRestrictInlineMatches(
     }
 
     const matches: SearchMatch[] = [];
+    const readBlockTypes = createDomBlockTypeReader();
     for (const candidate of candidates) {
         if (
             !isMatchWithinSelection(
@@ -363,6 +365,7 @@ export function enumerateRestrictInlineMatches(
             id: `${candidate.blockId}:${candidate.unitId}:0:${candidate.end}`,
             blockId: candidate.blockId,
             blockType: candidate.blockType,
+            blockTypes: readBlockTypes({...candidate, textNodes: []}),
             blockIndex: candidate.blockIndex,
             unitId: candidate.unitId,
             start: candidate.start,

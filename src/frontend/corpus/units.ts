@@ -26,6 +26,8 @@ const HOST_TYPES = new Set<string>(
 
 /** 会话缓存用的纯文本单元，不保留 DOM 节点。 */
 export interface CachedUnit {
+    /** Embedded source ancestry survives extraction/cache ownership rewriting. */
+    blockTypes?: SearchableBlock["blockTypes"];
     blockId: string;
     blockType: string;
     blockIndex: number;
@@ -177,6 +179,7 @@ export function freezeBlock(
     return {
         blockId: block.blockId,
         blockType: block.blockType,
+        blockTypes: block.blockType === "NodeBlockQueryEmbed" ? block.blockTypes : undefined,
         blockIndex,
         text: block.text,
         unitId: block.unitId,

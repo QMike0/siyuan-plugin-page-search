@@ -140,6 +140,7 @@ function fixture(includeUnchanged = true) {
         i18n: {},
         searchText: "foo",
         resultMatches: [],
+        resultBlockTypes: [],
         resultCount: 0,
         publishedCounts: [],
         resultIndex: 0,

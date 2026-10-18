@@ -1,7 +1,10 @@
 import type {AvBlockRef} from "./corpus/av";
+import type {ResultBlockType} from "./result-block-types";
 
 /** 前端 DOM 搜索块（含 element / textNodes，仅浏览器侧使用） */
 export interface SearchableBlock {
+    /** Content block types from the text's innermost block to its outer containers. */
+    blockTypes?: readonly ResultBlockType[];
     blockId: string;
     blockType: string;
     blockIndex: number;
@@ -55,6 +58,7 @@ export type TableReplaceLock = "table-rich" | "table-cell-editor";
 
 /** 带 Range 的搜索命中（高亮 / 导航） */
 export interface SearchMatch {
+    blockTypes?: readonly ResultBlockType[];
     id: string;
     blockId: string;
     blockType: string;

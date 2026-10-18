@@ -32,6 +32,7 @@ import {
     type RendererAdapterKind,
 } from "./renderer-adapters";
 import {splitTextNodesAtBarriers} from "./text-runs";
+import {createDomBlockTypeReader} from "./result-block-types";
 import {
     beginTextCollection,
     isCollectedTextHidden,
@@ -710,6 +711,7 @@ export function ownEmbeddedSearchUnit(block: SearchableBlock, ownerId: string): 
     return {
         ...block,
         blockId: ownerId,
+        blockTypes: block.blockTypes ?? createDomBlockTypeReader()(block),
         blockType: EMBED_BLOCK_TYPE,
         unitId: `embed:${block.embeddedSourceId ?? block.blockId}:${sourceUnit}`,
     };
@@ -724,12 +726,16 @@ function finishSearchableBlocks(
     skipEmbeddedOrder = false,
 ): SearchableBlock[] {
     const filtered = filterFoldedSearchableBlocks(blocks, includeFoldedBlocks);
+    const readTypes = createDomBlockTypeReader();
     const embedded = new Map<HTMLElement, SearchableBlock[]>();
     const owners = new Map<SearchableBlock, HTMLElement>();
     const sourceOf = createEmbeddedSourceReader();
     for (const block of filtered) {
         const owner = embeddedOwner(block.element);
         if (!owner) continue;
+        // Only embedded source units need their ancestry during collection:
+        // the carrier keeps this path after the source DOM is rewritten.
+        block.blockTypes = readTypes(block);
         owners.set(block, owner);
         block.embeddedSourceId = sourceOf(block.element, block.blockId);
         const group = embedded.get(owner) ?? [];

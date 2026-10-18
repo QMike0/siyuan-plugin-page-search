@@ -49,6 +49,13 @@ import {
 import {ComponentHighlights} from "./component-highlights";
 import {watchComponentLifecycle} from "./component-lifecycle";
 import {
+    RESULT_BLOCK_TYPES,
+    RESULT_BLOCK_TYPE_CHILDREN,
+    isResultBlockType,
+    resultBlockTypeGroup,
+    type ResultBlockType,
+} from "./result-block-types";
+import {
     rootUsesAttributeViews,
     releaseAvCacheOwner,
 } from "./corpus/av";
@@ -259,7 +266,7 @@ function newHighlight(ranges: readonly Range[]): any | null {
 }
 
 /** 结果列表：固定行高，只渲染视口附近的行。 */
-const RESULTS_ITEM_HEIGHT = 26;
+const RESULTS_ITEM_HEIGHT = 32;
 const RESULTS_LIST_PADDING = 4;
 const RESULTS_MAX_HEIGHT = 240;
 const RESULTS_OVERSCAN = 5;
@@ -376,6 +383,10 @@ export interface SearchBarI18n {
     /** 结果列表按钮的悬浮说明 */
     resultsPanelToggle?: string;
     resultsPanelEmpty?: string;
+    resultsTypeFilterHint?: string;
+    resultsTypeFilterActive?: string;
+    resultsTypeFilterToggle?: string;
+    resultsTypeFilterClear?: string;
     replaceDocTitleUnsupported?: string;
     /** 渲染失败未计入的块数 */
     searchUnrendered?: string;
@@ -525,6 +536,7 @@ export class SearchBar {
     private resultIndex = 0;
     private resultCount = 0;
     private resultMatches: SearchMatch[] = [];
+    private resultBlockTypes: ResultBlockType[] = [];
     private searchCoverageIncomplete = false;
     /** 已提交结果之外，特殊块/数据库仍在后台补全。 */
     private backgroundIndexing = false;
@@ -791,6 +803,9 @@ export class SearchBar {
     private settingsMenu: Menu | null = null;
     /** 关键字 / 正则表达式方法菜单（对齐官方搜索 method 菜单） */
     private methodMenu: Menu | null = null;
+    private resultTypeMenu: Menu | null = null;
+    private resultTypeDismissedOnPointerDown = false;
+    private lastFocusedSearchInput: HTMLInputElement | null = null;
     private searchMethodBtn: HTMLElement | null = null;
     private resultsPanelEl: HTMLElement | null = null;
     private resultsListEl: HTMLElement | null = null;
@@ -809,16 +824,34 @@ export class SearchBar {
             this.renderResultsWindow(this.resultsListEl?.scrollTop ?? 0);
         });
     };
-    private readonly onResultsPanelOutsidePointerDown = (event: PointerEvent) => {
+    private readonly onResultsPanelOutsidePointerDown = (event: PointerEvent) =>
+        this.handleResultsPanelOutsidePointerDown(event);
+    private readonly onDismissedResultTypeMenuClick = (event: MouseEvent) => {
+        if (!this.resultTypeDismissedOnPointerDown) return;
+        this.resultTypeDismissedOnPointerDown = false;
+        if (event.detail > 0 && event.target instanceof Node && this.dialog.contains(event.target)) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    };
+
+    private handleResultsPanelOutsidePointerDown(event: PointerEvent) {
+        this.resultTypeDismissedOnPointerDown = false;
         if (!this.resultsPanelOpen) {
             return;
         }
         const target = event.target;
-        if (!(target instanceof Node) || this.dialog.contains(target)) {
+        if (!(target instanceof Node) || this.resultTypeMenu?.element.contains(target)) {
             return;
         }
+        if (this.resultTypeMenu) {
+            this.closeResultTypeMenu();
+            this.resultTypeDismissedOnPointerDown = true;
+            return;
+        }
+        if (this.dialog.contains(target)) return;
         this.closeResultsPanel();
-    };
+    }
 
     constructor(options: {
         edit: Element;
@@ -1343,6 +1376,7 @@ export class SearchBar {
         this.componentHighlights = null;
         this.closeResultsPanel();
         document.removeEventListener("pointerdown", this.onResultsPanelOutsidePointerDown, true);
+        document.removeEventListener("click", this.onDismissedResultTypeMenuClick, true);
         window.removeEventListener("pointerdown", this.onCaptureSelectionPointerDown, true);
         document.removeEventListener("scroll", this.onViewportRangeChange, true);
         window.removeEventListener("resize", this.onViewportRangeChange);
@@ -1534,7 +1568,8 @@ export class SearchBar {
     </div>
   </div>
   <div class="search-results-panel search-no-drag" hidden>
-    <div class="search-results-panel__list" role="listbox"></div>
+    <div class="search-results-panel__filters"></div>
+    <div class="search-results-panel__list" role="list"></div>
   </div>
 </div>`;
     }
@@ -1543,7 +1578,12 @@ export class SearchBar {
         // “最后活动组件”只控制主动导航，不再代表整页高亮的独占权。
         const activate = () => this.plugin.updateLastHighlightComponent(this.root);
         this.root.addEventListener("pointerdown", activate, true);
-        this.root.addEventListener("focusin", activate);
+        this.root.addEventListener("focusin", (event) => {
+            activate();
+            if (event.target === this.input || event.target === this.replaceInput) {
+                this.lastFocusedSearchInput = event.target as HTMLInputElement;
+            }
+        });
         this.input.addEventListener("compositionstart", () => {
             this.findComposing = true;
         });
@@ -1611,23 +1651,20 @@ export class SearchBar {
         this.root.querySelector(".search-replace-help")?.addEventListener("pointerdown", (event) => {
             event.preventDefault();
         });
-        this.resultsListEl?.addEventListener("click", (event) => {
-            const target = event.target instanceof Element ?
-                event.target.closest<HTMLElement>(".search-results-panel__item") :
-                null;
-            if (!target) {
-                return;
+        this.resultsPanelEl?.addEventListener("pointerdown", (event) => {
+            if (event.button === 0 && event.target instanceof Element &&
+                event.target.closest("button, .search-results-panel__item")) {
+                event.preventDefault();
             }
-            const index = Number(target.dataset.index);
-            if (!Number.isInteger(index)) {
-                return;
-            }
-            event.preventDefault();
-            event.stopPropagation();
-            this.clickResultsItem(index);
         });
+        this.resultsPanelEl?.addEventListener("click", (event) => this.onResultsPanelClick(event));
+        this.resultsPanelEl?.addEventListener("contextmenu", (event) => this.onResultTypeContextMenu(event));
+        this.resultsPanelEl?.addEventListener("pointerover", (event) => this.onResultTypesPointerOver(event));
+        this.resultsPanelEl?.addEventListener("pointerout", (event) => this.onResultTypesPointerOut(event));
+        this.resultsPanelEl?.addEventListener("focusout", (event) => this.onResultTypesFocusOut(event));
         this.resultsListEl?.addEventListener("scroll", this.onResultsListScroll);
         document.addEventListener("pointerdown", this.onResultsPanelOutsidePointerDown, true);
+        document.addEventListener("click", this.onDismissedResultTypeMenuClick, true);
         window.addEventListener("pointerdown", this.onCaptureSelectionPointerDown, true);
         document.addEventListener("scroll", this.onViewportRangeChange, true);
         window.addEventListener("resize", this.onViewportRangeChange);
@@ -1652,7 +1689,7 @@ export class SearchBar {
         el.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
-            onClick(event);
+            onClick(event as MouseEvent);
             if (retainFocus === "find") {
                 this.input.focus();
             } else if (retainFocus === "replace") {
@@ -1722,6 +1759,10 @@ export class SearchBar {
         }
         event.preventDefault();
         event.stopPropagation();
+        if (this.resultTypeMenu) {
+            this.closeResultTypeMenu();
+            return true;
+        }
         if (this.resultsPanelOpen) {
             this.closeResultsPanel();
             return true;
@@ -2212,6 +2253,10 @@ export class SearchBar {
             display?.index ?? this.resultIndex,
             display?.count ?? this.resultCount,
         );
+        const filtered = this.resultBlockTypes?.length > 0;
+        this.countEl.classList.toggle("is-type-filtered", filtered);
+        this.countEl.setAttribute("aria-label", (this.i18n.resultsPanelToggle ?? "搜索结果列表") +
+            (filtered ? ` · ${this.i18n.resultsTypeFilterActive ?? "临时筛选：同时满足所选类型"}` : ""));
         if (this.resultsPanelOpen) {
             this.renderResultsPanel(scrollPanelToActive);
         }
@@ -2260,6 +2305,7 @@ export class SearchBar {
     }
 
     private closeResultsPanel() {
+        this.closeResultTypeMenu();
         if (this.resultsScrollRaf) {
             window.cancelAnimationFrame(this.resultsScrollRaf);
             this.resultsScrollRaf = 0;
@@ -2293,11 +2339,159 @@ export class SearchBar {
         );
     }
 
+    private onResultsPanelClick(event: MouseEvent) {
+        if (!(event.target instanceof Element)) return;
+        const more = event.target.closest(".search-results-panel__types-more");
+        if (more) {
+            event.preventDefault();
+            event.stopPropagation();
+            const row = more.closest(".search-results-panel__item");
+            row?.classList.add("is-types-expanded");
+            if (event.detail === 0) {
+                row?.querySelector<HTMLElement>(".search-results-panel__type--extra")?.focus({preventScroll: true});
+            }
+            return;
+        }
+        const type = event.target.closest<HTMLElement>("[data-result-block-type]")?.dataset.resultBlockType;
+        const clear = event.target.closest("[data-action=\"clear-result-types\"]");
+        if (type || clear) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (clear) this.setResultBlockTypes([]);
+            else if (isResultBlockType(type)) this.toggleResultBlockType(type);
+            return;
+        }
+        const target = event.target.closest<HTMLElement>(".search-results-panel__item");
+        if (!target) return;
+        const index = Number(target.dataset.index);
+        if (!Number.isInteger(index)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.clickResultsItem(index);
+    }
+
+    private onResultTypesPointerOver(event: PointerEvent) {
+        if (!(event.target instanceof Element)) return;
+        event.target.closest(".search-results-panel__types-more")?.closest(".search-results-panel__item")
+            ?.classList.add("is-types-expanded");
+    }
+
+    private onResultTypesPointerOut(event: PointerEvent) {
+        if (!(event.target instanceof Element)) return;
+        const row = event.target.closest(".search-results-panel__item");
+        if (row && (!(event.relatedTarget instanceof Node) || !row.contains(event.relatedTarget))) {
+            row.classList.remove("is-types-expanded");
+            const types = row.querySelector(".search-results-panel__types");
+            if (types) types.scrollLeft = 0;
+        }
+    }
+
+    private onResultTypesFocusOut(event: FocusEvent) {
+        if (!(event.target instanceof Element)) return;
+        const row = event.target.closest(".search-results-panel__item");
+        if (row && (!(event.relatedTarget instanceof Node) || !row.contains(event.relatedTarget))) {
+            row.classList.remove("is-types-expanded");
+        }
+    }
+
     private escapeResultsText(text: string): string {
         return text
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")
             .replace(/>/g, "&gt;");
+    }
+
+    private toggleResultBlockType(type: ResultBlockType) {
+        const selected = this.resultBlockTypes;
+        if (RESULT_BLOCK_TYPE_CHILDREN[type]) {
+            const active = selected.some((value) => resultBlockTypeGroup(value) === type);
+            this.setResultBlockTypes(active ? selected.filter((value) => resultBlockTypeGroup(value) !== type) : [...selected, type]);
+        } else {
+            this.setResultBlockTypes(selected.indexOf(type) >= 0 ? selected.filter((value) => value !== type) :
+                [...selected.filter((value) => value !== resultBlockTypeGroup(type)), type]);
+        }
+    }
+
+    private setResultBlockTypes(types: ResultBlockType[]) {
+        if (this.replaceBusy || this.destroyed) return;
+        this.closeResultTypeMenu();
+        this.resultBlockTypes = types.slice().sort();
+        clearTimeout(this.typingTimer);
+        this.typingTimer = undefined;
+        this.pendingDocumentCountDisplay = null;
+        this.renderResultTypeFilters();
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private resultTypeButton(type: ResultBlockType, showLabel = false, extra = false): string {
+        const config = RESULT_BLOCK_TYPES[type];
+        const label = this.i18n[config.label];
+        const children = RESULT_BLOCK_TYPE_CHILDREN[type];
+        const selected = children ? this.resultBlockTypes.some((value) => resultBlockTypeGroup(value) === type) :
+            this.resultBlockTypes.indexOf(type) >= 0;
+        const title = (this.i18n.resultsTypeFilterToggle ?? "临时筛选：{type}（再次点击取消）").replace("{type}", label);
+        return `<button type="button" class="search-results-panel__type${selected ? " is-selected" : ""}${extra ? " search-results-panel__type--extra" : ""}"` +
+            ` data-result-block-type="${type}" title="${escapeAttr(label)}" aria-label="${escapeAttr(title)}"` +
+                (children && !showLabel ? " aria-haspopup=\"menu\"" : "") +
+            ` aria-pressed="${selected}">${iconUse("#" + config.icon)}` +
+            (showLabel ? `<span>${this.escapeResultsText(label)}</span>` : "") + "</button>";
+    }
+
+    private onResultTypeContextMenu(event: MouseEvent) {
+        if (!(event.target instanceof Element)) return;
+        const type = event.target.closest<HTMLElement>("[data-result-block-type]")?.dataset.resultBlockType;
+        if (!type || !isResultBlockType(type) || !RESULT_BLOCK_TYPE_CHILDREN[type]) return;
+        const row = event.target.closest<HTMLElement>(".search-results-panel__item");
+        if (!row) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (this.replaceBusy || this.destroyed) return;
+        const blockTypes = this.resultMatches[Number(row.dataset.index)]?.blockTypes;
+        const children = RESULT_BLOCK_TYPE_CHILDREN[type].filter((child) => blockTypes?.includes(child));
+        if (!children.length) return;
+        this.closeSettingsMenu();
+        this.closeSearchMethodMenu();
+        this.closeResultTypeMenu();
+        // Right-clicking the icon can already have moved focus off the input.
+        const focusInput = this.lastFocusedSearchInput ?? this.input;
+        const menu = new Menu("page-search-result-types", () => {
+            if (this.resultTypeMenu === menu) this.resultTypeMenu = null;
+        });
+        this.resultTypeMenu = menu;
+        for (const child of children) {
+            const config = RESULT_BLOCK_TYPES[child];
+            menu.addItem({
+                icon: config.icon,
+                label: this.i18n[config.label],
+                checked: this.resultBlockTypes.indexOf(child) >= 0,
+                click: () => {
+                    if (this.destroyed || this.replaceBusy || this.resultTypeMenu !== menu) return;
+                    this.toggleResultBlockType(child);
+                    // Restore only after choosing a subtype, not on outside dismissal.
+                    if (!this.destroyed && focusInput?.isConnected) focusInput.focus({preventScroll: true});
+                },
+            });
+        }
+        menu.open({x: event.clientX, y: event.clientY, isLeft: true});
+        menu.element.style.zIndex = String(resolveSettingsMenuZIndex(this.dialog, menu.element));
+    }
+
+    private closeResultTypeMenu() {
+        const menu = this.resultTypeMenu;
+        this.resultTypeMenu = null;
+        menu?.close();
+    }
+
+    private renderResultTypeFilters() {
+        const header = this.resultsPanelEl?.querySelector(".search-results-panel__filters");
+        if (!header) return;
+        const selected = this.resultBlockTypes;
+        header.hidden = selected.length === 0;
+        header.innerHTML = selected.length ?
+            "<div class=\"search-results-panel__chips\">" +
+                selected.map((type) => this.resultTypeButton(type, true)).join("") +
+                "<button type=\"button\" class=\"search-results-panel__clear\" data-action=\"clear-result-types\">" +
+                this.escapeResultsText(this.i18n.resultsTypeFilterClear ?? "清除筛选") + "</button></div>" : "";
     }
 
     private formatResultsItemHtml(index: number): string {
@@ -2308,11 +2502,25 @@ export class SearchBar {
         const mark = match?.listMark;
         let body = this.escapeResultsText(plain);
         if (mark && mark.start >= 0 && mark.end <= plain.length && mark.start < mark.end) {
-            body = this.escapeResultsText(plain.slice(0, mark.start)) +
+            // Shorten only the displayed prefix; the original snippet remains a navigation anchor.
+            let start = Math.max(0, mark.start - 8);
+            if (start > 0 && /[\uDC00-\uDFFF]/.test(plain[start])) start--;
+            body = (start > 0 ? "…" : "") + this.escapeResultsText(plain.slice(start, mark.start)) +
                 `<mark>${this.escapeResultsText(plain.slice(mark.start, mark.end))}</mark>` +
                 this.escapeResultsText(plain.slice(mark.end));
         }
-        return `<div class="search-results-panel__item${active}" role="option" data-index="${index}" title="${title}">${body}</div>`;
+        const types = Array.from(new Set((match?.blockTypes ?? []).map(resultBlockTypeGroup)));
+        const overflow = types.length > 3;
+        const icons = types.map((type, position) => this.resultTypeButton(type, false, overflow && position >= 3)).join("");
+        const more = overflow ? `<button type="button" class="search-results-panel__types-more"` +
+            ` aria-label="${escapeAttr(this.i18n.resultsTypeExpand ?? "显示全部块类型")}">` +
+            '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3" cy="8" r="1.3"/>' +
+            '<circle cx="8" cy="8" r="1.3"/><circle cx="13" cy="8" r="1.3"/></svg></button>' : "";
+        return `<div class="search-results-panel__item${active}" role="listitem" aria-current="${index + 1 === this.resultIndex}" data-index="${index}">` +
+            `<span class="search-results-panel__number">${index + 1}</span>` +
+            `<span class="search-results-panel__text" title="${title}">${body}</span>` +
+            `<span class="search-results-panel__types${overflow ? " is-overflow" : ""}"` +
+            ` style="--result-types-width:${types.length * 26 - 3}px"><span class="search-results-panel__types-track">${icons}</span>${more}</span></div>`;
     }
 
     private resultsContentHeight(): number {
@@ -2371,6 +2579,7 @@ export class SearchBar {
         if (!this.resultsPanelOpen || !list) {
             return;
         }
+        this.renderResultTypeFilters();
         if (this.resultsScrollRaf) {
             window.cancelAnimationFrame(this.resultsScrollRaf);
             this.resultsScrollRaf = 0;
@@ -2621,6 +2830,7 @@ export class SearchBar {
     /** 搜索与替换快照共用这些选项，避免新增范围开关时漏掉写入保护。 */
     private searchOptions() {
         return {
+            resultBlockTypes: this.resultBlockTypes,
             caseSensitive: this.caseSensitive,
             wholeWord: this.wholeWord,
             regex: this.regex,
@@ -5097,11 +5307,14 @@ export class SearchBar {
             showMessage(this.i18n.replaceCurrentUnsupported, 3000, "info");
             return;
         }
-        const scope = this.selectionOnly ?
+        let scope = this.selectionOnly ?
             (this.i18n.replaceAllScopeSelection ?? "Current selection") :
             editorFocusId(this.edit) ?
             (this.i18n.replaceAllScopeFocus ?? "Focused block and its content") :
             (this.i18n.replaceAllScopeDocument ?? "Current search scope");
+        if (this.resultBlockTypes.length) {
+            scope += " · " + this.resultBlockTypes.map((type) => this.i18n[RESULT_BLOCK_TYPES[type].label]).join(" ∩ ");
+        }
         // 当前可写数是预检信息；实际成功数仍由提交后的读回确认决定。
         const confirmText = this.i18n.replaceAllConfirm
             .replace("{scope}", scope)
@@ -5318,6 +5531,7 @@ export class SearchBar {
      * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/plugin/Menu.ts
      */
     private openSettingsMenu(anchor: HTMLElement) {
+        this.closeResultTypeMenu();
         this.closeSearchMethodMenu();
         this.closeSettingsMenu();
         const menu = new Menu("page-search-settings", () => {
@@ -5517,7 +5731,7 @@ export class SearchBar {
                 }),
                 this.buildMatchSwitchMenuItem({
                     id: "page-search-include-custom-block",
-                    icon: "iconCode",
+                    icon: "iconPlugin",
                     label: this.i18n.settingsIncludeCustomBlock,
                     checked: this.includeCustomBlock,
                     onChange: (checked) => {
@@ -5568,6 +5782,7 @@ export class SearchBar {
      * 再次点击触发器则关闭；选中当前项仅关菜单不翻转。
      */
     private openSearchMethodMenu(anchor: HTMLElement) {
+        this.closeResultTypeMenu();
         if (this.methodMenu) {
             this.closeSearchMethodMenu();
             return;

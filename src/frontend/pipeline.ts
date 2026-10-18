@@ -47,6 +47,11 @@ import {
 } from "./ranges";
 import type {RegexTextMatcher} from "./regex-matcher";
 import {enumerateRestrictInlineMatches} from "./restrict-enumerate";
+import {
+    createDomBlockTypeReader,
+    passesResultTypeFilter,
+    type ResultBlockType,
+} from "./result-block-types";
 import {matchRangePassesRestrictInline} from "./restrict-inline-dom";
 import {
     cloneSelectionScope,
@@ -57,6 +62,8 @@ import {
 } from "./selection";
 
 export interface SearchPipelineOptions extends MatchOptions {
+    /** Temporary result-list filter; independent of persisted search preferences. */
+    resultBlockTypes?: readonly ResultBlockType[];
     /** 正文采集快照，包含零命中单元；用于核对异步图表渲染后的搜索语义。 */
     onLiveUnitsCollected?: (blocks: readonly SearchableBlock[]) => void;
     /** 当前搜索框的正则隔离器；未提供时保留纯函数/内核调用的同步行为。 */
@@ -334,10 +341,17 @@ export async function calculateSearchMatches(
             return full;
         }
         const loaded = await calculateLoadedDomMatches(plugin, edit, value, options);
-        return {...loaded, degraded: true};
+        return {...filterLoadedResults(loaded, options), degraded: true};
     }
 
-    return calculateLoadedDomMatches(plugin, edit, value, options);
+    return filterLoadedResults(await calculateLoadedDomMatches(plugin, edit, value, options), options);
+}
+
+function filterLoadedResults(result: SearchPipelineResult, options: SearchPipelineOptions): SearchPipelineResult {
+    return options.resultBlockTypes?.length ? {
+        ...result,
+        matches: result.matches.filter((match) => passesResultTypeFilter(match.blockTypes, options.resultBlockTypes)),
+    } : result;
 }
 
 /**
@@ -477,6 +491,7 @@ async function calculateLoadedDomMatches(
             allowFoldedHidden: options.includeFoldedBlocks === true,
             restrictInlineTypes: options.restrictInlineTypes,
             includeSourceFallback: !selectionOnly,
+            resultBlockTypes: options.resultBlockTypes,
         }),
         error: "",
     };
@@ -490,11 +505,15 @@ function attachRangesToHits(
         allowFoldedHidden?: boolean;
         restrictInlineTypes?: RestrictInlineType[];
         includeSourceFallback?: boolean;
+        resultBlockTypes?: readonly ResultBlockType[];
     } = {},
 ): SearchMatch[] {
     const result: SearchMatch[] = [];
     /** 每个单元的 hits 已按偏移排序；记录最后接受的终点即可线性去重。 */
     const acceptedEndByUnit = new Map<string, number>();
+    // Type ancestry is only needed for accepted hits. Keep this reader local to
+    // the current collection so its WeakMap does not retain stale DOM paths.
+    const readBlockTypes = createDomBlockTypeReader();
     // 1) 模式级：导出预览 / 只读 → 全部不可替
     const modeBlocked = edit ? isEditorReplaceModeBlocked(edit) : false;
     const restrictInlineTypes = visibility.restrictInlineTypes;
@@ -513,6 +532,14 @@ function attachRangesToHits(
             continue;
         }
 
+        // Reject type-filtered units before constructing a Range. This keeps
+        // temporary result filters cheap on large loaded documents while the
+        // final result still carries the ancestry used by the result list.
+        const blockTypes = visibility.resultBlockTypes?.length ? readBlockTypes(block) : undefined;
+        if (!passesResultTypeFilter(blockTypes, visibility.resultBlockTypes)) {
+            continue;
+        }
+
         if (
             visibility.includeSourceFallback &&
             (!restrictActive || (isInlineMathSearchUnit(block) && restrictInlineTypes?.includes("inline-math"))) &&
@@ -521,6 +548,7 @@ function attachRangesToHits(
             acceptedEndByUnit.set(key, hit.end);
             result.push({
                 ...hit,
+                blockTypes,
                 embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
                 replaceable: false,
                 highlightKind: isInlineMathSearchUnit(block) ? "inline-math" : "text",
@@ -537,6 +565,7 @@ function attachRangesToHits(
                 acceptedEndByUnit.set(key, hit.end);
                 result.push({
                     ...hit,
+                    blockTypes,
                     embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
                     replaceable: !modeBlocked && !isDocTitleSearchUnit(block) &&
                         !isTabsTitleSearchUnit(block) &&
@@ -596,6 +625,7 @@ function attachRangesToHits(
             id: hit.id,
             blockId: hit.blockId,
             blockType: hit.blockType,
+            blockTypes,
             blockIndex: hit.blockIndex,
             unitId: hit.unitId,
             embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
@@ -619,6 +649,12 @@ function attachRangesToHits(
     }
 
     // 按文档位置排序；同位置正文优先于公式/备注（导航顺序可读）
+    for (const match of result) {
+        const block = blockMap.get(unitKey(match.blockId, match.unitId));
+        if (!match.blockTypes && block) {
+            match.blockTypes = block.blockTypes ?? readBlockTypes(block);
+        }
+    }
     result.sort(compareSearchMatches);
     orderEmbeddedVisualMatches(result, blockMap.values());
     return result;

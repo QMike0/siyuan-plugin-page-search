@@ -419,6 +419,10 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 "{count} blocks failed to render and were not counted",
             resultsPanelToggle: t.resultsPanelToggle || "Search results",
             resultsPanelEmpty: t.resultsPanelEmpty || "No results",
+            resultsTypeFilterHint: t.resultsTypeFilterHint || "Click block icons to filter; right-click heading, list or code icons for subtypes",
+            resultsTypeFilterActive: t.resultsTypeFilterActive || "Temporary filter: match all selected types",
+            resultsTypeFilterToggle: t.resultsTypeFilterToggle || "Filter by {type} (click again to remove)",
+            resultsTypeFilterClear: t.resultsTypeFilterClear || "Clear filters",
             settingsTitle: t.settingsTitle || "Search scope",
             settingsRestrictInline: t.settingsRestrictInline || "Limit search",
             settingsRestrictInlineHint: t.settingsRestrictInlineHint ||

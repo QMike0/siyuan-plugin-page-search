@@ -67,6 +67,7 @@ import {
     isUnderNonHeadingCssFold,
 } from "../fold-dom";
 import {buildListSnippet} from "../list-snippet";
+import {createResultBlockTypeReader, passesResultTypeFilter} from "../result-block-types";
 import type {
     SearchPipelineOptions,
     SearchPipelineResult,
@@ -458,6 +459,7 @@ function estimateCacheEntryBytes(hash: string, units: readonly CachedUnit[]): nu
         }
         bytes += (unit.segmentLengths?.length ?? 0) * 8;
         bytes += (unit.restrictSpans?.length ?? 0) * 40;
+        bytes += (unit.blockTypes?.length ?? 0) * 32;
         for (const segment of unit.embeddedOrder ?? []) bytes += 40 + segment.path.length * 8;
     }
     return bytes;
@@ -3446,6 +3448,7 @@ async function searchCurrentDocumentImpl(
                     ...avToCached(unit, orderIndex),
                     blockId: carrier.blockId,
                     blockType: "NodeBlockQueryEmbed",
+                    blockTypes: carrier.blockTypes,
                     blockIndex: carrier.blockIndex,
                     unitId: prefix + unit.unitId,
                     embeddedOrder: rank !== undefined ?
@@ -3552,6 +3555,8 @@ async function searchCurrentDocumentImpl(
         Array.from(meta.byId.values()).filter(isTabsTitleBlockMeta).map((item) => item.id),
     );
     const matches: SearchMatch[] = [];
+    const readBlockTypes = createResultBlockTypeReader(liveAll, meta.links, meta.byId);
+    const typesByUnit = new Map<CachedUnit, ReturnType<typeof readBlockTypes>>();
     let phaseStarted = performance.now();
     for (let hitIndex = 0; hitIndex < matched.hits.length; hitIndex += 1) {
         if ((hitIndex & 255) === 255 && performance.now() - phaseStarted >= 8) {
@@ -3580,10 +3585,17 @@ async function searchCurrentDocumentImpl(
             isInlineMathSearchUnit(unit) ||
             hit.unitId?.startsWith("embed:");
         const replaceLock = nonReplaceable ? undefined : virtualTableReplaceLock(virtualTables, unit);
+        let blockTypes = typesByUnit.get(unit);
+        if (!blockTypes) {
+            blockTypes = readBlockTypes(unit);
+            typesByUnit.set(unit, blockTypes);
+        }
+        if (!passesResultTypeFilter(blockTypes, options.resultBlockTypes)) continue;
         matches.push({
             id: hit.id,
             blockId: hit.blockId,
             blockType: hit.blockType,
+            blockTypes,
             blockIndex: orderIndex.get(hit.blockId) ?? (hit.blockId === "__doc-title__" ? -1 : hit.blockIndex),
             unitId: hit.unitId,
             unitSeq: navSeq(unit, hit.start),

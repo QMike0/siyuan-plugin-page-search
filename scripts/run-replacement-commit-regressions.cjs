@@ -187,6 +187,7 @@ function barFixture(f) {
         resultCount: f.matches.length,
         resultIndex: 1,
         resultMatches: f.matches,
+        resultBlockTypes: [],
         resultSearchKey: "key",
         resultSelectionScope: null,
         searchGeneration: 1,
