@@ -2,6 +2,7 @@ import type {
     IOperation,
     Protyle,
 } from "siyuan";
+import {errorDetails, logDebug, logError, logWarning} from "../shared/logger";
 import {
     fetchSyncPost,
     getAllEditor,
@@ -708,7 +709,7 @@ export async function replaceCurrentMatchInEditor(
     try {
         protyle.updateTransactionElement(submit, oldHTML);
     } catch (error) {
-        console.warn("[page-search] updateTransactionElement failed", error);
+        logError("updateTransactionElement failed", errorDetails(error));
         rollback();
         invalidateEditedDocument(rootId, [match.blockId]);
         return {replacedCount: 0, skippedCount: 1, error: "transaction-failed", commitState: "failed"};
@@ -1037,7 +1038,7 @@ async function prepareFetchedBlockUpdates(
             } catch (extractError) {
                 const conflict = checkCurrent();
                 if (conflict) return cancelled(conflict);
-                console.warn("[page-search] prepare unloaded replace failed", extractError);
+                logWarning("prepare unloaded replace failed", errorDetails(extractError));
                 for (const id of present) {
                     skippedCount += matchesById.get(id)?.length ?? 0;
                 }
@@ -1208,7 +1209,7 @@ export async function replaceAllMatchesInEditor(
     }
     const loadedConflict = guard(true);
     if (loadedConflict) {
-        console.warn("[page-search] replace-all cancelled", {
+        logWarning("replace-all cancelled", {
             stage: "loaded-guard",
             error: loadedConflict,
             liveBlocks: submitIndex.preferred.size,
@@ -1267,7 +1268,7 @@ export async function replaceAllMatchesInEditor(
     });
     // 搜索时标为可替换的目标现在准备失败，说明快照已陈旧或覆盖丢失；全部替换不得部分提交。
     if (bodySkipped > 0) {
-        console.warn("[page-search] replace-all cancelled", {
+        logWarning("replace-all cancelled", {
             stage: "block-preparation",
             bodySkipped,
             firstError,
@@ -1290,7 +1291,7 @@ export async function replaceAllMatchesInEditor(
     const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, checkCurrent, notebook, protyle);
     const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
     if (conflict) {
-        console.warn("[page-search] replace-all cancelled", {
+        logWarning("replace-all cancelled", {
             stage: "final-guard",
             error: conflict,
             kernelCurrent,
@@ -1387,12 +1388,13 @@ export async function replaceAllMatchesInEditor(
         }
     }
     try {
+        logDebug("replace-all transaction submit", {blocks: changed.length, fetchedBlocks: fetched.updates.length});
         protyle.transaction(
             changed.map((update) => updateOperation(update.id, update.newHTML)),
             changed.map((update) => updateOperation(update.id, update.oldHTML)),
         );
     } catch (error) {
-        console.warn("[page-search] transaction failed", error);
+        logError("transaction failed", errorDetails(error));
         rollback();
         invalidateEditedDocument(rootId, changed.map((update) => update.id));
         return {
@@ -1504,7 +1506,7 @@ async function replaceFetchedBlockMatches(
             [updateOperation(update.id, update.oldHTML)],
         );
     } catch (error) {
-        console.warn("[page-search] transaction failed", error);
+        logError("transaction failed", errorDetails(error));
         rollback();
         invalidateEditedDocument(rootId, [update.id]);
         return {replacedCount: 0, skippedCount: matches.length, error: "transaction-failed", commitState: "failed"};

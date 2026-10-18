@@ -2,6 +2,7 @@ import {
     createTextUnitsMatchIterator,
     matchTextUnitsDetailed,
 } from "../shared/match-text";
+import {errorDetails, logError, logWarning} from "../shared/logger";
 import type {
     RegexReplacementExpansion,
     RegexReplacementUnitRequest,
@@ -262,6 +263,7 @@ export class RegexTextMatcher {
                 // Worker 的下载/初始化不占正则回溯预算；加载也有上限，不能无限闪烁。
                 pending.timer = window.setTimeout(() => {
                     if (this.pending !== pending) return;
+                    logWarning("regex worker startup timed out", {kind});
                     this.finishPending(
                         kind === "match" ?
                             {hits: [], error: REGEX_WORKER_STARTUP_TIMEOUT_ERROR} :
@@ -279,6 +281,7 @@ export class RegexTextMatcher {
         if (pending.timer !== null) window.clearTimeout(pending.timer);
         pending.timer = window.setTimeout(() => {
             if (this.pending !== pending) return;
+            logWarning("regex worker execution timed out", {kind: pending.kind});
             this.finishPending(regexTimeoutResult(pending.kind));
             this.terminateWorker();
         }, REGEX_EXECUTION_BUDGET_MS);
@@ -287,6 +290,7 @@ export class RegexTextMatcher {
         try {
             worker.postMessage(message);
         } catch (error) {
+            logError("regex worker post failed", errorDetails(error));
             this.finishPending(
                 pending.kind === "match" ?
                     {hits: [], error: error instanceof Error ? error.message : "正则 Worker 无法启动"} :
@@ -327,7 +331,7 @@ export class RegexTextMatcher {
             return worker;
         } catch (error) {
             this.workerUnavailable = true;
-            console.warn("[page-search] regex worker unavailable; regex search is disabled to protect the UI", error);
+            logWarning("regex worker unavailable; regex search is disabled to protect the UI", errorDetails(error));
             return null;
         }
     }
@@ -369,9 +373,7 @@ export class RegexTextMatcher {
 
     private readonly onWorkerError = (event: ErrorEvent) => {
         if (!this.worker || event.currentTarget !== this.worker) return;
-        console.warn("[page-search] regex worker failed", {
-            message: event.message,
-            filename: event.filename,
+        logError("regex worker failed", {
             lineno: event.lineno,
         });
         if (this.pending) {

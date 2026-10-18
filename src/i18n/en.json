@@ -1,4 +1,7 @@
 {
+  "settingsDebugLogging": "Debug logs",
+  "settingsDebugLoggingDescription": "Off by default. Log search, navigation and replacement diagnostics to the console for troubleshooting. Warnings and errors are always logged.",
+  "settingsSaveFailed": "Could not save settings. Please try again.",
   "pluginOnload": "plugin enabled",
   "pluginOnunload": "plugin disabled",
   "pluginUninstall": "plugin uninstalled",

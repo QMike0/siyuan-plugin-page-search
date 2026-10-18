@@ -1,4 +1,7 @@
 {
+  "settingsDebugLogging": "调试日志",
+  "settingsDebugLoggingDescription": "默认关闭。开启后在控制台记录搜索、跳转和替换的调试信息，便于排查问题；警告和错误始终记录。",
+  "settingsSaveFailed": "设置保存失败，请重试。",
   "pluginOnload": "插件已启用",
   "pluginOnunload": "插件已禁用",
   "pluginUninstall": "插件已卸载",

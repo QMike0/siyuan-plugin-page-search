@@ -49,6 +49,10 @@ Some hits are searchable/highlightable but not auto-replaceable, e.g. document t
 
 Under the publish service, export preview, or document read-only mode, find & highlight still work; replace is disabled and settings are not persisted (in-session toggles still apply locally).
 
+### (6) Debug logs
+
+Enable **Debug logs** under SiYuan → Settings → Bazaar → Downloaded → this plugin’s settings and confirm to view search, navigation and replacement diagnostics in the console (prefix: `[page-search]`). Off by default; warnings and errors are always logged. Select the console’s **Verbose** level if debug messages are hidden.
+
 ## Changelog
 
 See [CHANGELOG.md](https://cdn.jsdelivr.net/gh/QMike0/siyuan-plugin-page-search@main/CHANGELOG.md)

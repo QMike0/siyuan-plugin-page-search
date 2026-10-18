@@ -49,6 +49,10 @@
 
 发布服务、导出预览、文档只读下仍可搜索与高亮，替换按钮禁用；配置也不会写入存储（会话内开关仍可临时生效）。
 
+### （6）调试日志
+
+在思源「设置 → 集市 → 已下载 → 本插件设置」中开启「调试日志」并确认，可在控制台查看搜索、跳转和替换的排查信息（前缀为 `[page-search]`）。默认关闭；警告和错误始终记录。若看不到调试信息，请在控制台勾选 Verbose（详细）级别。
+
 ## 更新日志
 
 见 [CHANGELOG.md](https://cdn.jsdelivr.net/gh/QMike0/siyuan-plugin-page-search@main/CHANGELOG.md)

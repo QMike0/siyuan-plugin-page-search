@@ -6,6 +6,7 @@ import {
     normalizePrefsPatch,
 } from "./shared";
 import type {PluginPrefs} from "./shared";
+import {LOGGING_STORAGE_PATH, errorDetails, isDebugLoggingEnabled, setDebugLogging} from "./shared/logger";
 
 /**
  * 页内查找替换 — 内核插件。
@@ -30,14 +31,15 @@ class KernelPlugin {
 
     private async onload(): Promise<void> {
         const {rpc, storage, logger, plugin} = this.siyuan;
-        await logger.info("page-search kernel onload:", plugin.name, plugin.version);
+        await this.loadLoggingSettings();
+        if (isDebugLoggingEnabled()) await logger.debug("[page-search] kernel onload:", plugin.name, plugin.version);
 
         this.prefsCache = await this.readPrefsFromStorage();
 
         try {
             await storage.watcher.add("./");
         } catch (error) {
-            await logger.warn("storage.watcher.add failed:", error);
+            await logger.warn("[page-search] storage.watcher.add failed:", errorDetails(error));
         }
 
         await rpc.bind(
@@ -52,12 +54,12 @@ class KernelPlugin {
             "Merge and persist plugin preferences.",
         );
 
-        await logger.info("page-search kernel registered rpc");
+        if (isDebugLoggingEnabled()) await logger.debug("[page-search] kernel registered rpc");
     }
 
     private async onrunning(): Promise<void> {
         const {logger} = this.siyuan;
-        await logger.info("page-search kernel running");
+        if (isDebugLoggingEnabled()) await logger.debug("[page-search] kernel running");
     }
 
     private async onunload(): Promise<void> {
@@ -65,16 +67,17 @@ class KernelPlugin {
         try {
             await storage.watcher.remove("./");
         } catch (error) {
-            await logger.warn("storage.watcher.remove failed:", error);
+            await logger.warn("[page-search] storage.watcher.remove failed:", errorDetails(error));
         }
         for (const name of ["prefs.get", "prefs.set"]) {
             try {
                 await rpc.unbind(name);
             } catch (error) {
-                await logger.warn(`rpc.unbind ${name} failed:`, error);
+                await logger.warn(`[page-search] rpc.unbind ${name} failed:`, errorDetails(error));
             }
         }
-        await logger.info("page-search kernel unload");
+        if (isDebugLoggingEnabled()) await logger.debug("[page-search] kernel unload");
+        setDebugLogging(false);
     }
 
     private async eventHandler(event: kernel.TEventMessage): Promise<void> {
@@ -82,6 +85,11 @@ class KernelPlugin {
             return;
         }
         const path = String(event.detail?.path ?? "").replace(/^\.\//, "");
+        if (path === LOGGING_STORAGE_PATH || path.endsWith(`/${LOGGING_STORAGE_PATH}`)) {
+            if (event.detail?.operation === "REMOVE") setDebugLogging(false);
+            else await this.loadLoggingSettings();
+            return;
+        }
         if (path !== PREFS_STORAGE_PATH && !path.endsWith(`/${PREFS_STORAGE_PATH}`)) {
             return;
         }
@@ -97,9 +105,9 @@ class KernelPlugin {
             const obj = await this.siyuan.storage.get(PREFS_STORAGE_PATH);
             const raw = await obj.json();
             this.prefsCache = mergePrefs(this.prefsCache, raw as Partial<PluginPrefs>);
-            await this.siyuan.logger.debug("prefs reloaded from fs-notify:", this.prefsCache);
+            if (isDebugLoggingEnabled()) await this.siyuan.logger.debug("[page-search] preferences reloaded");
         } catch (error) {
-            await this.siyuan.logger.warn("prefs fs-notify reload failed:", error);
+            await this.siyuan.logger.warn("[page-search] prefs fs-notify reload failed:", errorDetails(error));
         }
     }
 
@@ -113,7 +121,7 @@ class KernelPlugin {
         // 忽略随后自身写入触发的 fs-notify（否则可能读到尚未更新完的旧 prefs.json）
         this.ignorePrefsFsNotifyUntil = Date.now() + 800;
         await storage.put(PREFS_STORAGE_PATH, JSON.stringify(this.prefsCache));
-        await logger.debug("prefs.set:", this.prefsCache);
+        if (isDebugLoggingEnabled()) await logger.debug("[page-search] preferences saved");
         return {...this.prefsCache};
     }
 
@@ -124,8 +132,18 @@ class KernelPlugin {
             const raw = await obj.json();
             return mergePrefs(DEFAULT_PREFS, raw as Partial<PluginPrefs>);
         } catch {
-            await logger.debug("prefs.json missing, using defaults");
+            if (isDebugLoggingEnabled()) await logger.debug("[page-search] prefs.json missing, using defaults");
             return {...DEFAULT_PREFS};
+        }
+    }
+
+    private async loadLoggingSettings(): Promise<void> {
+        try {
+            const stored = await this.siyuan.storage.get(LOGGING_STORAGE_PATH);
+            setDebugLogging((await stored.json())?.debug === true);
+        } catch {
+            // Missing diagnostics settings are normal on a fresh installation.
+            setDebugLogging(false);
         }
     }
 }

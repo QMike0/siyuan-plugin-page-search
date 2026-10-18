@@ -2,6 +2,7 @@ import type {
     IMenu,
     Plugin,
 } from "siyuan";
+import {errorDetails, isDebugLoggingEnabled, logDebug, logError, logWarning} from "../shared/logger";
 import {
     confirm,
     Menu,
@@ -2668,6 +2669,8 @@ export class SearchBar {
         const documentEpoch = this.documentEpoch;
         this.searchesInFlight += 1;
         this.syncIndexingIndicator();
+        const searchStarted = isDebugLoggingEnabled() ? performance.now() : undefined;
+        logDebug("search started", {rootId, generation, regex: this.regex, selectionOnly: this.selectionOnly});
         let result: SearchPipelineResult;
         try {
             const pending = this.runSearchPipeline(value, abortController.signal);
@@ -2683,12 +2686,15 @@ export class SearchBar {
                 selectionScope === (this.selectionOnly ? this.rememberedSelectionScope : null) &&
                 rootId === this.documentSearchIndices.activeRoot && this.rememberCurrentRootId() === rootId;
             if (result.cancelled || !isCurrent()) {
+                logDebug("search discarded", {rootId, generation, aborted: abortController.signal.aborted});
                 // 调用方若是高亮流程，不得拿另一篇文档的旧 Range 再次上屏。
                 this.syncIndexingIndicator();
                 return [];
             }
 
             if (error) {
+                // Worker/regex error text can include the user's pattern; log only its category here.
+                logWarning("search could not complete", {rootId, generation, regex: this.regex});
                 clearViewportProjection(this.edit);
                 this.incompleteBlockIds = [];
                 this.clearHighlight();
@@ -2768,7 +2774,18 @@ export class SearchBar {
             }
             this.updateCountLabel(true);
             this.syncReplaceButtons();
+            logDebug("search completed", {
+                rootId, generation, matches: matches.length, regex: this.regex, selectionOnly: this.selectionOnly,
+                incomplete: this.searchCoverageIncomplete, degraded: Boolean(degraded), partial: Boolean(partial),
+                unrendered: unrendered ?? 0, truncated: truncated ?? 0,
+                elapsedMs: searchStarted === undefined ? undefined : Math.round(performance.now() - searchStarted),
+            });
             return matches;
+        } catch (error) {
+            if (!abortController.signal.aborted && !this.destroyed && generation === this.searchGeneration) {
+                logError("search failed", {rootId, generation, ...errorDetails(error)});
+            }
+            throw error;
         } finally {
             this.searchesInFlight -= 1;
             if (this.searchAbortController === abortController) {
@@ -2870,6 +2887,7 @@ export class SearchBar {
     private noteSearchCoverage(degraded?: boolean, partial?: boolean, unrendered?: number, truncated?: number) {
         if (degraded && !this.degradedNotified) {
             this.degradedNotified = true;
+            logWarning("search coverage degraded", {rootId: this.rememberCurrentRootId()});
             showMessage(
                 this.i18n.searchDegradedLoadedOnly ??
                     "当前环境不能读取未加载内容，结果只包含已加载区域",
@@ -2882,6 +2900,7 @@ export class SearchBar {
         const failedCount = Math.max(0, (unrendered ?? 0) - (truncated ?? 0));
         if (failedCount > 0 && !this.unrenderedNotified) {
             this.unrenderedNotified = true;
+            logWarning("search blocks unavailable", {blocks: failedCount});
             showMessage(
                 (this.i18n.searchUnrendered ?? "有 {count} 个块未完成解析，未计入")
                     .replace("{count}", String(failedCount)),
@@ -2891,6 +2910,7 @@ export class SearchBar {
         }
         if (truncated && truncated > 0 && !this.truncatedNotified) {
             this.truncatedNotified = true;
+            logWarning("search results truncated", {blocks: truncated});
             showMessage(
                 (this.i18n.searchTruncated ?? "有 {count} 个数据库达到分页上限，结果未完整计入")
                     .replace("{count}", String(truncated)),
@@ -3521,15 +3541,24 @@ export class SearchBar {
         this.pauseAvWatch(1400);
         const generation = this.searchGeneration;
         try {
-            if (openFileByURL(`siyuan://blocks/${blockId}?${query.toString()}`) === false) return false;
-        } catch {
+            logDebug("database native locate", {blockId, index: index + 1});
+            if (openFileByURL(`siyuan://blocks/${blockId}?${query.toString()}`) === false) {
+                logWarning("database native locate refused", {blockId});
+                return false;
+            }
+        } catch (error) {
+            logWarning("database native locate failed", {blockId, ...errorDetails(error)});
             return false;
         }
         // Native locating rebuilds the virtual window asynchronously.  Reuse
         // the existing bounded observer so the current result is rebound as
         // soon as its row is mounted, then perform the normal Range centering.
         void this.waitForLocatedMatchRange(index + 1, match.id, true).then(bound => {
-            if (!bound || generation !== this.searchGeneration || this.getCurrentMatch()?.id !== match.id) return;
+            if (this.destroyed || generation !== this.searchGeneration || this.getCurrentMatch()?.id !== match.id) return;
+            if (!bound) {
+                logWarning("database locate did not bind target", {blockId, index: index + 1});
+                return;
+            }
             // Binding a Range does not mean native scrolling/layout has finished.
             // Only center locally here: re-entering native locate can starve the
             // browser's next frame with an unbounded chain of resolved promises.
@@ -4690,6 +4719,10 @@ export class SearchBar {
         }
         const match = this.resultMatches[index];
         if (scroll) {
+            logDebug("navigate to match", {
+                index: index + 1, total: this.resultMatches.length, blockId: match?.blockId,
+                blockType: match?.blockType, loadedRange: Boolean(match?.range),
+            });
             this.revealMatchTabs(match);
             if (this.unfoldAttributeViewGroup(match)) {
                 const generation = this.searchGeneration;
@@ -5018,6 +5051,7 @@ export class SearchBar {
     private replacePendingMessageId?: string;
 
     private onReplaceCommitStateChange(state: ReplaceCommitState): void {
+        logDebug("replacement commit state", {state});
         if (this.destroyed) return;
         if (state === "pending") {
             this.replacePendingMessageId ??= `page-search-replace-${Date.now()}-${Math.random()}`;
@@ -5036,6 +5070,21 @@ export class SearchBar {
         if (!this.replacePendingMessageId) return;
         hideMessage(this.replacePendingMessageId);
         this.replacePendingMessageId = undefined;
+    }
+
+    private logReplacementResult(operation: "single" | "all", result: ReplaceWriteResult): void {
+        const details = {
+            operation, replaced: result.replacedCount, skipped: result.skippedCount,
+            submitted: result.submittedCount, state: result.commitState, reason: result.error,
+            unchanged: Boolean(result.unchanged),
+        };
+        if (result.commitState === "failed" || result.error === "transaction-failed") {
+            logError("replacement failed", details);
+        } else if (result.error || result.commitState === "unknown") {
+            logWarning("replacement incomplete or cancelled", details);
+        } else {
+            logDebug("replacement completed", details);
+        }
     }
 
     private finishReplacementRefresh() {
@@ -5182,6 +5231,7 @@ export class SearchBar {
             const currentIndex = this.resultMatches.indexOf(current);
             if (currentIndex < 0) return;
             const successor = this.resultMatches[(currentIndex + 1) % this.resultMatches.length];
+            logDebug("replace single started", {blockId: current.blockId, regex: this.regex});
             const result = await replaceCurrentMatchInEditor(
                 this.edit,
                 current,
@@ -5200,6 +5250,7 @@ export class SearchBar {
                         this.replaceText === replacementText,
                 },
             );
+            this.logReplacementResult("single", result);
             if (this.destroyed) return;
             if (await this.handleUnconfirmedReplacement(result) || this.destroyed) return;
             if (result.error === "readonly-or-preview") {
@@ -5273,6 +5324,9 @@ export class SearchBar {
                 this.scrollIntoRanges(this.resultIndex - 1, false);
             }
             showMessage(this.i18n.replaceCurrentDone, 2000, "info");
+        } catch (error) {
+            logError("replace single failed unexpectedly", errorDetails(error));
+            throw error;
         } finally {
             this.finishReplacementRefresh();
         }
@@ -5399,6 +5453,10 @@ export class SearchBar {
             this.resultCount === 0 ||
             this.isRestrictEnumerateMode()
         ) {
+            logWarning("replace all cancelled before preparation", {
+                stable: this.hasStableReplaceAllSnapshot(), incomplete: this.searchCoverageIncomplete,
+                sameIntent: sameReplaceIntent(), sameGeneration: searchGeneration === this.searchGeneration,
+            });
             showMessage(this.i18n.replaceAllIncomplete, 4000, "info");
             if (!this.hasStableReplaceAllSnapshot() && !refreshedAfterConfirm) {
                 await this.highlightHitResult(this.searchText, false);
@@ -5415,6 +5473,7 @@ export class SearchBar {
             const searchKey = this.resultSearchKey;
             const documentEpoch = this.documentEpoch;
             const replacementText = this.replaceText;
+            logDebug("replace all started", {matches: this.resultMatches.length, writable: writableCount, regex: this.regex});
             const result = await replaceAllMatchesInEditor(
                 this.edit,
                 this.resultMatches,
@@ -5437,6 +5496,7 @@ export class SearchBar {
                         this.replaceText === replacementText,
                 },
             );
+            this.logReplacementResult("all", result);
             if (this.destroyed) return;
             if (await this.handleUnconfirmedReplacement(result) || this.destroyed) return;
             if (result.error === "readonly-or-preview") {
@@ -5510,6 +5570,9 @@ export class SearchBar {
                 4000,
                 "info",
             );
+        } catch (error) {
+            logError("replace all failed unexpectedly", errorDetails(error));
+            throw error;
         } finally {
             this.finishReplacementRefresh();
         }

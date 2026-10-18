@@ -3,6 +3,8 @@ import {
     getFrontend,
     IKernelPluginState,
     Plugin,
+    Setting,
+    showMessage,
 } from "siyuan";
 import "./index.scss";
 import {
@@ -14,7 +16,7 @@ import {
     invalidateAvCache,
     invalidateAvCacheForIds,
 } from "./frontend/corpus/av";
-import {isEditorReplaceModeBlocked} from "./frontend/editor-mode";
+import {isEditorReplaceModeBlocked, isPluginStorageWritable, isPublishMode} from "./frontend/editor-mode";
 import {
     createClientId,
     isKernelRunning,
@@ -40,6 +42,15 @@ import {
     PREFS_STORAGE_PATH,
     type RestrictInlineType,
 } from "./shared";
+import {
+    LOGGING_STORAGE_PATH,
+    errorDetails,
+    isDebugLoggingEnabled,
+    logDebug,
+    logError,
+    logWarning,
+    setDebugLogging,
+} from "./shared/logger";
 
 export { isKernelRunning, rpcGetPrefs, rpcSetPrefs } from "./frontend/kernel-client";
 export { findOffsetMatchesInText, generateSearchVariants, matchTextUnits } from "./shared";
@@ -59,6 +70,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     private isMobile = false;
     private kernelReady = false;
     private readonly clientId = createClientId();
+    private loggingSettingsReady: Promise<void> = Promise.resolve();
+    private loggingSettingsWrite: Promise<void> = Promise.resolve();
+    private loggingSettingsVersion = 0;
 
     private searchComponentCallbacks: Set<(event: CustomEvent) => void> = new Set();
     private searchBars: Map<Element, SearchBar> = new Map();
@@ -91,6 +105,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     onload() {
         this.isMobile = isMobileFrontend();
         this.kernelReady = isKernelRunning(this);
+        setDebugLogging(false);
+        this.loggingSettingsReady = this.loadLoggingSettings();
+        this.setupLoggingSettings();
         this.bindSearchHistory();
         searchHistory.load();
 
@@ -138,10 +155,63 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         this.eventBus.on("loaded-protyle-static", this.onProtyleLoadedScrub);
         scrubSelectionScopePollution();
 
-        console.log(this.i18n.pluginOnload, {
-            isMobile: this.isMobile,
-            kernelReady: this.kernelReady,
-            clientId: this.clientId,
+        void this.loggingSettingsReady.then(() => logDebug("plugin loaded", {
+            isMobile: this.isMobile, kernelReady: this.kernelReady,
+        }));
+    }
+
+    private async loadLoggingSettings(): Promise<void> {
+        const version = ++this.loggingSettingsVersion;
+        // Diagnostics settings are private plugin data, not publish resources.
+        if (isPublishMode()) return;
+        try {
+            const stored = await this.loadData(LOGGING_STORAGE_PATH);
+            if (version === this.loggingSettingsVersion) setDebugLogging(stored?.debug === true);
+        } catch (error) {
+            logWarning("load logging settings failed", errorDetails(error));
+        }
+    }
+
+    private setupLoggingSettings(): void {
+        let draft = false;
+        let dirty = false;
+        this.setting = new Setting({
+            confirmCallback: () => {
+                if (!dirty) return;
+                dirty = false;
+                const debug = draft;
+                ++this.loggingSettingsVersion;
+                setDebugLogging(debug);
+                logDebug("debug logging enabled");
+                if (!isPluginStorageWritable()) return;
+                // Serialize explicit saves; reopening the dialog cannot reorder writes.
+                this.loggingSettingsWrite = this.loggingSettingsWrite.then(async () => {
+                    const response = await this.saveData(LOGGING_STORAGE_PATH, {debug});
+                    if (response && response.code !== 0) throw new Error(`code=${response.code}`);
+                }).catch((error) => {
+                    logError("save logging settings failed", errorDetails(error));
+                    showMessage(this.i18n.settingsSaveFailed, 4000, "error");
+                });
+            },
+        });
+        this.setting.addItem({
+            title: this.i18n.settingsDebugLogging,
+            description: this.i18n.settingsDebugLoggingDescription,
+            createActionElement: () => {
+                const input = document.createElement("input");
+                input.type = "checkbox";
+                input.className = "b3-switch fn__flex-center";
+                input.setAttribute("aria-label", this.i18n.settingsDebugLogging);
+                dirty = false;
+                input.disabled = true;
+                void this.loggingSettingsReady.then(() => {
+                    draft = isDebugLoggingEnabled();
+                    input.checked = draft;
+                    input.disabled = false;
+                });
+                input.addEventListener("change", () => { draft = input.checked; dirty = true; });
+                return input;
+            },
         });
     }
 
@@ -165,7 +235,9 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
      */
     onunload() {
         this.teardownRuntime();
-        console.log(this.i18n.pluginOnunload);
+        logDebug("plugin unloaded");
+        ++this.loggingSettingsVersion;
+        setDebugLogging(false);
     }
 
     /**
@@ -176,10 +248,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         try {
             await this.removeData(PREFS_STORAGE_PATH);
         } catch (error) {
-            console.warn("[page-search] uninstall removeData prefs.json failed", error);
+            logWarning("uninstall removeData prefs.json failed", errorDetails(error));
+        }
+        await this.loggingSettingsWrite;
+        try {
+            await this.removeData(LOGGING_STORAGE_PATH);
+        } catch (error) {
+            logWarning("uninstall removeData logging.json failed", errorDetails(error));
         }
         searchHistory.removePersisted();
-        console.log(this.i18n.pluginUninstall);
+        logDebug("plugin uninstalled");
     }
 
     /**

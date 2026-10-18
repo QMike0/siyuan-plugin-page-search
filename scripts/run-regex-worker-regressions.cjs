@@ -135,13 +135,14 @@ class PackagedWorker {
 
 const pageUrl = "https://127.0.0.1:6806/stage/build/app/?r=fixture";
 const warnings = [];
+const runtimeErrors = [];
 const context = vm.createContext({
     URL,
     Worker: PackagedWorker,
     performance,
     document: {baseURI: pageUrl}, // No currentScript or plugin script tag during SiYuan's eval.
     window: {setTimeout, clearTimeout},
-    console: {warn: (...args) => warnings.push(args)},
+    console: {warn: (...args) => warnings.push(args), error: (...args) => runtimeErrors.push(args)},
 });
 context.require = name => {
     assert.equal(name, "siyuan", "entry keeps the host-provided CommonJS API");
@@ -317,7 +318,9 @@ async function main() {
         assert.equal(slowExpansion.expansions[0].replacement, "[3]", "cold replacement also waits for readiness");
         matcher.dispose();
         PackagedWorker.startupDelay = 0;
-        assert.equal(warnings.length, 0, "release worker boots and executes without runtime errors");
+        assert.equal(runtimeErrors.length, 0, "release worker boots and executes without runtime errors");
+        assert.deepEqual(warnings.map(args => args[0]), ["[page-search] regex worker execution timed out"],
+            "only the deliberate catastrophic-backtracking test emits a warning");
         await checkReadinessLifecycle();
         console.log(
             "regex release: publish/eval/ZIP, slow startup and replacement, reuse, cancellation, timeout/retry and cleanup OK",

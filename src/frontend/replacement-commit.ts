@@ -1,5 +1,6 @@
 import type {Protyle} from "siyuan";
 import {fetchSyncPost} from "siyuan";
+import {logWarning} from "../shared/logger";
 
 export type ReplaceCommitState = "pending" | "confirmed" | "failed" | "unknown";
 
@@ -149,6 +150,8 @@ export async function confirmBlockUpdates(
     const pending = new Map<string, {update: CommitUpdate; expected?: string; lastHtml?: string;}>();
     const submittedCount = updates.reduce((count, update) => count + update.appliedCount, 0);
     let replacedCount = 0;
+    let failedReads = 0;
+    let lastReadCode: number | undefined;
     // Fast commits need only their completion message; slower queues show pending explicitly.
     const pendingMessage = window.setTimeout(() => notify(observer, "pending"), 500);
     try {
@@ -197,7 +200,11 @@ export async function confirmBlockUpdates(
                 for (let responseIndex = 0; responseIndex < responses.length; responseIndex += 1) {
                     const batch = batches[responseIndex];
                     const response = responses[responseIndex];
-                    if (response?.code !== 0 || !response.data || typeof response.data !== "object") continue;
+                    if (response?.code !== 0 || !response.data || typeof response.data !== "object") {
+                        failedReads += 1;
+                        if (typeof response?.code === "number") lastReadCode = response.code;
+                        continue;
+                    }
                     const data = response.data as Record<string, unknown>;
                     for (const id of batch) {
                         const item = pending.get(id);
@@ -221,6 +228,12 @@ export async function confirmBlockUpdates(
         window.clearTimeout(pendingMessage);
     }
     const commitState = pending.size ? "unknown" : "confirmed";
+    if (commitState === "unknown") {
+        // One summary per submission, rather than a warning for every polling attempt.
+        logWarning("replacement confirmation incomplete", {
+            blocks: pending.size, submitted: submittedCount, confirmed: replacedCount, failedReads, lastReadCode,
+        });
+    }
     notify(observer, commitState);
     return {commitState, replacedCount, submittedCount};
 }
