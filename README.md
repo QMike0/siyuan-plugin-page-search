@@ -101,7 +101,7 @@ Searchable and highlightable but unsupported by replacement include:
 * embedded content;
 * formulas, rendered Mermaid, and rendered HTML-block text;
 * plugin-rendered custom blocks;
-* rich-text table cells;
+* special rich-text table cells carrying the `data-sy-table-cell-rich` storage attribute; ordinary text in normal table cells is replaceable;
 * tab titles inside tabs blocks;
 * matches spanning complex marks, read-only regions, or content whose original source cannot be confirmed.
 
