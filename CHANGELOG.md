@@ -1,3 +1,8 @@
+## v2.1.1 2026-10-26
+
+- 🇨🇳 修复被引用块替换后的结果确认误判
+- 🇺🇸 Fix the false positive in result confirmation after a referenced block is replaced
+
 ## v2.1.0 2026-10-26
 
 - 🇨🇳 支持对表格富文本单元格内容的替换/全部替换
