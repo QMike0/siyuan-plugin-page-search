@@ -32,7 +32,11 @@ export function avCellUnitId(row: string, col: string, group = "nogroup"): strin
     return group === "nogroup" ? `av:${row}:${col}` : `av-group:${group}:${row}:${col}`;
 }
 
+/** Card field names are separate from values, but locate the same row/column. */
+export const AV_FIELD_NAME_PREFIX = "field-name:";
+
 export function avApiCellPosition(unitId: string): {row: string; col: string;} | null {
+    if (unitId.startsWith(AV_FIELD_NAME_PREFIX)) unitId = unitId.slice(AV_FIELD_NAME_PREFIX.length);
     if (unitId.startsWith("av-group:")) {
         const parts = unitId.split(":");
         if (parts.length < 4 || !parts[1] || !parts[2]) return null;
@@ -57,6 +61,10 @@ export function avApiUnitId(unitId?: string): string | undefined {
     if (unitId.startsWith("embed:") && sourceEnd < 0) return undefined;
     const prefix = sourceEnd < 0 ? "" : unitId.slice(0, sourceEnd + 1);
     const local = sourceEnd < 0 ? unitId : unitId.slice(sourceEnd + 1);
+    if (local.startsWith(AV_FIELD_NAME_PREFIX)) {
+        const cell = avApiUnitId(local.slice(AV_FIELD_NAME_PREFIX.length));
+        return cell && avApiCellPosition(cell) ? prefix + AV_FIELD_NAME_PREFIX + cell : undefined;
+    }
     if (local === "title") return prefix + "av-title";
     if (local.startsWith("view-name:")) return prefix + "av-view:" + local.slice(10);
     if (local === "av-title" || local.startsWith("av-view:") || local.startsWith("group-title:") || avApiCellPosition(local)) return unitId;
@@ -132,6 +140,7 @@ export function avApiUnitShown(
     if (coverage.cells.has(unitId)) {
         return true;
     }
+    if (unitId.startsWith(AV_FIELD_NAME_PREFIX)) return false;
     const label = coverage.rowLabelText.get(row);
     if (label && !usedRowLabels.has(row) && label === foldAvText(text)) {
         usedRowLabels.add(row);
@@ -207,12 +216,14 @@ function noteAvDomUnit(coverage: AvDomCoverage, unitId: string, text: string): v
     if (cell.row.startsWith("header:")) {
         return;
     }
-    coverage.cells.add(avCellUnitId(cell.row, cell.col, cell.group));
+    coverage.cells.add((unitId.startsWith(AV_FIELD_NAME_PREFIX) ? AV_FIELD_NAME_PREFIX : "") +
+        avCellUnitId(cell.row, cell.col, cell.group));
 }
 
 function parseShownCell(
     unitId: string,
 ): {group: string; row: string; col: string; unstable: boolean; label: boolean;} | null {
+    if (unitId.startsWith(AV_FIELD_NAME_PREFIX)) unitId = unitId.slice(AV_FIELD_NAME_PREFIX.length);
     let group = "nogroup";
     let row: string;
     let col: string;

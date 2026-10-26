@@ -33,6 +33,7 @@ import {
     type SearchableUnit,
 } from "../../shared";
 import {
+    AV_FIELD_NAME_PREFIX,
     avApiCellPosition,
     avApiUnitId,
 } from "../../shared/av-live";
@@ -3908,6 +3909,10 @@ function avMatchPosition(unitId: string | undefined): {row: string; col: string;
         return null;
     }
     unitId = unitId.replace(/#run-\d+$/, "");
+    if (unitId.startsWith(AV_FIELD_NAME_PREFIX)) {
+        const position = avMatchPosition(unitId.slice(AV_FIELD_NAME_PREFIX.length));
+        return position ? {...position, col: AV_FIELD_NAME_PREFIX + position.col} : null;
+    }
     if (unitId.startsWith("cell:")) {
         const parts = unitId.split(":");
         if (parts.length < 4 || !parts[2]) {
@@ -3942,7 +3947,9 @@ function avApiNavigationRanks(
     bounds: ReadonlyMap<string, {first: number; last: number;}>,
 ): Array<number | undefined> {
     if (!bounds.size) return [];
-    const groups = api.map((unit) => /^(?:av-group|group-title):([^:]+)/.exec(unit.unitId ?? "")?.[1] ?? "");
+    const groups = api.map((unit) => /^(?:av-group|group-title):([^:]+)/.exec(
+        (unit.unitId ?? "").replace(/^field-name:/, ""),
+    )?.[1] ?? "");
     const anchoredGroups = new Set<string>();
     api.forEach((unit, index) => {
         if (bounds.has(unit.unitId ?? "")) anchoredGroups.add(groups[index]);

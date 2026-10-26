@@ -1,5 +1,5 @@
 import type {SearchableUnit} from "../../shared";
-import {avCellUnitId} from "../../shared/av-live";
+import {AV_FIELD_NAME_PREFIX, avCellUnitId} from "../../shared/av-live";
 import {attributeViewHtmlTexts} from "../blocks";
 import {
     fetchSearchBlockDoms,
@@ -365,6 +365,8 @@ interface AvColumnInfo {
     type: string;
     dateFormat: string;
     renderTemplate: string;
+    showName: boolean;
+    showEmpty: boolean;
     cardCheckboxName?: string;
 }
 
@@ -388,6 +390,8 @@ function columnInfo(view: Record<string, unknown>): Map<string, AvColumnInfo> {
                 type: String(record.type ?? ""),
                 dateFormat: String(record.dateFormat ?? ""),
                 renderTemplate: String(record.renderTemplate ?? ""),
+                showName: ["gallery", "kanban"].includes(String(view.type)) && view.displayFieldName === true,
+                showEmpty: view.displayEmptyFields === true,
                 cardCheckboxName: ["gallery", "kanban"].includes(String(view.type)) && view.displayFieldName !== true ?
                     name || avLanguageValue("languages.checkbox") : undefined,
             });
@@ -598,12 +602,46 @@ function displayValueText(value: Record<string, unknown>, column?: AvColumnInfo,
     return textOf(value);
 }
 
+/** v3.8.8 cellValueIsEmpty(value, true, renderTemplate) controls card labels,
+ * including icon-only values whose searchable text can legitimately be empty. */
+function cardFieldIsEmpty(value: Record<string, unknown>, column: AvColumnInfo): boolean {
+    const type = String(value.type ?? "");
+    const rendered = type === "template" ? undefined : templateContent(value, column);
+    if (rendered !== undefined) return !rendered;
+    if (type === "checkbox") return false;
+    if (["block", "text", "url", "email", "phone", "template"].includes(type)) {
+        return !asRecord(value[type])?.content;
+    }
+    if (type === "number") return !asRecord(value.number)?.isNotEmpty;
+    if (["date", "created", "updated"].includes(type)) {
+        const date = asRecord(value[type]);
+        return !date?.isNotEmpty && !date?.isNotEmpty2;
+    }
+    if (["select", "mSelect", "mAsset"].includes(type)) {
+        const items = value[type === "select" ? "mSelect" : type];
+        return !Array.isArray(items) || !items.length;
+    }
+    if (type === "relation" || type === "rollup") {
+        const items = asRecord(value[type])?.[type === "relation" ? "blockIDs" : "contents"];
+        return !Array.isArray(items) || !items.length;
+    }
+    if (type === "location") {
+        const location = asRecord(value.location);
+        if (typeof location?.name === "string" && location.name.trim()) return false;
+        const {latitude, longitude} = location ?? {};
+        return !location || !Object.keys(location).every(key => ["name", "latitude", "longitude", "originalInput"].includes(key)) ||
+            typeof latitude !== "number" || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
+            typeof longitude !== "number" || !Number.isFinite(longitude) || longitude < -180 || longitude > 180;
+    }
+    return false;
+}
+
 function cellDisplay(
     cell: unknown,
     rowId: string,
     viewName: string,
     columns: ReturnType<typeof columnInfo>,
-): {itemId: string; keyId: string; cell: AvCell;} | null {
+): {itemId: string; keyId: string; cell: AvCell; fieldName?: string;} | null {
     const record = asRecord(cell);
     if (!record) {
         return null;
@@ -618,12 +656,14 @@ function cellDisplay(
     const html = displayValueHtml(value, column);
     const texts = html === undefined ? undefined : attributeViewHtmlTexts(html);
     const text = texts ? texts.join("") : displayValueText(value, column);
-    if (!itemId || !keyId || !text) {
+    const fieldName = column?.showName && (column.showEmpty || !cardFieldIsEmpty(value, column)) ?
+        column.name.trim() : undefined;
+    if (!itemId || !keyId || (!text && !fieldName)) {
         return null;
     }
     const columnName = column?.name ?? "";
     const snippet = [viewName, columnName, text].filter(Boolean).join(" · ");
-    return {itemId, keyId, cell: {text, snippet, texts}};
+    return {itemId, keyId, cell: {text, snippet, texts}, fieldName};
 }
 
 function rowList(view: Record<string, unknown>): unknown[] {
@@ -643,7 +683,14 @@ function absorbRows(
         if (!parsed) {
             return;
         }
-        target.set(avCellUnitId(parsed.itemId, parsed.keyId, groupId), parsed.cell);
+        const unitId = avCellUnitId(parsed.itemId, parsed.keyId, groupId);
+        if (parsed.fieldName) {
+            target.set(AV_FIELD_NAME_PREFIX + unitId, {
+                text: parsed.fieldName,
+                snippet: [viewName, parsed.fieldName].filter(Boolean).join(" · "),
+            });
+        }
+        if (parsed.cell.text) target.set(unitId, parsed.cell);
     };
     for (const row of rowList(view)) {
         const record = asRecord(row);

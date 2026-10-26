@@ -2875,6 +2875,74 @@ async function main() {
             '<div data-node-id="' + id +
             '" data-type="NodeBlockQueryEmbed" data-content="select * from blocks"></div>';
         const avRaw = {name: "database", views: [{id: "v", name: "table"}, {id: "v2", name: "other"}]};
+        for (const embedded of [false, true]) {
+            for (const type of ["gallery", "kanban"]) {
+                for (const grouped of [false, true]) {
+                    reset();
+                    let showNames = true;
+                    const groups = grouped ? ["g1", "g2"] : ["nogroup"];
+                    const shell = avShell().replace('data-av-type="table"', 'data-av-type="' + type + '"')
+                        .replace('data-node-id="source-av"', 'data-node-id="' + (embedded ? "source-av" : "b") + '"');
+                    add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell);
+                    doms.b = embedded ? embedShell("b") : shell;
+                    if (embedded) embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]}});
+                    let requests = 0;
+                    avResponder = async url => {
+                        if (url.endsWith("getAttributeView")) return {code: 0, data: avRaw};
+                        requests++;
+                        const rows = {cardCount: 3, pageSize: 3, cards: [0, 1, 2].map(i => ({id: "row" + i, values: [
+                            {value: {keyID: "col", type: "text", text: {content: "valueKeyword"}}},
+                        ]}))};
+                        return {code: 0, data: {view: {type, displayFieldName: showNames,
+                            fields: [{id: "col", type: "text", name: "fieldNameKeyword"}],
+                            ...(grouped ? {groups: groups.map(id => ({id, name: id, groupHidden: 0, ...rows}))} : rows)}}};
+                    };
+                    const mount = (indices, folded = false) => {
+                        const content = groups.map((group, i) => (grouped ? '<div class="av__group-title"><button data-type="av-group-fold" data-id="' +
+                            group + '"><svg></svg></button><span class="av__group-name">' + group + '</span></div>' : '') +
+                            '<div class="av__body' + (folded && i === 1 ? ' fn__none' : '') + '" data-page-size="3"' +
+                            (grouped ? ' data-group-id="' + group + '"' : '') + '>' + indices.map(index =>
+                                '<div class="av__gallery-item" data-id="row' + index + '"><div class="av__gallery-field">' +
+                                (showNames ? '<div class="av__gallery-name">\n        <svg></svg>fieldNameKeyword\n        \n    </div>' : '<div class="av__gallery-tip">fieldNameKeyword</div>') +
+                                '<div class="av__cell" data-field-id="col">valueKeyword</div></div></div>').join('') + '</div>').join('');
+                        wysiwyg.innerHTML = (embedded ? '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' : '') +
+                            shell.replace('<div></div>', content) + (embedded ? '</div>' : '');
+                    };
+                    corpus.retainBackgroundCorpusRoot("r");
+                    try {
+                        for (const indices of [[0, 2], [], [1, 2]]) {
+                            mount(indices);
+                            const result = await settle("fieldNameKeyword|valueKeyword", {includeAttributeView: true, regex: true});
+                            full(result);
+                            assert.equal(result.matches.length, 6 * groups.length, "mounted and unloaded names/values merge without loss or duplication");
+                            const names = result.matches.filter(match => match.matchedText === "fieldNameKeyword");
+                            assert.equal(names.length, 3 * groups.length);
+                            assert.equal(names.filter(match => match.range).length, indices.length * groups.length,
+                                "each mounted name has its own Range, independent of virtual window");
+                            assert.ok(names.every(match => !match.replaceable), "field names remain read-only");
+                            assert.deepEqual(result.matches.map(match => match.matchedText),
+                                Array.from({length: 3 * groups.length}, () => ["fieldNameKeyword", "valueKeyword"]).flat(),
+                                "API/DOM navigation stays in group/row/field-name/value order");
+                        }
+                        assert.equal(requests, 1, "virtual row changes reuse the complete AV cache");
+                        mount([0, 2], true);
+                        const folded = await settle("fieldNameKeyword", {includeAttributeView: true});
+                        full(folded);
+                        assert.equal(folded.matches.length, 3 * groups.length, "folded groups retain label coverage");
+                        showNames = false;
+                        mount([0, 2]);
+                        corpus.invalidateAttributeViewSearch("r", ["av-id"]);
+                        const disabled = await settle("fieldNameKeyword", {includeAttributeView: true});
+                        full(disabled);
+                        assert.equal(disabled.matches.length, 0, "switching display off removes both mounted and unloaded names");
+                    } finally {
+                        avModule.releaseAvCacheOwner("r", edit);
+                        corpus.releaseBackgroundCorpusRoot("r");
+                    }
+                }
+            }
+        }
+        console.log("ordinary/embedded AV field names: partial/cold virtual windows, group order, folded coverage, readonly and display invalidation OK");
         for (const sizes of [[1, 3], [3, 1]]) {
             reset();
             const owners = ["b", "c"];

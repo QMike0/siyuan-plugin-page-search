@@ -33,6 +33,7 @@ import {
 } from "./renderer-adapters";
 import {splitTextNodesAtBarriers} from "./text-runs";
 import {createDomBlockTypeReader} from "./result-block-types";
+import {AV_FIELD_NAME_PREFIX} from "../shared/av-live";
 import {beginRichCellSnapshot, isSupportedRichCell, richCellHasActiveEditor, richCellSearchRuns, richCellMathBlocks} from "./rich-table-cell";
 import {
     beginTextCollection,
@@ -135,6 +136,7 @@ const AV_EXCLUDED_CLOSEST = [
     // 关闭「显示条目图标」时主键前的 .b3-menu__avemoji 带 fn__none，但仍含 emoji 文本节点；
     // 若采入会导致「test」命中落在图标/主键文本边界，Range 起点落在 fn__none 内被可见性丢弃。
     ".b3-menu__avemoji",
+    ".av__gallery-fieldicon",
     "svg",
     "style",
     "script",
@@ -1573,8 +1575,11 @@ function collectAttributeViewSearchUnits(
             headingGates,
             separateInlineMath,
         );
-        const visible = omitAuthorCssHiddenText(textNodes);
-        const text = visible.map((node) => node.nodeValue ?? "").join("");
+        let visible = omitAuthorCssHiddenText(textNodes);
+        const fieldName = unitId.startsWith(AV_FIELD_NAME_PREFIX);
+        if (fieldName) visible = visible.filter(node => !isCollectedTextHidden(node) || shouldKeepHiddenSourceText(node));
+        const raw = visible.map((node) => node.nodeValue ?? "").join("");
+        const text = fieldName ? raw.trim() : raw;
         seenUnitKeys.add(unitId);
         const base = {
             blockId,
@@ -1587,6 +1592,17 @@ function collectAttributeViewSearchUnits(
         // Otherwise API values would reintroduce the filtered text.
         if (!text) {
             units.push({...base, text: "", textNodes: []});
+            return;
+        }
+        if (fieldName) {
+            // Native name chrome has indentation around its plain text. Slice
+            // that padding without changing the DOM or the name's Range offsets.
+            let offset = raw.length - raw.trimStart().length;
+            let first = 0;
+            while (first < visible.length && offset >= visible[first].length) {
+                offset -= visible[first++].length;
+            }
+            units.push({...base, text, textNodes: visible.slice(first), textStartOffset: offset});
             return;
         }
         units.push(...unitsFromTextNodes(base, visible));
@@ -1618,7 +1634,13 @@ function collectAttributeViewSearchUnits(
                 cell.dataset.keyId?.trim() ||
                 cell.dataset.avKeyId?.trim() ||
                 `idx-${index}`;
-            pushUnit(cell, `cell:${groupId}:${rowId}:${colId}`);
+            const unitId = `cell:${groupId}:${rowId}:${colId}`;
+            // getRowHTML renders visible gallery/kanban names beside the value.
+            const field = cell.parentElement;
+            const name = field?.classList.contains("av__gallery-field") ?
+                field.querySelector<HTMLElement>(":scope > .av__gallery-name") : null;
+            if (name) pushUnit(name, AV_FIELD_NAME_PREFIX + unitId);
+            pushUnit(cell, unitId);
         });
     };
 

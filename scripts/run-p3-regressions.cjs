@@ -1477,6 +1477,16 @@ async function galleryNavigationRegressions() {
             // Split-run identities require a genuinely split DOM cell.
             root.querySelectorAll(".av__cell").forEach(cell => cell.innerHTML = "foo<br>tail");
         }
+        if (local.startsWith("field-name:")) {
+            root.querySelectorAll(".av__cell").forEach(cell => {
+                const field = document.createElement("div");
+                field.className = "av__gallery-field";
+                cell.replaceWith(field);
+                field.innerHTML = '<div class="av__gallery-name">foo</div>';
+                field.append(cell);
+                cell.textContent = "value";
+            });
+        }
         bar.resultMatches = [{
             ...textMatches("foo", embedded ? "embed" : "ordinary-av", embedded ? "embed:source-av:" + local : local)[0],
             blockType: embedded ? "NodeBlockQueryEmbed" : "NodeAttributeView", replaceable: false,
@@ -1522,7 +1532,8 @@ async function galleryNavigationRegressions() {
                 assert.equal(bar.resultMatches[0].range.startContainer.parentElement.closest("[data-group-id]").dataset.groupId, "target");
                 bar.destroy();
             }
-            for (const local of ["group-title:target", "av-group:target:row:col", "cell:target:row:col", "cell:target:row:col#run-0"]) {
+            for (const local of ["group-title:target", "av-group:target:row:col", "cell:target:row:col", "cell:target:row:col#run-0",
+                "field-name:av-group:target:row:col", "field-name:cell:target:row:col"]) {
                 const test = setup(embedded, local);
                 const {bar, root} = test;
                 await bar.scrollIntoRangesAsync(0, false);
@@ -1644,7 +1655,14 @@ async function galleryNavigationRegressions() {
 
 async function avFoldCacheRegressions() {
     const av = source("frontend/corpus/av");
-    const {isAttrViewFoldOnlyTransaction, watchAttributeViewDom} = source("frontend/av-watch");
+    const {isAttrViewFoldOnlyTransaction, isAttrViewWsTransaction, attributeViewTransactionIds, watchAttributeViewDom} = source("frontend/av-watch");
+    for (const action of ["setAttrViewDisplayFieldName", "setAttrViewDisplayEmptyFields"]) {
+        const detail = {cmd: "transactions", data: [{doOperations: [{action, avID: "database", data: true}],
+            undoOperations: [{action, avID: "database", data: false}]}]};
+        assert.equal(isAttrViewWsTransaction(detail), true, "native field display actions trigger AV refresh");
+        assert.equal(isAttrViewFoldOnlyTransaction(detail), false, "display actions must invalidate cached names");
+        assert.deepEqual(attributeViewTransactionIds(detail), ["database"]);
+    }
     const queryHost = document.createElement("div");
     queryHost.innerHTML = '<div data-type="NodeAttributeView"><div data-type="av-search">keep</div>' +
         '<div class="av__kanban"><div class="av__body"><div class="av__cell">value</div></div></div></div>';

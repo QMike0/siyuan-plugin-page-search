@@ -105,7 +105,7 @@ import {
 import {isEditorReplaceModeBlocked} from "./editor-mode";
 import {EmbedSearchState} from "./embed-search-state";
 import {createEmbeddedSourceReader} from "./embedded-order";
-import {avApiCellPosition} from "../shared/av-live";
+import {AV_FIELD_NAME_PREFIX, avApiCellPosition} from "../shared/av-live";
 import {
     clearNonHeadingFoldLocally,
     collectNonHeadingFoldedAncestorIds,
@@ -290,9 +290,10 @@ function attributeViewLocateTarget(unitId: string | undefined): AttributeViewLoc
     const embedded = unitId.startsWith("embed:");
     const embeddedLocal = embedded ? unitId.slice(6) : unitId;
     const sourceEnd = embeddedLocal.indexOf(":");
-    const local = embedded ?
+    let local = embedded ?
         (sourceEnd >= 0 ? embeddedLocal.slice(sourceEnd + 1) : "") :
         embeddedLocal;
+    if (local.startsWith(AV_FIELD_NAME_PREFIX)) local = local.slice(AV_FIELD_NAME_PREFIX.length);
     if (local.startsWith("cell:")) {
         const parts = local.split(":");
         if (parts.length !== 4 || !parts[2] || parts[2].startsWith("header:")) return null;
@@ -4677,6 +4678,7 @@ export class SearchBar {
             sourceId = local.slice(6, end);
             local = local.slice(end + 1);
         } else if (match.blockType !== ATTRIBUTE_VIEW_TYPE) return null;
+        if (local.startsWith(AV_FIELD_NAME_PREFIX)) local = local.slice(AV_FIELD_NAME_PREFIX.length);
         const group = local.startsWith("av-group:") || local.startsWith("cell:") ?
             local.split(":")[1] :
             local.startsWith("group-title:") ?

@@ -177,9 +177,167 @@ async function avCalendarWindowRegressions() {
     console.log("AV calendar: native range/DST, row counts beyond table pageSize, range identity, limits and cancellation OK");
 }
 
+async function avFieldNameRegressions() {
+    const liveApi = source("shared/av-live");
+    const columns = [
+        {id: "k", name: "fieldKeyword & <tag>", type: "text"},
+        {id: "empty", name: "emptyLabel", type: "text"},
+        {id: "check", name: "checkboxLabel", type: "checkbox"},
+        {id: "hidden", name: "hiddenLabel", type: "text", hidden: true},
+    ];
+    const card = id => ({id, values: columns.map(field => ({
+        valueType: field.type, value: {keyID: field.id, type: field.type,
+            ...(field.type === "checkbox" ? {checkbox: {checked: false}} :
+                {text: {content: field.id === "k" ? "fieldKeyword" : ""}})},
+    }))});
+    try {
+        for (const type of ["gallery", "kanban", "table", "list", "calendar"]) {
+            for (const show of [false, true]) {
+                for (const grouped of [false, true]) {
+                    av.invalidateAvCache();
+                    let requests = 0;
+                    api = async url => {
+                        if (url.endsWith("getAttributeView")) return {code: 0, data: raw};
+                        requests++;
+                        const rows = {cards: [card("row"), card("other")], cardCount: 2, pageSize: 2};
+                        return {code: 0, data: {view: {type, displayFieldName: show, displayEmptyFields: true, fields: columns,
+                            ...(grouped ? {groups: [{id: "g", groupFolded: true, ...rows}]} : rows)}}};
+                    };
+                    const loaded = await av.loadAvUnits([ref()]);
+                    const names = loaded.filter(unit => unit.unitId.startsWith("field-name:"));
+                    const supported = ["gallery", "kanban"].includes(type);
+                    assert.deepEqual(names.map(unit => unit.text), supported && show ?
+                        [columns[0].name, "emptyLabel", "checkboxLabel", columns[0].name, "emptyLabel", "checkboxLabel"] : [],
+                        type + "/" + show + "/" + grouped + ": visible names only, including empty values");
+                    assert.equal(requests, 1, "names reuse the existing render request");
+                    assert.ok(loaded.every(unit => !unit.text.includes("hiddenLabel")), "hidden fields stay excluded");
+                    assert.equal(loaded.filter(unit => unit.text === "checkboxLabel").length, supported ? 2 : 0,
+                        "checkbox names are shown once per card in either display mode");
+                    if (!supported || !show) continue;
+                    const host = document.createElement("div");
+                    host.innerHTML = '<div class="av" data-node-id="b" data-type="NodeAttributeView" data-av-type="' + type +
+                        '"><div class="av__body"' + (grouped ? ' data-group-id="g"' : '') +
+                        '><div class="av__gallery-item" data-id="row">' +
+                        '<div class="av__gallery-field av__gallery-field--name"><div class="av__gallery-name">\n        ' +
+                        '<span class="av__gallery-fieldicon">iconSecret</span>fieldKeyword &amp; &lt;tag&gt;\n        ' +
+                        '<svg class="ariaLabel" aria-label="descriptionSecret"><text>svgSecret</text></svg>\n    </div>' +
+                        '<div class="av__cell" data-field-id="k">fieldKeyword</div></div>' +
+                        '<div class="av__gallery-field"><div class="av__gallery-name">emptyLabel</div>' +
+                        '<div class="av__cell" data-field-id="empty"></div></div>' +
+                        '<div class="av__gallery-field"><div class="av__gallery-tip">tipSecret</div>' +
+                        '<div class="av__cell" data-field-id="check">checkboxLabel</div></div>' +
+                        '</div></div></div>';
+                    document.body.append(host);
+                    try {
+                        const live = blocks.collectSearchableBlocks(host, {includeAttributeView: true, scopeRoots: [host.firstElementChild]});
+                        assert.deepEqual(live.filter(unit => unit.unitId.startsWith("field-name:")).map(unit => unit.text),
+                            [columns[0].name, "emptyLabel"], "only real names, without icons/descriptions/edit tips");
+                        assert.equal(matcher.matchTextUnitsDetailed(live, "<tag>fieldKeyword").hits.length, 0,
+                            "name and value never form a cross-boundary match");
+                        const coverage = liveApi.collectAvDomCoverage(live).get("b");
+                        assert.equal(coverage.unstable, false);
+                        assert.equal(names.filter(unit => liveApi.avApiUnitShown(unit.unitId, unit.text, coverage, new Set())).length, 2,
+                            "mounted names cover their own API units, independently of values and other rows");
+                        assert.ok(names.every(unit => liveApi.avApiUnitInView(unit.unitId, coverage, type)));
+                        const merged = [...live, ...loaded.filter(unit =>
+                            !liveApi.avApiUnitShown(unit.unitId, unit.text, coverage, new Set()))];
+                        assert.equal(matcher.matchTextUnitsDetailed(merged, "fieldKeyword").hits.length, 4,
+                            "identical name/value keywords remain independent hits across mounted and unloaded rows");
+                        const matches = matcher.matchTextUnitsDetailed(names, "fieldKeyword").hits;
+                        const rebound = project.fillLiveRanges(matches, live, true);
+                        assert.equal(rebound[0].range?.toString(), "fieldKeyword", "cold name binds to its label Range");
+                        assert.equal(rebound[1].range, undefined, "unmounted name cannot bind another row");
+                        for (const unit of live.filter(unit => unit.unitId.startsWith("field-name:"))) {
+                            const canonical = liveApi.avApiUnitId(unit.unitId);
+                            assert.equal(liveApi.avApiUnitId("embed:source:" + unit.unitId), "embed:source:" + canonical);
+                            assert.equal(liveApi.avApiCellPosition(canonical).col, unit.unitId.endsWith(":k") ? "k" : "empty");
+                        }
+                    } finally { host.remove(); }
+                }
+            }
+        }
+        const emptyCases = [
+            [{type: "block", block: {content: ""}}, false],
+            [{type: "text", text: {content: ""}}, false],
+            [{type: "text", text: {content: " "}}, true],
+            [{type: "number", number: {content: 0, isNotEmpty: true}}, true],
+            [{type: "number", number: {content: 0, isNotEmpty: false}}, false],
+            [{type: "checkbox", checkbox: {checked: false}}, true],
+            [{type: "checkbox", checkbox: {checked: false}, renderedContent: ""}, false],
+            [{type: "text", text: {content: "source"}, hasRenderTemplate: true}, false],
+            [{type: "text", text: {content: ""}, renderedContent: "<img>"}, true],
+            [{type: "template", template: {content: ""}}, false],
+            [{type: "template", template: {content: "<span></span>"}}, true],
+            [{type: "date", date: {isNotEmpty: false, isNotEmpty2: true}}, true],
+            [{type: "date", date: {isNotEmpty: false, isNotEmpty2: false}}, false],
+            [{type: "created", created: {isNotEmpty: true}}, true],
+            [{type: "updated", updated: {isNotEmpty: false}}, false],
+            [{type: "select", mSelect: []}, false],
+            [{type: "mSelect", mSelect: [{content: ""}]}, true],
+            [{type: "mAsset", mAsset: [{type: "image", content: "asset.png"}]}, true],
+            [{type: "relation", relation: {blockIDs: ["target"], contents: []}}, true],
+            [{type: "relation", relation: {blockIDs: [], contents: [{block: {content: "stale"}}]}}, false],
+            [{type: "rollup", rollup: {contents: []}}, false],
+            [{type: "rollup", rollup: {contents: [{type: "checkbox", checkbox: {checked: false}}]}}, true],
+            [{type: "location", location: {name: "", latitude: 0, longitude: 0}}, true],
+            [{type: "location", location: {name: " ", latitude: 91, longitude: 0}}, false],
+            [{type: "location", location: {name: "place"}}, true],
+            [{type: "lineNumber"}, true],
+        ];
+        for (const type of ["gallery", "kanban"]) {
+            for (const showEmpty of [false, true]) {
+                av.invalidateAvCache();
+                api = async url => ({code: 0, data: url.endsWith("getAttributeView") ? raw : {view: {
+                    type, displayFieldName: true, displayEmptyFields: showEmpty,
+                    fields: emptyCases.map(([value], i) => ({id: "k" + i, name: "label" + i, type: value.type})),
+                    cardCount: 1, cards: [{id: "row", values: emptyCases.map(([value], i) => ({value: {keyID: "k" + i, ...value}}))}],
+                }}});
+                const loaded = await av.loadAvUnits([ref()]);
+                assert.deepEqual(loaded.filter(unit => unit.unitId.startsWith("field-name:")).map(unit => unit.text),
+                    emptyCases.flatMap(([, visible], i) => showEmpty || visible ? ["label" + i] : []),
+                    "native hidden-empty rules, including icon-only values and rendered templates");
+            }
+        }
+        const hiddenHost = document.createElement("div");
+        hiddenHost.innerHTML = '<style>.av:not(.av--display-empty-fields) .av__gallery-field[data-empty="true"]{display:none}</style>' +
+            '<div class="av" data-node-id="b" data-type="NodeAttributeView"><div class="av__gallery-item" data-id="row">' +
+            '<div class="av__gallery-field" data-empty="true"><div class="av__gallery-name">emptyLabel</div>' +
+            '<div class="av__cell" data-field-id="empty"></div></div></div></div>';
+        document.body.append(hiddenHost);
+        try {
+            for (const showEmpty of [false, true, false]) {
+                const block = hiddenHost.querySelector(".av");
+                block.classList.toggle("av--display-empty-fields", showEmpty);
+                const live = blocks.collectSearchableBlocks(hiddenHost, {includeAttributeView: true, scopeRoots: [block]});
+                assert.equal(live.filter(unit => unit.text === "emptyLabel").length, Number(showEmpty),
+                    "mounted names follow native empty-field CSS without exposing hidden labels");
+            }
+        } finally { hiddenHost.remove(); }
+        for (const grouped of [false, true]) {
+            av.invalidateAvCache();
+            const pages = [];
+            api = async (url, body) => {
+                if (url.endsWith("getAttributeView")) return {code: 0, data: raw};
+                const page = grouped ? body.groupPaging.g?.page ?? 1 : body.page;
+                pages.push(page);
+                const rows = {cards: Array.from({length: page === 1 ? 200 : 1}, (_, i) => card("row" + ((page - 1) * 200 + i))),
+                    cardCount: 201, pageSize: 201};
+                return {code: 0, data: {view: {type: "gallery", displayFieldName: true, displayEmptyFields: true, fields: columns,
+                    ...(grouped ? {groups: [{id: "g", ...rows}]} : rows)}}};
+            };
+            const loaded = await av.loadAvUnits([ref()]);
+            assert.equal(loaded.filter(unit => unit.unitId.startsWith("field-name:")).length, 603);
+            assert.equal(new Set(loaded.map(unit => unit.unitId)).size, loaded.length);
+            assert.deepEqual(pages, [1, 2], "grouped/ordinary names follow existing pagination");
+        }
+    } finally { av.invalidateAvCache(); }
+    console.log("AV gallery/kanban field names: display modes, empty/hidden fields, checkbox, API aliases, pagination and Range binding OK");
+}
+
 async function main() {
     await avDisplayWindowRegressions();
     await avCalendarWindowRegressions();
+    await avFieldNameRegressions();
     // Native renderCell formats number/date text before painting. Cold matching
     // must use that same text, not stored timestamps or unformatted numbers.
     const stamp = new Date(2026, 9, 12, 9, 5).valueOf();
