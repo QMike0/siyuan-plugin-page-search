@@ -97,6 +97,8 @@ async function tests() {
             assert.equal(result.error, '', coverage); assert.equal(result.partial, false, coverage); assert.equal(result.degraded, false, coverage);
             assert.equal(result.matches.length, 2, coverage + ': complete math corpus');
             assert.ok(result.matches.every(hit => !hit.replaceable));
+            assert.ok(result.matches.every(hit => source('frontend/replacement-reasons').createReplacementReasonReader()(hit) === 'math'),
+                coverage + ': rich-cell math is described as math, not as an unsupported cell');
             const off = await corpus.searchCurrentDocument({}, f.edit, 'formulaNeedle', {...options, includeAttributeView: false, includeFoldedBlocks: true, includeMathBlock: false});
             assert.equal(off.matches.length, 0, coverage + ': math switch');
             assert.equal(f.wysiwyg.innerHTML, before, 'full corpus does not change live content');

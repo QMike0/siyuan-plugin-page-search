@@ -311,6 +311,17 @@ function collect(html, query = "foo") {
         const result = await calculateSearchMatches({}, f.edit, "foo", {includeDocTitle: false});
         assert.equal(result.matches.length, 2);
         assert.equal(result.matches.filter(match => match.replaceable).length, 1, "invalid rich data stays searchable and locked");
+        assert.equal(source("frontend/replacement-reasons").createReplacementReasonReader()(
+            result.matches.find(match => !match.replaceable)), "richCell");
+    }
+    {
+        const f = fixture(table("**f**oo", "foo"));
+        const result = await calculateSearchMatches({}, f.edit, "foo", {includeDocTitle: false});
+        assert.equal(result.matches.length, 2);
+        assert.equal(result.matches.filter(match => match.replaceable).length, 1, "only the rich format boundary is rejected");
+        assert.equal(source("frontend/replacement-reasons").createReplacementReasonReader()(
+            {...result.matches.find(match => !match.replaceable), range: undefined}), "richCell",
+            "unsupported rich spans retain a concrete reason when the live Range is absent");
     }
     const nativeTable = require('./rich-cell-native-fixture.cjs')(lute);
     const imageSamples = [

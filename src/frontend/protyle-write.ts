@@ -259,7 +259,7 @@ export function countWritableMatches(edit: Element, matches: readonly SearchMatc
     return count;
 }
 
-function isMatchContentWritable(
+export function isMatchContentWritable(
     match: Pick<SearchMatch, "replaceable" | "blockType" | "blockId" | "unitId">,
 ): boolean {
     if (!match.replaceable || match.unitId?.startsWith("embed:") || isDocTitleMatch(match)) {

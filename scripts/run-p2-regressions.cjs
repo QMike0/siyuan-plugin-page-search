@@ -11,6 +11,7 @@ let api;
 let editors = [];
 let editorReads = 0;
 let confirmAction = (yes) => yes();
+const shownMessages = [];
 const originalLoad = Module._load;
 Module._load = function(request, parent, main) {
     if (request === "siyuan") {
@@ -21,7 +22,7 @@ Module._load = function(request, parent, main) {
                 return editors;
             },
             confirm: (title, text, yes, no) => confirmAction(yes, no, text, title),
-            showMessage: () => {},
+            showMessage: (message) => shownMessages.push(message),
             hideMessage: () => {},
         };
     }
@@ -1044,6 +1045,65 @@ async function main() {
         {...writableMatch, id: "complex", blockId: "complex", replaceable: false},
     ];
     const mixedMatches = [writableMatch, ...nonWritableMatches];
+    const {createReplacementReasonReader} = source("frontend/replacement-reasons");
+    const readReason = createReplacementReasonReader();
+    const mixedReasons = ["docTitle", "database", "preview", "math", "richCell", "cellEditing", "embed", "complex"];
+    assert.deepEqual(nonWritableMatches.map(readReason), mixedReasons);
+    assert.deepEqual(nonWritableMatches.map(match => readReason({...match, range: undefined})), mixedReasons,
+        "unloaded/folded rejections use the same reasons without a live Range");
+    const reasonCases = [
+        [{blockType: "NodeCustomBlock"}, "custom"],
+        [{blockTypes: ["paragraph", "custom"]}, "custom"],
+        [{highlightKind: "inline-math"}, "inlineMath"],
+        [{blockType: "NodeHTMLBlock"}, "html"],
+        [{replaceReason: "tabsTitle"}, "tabsTitle"],
+        [{replaceReason: "preview"}, "preview"],
+        [{replaceReason: "tablePending"}, "tablePending"],
+        [{matchedText: "fo\u200bo"}, "marker"],
+        [{unitId: "mermaid-source"}, "mermaid"],
+        [{unitId: "diagram-rendered"}, "preview"],
+        [{unitId: "renderer:source-fallback:math:0:table-cell:0:0#run-1", replaceLock: "table-rich"}, "math"],
+        [{unitId: "embed:origin:renderer:rendered-text:math:0", blockType: "NodeMathBlock"}, "embed"],
+        ...["mermaid", "flowchart", "graphviz", "plantuml", "chart", "mindmap", "abc"].map(language =>
+            [{unitId: "renderer:rendered-text:" + language + ":0"}, language]),
+    ];
+    for (const [fields, expected] of reasonCases) {
+        assert.equal(readReason({...writableMatch, replaceable: false, range: undefined, ...fields}), expected);
+    }
+    const sameParent = document.createElement("div");
+    sameParent.append(document.createTextNode("fo"), document.createTextNode("o"));
+    const sharedReader = createReplacementReasonReader();
+    let ancestryReads = 0;
+    const nativeClosest = sameParent.closest.bind(sameParent);
+    sameParent.closest = selector => {ancestryReads++; return nativeClosest(selector);};
+    for (const text of sameParent.childNodes) {
+        const range = document.createRange(); range.selectNodeContents(text);
+        sharedReader({...writableMatch, replaceable: false, range});
+    }
+    assert.ok(ancestryReads <= 10, "different Text nodes in the same parent share one ancestry lookup");
+    for (const [html, expected] of [
+        ['<div data-type="NodeCustomBlock"><span>foo</span></div>', "custom"],
+        ['<div tabs-title="true"><span>foo</span></div>', "tabsTitle"],
+        ['<span data-type="strong inline-math">foo</span>', "inlineMath"],
+        ['<div data-type="NodeMathBlock"><span>foo</span></div>', "math"],
+        ['<protyle-html><span>foo</span></protyle-html>', "html"],
+        ['<div data-type="NodeCodeBlock" data-subtype="flowchart"><span>foo</span></div>', "flowchart"],
+        ['<div class="mindmap-view"><span>foo</span></div>', "preview"],
+        ['<div contenteditable="false"><span>foo</span></div>', "readonly"],
+        ['<div contenteditable="false"><span contenteditable="true">foo</span></div>', "complex"],
+        ['<div contenteditable="true"><b>fo</b>o</div>', "complex"],
+    ]) {
+        const container = document.createElement("section");
+        container.innerHTML = html;
+        const range = document.createRange();
+        const target = container.querySelector('[contenteditable="true"]') ?? container.firstElementChild;
+        range.selectNodeContents(target);
+        const reader = createReplacementReasonReader();
+        const match = {...writableMatch, replaceable: false, range};
+        assert.equal(reader(match), expected, html);
+        target.closest = () => {throw new Error("duplicate reasons must reuse cached ancestry");};
+        assert.equal(reader(match), expected);
+    }
     assert.equal(write.countWritableMatches(edit, mixedMatches), 1);
     assert.equal(write.isMatchWritable(edit, mixedMatches.find(match => match.id === "embed")), false,
         "embedded matches stay unwritable even if an upstream path marks them replaceable");
@@ -1103,9 +1163,46 @@ async function main() {
                     .replace("{scope}", scopeText)
                     .replace("{matchCount}", "9")
                     .replace("{count}", "1")
-                    .replace("{skippedCount}", "8"),
+                    .replace("{skippedCount}", "8")
+                    .replace("{reasons}", text.replaceAllSkipReason.replace("{reasons}", [
+                        text.settingsIncludeDocTitle, text.settingsIncludeAttributeView, text.replaceReasonPreview,
+                        text.settingsIncludeMathBlock, text.replaceReasonRichCell, text.replaceReasonCellEditing,
+                        text.settingsIncludeEmbedBlock, text.replaceReasonComplex,
+                    ].join(text.replaceReasonSeparator))),
             }, "localized confirmation describes the actual eligible count and scope");
             assert.equal(commits, before, "cancelled confirmation does not write");
+        }
+        for (const rejected of [[], [nonWritableMatches[3], {...nonWritableMatches[3], id: "second-math"}]]) {
+            const bar = searchBarFixture();
+            bar.i18n = text;
+            bar.resultMatches.push(...rejected);
+            bar.resultCount = bar.resultMatches.length;
+            let message;
+            confirmAction = (_yes, no, value) => {message = value; no();};
+            await bar.clickReplaceAll();
+            assert.ok(!/\{(?:scope|count|matchCount|skippedCount|reasons)\}/.test(message), "all placeholders are resolved");
+            if (rejected.length) {
+                assert.ok(message.includes(text.replaceAllSkipReason.replace("{reasons}", text.settingsIncludeMathBlock)),
+                    "only the actual math reason is shown once, despite duplicate rejected matches");
+            } else {
+                assert.ok(!message.includes("不支持替换") && !message.includes("cannot be replaced"), "zero skips has no reason clause");
+            }
+            assert.ok(!message.includes(text.settingsIncludeEmbedBlock), "unrelated unsupported types are not listed");
+        }
+        const labels = [
+            text.replaceDocTitleUnsupported, text.settingsIncludeAttributeView, text.replaceReasonPreview,
+            text.settingsIncludeMathBlock, text.replaceTableRichUnsupported, text.replaceTableCellEditingUnsupported,
+            text.settingsIncludeEmbedBlock, text.replaceReasonComplex,
+        ];
+        for (const [index, match] of nonWritableMatches.entries()) {
+            const bar = searchBarFixture();
+            bar.i18n = text; bar.resultMatches = [match];
+            let advanced = 0; bar.clickNext = () => advanced++;
+            const before = commits;
+            await bar.clickReplace();
+            assert.ok(shownMessages.at(-1).includes(labels[index]), "single replacement names the actual reason: " + mixedReasons[index]);
+            assert.equal(advanced, 1);
+            assert.equal(commits, before, "unsupported single matches do not write");
         }
     }
     const unsupportedAll = searchBarFixture();
@@ -1119,6 +1216,29 @@ async function main() {
     const beforeUnsupportedAll = commits;
     await unsupportedAll.clickReplaceAll();
     assert.equal(commits, beforeUnsupportedAll);
+    const modeChangedDuringRefresh = searchBarFixture();
+    modeChangedDuringRefresh.i18n.replaceModeUnsupported = "readonly mode";
+    modeChangedDuringRefresh.domEpoch++;
+    modeChangedDuringRefresh.highlightHitResult = async () => {
+        modeChangedDuringRefresh.resultDomEpoch = modeChangedDuringRefresh.domEpoch;
+        protyle.protyle.disabled = true;
+    };
+    try {
+        await modeChangedDuringRefresh.clickReplaceAll();
+        assert.equal(shownMessages.at(-1), "readonly mode", "mode changes during refresh are not described as unsupported formatting");
+        assert.equal(commits, beforeUnsupportedAll);
+    } finally {
+        protyle.protyle.disabled = false;
+    }
+    for (const language of ["zh-CN", "en"]) {
+        const text = JSON.parse(fs.readFileSync(path.join(repo, "src/i18n", language + ".json"), "utf8"));
+        const bar = searchBarFixture();
+        bar.i18n = text; bar.resultMatches = [nonWritableMatches[3]];
+        await bar.clickReplaceAll();
+        assert.equal(shownMessages.at(-1), text.replaceAllNoneWritable.replace("{reasons}",
+            text.replaceAllSkipReason.replace("{reasons}", text.settingsIncludeMathBlock)),
+            "all-unsupported results explain the actual type without a misleading confirmation");
+    }
     confirmAction = (yes) => yes();
     const mixedAll = searchBarFixture();
     mixedAll.resultMatches = [mixedAll.resultMatches[0], ...nonWritableMatches];

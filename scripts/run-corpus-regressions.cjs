@@ -371,6 +371,37 @@ async function main() {
         assert.equal(orderIndependentSearch.matches.length, 1, "order-independent searches retain the existing fallback");
         console.log("heading type filters: full/unloaded/partial/folded scope, semantic containers, exact AND, missing-order guards and no extra DOM reads OK");
         {
+            const {createReplacementReasonReader} = source("frontend/replacement-reasons");
+            const {calculateSearchMatches} = source("frontend/pipeline");
+            for (const mounted of ["none", "full", "folded"]) {
+                reset();
+                add("b", "p", "needle", "", "r", 'tabs-title="true"');
+                doms.b = '<div data-node-id="b" data-type="NodeParagraph" tabs-title="true"><div contenteditable="true">needle</div></div>';
+                if (mounted !== "none") wysiwyg.innerHTML =
+                    '<div data-node-id="tabs" data-type="NodeTabs" class="tabs"><div class="tab-item"' +
+                    (mounted === "folded" ? ' data-tabs-hidden="true"' : '') + '><div class="tab-item-info">' + doms.b + '</div></div></div>';
+                const result = await search("needle");
+                full(result);
+                assert.equal(result.matches.length, 1, mounted + ': tab title still indexed');
+                const title = result.matches[0];
+                assert.equal(title.replaceable, false);
+                assert.equal(createReplacementReasonReader()({...title, range: undefined}), "tabsTitle",
+                    mounted + ': reason survives absent/offscreen Range');
+                if (mounted !== "none") {
+                    const {collectSearchableBlocks} = source("frontend/blocks");
+                    const {unitKeyOf} = source("frontend/selection");
+                    const opts = {includeDocTitle: false, includeFoldedBlocks: true};
+                    const selectionScope = new Map(collectSearchableBlocks(edit, opts).map(unit =>
+                        [unitKeyOf(unit), [{start: 0, end: unit.text.length}]]));
+                    const fallback = await calculateSearchMatches({}, edit, "needle", {...opts, selectionOnly: true, selectionScope});
+                    assert.equal(fallback.matches.length, 1);
+                    assert.equal(fallback.matches[0].replaceable, false);
+                    assert.equal(createReplacementReasonReader()({...fallback.matches[0], range: undefined}), "tabsTitle");
+                }
+            }
+            console.log("Replacement reasons: loaded/unloaded/inactive tab titles retain type without a Range OK");
+        }
+        {
             // v3.8.7 custom blocks persist data-content, not arbitrary renderer DOM.
             const custom = '<div data-node-id="b" data-type="NodeCustomBlock" class="custom-block" ' +
                 'data-info="fixture" data-content="needle" contenteditable="false">' +
@@ -389,6 +420,8 @@ async function main() {
             full(cold);
             assert.equal(cold.matches.length, 2, "unloaded custom text keeps existing search coverage");
             assert.equal(cold.matches.find(match => match.blockId === "b").replaceable, false);
+            assert.equal(source("frontend/replacement-reasons").createReplacementReasonReader()(
+                cold.matches.find(match => match.blockId === "b")), "custom");
             assert.equal(cold.matches.find(match => match.blockId === "c").replaceable, true);
             const disabled = await search("needle", {includeCustomBlock: false});
             full(disabled);
@@ -481,6 +514,8 @@ async function main() {
                     full(rendered);
                     assert.equal(rendered.matches.length, 1, "first cold query sees generated glyphs absent from SQL content");
                     assert.ok(!rendered.matches[0].replaceable && !rendered.matches[0].range);
+                    assert.equal(source("frontend/replacement-reasons").createReplacementReasonReader()(rendered.matches[0]),
+                        inline ? "inlineMath" : "math", "cold rendered formula uses its actual kind");
                     assert.equal((await search("delta", options)).matches.length, 0, "rendered/source are exclusive");
                     assert.equal((await search("sourceSecret", options)).matches.length, 0, "MathML is not searchable");
                     const calls = renderCalls;

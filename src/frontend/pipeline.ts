@@ -588,6 +588,7 @@ function attachRangesToHits(
                         !isTabsTitleSearchUnit(block) &&
                         !isInlineMathSearchUnit(block) && !isRendererUnitId(hit.unitId) &&
                         !hit.unitId?.startsWith("embed:") && hit.replaceable,
+                    replaceReason: isTabsTitleSearchUnit(block) ? "tabsTitle" : undefined,
                     range: undefined,
                     highlightKind: "text",
                     ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
@@ -630,8 +631,10 @@ function attachRangesToHits(
                     `[data-node-id="${CSS.escape(block.blockId)}"][data-type]:not(.mindmap-view)`,
                 ),
             );
+        const richSpanBlocked = !replaceLock && spans !== undefined &&
+            !spans.some(span => hit.start >= span.start && hit.end <= span.end);
         const replaceable = !replaceLock &&
-            (spans === undefined || spans.some(span => hit.start >= span.start && hit.end <= span.end)) &&
+            !richSpanBlocked &&
             !isRendererUnitId(hit.unitId) &&
             !hit.unitId?.startsWith("embed:") &&
             !isDocTitle &&
@@ -655,6 +658,7 @@ function attachRangesToHits(
             end: hit.end,
             matchedText: hit.matchedText,
             replaceable,
+            replaceReason: isTabsTitle ? "tabsTitle" : richSpanBlocked ? "richCell" : undefined,
             replaceLock,
             range,
             highlightKind: isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),

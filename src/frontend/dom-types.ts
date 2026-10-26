@@ -60,6 +60,8 @@ export type TableReplaceLock = "table-rich" | "table-cell-editor";
 
 /** 带 Range 的搜索命中（高亮 / 导航） */
 export interface SearchMatch {
+    /** Explanation only; the existing replaceable/lock policy remains authoritative. */
+    replaceReason?: import("./replacement-reasons").ReplacementSkipReason;
     blockTypes?: readonly ResultBlockType[];
     id: string;
     blockId: string;

@@ -102,7 +102,6 @@ Searchable and highlightable but unsupported by replacement include:
 * embedded content;
 * formulas, rendered Mermaid, and rendered HTML-block text;
 * plugin-rendered custom blocks;
-* rich-text cell content whose source or formatting cannot be reliably preserved; finish an open cell editor before replacing. Nested tables, databases, embeds, and other unsupported rich-cell structures remain unsupported;
 * tab titles inside tabs blocks;
 * matches spanning complex marks, read-only regions, or content whose original source cannot be confirmed.
 

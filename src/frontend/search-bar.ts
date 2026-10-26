@@ -19,7 +19,6 @@ import {
     formatSearchCountLabel,
     hasRestrictInlineType,
     isRestrictInlineActive,
-    isRendererUnitFor,
     isRendererSourceFallbackUnitId,
     normalizeRestrictInlineTypes,
     toggleRestrictInlineType,
@@ -136,6 +135,7 @@ import {
 } from "./pipeline";
 import {
     countWritableMatches,
+    isMatchContentWritable,
     isMatchWritable,
     replaceAllMatchesInEditor,
     replaceCurrentMatchInEditor,
@@ -144,6 +144,7 @@ import {
 import {createRangeFromBlockOffsets} from "./ranges";
 import {RegexTextMatcher} from "./regex-matcher";
 import type {ReplaceCommitState} from "./replacement-commit";
+import {createReplacementReasonReader, type ReplacementSkipReason} from "./replacement-reasons";
 import {
     searchHistory,
     stableSearchHistoryDocId,
@@ -343,6 +344,18 @@ export interface SearchBarI18n {
     replaceAllAction: string;
     replaceToggle: string;
     replaceCurrentUnsupported: string;
+    replaceUnsupportedByReason?: string;
+    replaceAllSkipReason?: string;
+    replaceAllNoneWritable?: string;
+    replaceReasonSeparator?: string;
+    replaceReasonTabsTitle?: string;
+    replaceReasonRichCell?: string;
+    replaceReasonCellEditing?: string;
+    replaceReasonTablePending?: string;
+    replaceReasonMarker?: string;
+    replaceReasonPreview?: string;
+    replaceReasonReadonly?: string;
+    replaceReasonComplex?: string;
     replaceStaleTarget?: string;
     /** 单次正则替换：模板展开失败并跳过 */
     replaceRegexExpandFailed: string;
@@ -5026,27 +5039,49 @@ export class SearchBar {
         return null;
     }
 
-    /** 不可替换时的提示。表格两类单独说明，其余保持原来的文案。 */
+    private replacementReasonLabel(reason: ReplacementSkipReason): string {
+        const labels: Record<ReplacementSkipReason, string> = {
+            docTitle: this.i18n.settingsIncludeDocTitle || "document titles",
+            embed: this.i18n.settingsIncludeEmbedBlock || "embedded blocks",
+            database: this.i18n.settingsIncludeAttributeView || "database blocks",
+            math: this.i18n.settingsIncludeMathBlock || "math blocks",
+            inlineMath: this.i18n.settingsRestrictInlineMath || "inline formulas",
+            html: this.i18n.settingsIncludeHtmlBlock || "HTML blocks",
+            custom: this.i18n.settingsIncludeCustomBlock || "custom blocks",
+            mermaid: "Mermaid", flowchart: "flowchart", graphviz: "Graphviz", plantuml: "PlantUML",
+            chart: "ECharts", mindmap: "mindmap", abc: "ABC",
+            tabsTitle: this.i18n.replaceReasonTabsTitle || "tab titles",
+            richCell: this.i18n.replaceReasonRichCell || "unsupported rich-cell formatting",
+            cellEditing: this.i18n.replaceReasonCellEditing || "cells being edited",
+            tablePending: this.i18n.replaceReasonTablePending || "table text awaiting synchronization",
+            marker: this.i18n.replaceReasonMarker || "text containing invisible markers",
+            preview: this.i18n.replaceReasonPreview || "rendered preview text",
+            readonly: this.i18n.replaceReasonReadonly || "read-only text",
+            complex: this.i18n.replaceReasonComplex || "text spanning different formats",
+        };
+        return labels[reason];
+    }
+
+    /** One pass over rejected matches, using the writer's existing eligibility policy. */
+    private replacementSkipDetails(): string {
+        const reasons = new Set<ReplacementSkipReason>();
+        const readReason = createReplacementReasonReader();
+        for (const match of this.resultMatches) {
+            if (!isMatchContentWritable(match)) reasons.add(readReason(match));
+        }
+        if (!reasons.size) return "";
+        const labels = Array.from(reasons, reason => this.replacementReasonLabel(reason));
+        return (this.i18n.replaceAllSkipReason || " ({reasons} cannot be replaced)")
+            .replace("{reasons}", labels.join(this.i18n.replaceReasonSeparator || ", "));
+    }
+
+    /** Reuse actual search rejection reasons; never infer a whole block is unsupported from one complex hit. */
     private unsupportedReplaceMessage(match: SearchMatch): string {
-        if (match.blockType === ATTRIBUTE_VIEW_TYPE) {
-            return this.i18n.replaceAttributeViewUnsupported;
-        }
-        if (isRendererUnitFor(match.unitId, "mermaid") || match.unitId === "mermaid-source") {
-            return this.i18n.replaceMermaidUnsupported;
-        }
-        if (isRendererUnitFor(match.unitId, "html") || match.unitId === "html-block-rendered") {
-            return this.i18n.replaceHtmlBlockUnsupported;
-        }
-        if (match.blockType === "NodeCustomBlock") {
-            return this.i18n.replaceCustomBlockUnsupported;
-        }
-        if (match.replaceLock === "table-rich") {
-            return this.i18n.replaceTableRichUnsupported;
-        }
-        if (match.replaceLock === "table-cell-editor") {
-            return this.i18n.replaceTableCellEditingUnsupported;
-        }
-        return this.i18n.replaceCurrentUnsupported;
+        const reason = createReplacementReasonReader()(match);
+        if (reason === "richCell") return this.i18n.replaceTableRichUnsupported;
+        if (reason === "cellEditing") return this.i18n.replaceTableCellEditingUnsupported;
+        return (this.i18n.replaceUnsupportedByReason || "Replacement is not supported for {reason}.")
+            .replace("{reason}", this.replacementReasonLabel(reason));
     }
 
     private replacePendingMessageId?: string;
@@ -5188,7 +5223,7 @@ export class SearchBar {
             this.clickNext();
             return;
         }
-        if (!match.replaceable) {
+        if (!isMatchContentWritable(match)) {
             showMessage(this.unsupportedReplaceMessage(match), 3000, "info");
             this.clickNext();
             return;
@@ -5306,7 +5341,7 @@ export class SearchBar {
                 return;
             }
             if (result.replacedCount === 0) {
-                showMessage(this.i18n.replaceCurrentUnsupported, 3000, "info");
+                showMessage(this.unsupportedReplaceMessage(current), 3000, "info");
                 this.clickNext();
                 return;
             }
@@ -5366,8 +5401,16 @@ export class SearchBar {
         const initialSelectionScope = this.rememberedSelectionScope;
         const confirmationDomEpoch = this.domEpoch;
         const writableCount = countWritableMatches(this.edit, this.resultMatches);
+        if (!writableCount && isEditorReplaceModeBlocked(this.edit)) {
+            showMessage(this.i18n.replaceModeUnsupported, 3000, "info");
+            return;
+        }
+        const skippedDetails = writableCount < this.resultMatches.length ? this.replacementSkipDetails() : "";
         if (!writableCount) {
-            showMessage(this.i18n.replaceCurrentUnsupported, 3000, "info");
+            showMessage(skippedDetails ?
+                (this.i18n.replaceAllNoneWritable || "No replaceable matches{reasons}.")
+                    .replace("{reasons}", skippedDetails) :
+                this.i18n.replaceModeUnsupported, 3000, "info");
             return;
         }
         let scope = this.selectionOnly ?
@@ -5383,7 +5426,8 @@ export class SearchBar {
             .replace("{scope}", scope)
             .replace("{matchCount}", String(this.resultMatches.length))
             .replace("{count}", String(writableCount))
-            .replace("{skippedCount}", String(this.resultMatches.length - writableCount));
+            .replace("{skippedCount}", String(this.resultMatches.length - writableCount))
+            .replace("{reasons}", skippedDetails);
         const confirmed = await confirmDialog(
             this.i18n.replaceAllConfirmTitle,
             confirmText,

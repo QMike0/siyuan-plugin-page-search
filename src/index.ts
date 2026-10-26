@@ -443,6 +443,19 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             replaceToggle: t.replaceToggle || "Expand or collapse replace row",
             replaceCurrentUnsupported: t.replaceCurrentUnsupported ||
                 "This match cannot be replaced directly",
+            replaceUnsupportedByReason: t.replaceUnsupportedByReason ||
+                "Replacement is not supported for {reason}.",
+            replaceAllSkipReason: t.replaceAllSkipReason || " ({reasons} cannot be replaced)",
+            replaceAllNoneWritable: t.replaceAllNoneWritable || "No replaceable matches{reasons}.",
+            replaceReasonSeparator: t.replaceReasonSeparator || ", ",
+            replaceReasonTabsTitle: t.replaceReasonTabsTitle || "tab titles",
+            replaceReasonRichCell: t.replaceReasonRichCell || "unsupported rich-cell formatting",
+            replaceReasonCellEditing: t.replaceReasonCellEditing || "cells being edited",
+            replaceReasonTablePending: t.replaceReasonTablePending || "table text awaiting synchronization",
+            replaceReasonMarker: t.replaceReasonMarker || "text containing invisible markers",
+            replaceReasonPreview: t.replaceReasonPreview || "rendered preview text",
+            replaceReasonReadonly: t.replaceReasonReadonly || "read-only text",
+            replaceReasonComplex: t.replaceReasonComplex || "text spanning different formats",
             replaceRegexExpandFailed: t.replaceRegexExpandFailed ||
                 "Regex replace expansion failed; skipped",
             replaceRegexBudgetExceeded: t.replaceRegexBudgetExceeded ||
@@ -456,7 +469,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             replaceCustomBlockUnsupported: t.replaceCustomBlockUnsupported ||
                 "Custom blocks are rendered by plugins and cannot be replaced directly",
             replaceTableRichUnsupported: t.replaceTableRichUnsupported ||
-                "Rich-text table cells support search and highlight only; replacement is not supported",
+                "This rich-text cell's formatting cannot be safely written back; replacement is not supported",
             replaceTableCellEditingUnsupported: t.replaceTableCellEditingUnsupported ||
                 "This cell is being edited. Click outside the cell to finish editing, then replace",
             replaceTablePendingEdit: t.replaceTablePendingEdit ||
@@ -468,7 +481,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             replaceDocTitleEmpty: t.replaceDocTitleEmpty ||
                 "Document title is invalid; skipped",
             replaceAllConfirm: t.replaceAllConfirm ||
-                "Scope: {scope}. {matchCount} matches, {count} currently replaceable, {skippedCount} not replaceable. Replace the replaceable matches?",
+                "{scope}: {matchCount} matches, {count} replaceable, {skippedCount} to skip{reasons}. Continue replacing?",
             replaceAllConfirmTitle: t.replaceAllConfirmTitle || "Replace all",
             replaceAllScopeDocument: t.replaceAllScopeDocument || "Current document (using search settings)",
             replaceAllScopeFocus: t.replaceAllScopeFocus || "Focused block and its content (using search settings)",

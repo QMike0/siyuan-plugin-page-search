@@ -3613,6 +3613,9 @@ async function searchCurrentDocumentImpl(
             typesByUnit.set(unit, blockTypes);
         }
         if (!passesResultTypeFilter(blockTypes, options.resultBlockTypes)) continue;
+        const richSpanBlocked = !nonReplaceable && !replaceLock && writableSpans !== undefined &&
+            !writableSpans.some(span => hit.start >= span.start && hit.end <= span.end);
+        const tablePending = !nonReplaceable && tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`);
         matches.push({
             id: hit.id,
             blockId: hit.blockId,
@@ -3621,6 +3624,9 @@ async function searchCurrentDocumentImpl(
             blockIndex: orderIndex.get(hit.blockId) ?? (hit.blockId === "__doc-title__" ? -1 : hit.blockIndex),
             unitId: hit.unitId,
             unitSeq: navSeq(unit, hit.start),
+            replaceReason: mountedTabsTitleIds.has(hit.blockId) || unloadedTabsTitleIds.has(hit.blockId) ? "tabsTitle" :
+                unit.matchSource === "projection" && !projectionSourceBacked.has(hit.blockId) ? "preview" :
+                tablePending ? "tablePending" : richSpanBlocked ? "richCell" : undefined,
             embeddedPosition: embeddedPositionAt(unit.embeddedOrder, hit.start),
             embeddedAvViewId: hit.unitId?.startsWith("embed:") ?
                 embeddedAvViews.get(`${hit.blockId}\0${hit.unitId.slice(0, hit.unitId.indexOf(":", 6) + 1)}`) :
@@ -3629,10 +3635,9 @@ async function searchCurrentDocumentImpl(
             end: hit.end,
             matchedText: hit.matchedText,
             replaceable: (nonReplaceable || Boolean(replaceLock) ||
-                    (writableSpans !== undefined && !writableSpans.some(span =>
-                        hit.start >= span.start && hit.end <= span.end)) ||
+                    richSpanBlocked ||
                     (unit.matchSource === "projection" && !projectionSourceBacked.has(hit.blockId)) ||
-                    tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`)) ?
+                    tablePending) ?
                 false :
                 hit.replaceable,
             replaceLock,
