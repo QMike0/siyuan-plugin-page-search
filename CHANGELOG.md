@@ -1,3 +1,18 @@
+## v2.1.0 2026-10-26
+
+- 🇨🇳 支持对表格富文本单元格内容的替换/全部替换
+- 🇨🇳 支持数据库不同视图下的字段名称搜索、高亮和跳转，并遵守显示字段名称、显示空字段和隐藏字段等设置
+- 🇨🇳 优化搜索/替换面板的触发范围
+- 🇨🇳 优化替换&全部替换在不可替换情况下的提示文本
+- 🇨🇳 修复图片标题文本替换问题
+- 🇨🇳 更新README，优化相关表述
+- 🇺🇸 Support replacing/replace all for rich text cell content in tables
+- 🇺🇸 Support field name search, highlighting, and navigation across different database views, while respecting settings such as showing field names, showing empty fields, and hiding fields
+- 🇺🇸 Optimize the trigger range of the search/replace panel
+- 🇺🇸 Optimize the prompt text for replace & replace all when replacement is not possible
+- 🇺🇸 Fix the issue with replacing image caption text
+- 🇺🇸 Update README and optimize related wording
+
 ## v2.0.2 2026-10-18
 
 - 🇨🇳 在“是否搜索”菜单中添加自定义块的开关项
