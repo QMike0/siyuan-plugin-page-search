@@ -71,6 +71,11 @@ export function createCommitContentReader(
             template.content.querySelectorAll("[data-node-id]").forEach((element) => {
                 element.removeAttribute("updated");
                 element.removeAttribute("parent-heading");
+                // Source-block reference counts are maintained independently by
+                // the kernel/UI. Lute includes this derived badge in Markdown,
+                // unlike its rendered .protyle-attr contents. Never compare it as
+                // saved user content, and only normalize this detached copy.
+                element.removeAttribute("refcount");
                 if (element.getAttribute("data-type") === "NodeTable" && element.getAttribute("colgroup") === "") {
                     element.removeAttribute("colgroup");
                 }

@@ -1180,6 +1180,63 @@ async function main() {
     }
     console.log("Untouched dynamic-reference refresh remains a confirmed replacement OK");
 
+    // Ref-count is a derived badge, not the source block's saved text. A pasted
+    // reference/embed can add/remove it independently of the replacement queue.
+    for (const all of [false, true]) {
+        for (const fetched of [false, true]) {
+            for (const nextCount of [null, "2", "0"]) {
+                const referred = fixture([paragraph(id, "foo").replace('data-type="NodeParagraph"',
+                    'data-type="NodeParagraph" refcount="1"')]);
+                if (!lute) referred.protyle.protyle.lute = {BlockDOM2Md: html => html};
+                if (fetched) referred.wysiwyg.innerHTML = "";
+                const referredApi = api;
+                let confirmationReads = 0;
+                api = async (url, body) => {
+                    if (referred.calls.length) confirmationReads++;
+                    const response = await referredApi(url, body);
+                    if (referred.calls.length && response.data?.[id]) {
+                        response.data[id] = response.data[id].replace(/ refcount="[^"]*"/g,
+                            nextCount === null ? "" : ' refcount="' + nextCount + '"');
+                    }
+                    return response;
+                };
+                const result = await run(referred, all);
+                assert.equal(result.commitState, "confirmed", "derived ref-count changes must not hide a saved replacement");
+                assert.equal(result.replacedCount, 1);
+                assert.equal(confirmationReads, 1, "ref-count difference does not cause repeated confirmation polling");
+                assert.ok(referred.calls[0].operations[0].data.includes('refcount="1"'), "submitted DOM is not stripped");
+                assert.ok(referred.calls[0].undo[0].data.includes('refcount="1"'), "undo DOM is not stripped");
+                assert.ok(referred.calls[0].undo[0].data.includes("foo"), "original text remains undoable");
+                api = referredApi;
+            }
+        }
+    }
+    const refCountReader = commit.createCommitContentReader(contentFixture.protyle);
+    const referredParent = '<div data-node-id="' + otherId + '" data-type="NodeBlockquote" refcount="1">' +
+        paragraph(id, "bar").replace('data-type="NodeParagraph"', 'data-type="NodeParagraph" refcount="3"') + '</div>';
+    assert.equal(refCountReader(referredParent), refCountReader(referredParent.replace(/ refcount="[^"]*"/g, "")),
+        "nested block reference badges are derived too");
+    assert.equal(refCountReader(referredParent), refCountReader(referredParent.replace(/refcount="[^"]*"/g, 'refcount="9"')));
+    for (const changed of [
+        referredParent.replace("bar", "foo"),
+        referredParent.replace('data-type="NodeBlockquote"', 'data-type="NodeBlockquote" custom-note="changed"'),
+        referredParent.replace('data-type="NodeParagraph"', 'data-type="NodeParagraph" name="changed"'),
+    ]) assert.notEqual(refCountReader(referredParent), refCountReader(changed), "body and authored attributes stay strict");
+    for (const all of [false, true]) {
+        const rejectedRef = fixture([paragraph(id, "foo").replace('data-type="NodeParagraph"',
+            'data-type="NodeParagraph" refcount="1"')], "rejected");
+        if (!lute) rejectedRef.protyle.protyle.lute = {BlockDOM2Md: html => html};
+        const rejectedApi = api;
+        api = async (url, body) => {
+            const response = await rejectedApi(url, body);
+            if (response.data?.[id]) response.data[id] = response.data[id].replace(/ refcount="[^"]*"/g, "");
+            return response;
+        };
+        assert.equal((await run(rejectedRef, all)).commitState, "unknown", "badge changes cannot confirm rejected text");
+        api = rejectedApi;
+    }
+    console.log("Referenced source blocks: single/all, live/fetched, ref-count removal/change, nested metadata and rejected-content guards OK");
+
     for (const all of [false, true]) {
         const scoped = fixture(undefined, "delayed");
         scoped.protyle.protyle.notebookId = "encrypted-notebook";
