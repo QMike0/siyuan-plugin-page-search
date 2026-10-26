@@ -41,6 +41,8 @@ import {
     orderEmbeddedVisualMatches,
 } from "./embedded-order";
 import {buildListSnippet} from "./list-snippet";
+import {deferRichCellCapability, resolveRichCellCapabilities, type RichCellCapability, type RichCellSearchInfo} from "./rich-table-cell";
+import {searchableTextLengths} from "./text-runs";
 import {
     createRangeFromBlockOffsets,
     isRangePlainTextOnly,
@@ -170,7 +172,7 @@ function toSearchableUnit(block: SearchableBlock): SearchableUnit {
     const segmentLengths = block.element.closest('[data-type="NodeCustomBlock"]') ?
         undefined : block.matchSource === "projection" ?
         (block.text.length > 0 ? [block.text.length] : undefined) :
-        block.textNodes.map((node) => node.nodeValue?.length ?? 0);
+        searchableTextLengths(block);
     return {
         blockId: block.blockId,
         blockType: block.blockType,
@@ -486,8 +488,20 @@ async function calculateLoadedDomMatches(
         ) :
         matched.hits;
 
+    const richTargets = new Map<SearchableBlock, RichCellSearchInfo>();
+    for (const hit of scopedHits) {
+        const block = blockMap.get(unitKey(hit.blockId, hit.unitId));
+        if (!block || block.blockType !== TABLE_TYPE || richTargets.has(block)) continue;
+        const rich = deferRichCellCapability(block);
+        if (rich) richTargets.set(block, rich);
+    }
+    const resolved = await resolveRichCellCapabilities(richTargets.values(), () => options.signal?.aborted !== true);
+    if (!resolved) return {matches: [], error: "", cancelled: true};
+    const richCapabilities = new Map<SearchableBlock, RichCellCapability>();
+    for (const [block, info] of richTargets) richCapabilities.set(block, resolved.get(info)!);
     return {
         matches: attachRangesToHits(blockMap, scopedHits, edit, {
+            richCapabilities,
             allowFoldedHidden: options.includeFoldedBlocks === true,
             restrictInlineTypes: options.restrictInlineTypes,
             includeSourceFallback: !selectionOnly,
@@ -502,6 +516,7 @@ function attachRangesToHits(
     hits: MatchHit[],
     edit?: Element,
     visibility: {
+        richCapabilities?: Map<SearchableBlock, RichCellCapability>;
         allowFoldedHidden?: boolean;
         restrictInlineTypes?: RestrictInlineType[];
         includeSourceFallback?: boolean;
@@ -509,6 +524,8 @@ function attachRangesToHits(
     } = {},
 ): SearchMatch[] {
     const result: SearchMatch[] = [];
+    const richSpans = new Map<SearchableBlock, RichCellCapability["writableSpans"]>();
+    const tableLocks = new Map<SearchableBlock, ReturnType<typeof tableCellReplaceLock>>();
     /** 每个单元的 hits 已按偏移排序；记录最后接受的终点即可线性去重。 */
     const acceptedEndByUnit = new Map<string, number>();
     // Type ancestry is only needed for accepted hits. Keep this reader local to
@@ -598,9 +615,13 @@ function attachRangesToHits(
 
         // 文档标题只参与查找。编辑中 Protyle 常把连续字拆成多个相邻 Text。
         // 富文本格和开着的单元格编辑器单独标原因，公式等仍走原来的不可替换。
-        const replaceLock = hit.blockType === TABLE_TYPE && !isDocTitle && !isMath ?
-            tableCellReplaceLock(block.element) :
-            undefined;
+        if (hit.blockType === TABLE_TYPE && !isDocTitle && !isMath && !tableLocks.has(block)) {
+            const rich = visibility.richCapabilities?.get(block);
+            tableLocks.set(block, rich ? rich.replaceLock : tableCellReplaceLock(block.element));
+            richSpans.set(block, rich?.writableSpans);
+        }
+        const replaceLock = tableLocks.get(block);
+        const spans = richSpans.get(block);
         const projectionHost = block.element.closest(".tabs-header, .mindmap-view");
         const projectionSourceBacked = block.matchSource === "projection" &&
             Boolean(projectionHost) &&
@@ -610,6 +631,7 @@ function attachRangesToHits(
                 ),
             );
         const replaceable = !replaceLock &&
+            (spans === undefined || spans.some(span => hit.start >= span.start && hit.end <= span.end)) &&
             !isRendererUnitId(hit.unitId) &&
             !hit.unitId?.startsWith("embed:") &&
             !isDocTitle &&

@@ -12,6 +12,7 @@ import {isInlineMemoSearchUnit} from "./blocks";
 import type {SearchableBlock} from "./dom-types";
 import type {SearchMatch} from "./dom-types";
 import {preserveReplacementCase} from "./preserve-case";
+import {prepareRichCellEdit, publishRichCellEdit, RICH_CELL_ATTRIBUTE, type RichCellEdit} from "./rich-table-cell";
 import {
     isRangePlainTextOnly,
     locateRangeInSingleTextNode,
@@ -38,6 +39,8 @@ export interface ApplyReplacementOptions {
     caseSensitive?: boolean;
     /** Worker 已准备的正则展开结果；有值时绝不在主线程重新执行 RegExp。 */
     regexPlan?: RegexReplacementPlan;
+    /** Private, per-preparation rich-cell plan; consumed without another Lute conversion. */
+    richPlan?: RichReplacementPlan;
 }
 
 export interface ApplyReplacementOutcome {
@@ -48,6 +51,7 @@ export interface ApplyReplacementOutcome {
     skippedCount: number;
     /** 其中因正则模板展开失败而跳过的条数 */
     regexExpandFailedCount: number;
+    richCellFailedCount?: number;
 }
 
 export interface RegexReplacementPlan {
@@ -174,6 +178,7 @@ function groupReplacementSpecs(
 }
 
 function replacementHaystack(unit: SearchableBlock): string {
+    if (unit.element.hasAttribute(RICH_CELL_ATTRIBUTE)) return unit.text;
     if (isInlineMemoSearchUnit(unit)) {
         return plainTextFromInlineMemoContent(
             unit.element.getAttribute("data-inline-memo-content") ?? "",
@@ -581,6 +586,93 @@ function followNodePath(root: Node, path: number[]): Node | null {
     return current;
 }
 
+/** Rich cells are source edits, grouped across every text run in the cell.
+ * Prepare all of them before touching live DOM; never modify preview Text only. */
+interface RichReplacementPlan {
+    handled: Set<SearchableBlock>;
+    prepared: Array<{cell: HTMLElement; value: NonNullable<ReturnType<typeof prepareRichCellEdit>>; count: number;}>;
+    skippedCount: number;
+    regexExpandFailedCount: number;
+    replacementEnd?: number;
+}
+
+function* prepareRichReplacementSteps(
+    grouped: Map<SearchableBlock, ReplacementSpec[]>,
+    replacementText: string,
+    options: ApplyReplacementOptions,
+): Generator<void, RichReplacementPlan, void> {
+    const cells = new Map<HTMLElement, {edits: RichCellEdit[]; count: number; failed: boolean;}>();
+    const handled = new Set<SearchableBlock>();
+    let regexExpandFailedCount = 0;
+    let replacementEnd: number | undefined;
+    for (const [unit, specs] of grouped) {
+        const cell = unit.element.closest<HTMLElement>(`[${RICH_CELL_ATTRIBUTE}]`);
+        if (!cell) continue;
+        handled.add(unit);
+        const group = cells.get(cell) ?? {edits: [], count: 0, failed: false};
+        cells.set(cell, group);
+        group.count += specs.length;
+        if (unit.element !== cell || isInlineMemoSearchUnit(unit)) {
+            group.failed = true;
+            continue;
+        }
+        for (const spec of specs) {
+            const text = resolveReplacementText(unit.text, spec, replacementText, options);
+            if (text === null) {
+                group.failed = true;
+                if (options.regex) regexExpandFailedCount += 1;
+            } else {
+                group.edits.push({...spec, nodes: unit.textNodes, nodeOffset: unit.textStartOffset, text});
+                replacementEnd = spec.start + text.length;
+            }
+        }
+    }
+    const prepared: Array<{cell: HTMLElement; value: NonNullable<ReturnType<typeof prepareRichCellEdit>>; count: number;}> = [];
+    let skippedCount = 0;
+    for (const [cell, group] of cells) {
+        const value = group.failed ? undefined : prepareRichCellEdit(cell, group.edits);
+        if (value) prepared.push({cell, value, count: group.count});
+        else skippedCount += group.count;
+        yield;
+    }
+    return {handled, prepared, skippedCount, regexExpandFailedCount, replacementEnd};
+}
+
+function prepareRichReplacements(
+    grouped: Map<SearchableBlock, ReplacementSpec[]>,
+    replacementText: string,
+    options: ApplyReplacementOptions,
+): RichReplacementPlan {
+    if (options.richPlan) return options.richPlan;
+    const steps = prepareRichReplacementSteps(grouped, replacementText, options);
+    let step = steps.next();
+    while (!step.done) step = steps.next();
+    return step.value;
+}
+
+/** Pure preparation only: yield between expensive cell conversions, before any
+ * live mutation. The caller must revalidate all targets before synchronous publish. */
+export async function prepareRichReplacementPlan(
+    unitsByKey: Map<string, SearchableBlock>,
+    matches: Parameters<typeof groupReplacementSpecs>[1],
+    replacementText: string,
+    options: ApplyReplacementOptions,
+    checkCurrent: () => string | undefined,
+): Promise<{plan?: RichReplacementPlan; error?: string;}> {
+    const steps = prepareRichReplacementSteps(groupReplacementSpecs(unitsByKey, matches).byUnit, replacementText, options);
+    let deadline = performance.now() + 8;
+    while (true) {
+        const error = checkCurrent();
+        if (error) return {error};
+        const step = steps.next();
+        if (step.done) return {plan: step.value};
+        if (performance.now() >= deadline) {
+            await new Promise<void>(resolve => setTimeout(resolve, 0));
+            deadline = performance.now() + 8;
+        }
+    }
+}
+
 /**
  * 在提交块的 clone 上应用同一 blockId 下多个命中（可含不同 unitId）。
  * liveSubmit + units 用于把偏移映射到 clone。
@@ -596,11 +688,13 @@ export function applyMatchesToSubmitClone(
     options: ApplyReplacementOptions = {},
 ): ApplyReplacementOutcome {
     const grouped = groupReplacementSpecs(unitsByKey, matches);
+    const rich = prepareRichReplacements(grouped.byUnit, replacementText, options);
     let appliedCount = 0;
-    let skippedCount = grouped.skippedCount;
-    let regexExpandFailedCount = 0;
-    let replacementEnd: number | undefined;
+    let skippedCount = grouped.skippedCount + rich.skippedCount;
+    let regexExpandFailedCount = rich.regexExpandFailedCount;
+    let replacementEnd = matches.length === 1 ? rich.replacementEnd : undefined;
     for (const [unit, specs] of grouped.byUnit) {
+        if (rich.handled.has(unit)) continue;
         if (liveSubmit !== unit.element && !liveSubmit.contains(unit.element)) {
             skippedCount += specs.length;
             continue;
@@ -654,7 +748,17 @@ export function applyMatchesToSubmitClone(
         regexExpandFailedCount += outcome.regexExpandFailedCount;
     }
 
-    return {appliedCount, skippedCount, regexExpandFailedCount, replacementEnd};
+    for (const {cell, value, count} of rich.prepared) {
+        const path = getNodePath(liveSubmit, cell);
+        const target = path && followNodePath(cloneSubmit, path);
+        if (!(target instanceof HTMLElement)) skippedCount += count;
+        else {
+            publishRichCellEdit(target, value);
+            appliedCount += count;
+        }
+    }
+    return {appliedCount, skippedCount, regexExpandFailedCount, replacementEnd,
+        ...(rich.skippedCount ? {richCellFailedCount: rich.skippedCount} : {})};
 }
 
 /**
@@ -669,11 +773,13 @@ export function applyMatchesToLiveUnits(
     options: ApplyReplacementOptions = {},
 ): ApplyReplacementOutcome {
     const grouped = groupReplacementSpecs(unitsByKey, matches);
+    const rich = prepareRichReplacements(grouped.byUnit, replacementText, options);
     let appliedCount = 0;
-    let skippedCount = grouped.skippedCount;
-    let regexExpandFailedCount = 0;
-    let replacementEnd: number | undefined;
+    let skippedCount = grouped.skippedCount + rich.skippedCount;
+    let regexExpandFailedCount = rich.regexExpandFailedCount;
+    let replacementEnd = matches.length === 1 ? rich.replacementEnd : undefined;
     for (const [unit, specs] of grouped.byUnit) {
+        if (rich.handled.has(unit)) continue;
         if (isInlineMemoSearchUnit(unit)) {
             const outcome = applyReplacementsToInlineMemoElement(
                 unit.element,
@@ -698,5 +804,10 @@ export function applyMatchesToLiveUnits(
         skippedCount += outcome.skippedCount;
         regexExpandFailedCount += outcome.regexExpandFailedCount;
     }
-    return {appliedCount, skippedCount, regexExpandFailedCount, replacementEnd};
+    for (const {cell, value, count} of rich.prepared) {
+        publishRichCellEdit(cell, value);
+        appliedCount += count;
+    }
+    return {appliedCount, skippedCount, regexExpandFailedCount, replacementEnd,
+        ...(rich.skippedCount ? {richCellFailedCount: rich.skippedCount} : {})};
 }

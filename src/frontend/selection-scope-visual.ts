@@ -1114,7 +1114,7 @@ export function captureSelectionScopeWithKind(
     });
     if (tableCellText) {
         const cellTextScope = selectionScopeFromTableCellText(blocks, tableCellText);
-        if (cellTextScope.size > 0) {
+        if (cellTextScope.size > 0 || tableCellText.richText) {
             return {
                 scope: cellTextScope,
                 kind: "text",

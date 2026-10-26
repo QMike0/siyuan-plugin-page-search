@@ -21,7 +21,7 @@
   "searchMethodRegex": "正则表达式",
   "preserveCase": "保留大小写",
   "preserveCaseDisabledByRegex": "正则模式下不可用（替换串按 $1 等展开）",
-  "replaceUnsupportedHelp": "只读、发布或预览模式不能替换；公式、数据库、HTML、Mermaid、文档标题、富文本单元格和复杂格式文字也不能替换。正则模式支持 $1、$& 等替换语法",
+  "replaceUnsupportedHelp": "只读、发布或预览模式不能替换；公式、数据库、HTML、Mermaid、文档标题及无法安全保存的复杂格式文字也不能替换。正则模式支持 $1、$& 等替换语法",
   "replaceAction": "替换 (Enter)",
   "replaceAllAction": "全部替换 (Ctrl+Alt+Enter)",
   "replaceToggle": "展开或折叠替换栏",
@@ -34,14 +34,14 @@
   "replaceMermaidUnsupported": "Mermaid 图仅支持搜索与高亮，不支持替换",
   "replaceHtmlBlockUnsupported": "HTML 块仅支持搜索与高亮渲染可见文字，不支持替换",
   "replaceCustomBlockUnsupported": "自定义块由插件渲染，不支持直接替换",
-  "replaceTableRichUnsupported": "富文本单元格仅支持搜索与高亮，不支持替换",
+  "replaceTableRichUnsupported": "这处富文本内容暂不支持安全替换",
   "replaceTableCellEditingUnsupported": "单元格正在编辑，请先点击单元格外退出编辑后再替换",
   "replaceTablePendingEdit": "表格里还有未写入的编辑，请先点击单元格外完成编辑后再替换",
   "replaceModeUnsupported": "当前为发布服务、导出预览或只读模式，不支持替换",
   "replaceDocTitleUnsupported": "文档标题仅支持搜索，不参与替换",
   "replaceDocTitleFailed": "文档标题重命名失败",
   "replaceDocTitleEmpty": "文档标题非法，已跳过",
-  "replaceAllConfirm": "范围：{scope}。共 {matchCount} 处命中，可替 {count} 处，{skippedCount} 处将跳过（文档标题、嵌入块、数据库、公式、Mermaid/HTML 渲染文字、富文本单元格或复杂格式文字不支持替换）。继续吗？",
+  "replaceAllConfirm": "范围：{scope}。共 {matchCount} 处命中，可替 {count} 处，{skippedCount} 处将跳过（文档标题、嵌入块、数据库、公式、Mermaid/HTML 渲染文字或暂不支持的复杂格式不支持替换）。继续吗？",
   "replaceAllConfirmTitle": "全部替换",
   "replaceAllScopeDocument": "当前文档（按搜索设置）",
   "replaceAllScopeFocus": "当前聚焦块及其内容（按搜索设置）",
@@ -124,5 +124,6 @@
   "settingsRestrictInlineMemo": "行内备注",
   "settingsRestrictInlineMemoHint": "需先开启「是否搜索-行内备注」",
   "settingsRestrictInlineMemoOnHint": "需先开启「是否搜索-行内备注」",
-  "invalidRegex": "正则无效：{error}"
+  "invalidRegex": "正则无效：{error}",
+  "replaceRichCellUnsafe": "富文本格式或替换文字无法安全保存，已取消本次替换"
 }

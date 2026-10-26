@@ -1,3 +1,4 @@
+import {resolveRichCellCapabilities, type RichCellSearchInfo} from "../rich-table-cell";
 import {getAllEditor} from "siyuan";
 import type {Plugin} from "siyuan";
 import {
@@ -443,6 +444,7 @@ function textBytes(value: string | undefined): number {
  */
 function estimateCacheEntryBytes(hash: string, units: readonly CachedUnit[]): number {
     let bytes = 64 + textBytes(hash);
+    const richSnapshots = new Set<RichCellSearchInfo["snapshot"]>();
     for (const unit of units) {
         bytes += 96 +
             textBytes(unit.blockId) +
@@ -457,6 +459,13 @@ function estimateCacheEntryBytes(hash: string, units: readonly CachedUnit[]): nu
             bytes += 64 + textBytes(ref.blockId) + textBytes(ref.avId) + textBytes(ref.updated) +
                 textBytes(ref.carrierViewId) + textBytes(ref.query);
         }
+        const snapshot = unit.richCell?.snapshot;
+        if (snapshot && !richSnapshots.has(snapshot)) {
+            richSnapshots.add(snapshot);
+            bytes += 64 + textBytes(snapshot.encoded) + textBytes(snapshot.html);
+        }
+        bytes += (unit.richCell?.segments?.length ?? 0) * 48;
+        bytes += (unit.writableSpans?.length ?? 0) * 32;
         bytes += (unit.segmentLengths?.length ?? 0) * 8;
         bytes += (unit.restrictSpans?.length ?? 0) * 40;
         bytes += (unit.blockTypes?.length ?? 0) * 32;
@@ -3551,6 +3560,13 @@ async function searchCurrentDocumentImpl(
             projectionSourceBacked.add(unit.blockId);
         }
     }
+    const richTargets = new Set<RichCellSearchInfo>();
+    for (const hit of matched.hits) {
+        const rich = byKey.get(`${hit.blockId}\u0000${hit.unitId ?? ""}`)?.richCell;
+        if (rich) richTargets.add(rich);
+    }
+    const richCapabilities = await resolveRichCellCapabilities(richTargets, () => !cancelled());
+    if (!richCapabilities) return {matches: [], error: "", cancelled: true};
     const mountedTabsTitleIds = new Set(
         liveAll.filter(isTabsTitleSearchUnit).map((unit) => unit.blockId),
     );
@@ -3587,7 +3603,10 @@ async function searchCurrentDocumentImpl(
             hit.unitId === "diagram-rendered" ||
             isInlineMathSearchUnit(unit) ||
             hit.unitId?.startsWith("embed:");
-        const replaceLock = nonReplaceable ? undefined : virtualTableReplaceLock(virtualTables, unit);
+        const richCapability = unit.richCell && richCapabilities.get(unit.richCell);
+        const replaceLock = nonReplaceable ? undefined :
+            richCapability?.replaceLock ?? virtualTableReplaceLock(virtualTables, unit);
+        const writableSpans = richCapability?.writableSpans ?? unit.writableSpans;
         let blockTypes = typesByUnit.get(unit);
         if (!blockTypes) {
             blockTypes = readBlockTypes(unit);
@@ -3610,6 +3629,8 @@ async function searchCurrentDocumentImpl(
             end: hit.end,
             matchedText: hit.matchedText,
             replaceable: (nonReplaceable || Boolean(replaceLock) ||
+                    (writableSpans !== undefined && !writableSpans.some(span =>
+                        hit.start >= span.start && hit.end <= span.end)) ||
                     (unit.matchSource === "projection" && !projectionSourceBacked.has(hit.blockId)) ||
                     tableStale.has(`${hit.blockId}\u0000${hit.unitId ?? ""}`)) ?
                 false :
@@ -3840,10 +3861,22 @@ function structuralNavSeq(
             2 :
             (unit.tableSlot ? 0 : 1);
         const run = tableRunIndex(unit.unitId);
+        const richBody = unit.richCell && unit.richCell.replaceLock !== "table-cell-editor" &&
+            unit.unitId?.startsWith("table-cell:");
+        const richMath = unit.tableSlot && isRendererUnitId(unit.unitId);
         // 没切开的格子保持原来的偏移序号。切开后每一段独占一段序号，段内仍按命中位置排。
         const atInRun = run === 0 ? at : Math.min(at, 1023);
-        const inner = (run === 0 ? atInRun : run * 1024 + atInRun) * TABLE_CELL_SLOT + slot;
-        return rank * TABLE_CELL_SEQ_SPAN + Math.min(inner, TABLE_CELL_SEQ_SPAN - 1);
+        // Rich run IDs carry source-text offsets, not ordinary run ordinals.
+        // Scaling them by 1024 would both misplace math and prematurely cap
+        // navigation in cells with more than a few hundred preceding chars.
+        const inner = (richBody || richMath ? run + at :
+            (run === 0 ? atInRun : run * 1024 + atInRun)) * TABLE_CELL_SLOT + slot;
+        const position = rank * TABLE_CELL_SEQ_SPAN + Math.min(inner, TABLE_CELL_SEQ_SPAN - 1);
+        // Consecutive rich-cell formulas share a body boundary. Their own
+        // match offsets must not reorder the formulas; a fraction below the
+        // next slot preserves source order ahead of the following body text.
+        return richMath ?
+            position + (seq.get(key) ?? 0) / (units.length + 1) : position;
     };
 }
 

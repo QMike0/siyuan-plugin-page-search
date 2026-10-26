@@ -24,6 +24,20 @@ const COMMIT_WAIT_MS = 8000;
 const COMMIT_BATCH_SIZE = 64;
 const COMMIT_READ_CONCURRENCY = 4;
 
+/** Compare saved values, without imposing edit eligibility on untouched cells.
+ * Go JSON escapes HTML characters, so equal sources need not have equal base64. */
+function richSourceSignature(encoded: string): unknown {
+    try {
+        const bytes = Uint8Array.from(atob(encoded.replace(/-/g, "+").replace(/_/g, "/")), char => char.charCodeAt(0));
+        const value = JSON.parse(new TextDecoder("utf-8", {fatal: true}).decode(bytes));
+        if (value && Object.keys(value).length === 3 && value.spec === 1 && value.format === "kramdown" &&
+            typeof value.content === "string") return [value.spec, value.format, value.content];
+    } catch {
+        // Unknown/invalid encodings must still participate in conflict checks.
+    }
+    return encoded;
+}
+
 function notify(observer: CommitObserver, state: ReplaceCommitState): void {
     try {
         observer.onCommitStateChange?.(state);
@@ -87,6 +101,11 @@ export function createCommitContentReader(
                 });
             }
             const markdown = lute.BlockDOM2Md(template.innerHTML);
+            // Rich-cell previews are derived. A matching preview cannot confirm
+            // persistence unless every saved source also matches.
+            const richSources = Array.from(template.content.querySelectorAll("td[data-sy-table-cell-rich], th[data-sy-table-cell-rich]"),
+                cell => richSourceSignature(cell.getAttribute("data-sy-table-cell-rich")!));
+            if (markdown && richSources.length) return JSON.stringify([markdown, richSources]);
             return markdown || undefined;
         } catch {
             // Failure to read content is not evidence that the write succeeded.

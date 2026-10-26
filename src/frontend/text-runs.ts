@@ -2,6 +2,18 @@ import {
     isCssHideBoundary,
     textDisplay,
 } from "./visibility";
+import type {SearchableBlock} from "./dom-types";
+
+/** Rich previews retain native Text nodes; a soft-break line can use a slice. */
+export function searchableTextLengths(block: SearchableBlock): number[] {
+    if (block.textStartOffset === undefined) return block.textNodes.map(node => node.data.length);
+    let remaining = block.text.length;
+    return block.textNodes.map((node, index) => {
+        const length = Math.max(0, Math.min(remaining, node.data.length - (index === 0 ? block.textStartOffset! : 0)));
+        remaining -= length;
+        return length;
+    });
+}
 
 const FLOW_SELECTOR = "p,div,h1,h2,h3,h4,h5,h6,li,pre,blockquote,td,th,figcaption,section,article";
 const GAP_SELECTOR = "br,hr,img,.img,span[data-type~='inline-math']";

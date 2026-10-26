@@ -135,7 +135,17 @@ export function callRenders(
 
 /** 只修正克隆中的渲染标记，保留真实编辑器的公式和折叠状态。 */
 function prepareOffscreenMath(root: ParentNode): void {
-    root.querySelectorAll<HTMLElement>('[data-type="NodeMathBlock"], span[data-type~="inline-math"]').forEach((el) => {
+    // Saved rich-cell previews contain static TeX. Adapt only this detached
+    // copy to mathRender's contract, without changing the native block type.
+    root.querySelectorAll<HTMLElement>('[data-sy-table-cell-rich] div.language-math').forEach((el) => {
+        if (!el.hasAttribute("data-content")) {
+            el.setAttribute("data-content",
+                (el.textContent ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+            el.replaceChildren(document.createElement("div"));
+        }
+        el.setAttribute("data-subtype", "math");
+    });
+    root.querySelectorAll<HTMLElement>('[data-type="NodeMathBlock"], span[data-type~="inline-math"], [data-sy-table-cell-rich] div.language-math').forEach((el) => {
         if (!el.hasAttribute("data-content")) return;
         if (!el.getAttribute("data-subtype")) el.setAttribute("data-subtype", "math");
         if (!el.querySelector(".katex-html") && !el.matches(".ft__error") && !el.querySelector(".ft__error")) {

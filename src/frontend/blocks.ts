@@ -33,6 +33,7 @@ import {
 } from "./renderer-adapters";
 import {splitTextNodesAtBarriers} from "./text-runs";
 import {createDomBlockTypeReader} from "./result-block-types";
+import {beginRichCellSnapshot, isSupportedRichCell, richCellHasActiveEditor, richCellSearchRuns, richCellMathBlocks} from "./rich-table-cell";
 import {
     beginTextCollection,
     isCollectedTextHidden,
@@ -342,6 +343,7 @@ export function collectSearchableBlocks(
     edit: Element,
     options: CollectSearchableBlocksOptions = {},
 ): SearchableBlock[] {
+    beginRichCellSnapshot();
     const includeDocTitle = options.includeDocTitle !== false;
     const includeImageTitle = options.includeImageTitle !== false;
     const includeAttributeView = options.includeAttributeView !== false;
@@ -814,7 +816,7 @@ type HeadingIncludeGates = Pick<
     | "includeHeadingH4"
     | "includeHeadingH5"
     | "includeHeadingH6"
->;
+> & {includeMathBlock?: boolean;};
 
 /** Runtime content coverage must use the same container/type gates as text collection. */
 export function createRendererElementFilter(
@@ -1371,7 +1373,27 @@ function pushTableCellUnit(
     if (seenUnitKeys.has(unitId)) {
         return;
     }
-    const textNodes = collectDescendantTextNodes(tableCellTextRoot(cell), includeImageTitle, headingGates);
+    if (headingGates?.includeMathBlock !== false) {
+        for (const [index, math] of richCellMathBlocks(cell).entries()) {
+            if (headingGates && shouldSkipElementByHeadingInclude(math.element, headingGates)) continue;
+            for (const unit of collectRendererSearchUnits(math.element, {blockId, blockType: TABLE_TYPE, blockIndex}, "math", math.source)) {
+                // Body runs already use stable rich-source coordinates. Keep
+                // math at the same boundary, ahead of the following body run.
+                units.push({...unit, unitId: `${unit.unitId}:${unitId}:${index}#run-${math.offset}`,
+                    tableSlot: {row: logicalRow, column: columnIndex, offset: 0}});
+            }
+        }
+    }
+    const collected = collectDescendantTextNodes(tableCellTextRoot(cell), includeImageTitle, headingGates);
+    const textNodes = cell.hasAttribute("data-sy-table-cell-rich") ?
+        collected.filter(node => !node.parentElement?.closest('[data-type="NodeMathBlock"], div.language-math')) : collected;
+    const richRuns = richCellSearchRuns(cell, textNodes.filter(node => !isCollectedTextHidden(node) || shouldKeepHiddenSourceText(node)));
+    if (richRuns) {
+        seenUnitKeys.add(unitId);
+        for (const run of richRuns) units.push({blockId, blockType: TABLE_TYPE, blockIndex, element: cell,
+            unitId: `${unitId}#run-${run.offset}`, text: run.text, textNodes: run.nodes, textStartOffset: run.nodeOffset});
+        return;
+    }
     const produced = unitsFromTextNodes({
         blockId,
         blockType: TABLE_TYPE,
@@ -1412,7 +1434,7 @@ const RICH_TABLE_CELL_SELECTOR =
     'td[data-sy-table-cell-rich], th[data-sy-table-cell-rich], [data-type="NodeTableCell"][data-sy-table-cell-rich], .table__cell[data-sy-table-cell-rich]';
 
 /**
- * 富文本格和正在编辑的格子不能按画面文字替换。
+ * 富文本格必须通过源适配器校验，不能只改画面文字。
  * 富文本的源码在属性里，思源写回时会按属性重画。
  * 编辑器开着时，提交要等它自己结束；这之前整表被换掉，这次修改就丢了。
  */
@@ -1425,16 +1447,21 @@ export function tableCellReplaceLock(element: Element | null | undefined): Table
     if (!(cell instanceof HTMLElement)) {
         return undefined;
     }
-    // 富文本属性在 td/th 上。嵌套内容也算在外层富文本格里。
-    if (cell.closest(RICH_TABLE_CELL_SELECTOR)) {
-        return "table-rich";
-    }
     // 编辑器是格子的直接子节点。格内 span 能 closest 到它；格子单元本身只看这一层。
     if (
         element.closest(TABLE_CELL_EDITOR_SELECTOR) ||
         cell.querySelector(`:scope > ${TABLE_CELL_EDITOR_SELECTOR}`)
     ) {
         return "table-cell-editor";
+    }
+    const rich = cell.closest<HTMLElement>(RICH_TABLE_CELL_SELECTOR);
+    if (rich) {
+        if (richCellHasActiveEditor(rich)) {
+            return "table-cell-editor";
+        }
+        // Only the source adapter may unlock body text. Attribute-only memo
+        // units still need their own source mapping and remain read-only.
+        if (element !== rich || !isSupportedRichCell(rich)) return "table-rich";
     }
     return undefined;
 }

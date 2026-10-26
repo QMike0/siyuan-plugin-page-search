@@ -115,7 +115,7 @@ export function getSelectionScope(
 ): SelectionScope {
     if (tableCellText) {
         const fromCellText = selectionScopeFromTableCellText(blocks, tableCellText);
-        if (fromCellText.size > 0) {
+        if (fromCellText.size > 0 || tableCellText.richText) {
             return fromCellText;
         }
     }
@@ -242,6 +242,78 @@ export interface TableCellTextSelection {
     /** 去掉零宽字符后的正文，用来核对写回后的格子文本。 */
     text: string;
     inlineMarks: ReadonlyArray<{kind: "math" | "memo"; index: number;}>;
+    /** Stable body coordinates across rich-editor / native / static previews. */
+    richText?: {text: string; start: number; end: number; includeImageTitle: boolean;};
+}
+
+/** One cell only, on selection capture/restore. No Lute conversion or DOM edits.
+ * The prefix map also handles repeated words, soft breaks and temporary ZWSPs
+ * without relocating a selection by its text. Code-body newlines stay literal. */
+function projectRichCellSelection(nodes: Text[]): {
+    text: string;
+    nodes: Map<Text, {start: number; offsets: Uint32Array;}>;
+} {
+    const mapped = new Map<Text, {start: number; offsets: Uint32Array;}>();
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const node of nodes) {
+        const parent = node.parentElement;
+        const omitted = !parent || Boolean(parent.closest(".protyle-linenumber__rows")) ||
+            Boolean(parent.closest(".protyle-action") && !parent.closest(".protyle-action__title")) ||
+            parent.matches("ul, ol, li, blockquote, .table__cell-rich, td, th, [data-type^=Node]") && /^[\r\n]+$/.test(node.data);
+        const code = Boolean(parent?.closest('[data-type="NodeCodeBlock"], pre'));
+        const offsets = new Uint32Array(node.data.length + 1);
+        let length = 0;
+        for (let index = 0; index < node.data.length; index += 1) {
+            if (!omitted && !isZwsp(node.data.charCodeAt(index)) && (code || node.data[index] !== "\n")) length += 1;
+            offsets[index + 1] = length;
+        }
+        const text = omitted ? "" : stripZwsp(code ? node.data : node.data.replace(/\n/g, ""));
+        mapped.set(node, {start: cursor, offsets});
+        cursor += length;
+        parts.push(text);
+    }
+    return {text: parts.join(""), nodes: mapped};
+}
+
+function richSelectionRawOffset(offsets: Uint32Array, target: number, from: number, to: number, end: boolean): number {
+    let low = from;
+    let high = to;
+    while (low < high) {
+        const middle = end ? (low + high) >>> 1 : (low + high + 1) >>> 1;
+        if (end ? offsets[middle] < target : offsets[middle] <= target) low = end ? middle + 1 : middle;
+        else high = end ? middle : middle - 1;
+    }
+    return low;
+}
+
+function richCellTextSelectionScope(blocks: readonly SearchableBlock[], snap: TableCellTextSelection): SelectionScope {
+    const scope: SelectionScope = new Map();
+    const saved = snap.richText!;
+    const projected = projectRichCellSelection(collectTableCellSearchTextNodes(snap.cell, saved.includeImageTitle));
+    // Closing the native editor may rebuild nodes; a changed body is not a
+    // license to select the nearest duplicate or fall back to the whole cell.
+    if (projected.text !== saved.text) return scope;
+    for (const block of blocks) {
+        const ranges: TextOffsetRange[] = [];
+        let cursor = 0;
+        for (const [index, node] of block.textNodes.entries()) {
+            const from = index === 0 ? block.textStartOffset ?? 0 : 0;
+            const to = Math.min(node.data.length, from + block.text.length - cursor);
+            const item = projected.nodes.get(node);
+            if (item && to > from) {
+                const start = Math.max(saved.start, item.start + item.offsets[from]) - item.start;
+                const end = Math.min(saved.end, item.start + item.offsets[to]) - item.start;
+                if (end > start) ranges.push({
+                    start: cursor + richSelectionRawOffset(item.offsets, start, from, to, false) - from,
+                    end: cursor + richSelectionRawOffset(item.offsets, end, from, to, true) - from,
+                });
+            }
+            cursor += Math.max(0, to - from);
+        }
+        if (ranges.length) scope.set(unitKeyOf(block), mergeTextOffsetRanges(ranges));
+    }
+    return scope;
 }
 
 /**
@@ -282,7 +354,21 @@ export function snapshotTableCellTextSelection(includeImageTitle = true): TableC
     if (end <= start && inlineMarks.length === 0) {
         return null;
     }
-    return {cell: startCell, start, end, text: selected, inlineMarks};
+    const snap: TableCellTextSelection = {cell: startCell, start, end, text: selected, inlineMarks};
+    if (startCell.hasAttribute("data-sy-table-cell-rich")) {
+        const projected = projectRichCellSelection(textNodes);
+        let cursor = 0;
+        let projectedStart = 0;
+        let projectedEnd = 0;
+        for (const node of textNodes) {
+            const offsets = projected.nodes.get(node)!.offsets;
+            projectedStart += offsets[Math.max(0, Math.min(node.data.length, start - cursor))];
+            projectedEnd += offsets[Math.max(0, Math.min(node.data.length, end - cursor))];
+            cursor += node.data.length;
+        }
+        snap.richText = {text: projected.text, start: projectedStart, end: projectedEnd, includeImageTitle};
+    }
+    return snap;
 }
 
 /** 把划选偏移对到当前搜索单元。对不上选中文字时不猜范围。 */
@@ -290,25 +376,28 @@ export function selectionScopeFromTableCellText(
     blocks: readonly SearchableBlock[],
     snap: TableCellTextSelection,
 ): SelectionScope {
-    const scope: SelectionScope = new Map();
     if (!snap.cell.isConnected) {
-        return scope;
+        return new Map();
     }
     const body = blocks.filter((block) =>
         block.element === snap.cell && !isAttributeInlineSearchUnit(block) && block.text.length > 0
     );
-    // Snapshot offsets belong to the whole cell, not to each independent visual run.
-    const range = reconcileCellTextRange(body.map((block) => block.text).join(""), snap.start, snap.end, snap.text);
-    let cursor = 0;
-    for (const block of body) {
-        const end = cursor + block.text.length;
-        if (range && range.start < end && range.end > cursor) {
-            scope.set(unitKeyOf(block), [{
-                start: Math.max(0, range.start - cursor),
-                end: Math.min(block.text.length, range.end - cursor),
-            }]);
+    const scope: SelectionScope = snap.richText ? richCellTextSelectionScope(body, snap) : new Map();
+    if (!snap.richText) {
+        // Ordinary-cell behavior is unchanged; rich cells use deterministic
+        // body coordinates instead of the text-only nearest-match fallback.
+        const range = reconcileCellTextRange(body.map((block) => block.text).join(""), snap.start, snap.end, snap.text);
+        let cursor = 0;
+        for (const block of body) {
+            const end = cursor + block.text.length;
+            if (range && range.start < end && range.end > cursor) {
+                scope.set(unitKeyOf(block), [{
+                    start: Math.max(0, range.start - cursor),
+                    end: Math.min(block.text.length, range.end - cursor),
+                }]);
+            }
+            cursor = end;
         }
-        cursor = end;
     }
     if (snap.inlineMarks.length === 0) {
         return scope;
@@ -366,7 +455,9 @@ function inlineMarksInRange(
 function inlineHostsInCell(cell: HTMLTableCellElement, kind: "math" | "memo"): HTMLElement[] {
     const root = tableCellSearchRoot(cell);
     const selector = kind === "math" ?
-        'span[data-type~="inline-math"]' :
+        (cell.hasAttribute("data-sy-table-cell-rich") ?
+            'span[data-type~="inline-math"], [data-type="NodeMathBlock"], div.language-math' :
+            'span[data-type~="inline-math"]') :
         'span[data-type~="inline-memo"]';
     const hosts: HTMLElement[] = [];
     const found = root.querySelectorAll<HTMLElement>(selector);
@@ -744,7 +835,17 @@ function getSelectionRangesWithinUnit(
 
     const ranges: TextOffsetRange[] = [];
     for (let index = 0; index < selection.rangeCount; index += 1) {
-        ranges.push(...getIntersectedTextRanges(block.textNodes, selection.getRangeAt(index)));
+        const intersected = getIntersectedTextRanges(block.textNodes, selection.getRangeAt(index));
+        if (block.textStartOffset === undefined) {
+            ranges.push(...intersected);
+            continue;
+        }
+        // Native rich previews can share one Text across several logical lines.
+        for (const range of intersected) {
+            const start = Math.max(0, range.start - block.textStartOffset);
+            const end = Math.min(block.text.length, range.end - block.textStartOffset);
+            if (end > start) ranges.push({start, end});
+        }
     }
     return mergeTextOffsetRanges(ranges);
 }

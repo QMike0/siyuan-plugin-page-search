@@ -11,6 +11,8 @@ export interface SearchableBlock {
     element: HTMLElement;
     text: string;
     textNodes: Text[];
+    /** Rich preview line slice; offsets start inside the first Text node. */
+    textStartOffset?: number;
     unitId?: string;
     /** Copied source instance within an embed; retained until ownership is rewritten. */
     embeddedSourceId?: string;
@@ -51,7 +53,7 @@ export interface TableSlot {
 
 /**
  * 表格命中为什么不能替换。
- * table-rich：内容在 data-sy-table-cell-rich 里，改画面文字会被思源按源码重画掉。
+ * table-rich：富文本源无法可靠映射/保真，不能只改画面文字。
  * table-cell-editor：格子编辑器还开着，写回会等到编辑结束才提交，中途整表刷新会丢掉。
  */
 export type TableReplaceLock = "table-rich" | "table-cell-editor";

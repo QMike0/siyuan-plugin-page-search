@@ -21,7 +21,7 @@
   "searchMethodRegex": "Regular expression",
   "preserveCase": "Preserve case",
   "preserveCaseDisabledByRegex": "Unavailable with regex (replace uses $1 templates)",
-  "replaceUnsupportedHelp": "Replacement is unavailable in read-only, publish, or preview mode. Formulas, databases, HTML, Mermaid, document titles, rich-text table cells, and complex formatting also cannot be replaced. Regex mode supports $1, $&, and similar replacement syntax",
+  "replaceUnsupportedHelp": "Replacement is unavailable in read-only, publish, or preview mode. Formulas, databases, HTML, Mermaid, document titles, and complex formatting that cannot be safely saved are unsupported. Regex mode supports $1, $&, and similar replacement syntax",
   "replaceAction": "Replace (Enter)",
   "replaceAllAction": "Replace all (Ctrl+Alt+Enter)",
   "replaceToggle": "Expand or collapse replace row",
@@ -34,14 +34,14 @@
   "replaceMermaidUnsupported": "Mermaid diagrams support search and highlight only; replacement is not supported",
   "replaceHtmlBlockUnsupported": "HTML blocks support search and highlight of rendered text only; replacement is not supported",
   "replaceCustomBlockUnsupported": "Custom blocks are rendered by plugins and cannot be replaced directly",
-  "replaceTableRichUnsupported": "Rich-text table cells support search and highlight only; replacement is not supported",
+  "replaceTableRichUnsupported": "This rich-text content cannot be safely replaced yet",
   "replaceTableCellEditingUnsupported": "This cell is being edited. Click outside the cell to finish editing, then replace",
   "replaceTablePendingEdit": "This table still has an edit that has not been saved. Click outside the cell, then replace",
   "replaceModeUnsupported": "Replacement is unavailable in publish, export preview, or read-only mode",
   "replaceDocTitleUnsupported": "The document title can be searched, but it is not included in replace",
   "replaceDocTitleFailed": "Failed to rename the document title",
   "replaceDocTitleEmpty": "Document title is invalid; skipped",
-  "replaceAllConfirm": "Scope: {scope}. {matchCount} matches: {count} will be replaced and {skippedCount} skipped (document titles, embeds, databases, formulas, rendered Mermaid/HTML text, rich-text cells, and complex formatting cannot be replaced). Continue?",
+  "replaceAllConfirm": "Scope: {scope}. {matchCount} matches: {count} will be replaced and {skippedCount} skipped (document titles, embeds, databases, formulas, rendered Mermaid/HTML text, and unsupported complex formatting). Continue?",
   "replaceAllConfirmTitle": "Replace all",
   "replaceAllScopeDocument": "Current document (using search settings)",
   "replaceAllScopeFocus": "Focused block and its content (using search settings)",
@@ -124,5 +124,6 @@
   "settingsRestrictInlineMemo": "Inline memo",
   "settingsRestrictInlineMemoHint": "Turn on Include in search → Inline memos first",
   "settingsRestrictInlineMemoOnHint": "Turn on Include in search → Inline memos first",
-  "invalidRegex": "Invalid regex: {error}"
+  "invalidRegex": "Invalid regex: {error}",
+  "replaceRichCellUnsafe": "The rich-text format or replacement text cannot be safely saved. No changes were submitted"
 }

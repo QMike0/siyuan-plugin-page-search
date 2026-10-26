@@ -19,6 +19,8 @@ import type {
     TableSlot,
 } from "../dom-types";
 import type {AvBlockRef} from "./av";
+import {deferRichCellCapability, type RichCellSearchInfo} from "../rich-table-cell";
+import {searchableTextLengths} from "../text-runs";
 
 const HOST_TYPES = new Set<string>(
     RESTRICT_INLINE_TYPE_ALLOWLIST.filter((token) => token !== INLINE_MATH_TYPE && token !== INLINE_MEMO_TYPE),
@@ -50,8 +52,11 @@ export interface CachedUnit {
     snippet?: string;
     tableSlot?: TableSlot;
     mathOrdinal?: number;
-    /** 富文本格或正在编辑的格子。命中仍可搜索，但不能替换。 */
+    /** 无法安全编辑的富文本格，或正在编辑的格子。 */
     replaceLock?: TableReplaceLock;
+    /** Verified rich-source ranges, in this search unit's UTF-16 offsets. */
+    writableSpans?: Array<{start: number; end: number;}>;
+    richCell?: RichCellSearchInfo;
 }
 
 function nonReplaceable(block: SearchableBlock): boolean {
@@ -92,10 +97,11 @@ function collectRestrictSpans(block: SearchableBlock): CachedUnit["restrictSpans
     const bounds = new Map<Element, {start: number; end: number; reached: boolean;}>();
     const tokensOf = new Map<Element, string[]>();
     const reachedOrder: Element[] = [];
+    const lengths = block.textStartOffset === undefined ? undefined : searchableTextLengths(block);
     let cursor = 0;
-    for (const node of nodes) {
+    for (const [index, node] of nodes.entries()) {
         const start = cursor;
-        const length = node.nodeValue?.length ?? 0;
+        const length = lengths?.[index] ?? node.data.length;
         const end = start + length;
         cursor = end;
         let element = node.parentElement;
@@ -168,8 +174,10 @@ export function freezeBlock(
             (block.text.length > 0 ? [block.text.length] : undefined) :
             (isInlineMemoSearchUnit(block) ?
                 (block.text.length > 0 ? [block.text.length] : undefined) :
-                block.textNodes.map((node) => node.nodeValue?.length ?? 0)));
-    const replaceLock = block.blockType === "NodeTable" ? tableCellReplaceLock(block.element) : undefined;
+                searchableTextLengths(block)));
+    const richCell = block.blockType === "NodeTable" ? deferRichCellCapability(block) : undefined;
+    const replaceLock = richCell ? richCell.replaceLock :
+        block.blockType === "NodeTable" ? tableCellReplaceLock(block.element) : undefined;
     let highlightKind: CachedUnit["highlightKind"] = "text";
     if (isInlineMemoSearchUnit(block)) {
         highlightKind = "inline-memo";
@@ -194,6 +202,7 @@ export function freezeBlock(
         tableSlot: block.tableSlot,
         mathOrdinal: block.mathOrdinal,
         replaceLock,
+        richCell,
     };
 }
 

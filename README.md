@@ -91,6 +91,7 @@ Usually writable:
 * text in ordinary editable blocks;
 * image titles;
 * inline memos;
+* ordinary table cells and safely writable paragraphs, headings, lists, blockquotes, and plain code inside rich-text table cells;
 * writable source text in tabs and mind maps;
 * text in off-screen, folded, or unloaded areas when complete source data is available.
 
@@ -101,7 +102,7 @@ Searchable and highlightable but unsupported by replacement include:
 * embedded content;
 * formulas, rendered Mermaid, and rendered HTML-block text;
 * plugin-rendered custom blocks;
-* special rich-text table cells carrying the `data-sy-table-cell-rich` storage attribute; ordinary text in normal table cells is replaceable;
+* rich-text cell content whose source or formatting cannot be reliably preserved; finish an open cell editor before replacing. Nested tables, databases, embeds, and other unsupported rich-cell structures remain unsupported;
 * tab titles inside tabs blocks;
 * matches spanning complex marks, read-only regions, or content whose original source cannot be confirmed.
 

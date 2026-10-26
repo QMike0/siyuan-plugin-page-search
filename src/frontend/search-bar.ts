@@ -351,8 +351,9 @@ export interface SearchBarI18n {
     replaceMermaidUnsupported: string;
     replaceHtmlBlockUnsupported: string;
     replaceCustomBlockUnsupported: string;
-    /** 富文本单元格：源码在属性里，改画面文字不会被保存 */
+    /** 富文本单元格未通过源映射或格式保真校验 */
     replaceTableRichUnsupported: string;
+    replaceRichCellUnsafe?: string;
     /** 单元格编辑器还开着 */
     replaceTableCellEditingUnsupported: string;
     /** 同一张虚拟表里另有格子还在编辑，写回会盖掉它 */
@@ -5287,6 +5288,10 @@ export class SearchBar {
                 showMessage(this.i18n.replaceTablePendingEdit, 4000, "info");
                 return;
             }
+            if (result.error === "rich-cell-unsafe") {
+                showMessage(this.i18n.replaceRichCellUnsafe ?? this.i18n.replaceTableRichUnsupported, 4000, "info");
+                return;
+            }
             if (result.error === "title-invalid") {
                 showMessage(this.i18n.replaceDocTitleEmpty, 3000, "info");
                 this.clickNext();
@@ -5523,6 +5528,10 @@ export class SearchBar {
             }
             if (result.replacedCount === 0 && result.error === "table-pending-edit") {
                 showMessage(this.i18n.replaceTablePendingEdit, 4000, "info");
+                return;
+            }
+            if (result.error === "rich-cell-unsafe") {
+                showMessage(this.i18n.replaceRichCellUnsafe ?? this.i18n.replaceTableRichUnsupported, 4000, "info");
                 return;
             }
             if (result.error === "stale-target") {

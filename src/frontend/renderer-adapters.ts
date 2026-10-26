@@ -33,7 +33,8 @@ interface RendererContext {
 /** 返回块所使用的 adapter；普通正文/普通代码块返回 null。 */
 export function rendererAdapterKind(element: HTMLElement): RendererAdapterKind | null {
     const blockType = element.getAttribute("data-type") ?? "";
-    if (blockType === MATH_BLOCK_TYPE) {
+    if (blockType === MATH_BLOCK_TYPE || element.matches("div.language-math") &&
+        element.closest("[data-sy-table-cell-rich]")) {
         return "math";
     }
     if (blockType === HTML_BLOCK_TYPE) {
@@ -67,12 +68,13 @@ export function collectRendererSearchUnits(
     element: HTMLElement,
     context: RendererContext,
     kind: RendererAdapterKind | null = rendererAdapterKind(element),
+    mathSource?: string,
 ): SearchableBlock[] {
     if (!kind) {
         return [];
     }
     if (kind === "math") {
-        return collectMathUnits(element, context);
+        return collectMathUnits(element, context, mathSource);
     }
     if (kind === "html") {
         return collectHtmlUnits(element, context);
@@ -80,11 +82,11 @@ export function collectRendererSearchUnits(
     return collectDiagramUnits(element, context, kind);
 }
 
-function collectMathUnits(element: HTMLElement, context: RendererContext): SearchableBlock[] {
+function collectMathUnits(element: HTMLElement, context: RendererContext, source?: string): SearchableBlock[] {
     // 思源 mathRender 使用 output="html"；只取可见字形层，避免 MathML/源码重复。
     const katexHtml = element.querySelector<HTMLElement>(".katex-html");
     if (!katexHtml) {
-        const text = mathSourceFallbackText(element);
+        const text = source ?? mathSourceFallbackText(element);
         return text && !isAuthorCssHiddenElement(element) ?
             [{
                 ...context,

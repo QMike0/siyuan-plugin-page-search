@@ -37,7 +37,8 @@ import {
     createReplacementUnitLookup,
     collectRegexReplacementRequests,
     createRegexReplacementPlan,
-    type RegexReplacementPlan,
+    prepareRichReplacementPlan,
+    type ApplyReplacementOptions,
 } from "./replacement";
 import {
     confirmBlockUpdates,
@@ -470,9 +471,7 @@ function replaceOptionsFrom(
     };
 }
 
-type PreparedReplaceOptions = ReturnType<typeof replaceOptionsFrom> & {
-    regexPlan?: RegexReplacementPlan;
-};
+type PreparedReplaceOptions = ApplyReplacementOptions;
 
 /** 准备阶段的轻量检查：不扫描目标 DOM，也不序列化块内容。 */
 function createPreparationGuard(
@@ -680,7 +679,7 @@ export async function replaceCurrentMatchInEditor(
             skippedCount: Math.max(1, outcome.skippedCount),
             error: outcome.regexExpandFailedCount > 0 ?
                 "regex-expand-failed" :
-                "apply-failed",
+                outcome.richCellFailedCount ? "rich-cell-unsafe" : "apply-failed",
         };
     }
     if ((submit.getAttribute("data-type") ?? "") !== (typeBefore ?? "")) {
@@ -807,7 +806,7 @@ function orderBlockUpdates(updates: PreparedBlockUpdate[]): PreparedBlockUpdate[
     return ordered;
 }
 
-function prepareBlockElementUpdate(
+async function prepareBlockElementUpdate(
     blockId: string,
     blockEl: HTMLElement,
     oldHTML: string,
@@ -815,7 +814,14 @@ function prepareBlockElementUpdate(
     matches: SearchMatch[],
     replacementText: string,
     replaceOpts: PreparedReplaceOptions,
-): PreparedBlockResult {
+    checkCurrent: () => string | undefined,
+    retainRichPlan = false,
+): Promise<PreparedBlockResult> {
+    const rich = await prepareRichReplacementPlan(unitsByKey, matches, replacementText, replaceOpts, checkCurrent);
+    const error = checkCurrent() ?? rich.error;
+    if (error) return {update: null, skippedCount: matches.length, error};
+    // Never reuse a plan from another DOM copy (notably fetched/selected copies).
+    const preparedOptions = {...replaceOpts, richPlan: rich.plan};
     const clone = blockEl.cloneNode(true) as HTMLElement;
     const outcome = applyMatchesToSubmitClone(
         blockEl,
@@ -823,8 +829,11 @@ function prepareBlockElementUpdate(
         unitsByKey,
         matches,
         replacementText,
-        replaceOpts,
+        preparedOptions,
     );
+    if (outcome.richCellFailedCount) {
+        return {update: null, skippedCount: matches.length, error: "rich-cell-unsafe"};
+    }
     if (outcome.appliedCount === 0) {
         return {
             update: null,
@@ -842,7 +851,7 @@ function prepareBlockElementUpdate(
             newHTML: clone.outerHTML,
             appliedCount: outcome.appliedCount,
             replacementEnd: outcome.replacementEnd,
-            replaceOptions: replaceOpts,
+            replaceOptions: retainRichPlan ? preparedOptions : replaceOpts,
         },
         skippedCount: outcome.skippedCount,
     };
@@ -910,7 +919,8 @@ function overlayMountedVirtualCells(kernel: HTMLElement, live: HTMLElement): boo
         if (!kernelCell) {
             continue;
         }
-        if (cellPlainText(liveCell) === cellPlainText(kernelCell)) {
+        if (cellPlainText(liveCell) === cellPlainText(kernelCell) &&
+            CELL_CONTENT_ATTRS.every(name => liveCell.getAttribute(name) === kernelCell.getAttribute(name))) {
             continue;
         }
         if (liveCell.querySelector(":scope > .table__cell-editor")) {
@@ -1072,7 +1082,7 @@ async function prepareFetchedBlockUpdates(
                         error ??= "block-missing";
                         continue;
                     }
-                    const prepared = prepareBlockElementUpdate(
+                    const prepared = await prepareBlockElementUpdate(
                         id,
                         blockEl,
                         doms[id],
@@ -1080,7 +1090,10 @@ async function prepareFetchedBlockUpdates(
                         blockMatches,
                         replacementText,
                         preparedOptions.options,
+                        checkCurrent,
                     );
+                    const preparationConflict = checkCurrent();
+                    if (preparationConflict) return cancelled(preparationConflict);
                     skippedCount += prepared.skippedCount;
                     if (prepared.update) {
                         prepared.update.kernelHTML = htmlById.get(id);
@@ -1225,7 +1238,7 @@ export async function replaceAllMatchesInEditor(
     for (const [blockId, blockMatches] of grouped) {
         if (unloadedMatches.has(blockId)) continue;
         const submit = submitIndex.preferred.get(blockId)!;
-        const prepared = prepareBlockElementUpdate(
+        const prepared = await prepareBlockElementUpdate(
             blockId,
             submit,
             submit.outerHTML,
@@ -1233,7 +1246,10 @@ export async function replaceAllMatchesInEditor(
             blockMatches,
             replacementText,
             loadedOptions.options,
+            checkCurrent,
         );
+        const preparationConflict = checkCurrent();
+        if (preparationConflict) return {replacedCount: 0, skippedCount: matches.length, error: preparationConflict};
         bodySkipped += prepared.skippedCount;
         if (prepared.update) {
             loadedUpdates.push(prepared.update);
@@ -1288,13 +1304,11 @@ export async function replaceAllMatchesInEditor(
         };
     }
 
-    const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, checkCurrent, notebook, protyle);
-    const conflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
+    const conflict = guard();
     if (conflict) {
         logWarning("replace-all cancelled", {
             stage: "final-guard",
             error: conflict,
-            kernelCurrent,
             updates: ordered.length,
             fetched: fetched.updates.length,
         });
@@ -1306,6 +1320,9 @@ export async function replaceAllMatchesInEditor(
         0,
     );
     if (!changed.length) {
+        const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, checkCurrent, notebook, protyle);
+        const finalConflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
+        if (finalConflict) return {replacedCount: 0, skippedCount: matches.length, error: finalConflict};
         return {replacedCount: unchangedCount, skippedCount, commitState: "confirmed", unchanged: true};
     }
     const rootId = editorRootId(edit);
@@ -1343,7 +1360,7 @@ export async function replaceAllMatchesInEditor(
             }).filter((block) => !isPreviewSyntheticBlock(block));
             const localUnits = buildUnitMap(localBlocks, selectedMatches);
             liveRollbackHtml.set(selectedBlock, selectedBlock.outerHTML);
-            const prepared = prepareBlockElementUpdate(
+            const prepared = await prepareBlockElementUpdate(
                 update.id,
                 selectedBlock,
                 selectedBlock.outerHTML,
@@ -1351,6 +1368,8 @@ export async function replaceAllMatchesInEditor(
                 selectedMatches,
                 replacementText,
                 replaceOptions,
+                checkCurrent,
+                true,
             );
             if (prepared.update?.appliedCount !== update.appliedCount || prepared.skippedCount) {
                 return {replacedCount: 0, skippedCount: matches.length, error: "stale-target"};
@@ -1360,9 +1379,23 @@ export async function replaceAllMatchesInEditor(
                 units: localUnits,
                 matches: selectedMatches,
                 appliedCount: update.appliedCount,
-                options: replaceOptions,
+                options: prepared.update!.replaceOptions!,
             });
         }
+    }
+    // Async preparation may have yielded while selected copies were validated.
+    // Re-read fetched authority and all live snapshots once, then publish and
+    // submit without any further await. Never overwrite intervening edits.
+    const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, checkCurrent, notebook, protyle);
+    const finalConflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
+    if (finalConflict || Array.from(liveRollbackHtml).some(([element, html]) =>
+        !edit.contains(element) || element.outerHTML !== html)) {
+        return {replacedCount: 0, skippedCount: matches.length, error: finalConflict ?? "stale-target"};
+    }
+    const currentSelected = selectedChangedBlocks(edit, changedIds, collectSubmitBlockIndex(edit));
+    if (currentSelected.size !== selectedBlocks.size || Array.from(selectedBlocks).some(([id, copies]) =>
+        copies.length !== currentSelected.get(id)?.length || copies.some(element => !currentSelected.get(id)?.includes(element)))) {
+        return {replacedCount: 0, skippedCount: matches.length, error: "stale-target"};
     }
     const rollback = captureLiveRollback(
         edit,

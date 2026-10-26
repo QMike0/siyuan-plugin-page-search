@@ -46,8 +46,11 @@ async function drainWithBudget<T>(iterator: Generator<void, T>, current: () => b
 }
 
 function liveTextMatches(block: SearchableBlock): boolean {
-    return !block.textNodes.length || (block.textNodes.every((node) => node.isConnected) &&
-        block.textNodes.map((node) => node.nodeValue ?? "").join("") === block.text);
+    if (!block.textNodes.length) return true;
+    if (!block.textNodes.every((node) => node.isConnected)) return false;
+    const text = block.textNodes.map((node) => node.nodeValue ?? "").join("");
+    const prefix = block.textStartOffset ?? 0;
+    return (block.textStartOffset === undefined ? text : text.slice(prefix, prefix + block.text.length)) === block.text;
 }
 
 export function clearViewportProjection(edit: Element): void {

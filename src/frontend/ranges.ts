@@ -59,6 +59,8 @@ export function locateRangeInSingleTextNode(
   start: number,
   end: number,
 ): { node: Text, startOffset: number, endOffset: number } | null {
+  start += block.textStartOffset ?? 0
+  end += block.textStartOffset ?? 0
   if (end > start) {
     const startPoint = locateTextPoint(block.textNodes, start, "start")
     const endPoint = locateTextPoint(block.textNodes, end, "end")
@@ -162,8 +164,8 @@ export function createRangeFromBlockOffsets(
     return null
   }
 
-  const startPoint = locateTextPoint(block.textNodes, start, "start")
-  const endPoint = locateTextPoint(block.textNodes, end, "end")
+  const startPoint = locateTextPoint(block.textNodes, start + (block.textStartOffset ?? 0), "start")
+  const endPoint = locateTextPoint(block.textNodes, end + (block.textStartOffset ?? 0), "end")
   if (!startPoint || !endPoint) {
     return null
   }
