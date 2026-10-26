@@ -2,6 +2,7 @@ import {
     fetchPost,
     getFrontend,
     IKernelPluginState,
+    type IProtyle,
     Plugin,
     Setting,
     showMessage,
@@ -16,7 +17,8 @@ import {
     invalidateAvCache,
     invalidateAvCacheForIds,
 } from "./frontend/corpus/av";
-import {isEditorReplaceModeBlocked, isPluginStorageWritable, isPublishMode} from "./frontend/editor-mode";
+import {isPluginStorageWritable, isPublishMode} from "./frontend/editor-mode";
+import {getSearchHotkeyIntent, getSearchProtyle, resolveSearchHotkeyHost} from "./frontend/search-hotkeys";
 import {
     createClientId,
     isKernelRunning,
@@ -73,6 +75,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     private loggingSettingsReady: Promise<void> = Promise.resolve();
     private loggingSettingsWrite: Promise<void> = Promise.resolve();
     private loggingSettingsVersion = 0;
+    private searchOpenVersion = 0;
 
     private searchComponentCallbacks: Set<(event: CustomEvent) => void> = new Set();
     private searchBars: Map<Element, SearchBar> = new Map();
@@ -121,33 +124,31 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
 </g>
 </symbol>`);
 
-        const openFind = () => {
-            void this.addSearchElement({intent: "find"});
+        const openFind = (protyle?: IProtyle) => {
+            void this.addSearchElement({intent: "find", target: protyle?.element});
         };
-        const openReplace = () => {
-            void this.addSearchElement({intent: "replace"});
+        const openReplace = (protyle?: IProtyle) => {
+            void this.addSearchElement({intent: "replace", target: protyle?.element});
         };
-        // 思源：定义 editorCallback 等后，仅在对应焦点区域触发；callback 在其它区域作兜底。
-        // 四处都挂上，避免「只有光标在编辑器里快捷键才生效」。
+        // 命令入口也经过文档界面校验，editorCallback 优先使用宿主传入的编辑器。
         this.addCommand({
             langKey: "showSearch",
             hotkey: "⌘F",
             callback: openFind,
             editorCallback: openFind,
-            dockCallback: openFind,
-            fileTreeCallback: openFind,
+            dockCallback: () => openFind(),
+            fileTreeCallback: () => openFind(),
         });
         this.addCommand({
             langKey: "showReplace",
             hotkey: "⌘H",
             callback: openReplace,
             editorCallback: openReplace,
-            dockCallback: openReplace,
-            fileTreeCallback: openReplace,
+            dockCallback: () => openReplace(),
+            fileTreeCallback: () => openReplace(),
         });
 
-        // 只读 / 预览：焦点不在可编辑 wysiwyg，editorCallback 不触发；
-        // 且存在专用 callback 时普通 callback 也不会兜底。用捕获阶段补一层。
+        // 表格、数据库和只读区域可能截断冒泡；在捕获阶段处理有效文档的已配置快捷键。
         window.addEventListener("keydown", this.onWindowKeydownCapture, true);
 
         this.eventBus.on("kernel-plugin-state-change", this.onKernelPluginStateChange);
@@ -304,6 +305,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
 
     /** 卸下快捷键、搜索条、事件与选区视觉残留（不碰持久化配置） */
     private teardownRuntime() {
+        this.searchOpenVersion++;
         this.eventBus.off("ws-main", this.onSearchHistoryBroadcast);
         window.removeEventListener("keydown", this.onWindowKeydownCapture, true);
         this.closeSearchDialog();
@@ -322,7 +324,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     /**
      * 窗口捕获阶段快捷键：
      * - Esc：搜索面板已打开且焦点不在面板内时关闭（编辑器内也能退出）
-     * - Ctrl+F/H：只读 / 预览兜底（正常编辑仍走 editorCallback）
+     * - 查找/替换：在块内事件停止冒泡前处理，设置等非文档界面不接管
      */
     private readonly onWindowKeydownCapture = (event: KeyboardEvent) => {
         if (event.defaultPrevented || event.isComposing) {
@@ -343,33 +345,22 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             return;
         }
 
-        const mod = event.ctrlKey || event.metaKey;
-        if (!mod || event.altKey || event.shiftKey) {
-            return;
-        }
-        const key = event.key.toLowerCase();
-        if (key !== "f" && key !== "h") {
-            return;
-        }
+        const intent = getSearchHotkeyIntent(event, this.name, this.commands);
+        if (!intent) return;
 
-        const target = event.target instanceof Element ? event.target : null;
+        const target = event.composedPath().find(node => node instanceof Element) as Element | undefined
+            ?? document.activeElement;
         // 搜索面板内已有自己的快捷键处理
         if (target?.closest(`.${CLASS_NAME}`)) {
             return;
         }
-        // 设置页等外部输入框：不要抢走
-        if (target && isForeignTextInput(target)) {
-            return;
-        }
-
-        const host = resolveHotkeyHostElement(target);
-        if (!host || !isEditorReplaceModeBlocked(host)) {
-            return;
-        }
+        const host = resolveSearchHotkeyHost(target);
+        if (!host) return;
 
         event.preventDefault();
-        event.stopPropagation();
-        void this.addSearchElement({intent: key === "f" ? "find" : "replace"});
+        // 宿主全局监听也在 window；窗口自身转发的事件同样只能处理一次。
+        event.stopImmediatePropagation();
+        if (!event.repeat) void this.addSearchElement({intent, target: host});
     };
 
     /**
@@ -1023,6 +1014,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         isFromTopBar?: boolean;
         /** find=Ctrl+F；replace=Ctrl+H */
         intent?: "find" | "replace";
+        /** 已由快捷键/命令确定的文档，避免 await 后切换到其它分栏。 */
+        target?: Element;
     } = {}) {
         const isFromTopBar = Boolean(options.isFromTopBar);
         const intent = options.intent ?? "find";
@@ -1030,28 +1023,23 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         this.cleanupInvalidComponents();
 
         const mobile = this.isMobile;
-        let edits: NodeListOf<Element> | Element[] = mobile ?
-            document.querySelectorAll("#editor") :
-            document.querySelectorAll(".layout__wnd--active > .layout-tab-container");
-
-        if (edits.length === 0) {
-            const protyle = document.activeElement?.closest(".protyle");
-            if (protyle) {
-                edits = [protyle];
-            } else {
-                console.error("[page-search] no protyle found");
-                return;
-            }
-        }
+        const edit = resolveSearchHotkeyHost(options.target ?? (isFromTopBar ? null : document.activeElement));
+        if (!edit) return;
+        const protyle = getSearchProtyle(edit);
+        const activeWindow = document.querySelector(".layout__wnd--active");
+        const version = ++this.searchOpenVersion;
 
         const prefs = await rpcGetPrefs(this);
+        if (version !== this.searchOpenVersion || resolveSearchHotkeyHost(edit) !== edit ||
+            getSearchProtyle(edit) !== protyle ||
+            document.querySelector(".layout__wnd--active") !== activeWindow) return;
         // 会话内保留查找/替换文案；有选区时优先用选区填查找框（对齐常见编辑器）
-        const selectedText = this.getSelectedText();
+        const selectedText = this.getSelectedText(edit);
         const initialQuery = selectedText || this.sessionSearchText;
         const initialReplace = this.sessionReplaceText;
         const selectSearchOnOpen = !selectedText;
 
-        edits.forEach((edit) => {
+        {
             const existingElement = mobile ?
                 document.querySelector(`.${CLASS_NAME}`) :
                 edit.querySelector(`.${CLASS_NAME}`);
@@ -1141,15 +1129,16 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 // (2)(3)(4) 已打开时的快捷键行为
                 bar.applyHotkeyIntent(intent);
             }
-        });
+        }
     }
 
-    private getSelectedText(): string {
+    private getSelectedText(edit: Element): string {
         const selection = window.getSelection();
         if (!selection || selection.rangeCount === 0) {
             return "";
         }
-        return selection.getRangeAt(0).toString().trim() || "";
+        const range = selection.getRangeAt(0);
+        return edit.contains(range.commonAncestorContainer) ? range.toString().trim() : "";
     }
 }
 
@@ -1163,15 +1152,4 @@ function resolveHotkeyHostElement(target: Element | null): Element | null {
     return document.querySelector(".layout__wnd--active > .layout-tab-container") ??
         document.querySelector(".layout__wnd--active .protyle:not(.fn__none)") ??
         document.querySelector("#editor .protyle:not(.fn__none)");
-}
-
-/** 设置页等非文档输入区，避免抢 Ctrl+F/H */
-function isForeignTextInput(el: Element): boolean {
-    const tag = el.tagName;
-    const isField = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" ||
-        (el as HTMLElement).isContentEditable;
-    if (!isField) {
-        return false;
-    }
-    return !el.closest(".protyle") && !el.closest(`.${CLASS_NAME}`);
 }
