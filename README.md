@@ -100,12 +100,13 @@ Usually writable:
 Searchable and highlightable but unsupported by replacement include:
 
 * document titles;
+* OCR text in image;
 * database content;
 * embedded content;
 * formulas, rendered Mermaid, and rendered HTML-block text;
 * plugin-rendered custom blocks;
 * tab titles inside tabs blocks;
-* plain-code language labels (such as Python or MATLAB); matching blocks have a yellow frame, with an orange frame for the current result;
+* plain-code language labels (such as Python or MATLAB);
 * matches spanning complex marks, read-only regions, or content whose original source cannot be confirmed.
 
 **Replace all** reports these skipped items in its confirmation and result message.
