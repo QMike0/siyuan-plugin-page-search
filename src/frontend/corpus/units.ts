@@ -1,3 +1,4 @@
+import {isImageOCRUnit} from "../../shared/image-ocr";
 import {isCodeLanguageUnit} from "../../shared/code-block-language";
 import {
     INLINE_MATH_TYPE,
@@ -61,7 +62,7 @@ export interface CachedUnit {
 }
 
 function nonReplaceable(block: SearchableBlock): boolean {
-    return isCodeLanguageUnit(block) || block.blockType === "NodeMathBlock" ||
+    return isImageOCRUnit(block) || isCodeLanguageUnit(block) || block.blockType === "NodeMathBlock" ||
         block.blockType === "NodeHTMLBlock" ||
         block.blockType === "NodeCustomBlock" ||
         Boolean(block.element.closest('[data-type="NodeCustomBlock"]')) ||
@@ -176,11 +177,14 @@ export function freezeBlock(
             (isInlineMemoSearchUnit(block) ?
                 (block.text.length > 0 ? [block.text.length] : undefined) :
                 searchableTextLengths(block)));
-    const richCell = block.blockType === "NodeTable" ? deferRichCellCapability(block) : undefined;
+    const tableText = !isImageOCRUnit(block) && !isCodeLanguageUnit(block) && block.blockType === "NodeTable";
+    const richCell = tableText ? deferRichCellCapability(block) : undefined;
     const replaceLock = richCell ? richCell.replaceLock :
-        block.blockType === "NodeTable" ? tableCellReplaceLock(block.element) : undefined;
+        tableText ? tableCellReplaceLock(block.element) : undefined;
     let highlightKind: CachedUnit["highlightKind"] = "text";
-    if (isCodeLanguageUnit(block)) {
+    if (isImageOCRUnit(block)) {
+        highlightKind = "image-ocr";
+    } else if (isCodeLanguageUnit(block)) {
         highlightKind = "code-language";
     } else if (isInlineMemoSearchUnit(block)) {
         highlightKind = "inline-memo";
@@ -190,7 +194,8 @@ export function freezeBlock(
     return {
         blockId: block.blockId,
         blockType: block.blockType,
-        blockTypes: block.blockType === "NodeBlockQueryEmbed" ? block.blockTypes : undefined,
+        blockTypes: block.blockType === "NodeBlockQueryEmbed" ||
+            block.blockType === "NodeTable" && isCodeLanguageUnit(block) ? block.blockTypes : undefined,
         blockIndex,
         text: block.text,
         unitId: block.unitId,

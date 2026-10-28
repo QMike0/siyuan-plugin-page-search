@@ -109,6 +109,8 @@
   "settingsIncludeCodeBlock": "代码块",
   "settingsIncludePlainCodeBlock": "普通代码块",
   "settingsIncludeCodeBody": "普通代码块正文",
+  "searchOCRUnavailable": "部分图片 OCR 内容暂时无法读取或超出搜索容量，结果未完整计入。",
+  "replaceSkipImageOCR": "图片 OCR 内容",
   "settingsIncludeCodeLanguage": "普通代码块语言",
   "settingsIncludeMermaid": "Mermaid",
   "settingsIncludeMermaidHint": "优先匹配 Mermaid 图中渲染的可见文字；未渲染时回退到源码",

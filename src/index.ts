@@ -18,6 +18,7 @@ import {
     invalidateAvCacheForIds,
 } from "./frontend/corpus/av";
 import {isPluginStorageWritable, isPublishMode} from "./frontend/editor-mode";
+import {invalidateImageOCRCache} from "./frontend/image-ocr";
 import {getSearchHotkeyIntent, getSearchProtyle, resolveSearchHotkeyHost} from "./frontend/search-hotkeys";
 import {
     createClientId,
@@ -112,6 +113,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         this.loggingSettingsReady = this.loadLoggingSettings();
         this.setupLoggingSettings();
         this.bindSearchHistory();
+        window.addEventListener("siyuan-image-ocr", this.onImageOCRChanged);
         searchHistory.load();
 
         // 描边属性写在 g 上，避免被思源全局 svg { fill } 覆盖
@@ -292,6 +294,11 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
     }
 
     private readonly onSearchHistoryBroadcast = (event: CustomEvent) => {
+        const data = event.detail?.data;
+        if (event.detail?.cmd === "databaseIndexCommit" &&
+            (data?.backlinkFull === true || Array.isArray(data?.rootIDs) && data.rootIDs.length > 0)) {
+            invalidateImageOCRCache(false);
+        }
         // 搜索窗关闭后仍接收 AV 事务，不能在下次打开时复用未更新载体 hash 的旧单元格。
         if (isAttrViewWsTransaction(event.detail) && !isAttrViewFoldOnlyTransaction(event.detail)) {
             const avIds = attributeViewTransactionIds(event.detail);
@@ -303,10 +310,17 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         searchHistory.acceptBroadcast(event.detail);
     };
 
+    private readonly onImageOCRChanged = (event: Event) => {
+        invalidateImageOCRCache();
+        this.handleEventBusEvent(event as CustomEvent);
+    };
+
     /** 卸下快捷键、搜索条、事件与选区视觉残留（不碰持久化配置） */
     private teardownRuntime() {
         this.searchOpenVersion++;
         this.eventBus.off("ws-main", this.onSearchHistoryBroadcast);
+        window.removeEventListener("siyuan-image-ocr", this.onImageOCRChanged);
+        invalidateImageOCRCache();
         window.removeEventListener("keydown", this.onWindowKeydownCapture, true);
         this.closeSearchDialog();
         this.stopCleanupTimer();
@@ -538,6 +552,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
             settingsIncludePlainCodeBlock: t.settingsIncludePlainCodeBlock || "Plain code blocks",
             settingsIncludeCodeBody: t.settingsIncludeCodeBody || "Plain code: body",
+            searchOCRUnavailable: t.searchOCRUnavailable || "Some image OCR text could not be read; search results are incomplete.",
+            replaceSkipImageOCR: t.replaceSkipImageOCR || "image OCR text",
             settingsIncludeCodeLanguage: t.settingsIncludeCodeLanguage || "Plain code: language",
             settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
             settingsIncludeMermaidHint: t.settingsIncludeMermaidHint ||
@@ -919,6 +935,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
         this.searchComponentCallbacks.add(callback);
         this.activeSearchComponentsCount++;
         if (this.activeSearchComponentsCount === 1) {
+            invalidateImageOCRCache();
             this.eventBusOn();
             this.startCleanupTimer();
         }

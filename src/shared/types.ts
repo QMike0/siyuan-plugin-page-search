@@ -14,7 +14,7 @@ export interface SearchableUnit {
      */
     unitId?: string;
     /** Renderer copy (tab label / mindmap canvas) whose source block owns writes. */
-    matchSource?: "text" | "inline-memo" | "inline-math" | "projection" | "code-language";
+    matchSource?: "text" | "inline-memo" | "inline-math" | "projection" | "code-language" | "image-ocr";
     /**
      * 各 Text 节点字符长度（按拼接顺序）。
      * 用于判断 replaceable；省略则 replaceable 恒为 false。

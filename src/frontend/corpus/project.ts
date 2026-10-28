@@ -1,3 +1,4 @@
+import {isImageOCRUnit} from "../../shared/image-ocr";
 import {codeLanguageSearchEnabled} from "../../shared/code-block-language";
 import type {RestrictInlineType} from "../../shared";
 import {avApiUnitId} from "../../shared/av-live";
@@ -141,7 +142,7 @@ function* iterateViewportRanges(edit: Element, matches: SearchMatch[]): Generato
             const index = indexById.get(id);
             if (index === undefined) continue;
             const match = matches[index];
-            if (block.text.slice(match.start, match.end) !== match.matchedText) continue;
+            if (!isImageOCRUnit(block) && block.text.slice(match.start, match.end) !== match.matchedText) continue;
             const range = shown ?
                 createRangeFromBlockOffsets(block, match.start, match.end, {
                     allowFoldedHidden: projection.allowFoldedHidden,
@@ -308,7 +309,7 @@ function createRangeProjection(
         if (!block) {
             return {...match, range: undefined};
         }
-        if (block.text.slice(match.start, match.end) !== match.matchedText) {
+        if (!isImageOCRUnit(block) && block.text.slice(match.start, match.end) !== match.matchedText) {
             return {...match, range: undefined};
         }
         const shown = isShown(block);
@@ -568,7 +569,7 @@ function* iterateChangedRanges(
         let hiddenCopy = false;
         for (let index = 0; index < candidates.length; index += 1) {
             const block = candidates[index];
-            if (block.text.slice(match.start, match.end) !== match.matchedText) {
+            if (!isImageOCRUnit(block) && block.text.slice(match.start, match.end) !== match.matchedText) {
                 if (target.broken) {
                     textChanged += 1;
                 }
@@ -619,7 +620,8 @@ function liveUnitRank(block: SearchableBlock): number {
     // Mindmap/tab projections are the only live copy that can paint a match
     // while the source block is hidden. Prefer that copy for Range projection;
     // replacement still resolves the same blockId back to the source DOM.
-    if (block.matchSource === "projection") {
+    if (block.matchSource === "projection" ||
+        isImageOCRUnit(block) && block.element.closest('.mindmap-view [data-mindmap-source-id]')) {
         rank += 2;
     }
     return rank;

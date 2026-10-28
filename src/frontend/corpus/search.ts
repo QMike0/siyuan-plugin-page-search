@@ -1,3 +1,5 @@
+import {invalidateImageOCRCache, resolveImageOCRUnits} from "../image-ocr";
+import {isImageOCRUnit} from "../../shared/image-ocr";
 import {codeLanguageSearchEnabled, isCodeLanguageUnit} from "../../shared/code-block-language";
 import {resolveRichCellCapabilities, type RichCellSearchInfo} from "../rich-table-cell";
 import {getAllEditor} from "siyuan";
@@ -162,6 +164,7 @@ import {
 import {
     fetchBlockHashes,
     fetchContentCandidateIds,
+    fetchImageCandidateIds,
     fetchImageTitleCandidateIds,
     fetchLiteralGroupCandidateIds,
     fetchMemoCandidateIds,
@@ -270,6 +273,7 @@ export function invalidateTextCache(): void {
 }
 
 export function invalidateDocumentSearchCaches(): void {
+    invalidateImageOCRCache();
     // 清缓存时必须同时作废旧任务，否则旧任务完成后会把刚清掉的数据写回。
     cancelBackgroundCorpusJobs();
     invalidateTextCache();
@@ -2220,6 +2224,10 @@ async function searchCurrentDocumentImpl(
         memoOnlyRestriction,
         signal: options.signal,
     });
+    const imageCandidatesPromise = !keepRestrict ?
+        memoizedIds(context.rootId, queryMemoKey(context.rootId, "image-hosts"), meta.signature,
+            () => fetchImageCandidateIds(context.rootId, options.signal)).catch((): null => null) :
+        Promise.resolve([] as string[]);
     const avRefsPromise = options.includeAttributeView === false ?
         Promise.resolve({refs: [] as AvBlockRef[], failed: false}) :
         loadMemoizedAvRefs(context.rootId, meta.signature, options.signal)
@@ -2703,6 +2711,17 @@ async function searchCurrentDocumentImpl(
                 omits = tableHostOmitsRows(table);
                 tableOmitsRows.set(block.blockId, omits);
             }
+            if (isImageOCRUnit(block)) {
+                // Virtual-table text overlays stay authoritative for body text. OCR uses the
+                // complete kernel image list, then binds to the same logical cell on navigation.
+                if (!omits && isVisuallyInEditor(block.element)) {
+                    visibleMountedTables.add(block.blockId);
+                    mountedTableUnits.push(freezeLive(block, orderIndex.get(block.blockId) ?? block.blockIndex));
+                } else if (!omits) {
+                    hiddenMountedTables.add(block.blockId);
+                }
+                continue;
+            }
             const isCell = Boolean(block.unitId && block.unitId.indexOf(TABLE_CELL_UNIT) === 0);
             if (!isCell) {
                 if (omits || !isVisuallyInEditor(block.element)) {
@@ -3050,6 +3069,17 @@ async function searchCurrentDocumentImpl(
                 queueUnloaded(id);
             }
         }
+    }
+
+    const imageCandidates = await imageCandidatesPromise;
+    if (cancelled()) return {matches: [], error: "", cancelled: true};
+    // Reconcile the structural superset before matching; API errors retain the existing full fallback.
+    if (imageCandidates === null) {
+        for (const item of [...plainTargets, ...specialTargets]) queuedIds.add(item.id);
+        for (const item of meta.byId.values()) queueUnloaded(item.id);
+    } else {
+        for (const item of [...plainTargets, ...specialTargets]) queuedIds.add(item.id);
+        imageCandidates.forEach(queueUnloaded);
     }
 
     // 普通查询和带字面量预筛的正则都不能只依赖尚未追上 savedoc 的 SQL。
@@ -3526,6 +3556,11 @@ async function searchCurrentDocumentImpl(
     // 文字，避免异常 DOM 或重复提取把同一可见词计两次。
     units = dedupeCorpusUnits(units.filter((unit) => !unit.embeddedAvRef));
 
+    const ocr = await resolveImageOCRUnits(units, options.signal);
+    if (cancelled()) return {matches: [], error: "", cancelled: true};
+    units = ocr.units;
+    incompleteBlockIds.push(...ocr.failedIds);
+
     const matchOptions = {
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
@@ -3596,7 +3631,7 @@ async function searchCurrentDocumentImpl(
         if (!unit || !passesRestrict(unit, hit.start, hit.end, options)) {
             continue;
         }
-        const nonReplaceable = isCodeLanguageUnit(unit) || hit.blockId === "__doc-title__" ||
+        const nonReplaceable = isImageOCRUnit(unit) || isCodeLanguageUnit(unit) || hit.blockId === "__doc-title__" ||
             mountedTabsTitleIds.has(hit.blockId) ||
             unloadedTabsTitleIds.has(hit.blockId) ||
             hit.unitId === "doc-title" ||
@@ -3632,7 +3667,7 @@ async function searchCurrentDocumentImpl(
             blockIndex: orderIndex.get(hit.blockId) ?? (hit.blockId === "__doc-title__" ? -1 : hit.blockIndex),
             unitId: hit.unitId,
             unitSeq: navSeq(unit, hit.start),
-            replaceReason: isCodeLanguageUnit(unit) ? "codeLanguage" : mountedTabsTitleIds.has(hit.blockId) || unloadedTabsTitleIds.has(hit.blockId) ? "tabsTitle" :
+            replaceReason: isImageOCRUnit(unit) ? "imageOCR" : isCodeLanguageUnit(unit) ? "codeLanguage" : mountedTabsTitleIds.has(hit.blockId) || unloadedTabsTitleIds.has(hit.blockId) ? "tabsTitle" :
                 unit.matchSource === "projection" && !projectionSourceBacked.has(hit.blockId) ? "preview" :
                 tablePending ? "tablePending" : richSpanBlocked ? "richCell" : undefined,
             embeddedPosition: embeddedPositionAt(unit.embeddedOrder, hit.start),
@@ -3679,6 +3714,7 @@ async function searchCurrentDocumentImpl(
         unrendered,
         truncated,
         incompleteBlockIds,
+        ocrUnavailable: ocr.failedIds.length,
     };
 }
 
@@ -3710,7 +3746,7 @@ function compareMatchOrder(left: SearchMatch, right: SearchMatch): number {
     }
     const embedded = compareEmbeddedPositions(left, right);
     if (embedded !== undefined && embedded !== 0) return embedded;
-    if (isCodeLanguageUnit(left) !== isCodeLanguageUnit(right)) {
+    if (left.blockType !== "NodeTable" && isCodeLanguageUnit(left) !== isCodeLanguageUnit(right)) {
         return isCodeLanguageUnit(left) ? -1 : 1;
     }
     if (

@@ -1,6 +1,6 @@
 import type {SearchableBlock} from "./dom-types";
 import type {BlockTreeLink} from "../shared/block-tree";
-import {effectiveCodeBlockLanguage} from "../shared/code-block-language";
+import {effectiveCodeBlockLanguage, isCodeLanguageUnit} from "../shared/code-block-language";
 
 /** Same icons and labels as the search scope menu. No preferences are written here. */
 export const RESULT_BLOCK_TYPES = {
@@ -98,8 +98,19 @@ function parentElement(element: Element): Element | null {
 function domTypeOf(node: Element): ResultBlockType | undefined {
     // SQL abbreviations are not DOM block names: inline data-type="s" is strikethrough.
     const type = node.getAttribute("data-type") ?? "";
-    return type.startsWith("Node") ? typeOf(type, node.getAttribute("data-subtype") ?? "",
-        node.getAttribute("custom-sy-list-mindmap") === "1" ? 'custom-sy-list-mindmap="1"' : "") : undefined;
+    if (type.startsWith("Node")) return typeOf(type, node.getAttribute("data-subtype") ?? "",
+        node.getAttribute("custom-sy-list-mindmap") === "1" ? 'custom-sy-list-mindmap="1"' : "");
+    // Cold rich cells use semantic HTML instead of native BlockDOM. Restrict
+    // this interpretation to their source previews, never arbitrary HTML blocks.
+    if (!node.matches("pre, blockquote, ul, ol, h1, h2, h3, h4, h5, h6") ||
+        !node.closest("[data-sy-table-cell-rich]")) return undefined;
+    if (/^H[1-6]$/.test(node.tagName)) return node.tagName.toLowerCase() as ResultBlockType;
+    if (node.tagName === "PRE") return "code";
+    if (node.tagName === "BLOCKQUOTE") return "quote";
+    // Native exported lists group their subtype. Read only the first item's
+    // direct task marker, without scanning an arbitrarily deep list subtree.
+    return node.tagName === "OL" ? "ordered" :
+        Array.from(node.firstElementChild?.children ?? []).some(child => child.matches("input[data-task]")) ? "task" : "unordered";
 }
 
 function headingLevel(type: ResultBlockType | undefined): number {
@@ -126,10 +137,10 @@ export function createDomBlockTypeReader(
                     parent.classList.contains("protyle-wysiwyg__embed"));
             let first = true;
             for (const child of parent.children) {
-                if (!(child.getAttribute("data-type") ?? "").startsWith("Node")) continue;
+                const key = domTypeOf(child);
+                if (!key && !(child.getAttribute("data-type") ?? "").startsWith("Node")) continue;
                 if (first && !independent) active = precedingHeadings?.(child) ?? [];
                 first = false;
-                const key = domTypeOf(child);
                 const level = headingLevel(key);
                 if (level) active = active.filter((type) => headingLevel(type) < level);
                 sections.set(child, active);
@@ -151,7 +162,7 @@ export function createDomBlockTypeReader(
             // A focused editor can mount a child without its enclosing containers.
             if (!path.length && id && outsideMountedRoot) path = outsideMountedRoot(id);
             const key = domTypeOf(node);
-            if ((node.getAttribute("data-type") ?? "").startsWith("Node")) {
+            if (key || (node.getAttribute("data-type") ?? "").startsWith("Node")) {
                 const headings = sectionOf(node);
                 if (headings.length) path = [...headings, ...path];
             }
@@ -162,6 +173,10 @@ export function createDomBlockTypeReader(
     };
     return (block) => {
         if (block.blockType === "doc-title") return ["docTitle"];
+        if (block.blockType === "NodeTable" && isCodeLanguageUnit(block)) {
+            const path = read(block.element);
+            return path[0] === "code" ? path : ["code", ...path];
+        }
         // Embedded units use the embed's ID/type for navigation, but their
         // text still belongs to the source blocks inside that owner.
         if (block.blockType === "NodeBlockQueryEmbed") {
@@ -181,7 +196,7 @@ export function createResultBlockTypeReader(
     links: ReadonlyMap<string, BlockTreeLink>,
     codeLanguages: ReadonlyMap<string, {codeLanguage?: string;}>,
     order: readonly string[] = [],
-): (unit: {blockId: string; blockType: string; blockTypes?: readonly ResultBlockType[];}) => readonly ResultBlockType[] {
+): (unit: {blockId: string; blockType: string; blockTypes?: readonly ResultBlockType[]; unitId?: string; matchSource?: string;}) => readonly ResultBlockType[] {
     // HeadingParent uses a preceding, lower-level heading in the SAME container.
     // Only kernel document order is trustworthy; SQL map/id order is not.
     let headingParents: Map<string, string> | undefined;
@@ -252,9 +267,16 @@ export function createResultBlockTypeReader(
     });
     for (const block of live) {
         if (block.unitId?.startsWith("embed:")) continue;
+        if (block.blockType === "NodeTable" && isCodeLanguageUnit(block)) continue;
         if (!mounted.has(block.blockId)) mounted.set(block.blockId, block);
     }
     return (unit) => {
+        if (unit.blockType === "NodeTable" && isCodeLanguageUnit(unit)) {
+            // Cell-internal containers have no SQL block IDs. Keep their frozen
+            // path, but resolve outer heading/container ancestry from this query.
+            const boundary = unit.blockTypes?.indexOf("table") ?? -1;
+            return [...(boundary >= 0 ? unit.blockTypes!.slice(0, boundary) : ["code" as const]), ...read(unit.blockId)];
+        }
         const mountedBlock = mounted.get(unit.blockId);
         let path: readonly ResultBlockType[];
         if (mountedBlock) {

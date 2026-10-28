@@ -1,3 +1,4 @@
+import {isImageOCRUnit} from "../shared/image-ocr";
 import {isInlineMemoSearchUnit, isInlineMathSearchUnit} from "./blocks";
 import {isCodeLanguageUnit} from "../shared/code-block-language";
 import {isRendererSourceFallbackUnitId} from "../shared/renderer-units";
@@ -154,6 +155,14 @@ export function createRangeFromBlockOffsets(
   existingRange?: Range,
 ): Range | null {
   if (isRendererSourceFallbackUnitId(block.unitId)) return null
+  if (isImageOCRUnit(block)) {
+    if (!isElementVisible(block.element, visibility)) return null
+    try {
+      const range = block.element.ownerDocument.createRange()
+      range.selectNode(block.element)
+      return range
+    } catch { return null }
+  }
   if (isCodeLanguageUnit(block)) return createRangeFromAttributeHost(block, start, end, visibility)
   if (isInlineMemoSearchUnit(block)) {
     return createRangeFromInlineMemo(block, start, end, visibility)

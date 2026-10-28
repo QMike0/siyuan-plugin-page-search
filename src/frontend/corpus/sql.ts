@@ -332,3 +332,12 @@ export function isAttributeViewType(type: string): boolean {
 export function shouldSkipAsContainer(type: string): boolean {
     return isContainerType(type);
 }
+
+/** Image hosts are structural candidates: OCR may be edited without changing block hashes.
+ * Native Markdown contains ![...](...), rich previews can also retain HTML img tags.
+ */
+export function fetchImageCandidateIds(rootId: string, signal?: AbortSignal): Promise<string[] | null> {
+    return queryScopedCandidates(rootId,
+        `AND type NOT IN (${CONTAINER_SQL}) AND (instr(markdown, '![') > 0 OR instr(markdown, '<img') > 0 OR type = 'query_embed') `,
+        signal);
+}

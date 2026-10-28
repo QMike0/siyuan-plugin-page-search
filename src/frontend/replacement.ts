@@ -1,3 +1,4 @@
+import {isImageOCRUnit} from "../shared/image-ocr";
 import {isCodeLanguageUnit} from "../shared/code-block-language";
 import {
     effectiveSearchQuery,
@@ -91,7 +92,7 @@ export function createReplacementUnitLookup(unitsByKey: Map<string, SearchableBl
     };
     return (match: ReplacementUnitMatch): SearchableBlock | undefined => {
         const direct = unitsByKey.get(unitKeyFor(match.blockId, match.unitId));
-        if (direct && isCodeLanguageUnit(direct)) return undefined;
+        if (direct && (isImageOCRUnit(direct) || isCodeLanguageUnit(direct))) return undefined;
         const memoMatch = match.highlightKind === "inline-memo" ||
             Boolean(match.unitId?.startsWith("inline-memo:")) ||
             Boolean(match.unitId?.startsWith("table-memo:"));

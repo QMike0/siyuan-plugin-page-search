@@ -1,3 +1,4 @@
+import {isImageOCRUnit} from "./image-ocr";
 /**
  * 虚拟大表：画面上的格子和 getBlockDOM 的完整表按逻辑行号、列号对齐。
  * 思源单元格是普通 td/th，没有 data-node-id。
@@ -304,7 +305,7 @@ export function mergeVirtualTableUnits<
         if (unstable.has(unit.blockId) || !virtual.has(unit.blockId)) {
             continue;
         }
-        if (unit.blockType !== "NodeTable") {
+        if (unit.blockType !== "NodeTable" || isImageOCRUnit(unit)) {
             continue;
         }
         // 备注和公式不是格子。它们的 unitId 没有行列号，不能因此放弃整张表的画面文字。
@@ -324,7 +325,7 @@ export function mergeVirtualTableUnits<
             next.push(unit);
             continue;
         }
-        if (unit.blockType !== "NodeTable") {
+        if (unit.blockType !== "NodeTable" || isImageOCRUnit(unit)) {
             next.push(unit);
             continue;
         }

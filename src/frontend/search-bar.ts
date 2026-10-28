@@ -1,3 +1,4 @@
+import {isFrameHighlight, isImageOCRUnit} from "../shared/image-ocr";
 import {applyCodeLanguageVisual, clearCodeLanguageVisual, codeLanguageFrameHost} from "./code-language-visual";
 import type {
     IMenu,
@@ -441,6 +442,8 @@ export interface SearchBarI18n {
     settingsIncludePlainCodeBlock: string;
     settingsIncludeCodeBody?: string;
     settingsIncludeCodeLanguage?: string;
+    replaceSkipImageOCR?: string;
+    searchOCRUnavailable?: string;
     settingsIncludeMermaid: string;
     settingsIncludeMermaidHint: string;
     settingsIncludeFlowchart: string;
@@ -564,6 +567,7 @@ export class SearchBar {
     private awaitingSearchResult = false;
     private degradedNotified = false;
     private unrenderedNotified = false;
+    private ocrUnavailableNotified = false;
     private truncatedNotified = false;
     private indexSettledTimer: number | null = null;
     private unsubscribeIndexSettled: (() => void) | null = null;
@@ -2703,7 +2707,7 @@ export class SearchBar {
             searchKey = this.searchResultKey(value);
             selectionScope = this.selectionOnly ? this.rememberedSelectionScope : null;
             result = await pending;
-            const {matches, error, degraded, partial, unrendered, truncated} = result;
+            const {matches, error, degraded, partial, unrendered, truncated, ocrUnavailable} = result;
             const isCurrent = () =>
                 !this.destroyed && !abortController.signal.aborted && generation === this.searchGeneration &&
                 documentEpoch === this.documentEpoch &&
@@ -2781,9 +2785,9 @@ export class SearchBar {
             this.pendingDocumentCountDisplay = null;
             this.awaitingSearchResult = false;
             this.searchCoverageIncomplete = Boolean(
-                degraded || partial || (unrendered ?? 0) > 0 || (truncated ?? 0) > 0,
+                degraded || partial || (unrendered ?? 0) > 0 || (truncated ?? 0) > 0 || (ocrUnavailable ?? 0) > 0,
             );
-            this.noteSearchCoverage(degraded, partial, unrendered, truncated);
+            this.noteSearchCoverage(degraded, partial, unrendered, truncated, ocrUnavailable);
             if (restoredSnapshot !== null) {
                 this.resultIndex = Math.min(restoredSnapshot.index, matches.length);
             } else if (change && matches.length > 0) {
@@ -2802,7 +2806,7 @@ export class SearchBar {
             logDebug("search completed", {
                 rootId, generation, matches: matches.length, regex: this.regex, selectionOnly: this.selectionOnly,
                 incomplete: this.searchCoverageIncomplete, degraded: Boolean(degraded), partial: Boolean(partial),
-                unrendered: unrendered ?? 0, truncated: truncated ?? 0,
+                unrendered: unrendered ?? 0, truncated: truncated ?? 0, ocrUnavailable: ocrUnavailable ?? 0,
                 elapsedMs: searchStarted === undefined ? undefined : Math.round(performance.now() - searchStarted),
             });
             return matches;
@@ -2910,7 +2914,12 @@ export class SearchBar {
         };
     }
 
-    private noteSearchCoverage(degraded?: boolean, partial?: boolean, unrendered?: number, truncated?: number) {
+    private noteSearchCoverage(degraded?: boolean, partial?: boolean, unrendered?: number, truncated?: number, ocrUnavailable?: number) {
+        if (ocrUnavailable && !this.ocrUnavailableNotified) {
+            this.ocrUnavailableNotified = true;
+            logWarning("image OCR search unavailable", {blocks: ocrUnavailable});
+            showMessage(this.i18n.searchOCRUnavailable || "Some image OCR text could not be read; search results are incomplete.", 5000, "info");
+        }
         if (degraded && !this.degradedNotified) {
             this.degradedNotified = true;
             logWarning("search coverage degraded", {rootId: this.rememberCurrentRootId()});
@@ -3013,9 +3022,9 @@ export class SearchBar {
             this.scrollIntoRanges(this.resultIndex - 1, false);
         } else if (Date.now() < this.indexResetPausedUntil) {
             const current = this.getCurrentMatch();
-            if (current?.range && current.highlightKind !== "inline-memo" && current.highlightKind !== "code-language") {
+            if (current?.range && current.highlightKind !== "inline-memo" && !isFrameHighlight(current)) {
                 this.applyFocusHighlight(current.range);
-            } else if (current?.highlightKind === "inline-memo" || current?.highlightKind === "code-language") {
+            } else if (current?.highlightKind === "inline-memo" || isFrameHighlight(current)) {
                 this.clearSearchFocus();
             }
         }
@@ -3066,15 +3075,15 @@ export class SearchBar {
         for (const match of this.resultMatches) {
             if (match.highlightKind === "inline-memo" && match.range && rangeBelongsToEditor(match.range, this.edit)) {
                 memoRanges.push(match.range);
-            } else if (match.highlightKind === "code-language" && match.range && rangeBelongsToEditor(match.range, this.edit)) {
+            } else if (isFrameHighlight(match) && match.range && rangeBelongsToEditor(match.range, this.edit)) {
                 codeRanges.push(match.range);
             }
         }
         const codeFocus = this.getCurrentMatch();
         try {
-            applyCodeLanguageVisual(this.edit, codeRanges, codeFocus?.highlightKind === "code-language" ? codeFocus.range : null);
+            applyCodeLanguageVisual(this.edit, codeRanges, (codeFocus && isFrameHighlight(codeFocus)) ? codeFocus.range : null);
         } catch (error) {
-            console.warn("[page-search] code language highlight failed", error);
+            console.warn("[page-search] block frame highlight failed", error);
         }
         if (!memoRanges.length && !codeRanges.length) {
             this.teardownMemoUnderlineLayoutSync();
@@ -3106,7 +3115,7 @@ export class SearchBar {
             }
             this.memoUnderlineLayoutRaf = window.requestAnimationFrame(() => {
                 this.memoUnderlineLayoutRaf = 0;
-                if (!this.resultMatches.some((m) => (m.highlightKind === "inline-memo" || m.highlightKind === "code-language") && m.range)) {
+                if (!this.resultMatches.some((m) => (m.highlightKind === "inline-memo" || isFrameHighlight(m)) && m.range)) {
                     return;
                 }
                 // Reuse the same frame-coalesced scroll/resize subscription for special highlights.
@@ -3167,6 +3176,7 @@ export class SearchBar {
         }
 
         const indexCommit = event.detail?.cmd === "databaseIndexCommit";
+        const imageOCRChanged = event.type === "siyuan-image-ocr";
         if (indexCommit) {
             const rootId = this.rememberCurrentRootId();
             const data = event.detail?.data;
@@ -3177,17 +3187,17 @@ export class SearchBar {
                     (Array.isArray(data?.rootIDs) && data.rootIDs.includes(rootId)))
             ) return;
         }
-        if (indexCommit || ["savedoc", "rename"].includes(event.detail?.cmd)) {
+        if (imageOCRChanged || indexCommit || ["savedoc", "rename"].includes(event.detail?.cmd)) {
             // SQL catch-up does not change the tree being validated by an
             // ongoing replacement. Merge its refresh without cancelling that
             // plan; actual savedoc/rename events still invalidate the plan.
-            if (!indexCommit || !this.replaceBusy) this.documentEpoch += 1;
+            if ((!indexCommit && !imageOCRChanged) || !this.replaceBusy) this.documentEpoch += 1;
             this.savedocDomEpoch = this.domEpoch;
             // In-flight searches can still hold the pre-write SQL candidates.
             // Re-read metadata and candidates after the index catches up as well.
             this.searchAbortController?.abort();
             const rootId = this.rememberCurrentRootId();
-            if (rootId) {
+            if (rootId && !imageOCRChanged) {
                 if (indexCommit) invalidateDocumentIndexCaches(rootId);
                 else {
                     const data = event.detail?.data;
@@ -3477,7 +3487,7 @@ export class SearchBar {
             skipEmbeddedOrder: true,
         });
         const block = live.find((item) => item.blockId === match.blockId && item.unitId === match.unitId);
-        if (!block || block.text.slice(match.start, match.end) !== match.matchedText) {
+        if (!block || (!isImageOCRUnit(block) && block.text.slice(match.start, match.end) !== match.matchedText)) {
             return false;
         }
         const range = createRangeFromBlockOffsets(block, match.start, match.end, {
@@ -4055,7 +4065,7 @@ export class SearchBar {
         if (!current?.range) {
             return false;
         }
-        if (current.highlightKind !== "inline-memo" && current.highlightKind !== "code-language") {
+        if (current.highlightKind !== "inline-memo" && !isFrameHighlight(current)) {
             this.applyFocusHighlight(current.range);
         }
         return true;
@@ -4160,7 +4170,7 @@ export class SearchBar {
         for (let index = 0; index < matches.length; index++) {
             if (!current()) return false;
             const match = matches[index];
-            if (match.range && rangeStillPainted(match, this.edit) && match.highlightKind !== "inline-memo" && match.highlightKind !== "code-language") {
+            if (match.range && rangeStillPainted(match, this.edit) && match.highlightKind !== "inline-memo" && !isFrameHighlight(match)) {
                 for (const range of [match.range, mirrorTabsTitleRange(match.range)]) {
                     if (!range || (range !== match.range && !rangeBelongsToEditor(range, this.edit))) continue;
                     count++;
@@ -4178,7 +4188,7 @@ export class SearchBar {
         this.getComponentHighlights().setResults(nextHighlight && count ? nextHighlight : null);
         this.resultHighlightPending = false;
         const focused = this.getCurrentMatch();
-        if (focused?.range && focused.highlightKind !== "inline-memo" && focused.highlightKind !== "code-language") this.applyFocusHighlight(focused.range);
+        if (focused?.range && focused.highlightKind !== "inline-memo" && !isFrameHighlight(focused)) this.applyFocusHighlight(focused.range);
         else this.clearSearchFocus();
         this.syncMemoUnderlineVisual();
         return true;
@@ -4198,7 +4208,7 @@ export class SearchBar {
     private appendResultHighlight(match: SearchMatch): boolean {
         if (
             !this.canPaintHighlights() || !match.range || !rangeStillPainted(match, this.edit) ||
-            (match.highlightKind === "inline-memo" || match.highlightKind === "code-language")
+            (match.highlightKind === "inline-memo" || isFrameHighlight(match))
         ) {
             return false;
         }
@@ -4790,7 +4800,7 @@ export class SearchBar {
             this.revealUnloadedMatch(index, match, scroll, allowNativeAvLocate);
             return;
         }
-        if (immediate && match.highlightKind !== "inline-memo" && match.highlightKind !== "code-language") {
+        if (immediate && match.highlightKind !== "inline-memo" && !isFrameHighlight(match)) {
             this.applyFocusHighlight(range);
         }
 
@@ -4857,7 +4867,7 @@ export class SearchBar {
             }
         }
 
-        if (match.highlightKind !== "inline-memo" && match.highlightKind !== "code-language") {
+        if (match.highlightKind !== "inline-memo" && !isFrameHighlight(match)) {
             this.applyFocusHighlight(range);
         } else {
             this.clearSearchFocus();
@@ -5064,6 +5074,7 @@ export class SearchBar {
             custom: this.i18n.settingsIncludeCustomBlock || "custom blocks",
             mermaid: "Mermaid", flowchart: "flowchart", graphviz: "Graphviz", plantuml: "PlantUML",
             chart: "ECharts", mindmap: "mindmap", abc: "ABC",
+            imageOCR: this.i18n.replaceSkipImageOCR || "image OCR text",
             codeLanguage: this.i18n.settingsIncludeCodeLanguage || "code-block language labels",
             tabsTitle: this.i18n.replaceReasonTabsTitle || "tab titles",
             richCell: this.i18n.replaceReasonRichCell || "unsupported rich-cell formatting",

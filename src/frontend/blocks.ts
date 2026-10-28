@@ -1,4 +1,5 @@
-import {CODE_LANGUAGE_UNIT_ID, codeLanguageSearchEnabled} from "../shared/code-block-language";
+import {isImageOCRUnit} from "../shared/image-ocr";
+import {CODE_LANGUAGE_UNIT_ID, codeLanguageSearchEnabled, isDiagramCodeLanguage} from "../shared/code-block-language";
 import {
     logicalTableRows,
     normalizeRestrictInlineTypes,
@@ -35,7 +36,7 @@ import {
 import {splitTextNodesAtBarriers} from "./text-runs";
 import {createDomBlockTypeReader} from "./result-block-types";
 import {AV_FIELD_NAME_PREFIX} from "../shared/av-live";
-import {beginRichCellSnapshot, isSupportedRichCell, richCellHasActiveEditor, richCellSearchRuns, richCellMathBlocks} from "./rich-table-cell";
+import {beginRichCellSnapshot, isSupportedRichCell, richCellHasActiveEditor, richCellSearchRuns, richCellMathBlocks, richCellCodeBlocks} from "./rich-table-cell";
 import {
     beginTextCollection,
     isCollectedTextHidden,
@@ -404,6 +405,7 @@ export function collectSearchableBlocks(
         includeBlockquote,
         includeCallout,
         includeSuperBlock,
+        includeTabs,
         includeListUnordered,
         includeListOrdered,
         includeListTask,
@@ -417,6 +419,7 @@ export function collectSearchableBlocks(
         includeMathBlock,
         includeEmbedBlock,
         includeCodeBlock,
+        includeCodeLanguage: codeLanguageSearchEnabled(options),
         includeMermaid,
         includeFlowchart,
         includeHtmlBlock,
@@ -585,6 +588,10 @@ export function collectSearchableBlocks(
             return;
         }
 
+        if (restrictInlineTypes.length === 0) {
+            blocks.push(...collectImageOCRSearchUnits(element, {blockId, blockType, blockIndex}, includeGates));
+        }
+
         if (blockType === ATTRIBUTE_VIEW_TYPE) {
             if (!includeAttributeView) {
                 return;
@@ -644,12 +651,7 @@ export function collectSearchableBlocks(
             if (codeLanguageSearchEnabled(options) &&
                 (!isAuthorCssHiddenElement(element) || isInactiveTabSourceElement(element)) &&
                 !element.closest('.fn__none, [hidden], [aria-hidden="true"]')) {
-                const label = element.querySelector<HTMLElement>(":scope > .protyle-action > .protyle-action__language");
-                const language = label?.textContent?.trim() ?? "";
-                if (language) blocks.push({
-                    blockId, blockType, blockIndex, element, text: language, textNodes: [],
-                    unitId: CODE_LANGUAGE_UNIT_ID, matchSource: "code-language",
-                });
+                blocks.push(...codeLanguageUnits(element, {blockId, blockType, blockIndex}));
             }
             if (includeCodeBlock) {
                 const body = element.querySelector<HTMLElement>(":scope > .hljs [contenteditable=\"true\"]") ??
@@ -687,7 +689,7 @@ export function collectSearchableBlocks(
         blocks.push(...collectTabsTitleUnits(attributeRoots));
     }
     if (includeMindmap && collectBodyText) {
-        blocks.push(...collectMindmapPreviewUnits(attributeRoots));
+        blocks.push(...collectMindmapPreviewUnits(attributeRoots, includeGates, restrictInlineTypes.length === 0, includeImageTitle));
     }
     if (collectMemo) {
         attributeRoots.forEach((root) => {
@@ -739,6 +741,106 @@ export function ownEmbeddedSearchUnit(block: SearchableBlock, ownerId: string): 
     };
 }
 
+/** Native images, including the plain HTML preview emitted for a rich table cell. */
+function collectImageOCRSearchUnits(
+    element: HTMLElement,
+    base: Pick<SearchableBlock, "blockId" | "blockType" | "blockIndex">,
+    gates?: IncludeGates,
+): SearchableBlock[] {
+    const {blockType} = base;
+    if (![PARAGRAPH_TYPE, HEADING_TYPE, TABLE_TYPE, CALLOUT_TYPE].includes(blockType) ||
+        element.closest('[data-type="NodeAttributeView"], [data-type="NodeCustomBlock"], [data-type="NodeHTMLBlock"]')) return [];
+    if (gates?.includeTabs === false && element.closest('[data-type="NodeTabs"]')) return [];
+    if (blockType === TABLE_TYPE && gates?.includeTable === false) return [];
+    const projection = element.hasAttribute("data-mindmap-source-id");
+    const images = element.querySelectorAll<HTMLImageElement>(blockType === TABLE_TYPE ? "img" : ".img img");
+    if (!images.length) return [];
+    if (gates && shouldSkipAttributeUnitByIncludeGates(element, gates)) return [];
+    const rows = blockType === TABLE_TYPE ? logicalRowIndexes(element) : undefined;
+    const cellOrdinals = new Map<HTMLElement, number>();
+    const units: SearchableBlock[] = [];
+    let sourceOrdinal = 0;
+    for (const image of images) {
+        if (image.closest('[data-type="NodeAttributeView"], [data-type="NodeCustomBlock"], [data-type="NodeHTMLBlock"]')) continue;
+        let prefix = "";
+        let tableSlot: TableSlot | undefined;
+        let cell: HTMLElement | null = null;
+        let ordinal: number;
+        if (rows) {
+            cell = image.closest<HTMLElement>(TABLE_CELL_SELECTOR);
+            const row = cell?.closest<HTMLElement>(".table__row, tr");
+            const logicalRow = row && rows.get(row);
+            const column = row && cell ? directTableCellColumn(row, cell) : -1;
+            if (!cell || logicalRow === undefined || column < 0 ||
+                cell.closest('[data-type="NodeTable"]') !== element || !tableCellTextRoot(cell).contains(image) ||
+                (!image.matches(".img img") && !cell.hasAttribute("data-sy-table-cell-rich"))) continue;
+            ordinal = cellOrdinals.get(cell) ?? 0;
+            cellOrdinals.set(cell, ordinal + 1);
+            prefix = `table-cell:${logicalRow}:${column}:`;
+            tableSlot = {row: logicalRow, column, offset: 0};
+        } else {
+            if ((projection ? image.closest('[data-mindmap-source-id]') : getOwnerBlock(image)) !== element) continue;
+            ordinal = sourceOrdinal++;
+        }
+        // Assign identity before scope/visibility filters, so toggles cannot rebind another picture.
+        if (gates && (shouldSkipAttributeUnitByIncludeGates(image, gates) ||
+            (cell && shouldSkipRichPreviewByInclude(image, cell, gates)))) continue;
+        if (isAuthorCssHiddenElement(image) && !isInactiveTabSourceElement(image)) continue;
+        const path = (image.getAttribute("data-src") || image.getAttribute("src"))?.trim();
+        if (!path) continue;
+        units.push({...base, element: image, text: path, textNodes: [], tableSlot,
+            unitId: `${prefix}image-ocr:${ordinal}:${encodeURIComponent(path)}`, matchSource: "image-ocr"});
+    }
+    return units;
+}
+
+function shouldSkipRichPreviewByInclude(element: Element, cell: HTMLElement, gates: IncludeGates): boolean {
+    if (!cell.hasAttribute("data-sy-table-cell-rich")) return false;
+    // Before live hydration Lute emits h1..h6/ul/ol instead of BlockDOM. Apply
+    // these extra gates only inside the native rich source, never arbitrary HTML.
+    const heading = element.closest("h1, h2, h3, h4, h5, h6");
+    if (heading && cell.contains(heading) &&
+        !isHeadingLevelIncluded(heading.tagName.toLowerCase() as HeadingLevel, gates)) return true;
+    const list = element.closest("ul, ol");
+    if (list && cell.contains(list)) {
+        const task = element.closest("li")?.querySelector(":scope > input[data-task]");
+        if (!isListSubtypeIncluded(task ? "t" : list.tagName === "OL" ? "o" : "u", gates)) return true;
+    }
+    const paragraph = element.closest("p");
+    if (!gates.includeParagraph && paragraph && cell.contains(paragraph) && !paragraph.closest(TABLE_CELL_EDITOR_SELECTOR)) return true;
+    return !gates.includeBlockquote && Boolean(element.closest("blockquote"));
+}
+
+/** Only image-containing source blocks/cells need an additional order snapshot.
+ * Reuse the bounded target-tree reader: OCR offsets are local to the picture, not body offsets.
+ */
+function recordImageHostOrder(blocks: readonly SearchableBlock[]): void {
+    const groups = new Map<HTMLElement, {units: SearchableBlock[]; slot?: TableSlot;}>();
+    const hostOf = (block: SearchableBlock) => block.blockType === TABLE_TYPE ?
+        block.element.closest<HTMLElement>(TABLE_CELL_SELECTOR) :
+        block.element.closest<HTMLElement>('.mindmap-view [data-mindmap-source-id]') ?? getOwnerBlock(block.element);
+    for (const block of blocks) {
+        if (!isImageOCRUnit(block) || embeddedOwner(block.element)) continue;
+        const host = hostOf(block);
+        if (host) groups.set(host, {units: [], slot: block.tableSlot});
+    }
+    if (!groups.size) return;
+    for (const block of blocks) {
+        const host = hostOf(block);
+        if (host) groups.get(host)?.units.push(block);
+    }
+    for (const [host, group] of groups) {
+        recordEmbeddedOrder(host, group.units);
+        if (group.slot) {
+            const {row, column} = group.slot;
+            for (const block of group.units) {
+                block.embeddedOrder = block.embeddedOrder?.map(segment =>
+                    ({start: segment.start, path: [row, column, ...segment.path]}));
+            }
+        }
+    }
+}
+
 function finishSearchableBlocks(
     blocks: SearchableBlock[],
     includeFoldedBlocks: boolean,
@@ -748,15 +850,18 @@ function finishSearchableBlocks(
     skipEmbeddedOrder = false,
 ): SearchableBlock[] {
     const filtered = filterFoldedSearchableBlocks(blocks, includeFoldedBlocks);
+    if (!skipEmbeddedOrder) recordImageHostOrder(filtered);
     const readTypes = createDomBlockTypeReader();
     const embedded = new Map<HTMLElement, SearchableBlock[]>();
     const owners = new Map<SearchableBlock, HTMLElement>();
     const sourceOf = createEmbeddedSourceReader();
     for (const block of filtered) {
+        // Rich-cell descendants have no SQL identities. Share one ancestry walk
+        // for all language labels, including tables in separate canvas copies.
+        if (block.blockType === TABLE_TYPE && block.matchSource === "code-language") block.blockTypes = readTypes(block);
         const owner = embeddedOwner(block.element);
         if (!owner) continue;
-        // Only embedded source units need their ancestry during collection:
-        // the carrier keeps this path after the source DOM is rewritten.
+        // Embedded carriers also keep this path after source ownership is rewritten.
         block.blockTypes = readTypes(block);
         owners.set(block, owner);
         block.embeddedSourceId = sourceOf(block.element, block.blockId);
@@ -803,6 +908,7 @@ function filterFoldedSearchableBlocks(
 
 /** 「是否查找」块级门闩：备注 / 行内公式独立采集时也须遵守 */
 interface IncludeGates {
+    includeTabs?: boolean;
     includeAttributeView: boolean;
     includeTable: boolean;
     includeBlockquote: boolean;
@@ -821,6 +927,7 @@ interface IncludeGates {
     includeMathBlock: boolean;
     includeEmbedBlock: boolean;
     includeCodeBlock: boolean;
+    includeCodeLanguage?: boolean;
     includeMermaid: boolean;
     includeFlowchart: boolean;
     includeHtmlBlock: boolean;
@@ -836,7 +943,7 @@ type HeadingIncludeGates = Pick<
     | "includeHeadingH4"
     | "includeHeadingH5"
     | "includeHeadingH6"
-> & {includeMathBlock?: boolean;};
+> & {includeMathBlock?: boolean; includeCodeBlock?: boolean; includeCodeLanguage?: boolean;};
 
 /** Runtime content coverage must use the same container/type gates as text collection. */
 export function createRendererElementFilter(
@@ -997,7 +1104,7 @@ export function shouldSkipElementByListInclude(
  * 行内备注 / 行内公式扫整棵文档树，不会走块级 forEach 的 include* 早退。
  * 关表格 / 引述 / 提示 / 嵌入 / 数据库等时，须在此过滤其内部的属性 unit。
  */
-function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeGates): boolean {
+function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeGates, ignoreCodeBody = false): boolean {
     if (!gates.includeCustomBlock && element.closest(`[data-type="${CUSTOM_BLOCK_TYPE}"]`)) {
         return true;
     }
@@ -1067,7 +1174,7 @@ function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeG
         return true;
     }
     const codeBlock = element.closest<HTMLElement>(`[data-type="${CODE_BLOCK_TYPE}"]`);
-    if (codeBlock) {
+    if (codeBlock && !ignoreCodeBody) {
         const kind = rendererAdapterKind(codeBlock);
         if (
             kind ?
@@ -1235,13 +1342,17 @@ function collectDescendantTextNodes(
     includeImageTitle = true,
     headingGates?: HeadingIncludeGates,
 ): Text[] {
+    const excludedCode = new WeakMap<HTMLElement, boolean>();
+    const previewView = container.closest(".mindmap-view");
     const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
             if (!(node instanceof Text) || !node.nodeValue?.length) {
                 return NodeFilter.FILTER_REJECT;
             }
             const parentElement = node.parentElement;
-            if (!parentElement || parentElement.closest(TEXT_NODE_EXCLUDED_CLOSEST)) {
+            if (!parentElement) return NodeFilter.FILTER_REJECT;
+            const excluded = parentElement.closest(TEXT_NODE_EXCLUDED_CLOSEST);
+            if (excluded && excluded !== previewView) {
                 return NodeFilter.FILTER_REJECT;
             }
             if (!includeImageTitle && parentElement.closest(IMAGE_TITLE_TEXT_CLOSEST)) {
@@ -1250,6 +1361,17 @@ function collectDescendantTextNodes(
             // 表格/AV 格内若嵌有标题块，正文走整格采集；须按标题级别门闩剔除其文本
             if (headingGates && shouldSkipElementByHeadingInclude(parentElement, headingGates)) {
                 return NodeFilter.FILTER_REJECT;
+            }
+            if (headingGates?.includeCodeBlock === false) {
+                const code = parentElement.closest<HTMLElement>('[data-type="NodeCodeBlock"], pre');
+                if (code?.closest('[data-sy-table-cell-rich]')) {
+                    let excluded = excludedCode.get(code);
+                    if (excluded === undefined) {
+                        excluded = !rendererAdapterKind(code) && !isDiagramCodeLanguage(codeLanguageText(code));
+                        excludedCode.set(code, excluded);
+                    }
+                    if (excluded) return NodeFilter.FILTER_REJECT;
+                }
             }
             return NodeFilter.FILTER_ACCEPT;
         },
@@ -1271,7 +1393,8 @@ function collectTableSearchUnits(
     blockId: string,
     blockIndex: number,
     includeImageTitle = true,
-    headingGates?: HeadingIncludeGates,
+    headingGates?: IncludeGates,
+    codeLanguageFallback?: (unitId: string) => string,
 ): SearchableBlock[] {
     const htmlRows = ownTableRows(tableBlock);
     if (htmlRows) {
@@ -1281,13 +1404,14 @@ function collectTableSearchUnits(
             blockIndex,
             includeImageTitle,
             headingGates,
+            codeLanguageFallback,
         );
         const virtual = htmlRows.some((row) => row.hasAttribute(TABLE_VIRTUAL_ROWS_ATTR));
         if (collected.length || virtual) {
             return collected;
         }
     }
-    return collectLooseTableUnits(tableBlock, blockId, blockIndex, includeImageTitle, headingGates);
+    return collectLooseTableUnits(tableBlock, blockId, blockIndex, includeImageTitle, headingGates, codeLanguageFallback);
 }
 
 function collectHtmlTableUnits(
@@ -1295,7 +1419,8 @@ function collectHtmlTableUnits(
     blockId: string,
     blockIndex: number,
     includeImageTitle: boolean,
-    headingGates?: HeadingIncludeGates,
+    headingGates?: IncludeGates,
+    codeLanguageFallback?: (unitId: string) => string,
 ): SearchableBlock[] {
     const placed = logicalTableRows(htmlRows);
     const units: SearchableBlock[] = [];
@@ -1323,6 +1448,7 @@ function collectHtmlTableUnits(
                 blockIndex,
                 includeImageTitle,
                 headingGates,
+                codeLanguageFallback,
             );
             column += 1;
         }
@@ -1336,7 +1462,8 @@ function collectLooseTableUnits(
     blockId: string,
     blockIndex: number,
     includeImageTitle: boolean,
-    headingGates?: HeadingIncludeGates,
+    headingGates?: IncludeGates,
+    codeLanguageFallback?: (unitId: string) => string,
 ): SearchableBlock[] {
     const units: SearchableBlock[] = [];
     const seenUnitKeys = new Set<string>();
@@ -1367,6 +1494,7 @@ function collectLooseTableUnits(
             blockIndex,
             includeImageTitle,
             headingGates,
+            codeLanguageFallback,
         );
     }
     return units;
@@ -1381,17 +1509,29 @@ function pushTableCellUnit(
     blockId: string,
     blockIndex: number,
     includeImageTitle: boolean,
-    headingGates?: HeadingIncludeGates,
+    headingGates?: IncludeGates,
+    codeLanguageFallback?: (unitId: string) => string,
 ): void {
     if (logicalRow < 0 || columnIndex < 0) {
         return;
     }
-    const cellId = cell.dataset.nodeId?.trim() || "";
+    const cellId = (cell.dataset.nodeId || cell.dataset.mindmapSourceId)?.trim() || "";
     const unitId = cellId ?
         `table-cell:${logicalRow}:${columnIndex}:${cellId}` :
         `table-cell:${logicalRow}:${columnIndex}`;
     if (seenUnitKeys.has(unitId)) {
         return;
+    }
+    if (codeLanguageSearchEnabled(headingGates ?? {})) {
+        for (const [index, code] of richCellCodeBlocks(cell).entries()) {
+            if (isAuthorCssHiddenElement(code.element) || headingGates &&
+                (shouldSkipAttributeUnitByIncludeGates(code.element, headingGates, true) ||
+                    shouldSkipRichPreviewByInclude(code.element, cell, headingGates))) continue;
+            const languageId = `${CODE_LANGUAGE_UNIT_ID}:${unitId}:${index}`;
+            units.push(...codeLanguageUnits(code.element, {blockId, blockType: TABLE_TYPE, blockIndex},
+                languageId, codeLanguageText(code.element) || codeLanguageFallback?.(languageId) || "").map(unit => ({...unit,
+                    tableSlot: {row: logicalRow, column: columnIndex, offset: code.offset}})));
+        }
     }
     if (headingGates?.includeMathBlock !== false) {
         for (const [index, math] of richCellMathBlocks(cell).entries()) {
@@ -2114,10 +2254,73 @@ export function isInsideMindmapBlock(element: Element): boolean {
     return Boolean(element.closest(MINDMAP_BLOCK_SELECTOR));
 }
 
-export function collectMindmapPreviewUnits(roots: HTMLElement[]): SearchableBlock[] {
+/** Native mindmap clones omit the toolbar; rich cold previews use PRE/CODE. */
+function codeLanguageText(element: HTMLElement): string {
+    const label = element.querySelector(":scope > .protyle-action > .protyle-action__language");
+    if (label) return label.textContent?.trim() ?? "";
+    if (element.getAttribute("data-type") === CODE_BLOCK_TYPE) return element.getAttribute("data-subtype") ?? "";
+    const code = element.querySelector(":scope > code");
+    return Array.from(code?.classList ?? []).find(name => name.startsWith("language-"))?.slice(9) ?? "";
+}
+
+function codeLanguageUnits(
+    element: HTMLElement,
+    base: Pick<SearchableBlock, "blockId" | "blockType" | "blockIndex">,
+    unitId = CODE_LANGUAGE_UNIT_ID,
+    text = codeLanguageText(element),
+): SearchableBlock[] {
+    return text && !rendererAdapterKind(element) && !isDiagramCodeLanguage(text) ?
+        [{...base, element, text, textNodes: [], unitId, matchSource: "code-language"}] : [];
+}
+
+/** Index rows once, but inspect only rich cells whose labels are actually needed. */
+function tableCodeLanguageReader(table: HTMLElement): (unitId: string) => string {
+    const rows = new Map<number, HTMLElement>();
+    for (const [row, logical] of logicalRowIndexes(table)) rows.set(logical, row as HTMLElement);
+    const cells = new WeakMap<HTMLElement, HTMLElement[]>();
+    const codes = new WeakMap<HTMLElement, ReturnType<typeof richCellCodeBlocks>>();
+    return (unitId) => {
+        const match = /^code-language:table-cell:([0-9]+):([0-9]+)(?::([^:]+))?:([0-9]+)$/.exec(unitId);
+        if (!match) return "";
+        const row = rows.get(Number(match[1]));
+        if (!row) return "";
+        let columns = cells.get(row);
+        if (!columns) {
+            columns = Array.from(row.children).filter(isDirectTableCell);
+            cells.set(row, columns);
+        }
+        const cell = columns[Number(match[2])];
+        if (!cell?.hasAttribute("data-sy-table-cell-rich") ||
+            (match[3] && cell.dataset.nodeId !== match[3])) return "";
+        let found = codes.get(cell);
+        if (!found) {
+            found = richCellCodeBlocks(cell);
+            codes.set(cell, found);
+        }
+        const code = found[Number(match[4])];
+        return code ? codeLanguageText(code.element) : "";
+    };
+}
+
+export function collectMindmapPreviewUnits(roots: HTMLElement[], gates?: IncludeGates, includeImages = true, includeImageTitle = true): SearchableBlock[] {
     const units: SearchableBlock[] = [];
-    const seen = new Set<string>();
     const views = new Set<HTMLElement>();
+    const sourceBlocks = new Map<Element, Map<string, HTMLElement>>();
+    const tableLanguages = new Map<HTMLElement, (unitId: string) => string>();
+    const sourceBlock = (view: HTMLElement, blockId: string): HTMLElement | undefined => {
+        const root = view.closest(MINDMAP_BLOCK_SELECTOR);
+        if (!root) return undefined;
+        let blocks = sourceBlocks.get(root);
+        if (!blocks) {
+            blocks = new Map();
+            // Plain code has no data-subtype in native Lute DOM. Its toolbar
+            // survives in the hidden source, even though the canvas removes it.
+            root.querySelectorAll<HTMLElement>('[data-type="NodeCodeBlock"][data-node-id], [data-type="NodeTable"][data-node-id]')
+                .forEach(block => blocks!.set(block.dataset.nodeId!, block));
+            sourceBlocks.set(root, blocks);
+        }
+        return blocks.get(blockId);
+    };
     for (const root of roots) {
         if (root.classList.contains("mindmap-view")) {
             views.add(root);
@@ -2129,28 +2332,63 @@ export function collectMindmapPreviewUnits(roots: HTMLElement[]): SearchableBloc
         }
     }
     views.forEach((view) => {
+        // Source IDs are shared by separate embeds. Deduplicate only within
+        // this canvas, and let nested canvases collect their own source nodes.
+        const seen = new Set<string>();
         view.querySelectorAll<HTMLElement>("[data-mindmap-source-id]").forEach((preview) => {
             const blockId = preview.getAttribute("data-mindmap-source-id") || "";
-            if (!blockId || seen.has(blockId) || preview.closest("[hidden]")) {
+            if (!blockId || seen.has(blockId) || preview.closest(".mindmap-view") !== view || preview.closest("[hidden]")) {
                 return;
             }
             if (!elementHasBox(preview)) {
                 return;
             }
-            const textNodes = collectMindmapOwnTextNodes(preview);
-            const text = textNodes.map((node) => node.nodeValue ?? "").join("");
-            if (!text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim()) {
-                return;
-            }
             seen.add(blockId);
-            units.push(...unitsFromTextNodes({
+            const base = {
                 blockId,
                 blockType: preview.getAttribute("data-type") || "NodeParagraph",
                 blockIndex: 0,
                 element: preview,
+            };
+            if (base.blockType === TABLE_TYPE) {
+                if (gates && shouldSkipAttributeUnitByIncludeGates(preview, gates)) return;
+                const fallback = (unitId: string): string => {
+                    const source = sourceBlock(view, blockId);
+                    if (!source) return "";
+                    let readLabel = tableLanguages.get(source);
+                    if (!readLabel) {
+                        readLabel = tableCodeLanguageReader(source);
+                        tableLanguages.set(source, readLabel);
+                    }
+                    return readLabel(unitId);
+                };
+                // Keep the same row/cell/run coordinates as the hidden source.
+                // A generic canvas text run both duplicates it and loses gates.
+                units.push(...collectTableSearchUnits(preview, blockId, 0, includeImageTitle, gates, fallback)
+                    .map(unit => unit.matchSource ? unit : {...unit, matchSource: "projection" as const}));
+                if (includeImages) units.push(...collectImageOCRSearchUnits(preview, base, gates));
+                return;
+            }
+            if (base.blockType === CODE_BLOCK_TYPE && !rendererAdapterKind(preview)) {
+                if (gates && shouldSkipAttributeUnitByIncludeGates(preview, gates, true)) return;
+                if (codeLanguageSearchEnabled(gates ?? {})) {
+                    let language = codeLanguageText(preview);
+                    if (!language) {
+                        const source = sourceBlock(view, blockId);
+                        language = source ? codeLanguageText(source) : "";
+                    }
+                    units.push(...codeLanguageUnits(preview, base, CODE_LANGUAGE_UNIT_ID, language));
+                }
+                if (gates?.includeCodeBlock === false) return;
+            }
+            const textNodes = collectMindmapOwnTextNodes(preview);
+            const text = textNodes.map((node) => node.nodeValue ?? "").join("");
+            if (text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").trim()) units.push(...unitsFromTextNodes({
+                ...base,
                 // Mindmap canvas text is a read-only clone of the source block.
                 matchSource: "projection",
             }, textNodes));
+            if (includeImages) units.push(...collectImageOCRSearchUnits(preview, base, gates));
         });
     });
     return units;

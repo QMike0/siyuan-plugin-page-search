@@ -541,6 +541,31 @@ export function richCellMathBlocks(cell: HTMLElement): Array<{element: HTMLEleme
     return found;
 }
 
+/** Static HTML and hydrated BlockDOM keep code order, but not generated node IDs.
+ * Read labels from the existing preview; never parse Markdown just to collect them.
+ */
+export function richCellCodeBlocks(cell: HTMLElement): Array<{element: HTMLElement; offset: number;}> {
+    if (!cell.hasAttribute(RICH_CELL_ATTRIBUTE)) return [];
+    const root = tableMathRoot(cell);
+    const selector = '[data-type="NodeCodeBlock"], pre';
+    if (!root.querySelector(selector)) return [];
+    const {searchOffsets} = richProjection(root);
+    const found: ReturnType<typeof richCellCodeBlocks> = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let offset = 0;
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (node instanceof HTMLElement && node.matches(selector) && !node.parentElement?.closest(selector)) {
+            found.push({element: node, offset});
+        } else if (node instanceof Text) {
+            const start = searchOffsets.get(node);
+            if (start !== undefined) offset = start + (node.parentElement?.closest(selector) ?
+                previewText(node).length : previewText(node).replace(/\n/g, "").length);
+        }
+    }
+    return found;
+}
+
 function tableMathRoot(cell: HTMLElement): HTMLElement {
     return cell.querySelector<HTMLElement>(".table__cell-editor .protyle-wysiwyg") ?? cell;
 }

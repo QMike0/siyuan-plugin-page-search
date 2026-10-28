@@ -1,3 +1,4 @@
+import {isImageOCRUnit} from "../shared/image-ocr";
 import {isCodeLanguageUnit} from "../shared/code-block-language";
 import type {
     IOperation,
@@ -263,7 +264,7 @@ export function countWritableMatches(edit: Element, matches: readonly SearchMatc
 export function isMatchContentWritable(
     match: Pick<SearchMatch, "replaceable" | "blockType" | "blockId" | "unitId">,
 ): boolean {
-    if (!match.replaceable || isCodeLanguageUnit(match) || match.unitId?.startsWith("embed:") || isDocTitleMatch(match)) {
+    if (!match.replaceable || isImageOCRUnit(match) || isCodeLanguageUnit(match) || match.unitId?.startsWith("embed:") || isDocTitleMatch(match)) {
         return false;
     }
     if (match.blockType === ATTRIBUTE_VIEW_TYPE || match.blockType === "NodeCustomBlock") {

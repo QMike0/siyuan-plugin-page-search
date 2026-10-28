@@ -15,6 +15,8 @@ A search and replacement plugin for the document currently open in SiYuan. It su
 
 In-page search works on the document shown by the current editor. Matches are highlighted in the editor: orange marks the current match and yellow marks the other matches.
 
+Image OCR text already recognized or saved in SiYuan is searchable. Matched images have yellow frames; the current result has an orange frame. Search does not run OCR, and OCR text cannot be replaced. Coverage follows the image's block type and scope options, including folded content.
+
 ![image-20261016002747503](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261016002747503.png)
 
 ### Search methods

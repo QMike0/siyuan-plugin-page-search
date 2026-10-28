@@ -1,3 +1,5 @@
+import {resolveImageOCRUnits} from "./image-ocr";
+import {isImageOCRUnit, imageOCRPath} from "../shared/image-ocr";
 import {codeLanguageSearchEnabled, isCodeLanguageUnit} from "../shared/code-block-language";
 import type {Plugin} from "siyuan";
 import {
@@ -154,6 +156,8 @@ export interface SearchPipelineResult {
     partial?: boolean;
     /** 图表 / HTML / 公式没有可用文本，这些块未计入命中 */
     unrendered?: number;
+    /** OCR read unavailable or over budget; existing note search may still be complete. */
+    ocrUnavailable?: number;
     /** 属性视图达到安全分页上限，结果未写入缓存且当前覆盖不完整 */
     truncated?: number;
     /** 未完成 API 解析的数据库载体，用于定位和手动重试；不把部分结果标成完整。 */
@@ -172,7 +176,7 @@ function toSearchableUnit(block: SearchableBlock): SearchableUnit {
     // spans. Its offsets are validated against the source block before commit,
     // so those visual boundaries must not make an otherwise source-backed hit
     // look non-replaceable.
-    const segmentLengths = isCodeLanguageUnit(block) ? undefined : block.element.closest('[data-type="NodeCustomBlock"]') ?
+    const segmentLengths = isImageOCRUnit(block) || isCodeLanguageUnit(block) ? undefined : block.element.closest('[data-type="NodeCustomBlock"]') ?
         undefined : block.matchSource === "projection" ?
         (block.text.length > 0 ? [block.text.length] : undefined) :
         searchableTextLengths(block);
@@ -417,7 +421,7 @@ async function calculateLoadedDomMatches(
         };
     }
 
-    const blocks = collectSearchableBlocks(edit, {
+    let blocks = collectSearchableBlocks(edit, {
         includeDocTitle,
         includeImageTitle: options.includeImageTitle !== false,
         includeAttributeView: options.includeAttributeView !== false,
@@ -449,13 +453,33 @@ async function calculateLoadedDomMatches(
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,
     });
+    const selectionOnly = options.selectionOnly === true;
+    const selectionScope = resolveSelectionScope(edit, blocks, options);
+    // Whole-block/cell selection can include an image. Text-only selection cannot;
+    // avoid reading OCR for pictures outside the selected scope.
+    const selectedBlocks = selectionOnly ? blocks.filter(block =>
+        !isImageOCRUnit(block) || selectionScope.has(unitKey(block.blockId, block.unitId))) : blocks;
+    const ocr = await resolveImageOCRUnits(selectedBlocks, options.signal);
+    if (options.signal?.aborted) return {matches: [], error: "", cancelled: true};
+    blocks = ocr.units;
     options.onLiveUnitsCollected?.(blocks);
     if (!blocks.length) {
         return {matches: [], error: ""};
     }
 
-    const selectionOnly = options.selectionOnly === true;
-    const selectionScope = resolveSelectionScope(edit, blocks, options);
+    // A selected block/cell includes the whole image result; frozen scope lengths were
+    // captured from URL placeholders before OCR was read, so expand only full selections.
+    if (selectionOnly) {
+        for (const block of blocks) {
+            if (!isImageOCRUnit(block)) continue;
+            const key = unitKey(block.blockId, block.unitId);
+            const selected = selectionScope.get(key);
+            if (selected?.length && selected[0].start === 0 &&
+                selected[selected.length - 1].end === imageOCRPath(block.unitId)?.length) {
+                selectionScope.set(key, [{start: 0, end: block.text.length}]);
+            }
+        }
+    }
     if (selectionOnly && selectionScope.size === 0) {
         return {matches: [], error: ""};
     }
@@ -496,7 +520,8 @@ async function calculateLoadedDomMatches(
     const richTargets = new Map<SearchableBlock, RichCellSearchInfo>();
     for (const hit of scopedHits) {
         const block = blockMap.get(unitKey(hit.blockId, hit.unitId));
-        if (!block || block.blockType !== TABLE_TYPE || richTargets.has(block)) continue;
+        if (!block || isImageOCRUnit(block) || isCodeLanguageUnit(block) ||
+            block.blockType !== TABLE_TYPE || richTargets.has(block)) continue;
         const rich = deferRichCellCapability(block);
         if (rich) richTargets.set(block, rich);
     }
@@ -513,6 +538,8 @@ async function calculateLoadedDomMatches(
             resultBlockTypes: options.resultBlockTypes,
         }),
         error: "",
+        ocrUnavailable: ocr.failedIds.length,
+        incompleteBlockIds: ocr.failedIds,
     };
 }
 
@@ -590,12 +617,12 @@ function attachRangesToHits(
                     blockTypes,
                     embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
                     replaceable: !modeBlocked && !isDocTitleSearchUnit(block) &&
-                        !isTabsTitleSearchUnit(block) && !isCodeLanguageUnit(block) &&
+                        !isTabsTitleSearchUnit(block) && !isImageOCRUnit(block) && !isCodeLanguageUnit(block) &&
                         !isInlineMathSearchUnit(block) && !isRendererUnitId(hit.unitId) &&
                         !hit.unitId?.startsWith("embed:") && hit.replaceable,
-                    replaceReason: isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitleSearchUnit(block) ? "tabsTitle" : undefined,
+                    replaceReason: isImageOCRUnit(block) ? "imageOCR" : isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitleSearchUnit(block) ? "tabsTitle" : undefined,
                     range: undefined,
-                    highlightKind: isCodeLanguageUnit(block) ? "code-language" : "text",
+                    highlightKind: isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : "text",
                     ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
                 });
             }
@@ -621,7 +648,8 @@ function attachRangesToHits(
 
         // 文档标题只参与查找。编辑中 Protyle 常把连续字拆成多个相邻 Text。
         // 富文本格和开着的单元格编辑器单独标原因，公式等仍走原来的不可替换。
-        if (hit.blockType === TABLE_TYPE && !isDocTitle && !isMath && !tableLocks.has(block)) {
+        if (hit.blockType === TABLE_TYPE && !isImageOCRUnit(block) && !isCodeLanguageUnit(block) &&
+            !isDocTitle && !isMath && !tableLocks.has(block)) {
             const rich = visibility.richCapabilities?.get(block);
             tableLocks.set(block, rich ? rich.replaceLock : tableCellReplaceLock(block.element));
             richSpans.set(block, rich?.writableSpans);
@@ -643,7 +671,7 @@ function attachRangesToHits(
             !isRendererUnitId(hit.unitId) &&
             !hit.unitId?.startsWith("embed:") &&
             !isDocTitle &&
-            !isTabsTitle && !isCodeLanguageUnit(block) &&
+            !isTabsTitle && !isImageOCRUnit(block) && !isCodeLanguageUnit(block) &&
             !isMath &&
             !modeBlocked &&
             isDomReplaceable(range, hit.blockType, hit.blockId, projectionSourceBacked) &&
@@ -663,10 +691,10 @@ function attachRangesToHits(
             end: hit.end,
             matchedText: hit.matchedText,
             replaceable,
-            replaceReason: isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitle ? "tabsTitle" : richSpanBlocked ? "richCell" : undefined,
+            replaceReason: isImageOCRUnit(block) ? "imageOCR" : isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitle ? "tabsTitle" : richSpanBlocked ? "richCell" : undefined,
             replaceLock,
             range,
-            highlightKind: isCodeLanguageUnit(block) ? "code-language" : isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
+            highlightKind: isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
             anchorOffset: isMemo ? block.anchorOffset : undefined,
             anchorEnd: isMemo ? block.anchorEnd : undefined,
             ...(isMath && block.mathOrdinal !== undefined ?
@@ -707,7 +735,7 @@ function compareSearchMatches(a: SearchMatch, b: SearchMatch): number {
     }
     const embedded = compareEmbeddedPositions(a, b);
     if (embedded !== undefined && embedded !== 0) return embedded;
-    if (isCodeLanguageUnit(a) !== isCodeLanguageUnit(b)) {
+    if (a.blockType !== TABLE_TYPE && isCodeLanguageUnit(a) !== isCodeLanguageUnit(b)) {
         return isCodeLanguageUnit(a) ? -1 : 1;
     }
     if (a.range && b.range && !textStartInsideMemoRange(a, b) && !textStartInsideMemoRange(b, a)) {
