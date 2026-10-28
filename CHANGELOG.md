@@ -1,3 +1,12 @@
+## v2.1.2 2026-10-29
+
+- 🇨🇳 优化插件对代码块语言标签的搜索匹配，实现搜索到语言标签时高亮代码块外框、禁止替换语言标签、实现独立开关项、离屏搜索
+- 🇨🇳 实现对图片OCR文本的搜索，搜索匹配到的对应图片采用黄色/橙色高亮
+- 🇨🇳 适配思源笔记v3.8.8引入的页签可见性判据，优化相关搜索逻辑
+- 🇺🇸 Optimize the plugin's search matching for code block language labels: highlight the code block's outer frame when a language label is matched, prevent replacement of language labels, implement a standalone toggle option, and support off-screen search
+- 🇺🇸 Implement search for OCR text in images, highlighting the corresponding matched images in yellow/orange
+- 🇺🇸 Adapt to the tab visibility criteria introduced in SiYuan Notes v3.8.8 and optimize the related search logic
+
 ## v2.1.1 2026-10-26
 
 - 🇨🇳 修复被引用块替换后的结果确认误判
