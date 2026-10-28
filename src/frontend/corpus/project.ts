@@ -1,3 +1,4 @@
+import {codeLanguageSearchEnabled} from "../../shared/code-block-language";
 import type {RestrictInlineType} from "../../shared";
 import {avApiUnitId} from "../../shared/av-live";
 import {isRendererSourceFallbackUnitId} from "../../shared/renderer-units";
@@ -226,6 +227,7 @@ function createRangeProjection(
         includeMathBlock: options.includeMathBlock !== false,
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
+        includeCodeLanguage: codeLanguageSearchEnabled(options),
         includeMermaid: options.includeMermaid !== false,
         includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,

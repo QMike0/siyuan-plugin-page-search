@@ -1,3 +1,4 @@
+import {codeLanguageSearchEnabled, isCodeLanguageUnit} from "../shared/code-block-language";
 import type {Plugin} from "siyuan";
 import {
     ATTRIBUTE_VIEW_TYPE,
@@ -115,8 +116,10 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeMathBlock?: boolean;
     /** 是否匹配嵌入块及其内部渲染内容；默认 true */
     includeEmbedBlock?: boolean;
-    /** 是否匹配普通代码块；默认 true。不含 Mermaid、flowchart。 */
+    /** 是否匹配普通代码块正文；默认 true。不含 Mermaid、flowchart。 */
     includeCodeBlock?: boolean;
+    /** 是否匹配普通代码块语言标签；默认随正文开关。 */
+    includeCodeLanguage?: boolean;
     /** 是否匹配 Mermaid；默认 true */
     includeMermaid?: boolean;
     /** 是否匹配 flowchart；默认 true */
@@ -169,7 +172,7 @@ function toSearchableUnit(block: SearchableBlock): SearchableUnit {
     // spans. Its offsets are validated against the source block before commit,
     // so those visual boundaries must not make an otherwise source-backed hit
     // look non-replaceable.
-    const segmentLengths = block.element.closest('[data-type="NodeCustomBlock"]') ?
+    const segmentLengths = isCodeLanguageUnit(block) ? undefined : block.element.closest('[data-type="NodeCustomBlock"]') ?
         undefined : block.matchSource === "projection" ?
         (block.text.length > 0 ? [block.text.length] : undefined) :
         searchableTextLengths(block);
@@ -401,6 +404,7 @@ async function calculateLoadedDomMatches(
                 includeMathBlock: options.includeMathBlock,
                 includeEmbedBlock: options.includeEmbedBlock,
                 includeCodeBlock: options.includeCodeBlock,
+                includeCodeLanguage: options.includeCodeLanguage,
                 includeMermaid: options.includeMermaid,
                 includeFlowchart: options.includeFlowchart,
                 includeHtmlBlock: options.includeHtmlBlock,
@@ -436,6 +440,7 @@ async function calculateLoadedDomMatches(
         includeMathBlock: options.includeMathBlock !== false,
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
+        includeCodeLanguage: codeLanguageSearchEnabled(options),
         includeMermaid: options.includeMermaid !== false,
         includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
@@ -585,12 +590,12 @@ function attachRangesToHits(
                     blockTypes,
                     embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
                     replaceable: !modeBlocked && !isDocTitleSearchUnit(block) &&
-                        !isTabsTitleSearchUnit(block) &&
+                        !isTabsTitleSearchUnit(block) && !isCodeLanguageUnit(block) &&
                         !isInlineMathSearchUnit(block) && !isRendererUnitId(hit.unitId) &&
                         !hit.unitId?.startsWith("embed:") && hit.replaceable,
-                    replaceReason: isTabsTitleSearchUnit(block) ? "tabsTitle" : undefined,
+                    replaceReason: isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitleSearchUnit(block) ? "tabsTitle" : undefined,
                     range: undefined,
-                    highlightKind: "text",
+                    highlightKind: isCodeLanguageUnit(block) ? "code-language" : "text",
                     ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
                 });
             }
@@ -638,7 +643,7 @@ function attachRangesToHits(
             !isRendererUnitId(hit.unitId) &&
             !hit.unitId?.startsWith("embed:") &&
             !isDocTitle &&
-            !isTabsTitle &&
+            !isTabsTitle && !isCodeLanguageUnit(block) &&
             !isMath &&
             !modeBlocked &&
             isDomReplaceable(range, hit.blockType, hit.blockId, projectionSourceBacked) &&
@@ -658,10 +663,10 @@ function attachRangesToHits(
             end: hit.end,
             matchedText: hit.matchedText,
             replaceable,
-            replaceReason: isTabsTitle ? "tabsTitle" : richSpanBlocked ? "richCell" : undefined,
+            replaceReason: isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitle ? "tabsTitle" : richSpanBlocked ? "richCell" : undefined,
             replaceLock,
             range,
-            highlightKind: isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
+            highlightKind: isCodeLanguageUnit(block) ? "code-language" : isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
             anchorOffset: isMemo ? block.anchorOffset : undefined,
             anchorEnd: isMemo ? block.anchorEnd : undefined,
             ...(isMath && block.mathOrdinal !== undefined ?
@@ -702,6 +707,9 @@ function compareSearchMatches(a: SearchMatch, b: SearchMatch): number {
     }
     const embedded = compareEmbeddedPositions(a, b);
     if (embedded !== undefined && embedded !== 0) return embedded;
+    if (isCodeLanguageUnit(a) !== isCodeLanguageUnit(b)) {
+        return isCodeLanguageUnit(a) ? -1 : 1;
+    }
     if (a.range && b.range && !textStartInsideMemoRange(a, b) && !textStartInsideMemoRange(b, a)) {
         try {
             const startCmp = a.range.compareBoundaryPoints(Range.START_TO_START, b.range);

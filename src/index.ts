@@ -537,6 +537,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeEmbedBlock: t.settingsIncludeEmbedBlock || "Embed block",
             settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
             settingsIncludePlainCodeBlock: t.settingsIncludePlainCodeBlock || "Plain code blocks",
+            settingsIncludeCodeBody: t.settingsIncludeCodeBody || "Plain code: body",
+            settingsIncludeCodeLanguage: t.settingsIncludeCodeLanguage || "Plain code: language",
             settingsIncludeMermaid: t.settingsIncludeMermaid || "Mermaid",
             settingsIncludeMermaidHint: t.settingsIncludeMermaidHint ||
                 "Match visible text rendered in Mermaid diagrams; fall back to source when not rendered",
@@ -744,6 +746,15 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeCodeBlock(value);
+        });
+    }
+
+    syncIncludeCodeLanguage(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar === source) {
+                return;
+            }
+            bar.applyIncludeCodeLanguage(value);
         });
     }
 
@@ -1088,6 +1099,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeMathBlock: prefs.includeMathBlock !== false,
                     includeEmbedBlock: prefs.includeEmbedBlock !== false,
                     includeCodeBlock: prefs.includeCodeBlock !== false,
+                    includeCodeLanguage: prefs.includeCodeLanguage !== false,
                     includeMermaid: prefs.includeMermaid !== false,
                     includeFlowchart: prefs.includeFlowchart !== false,
                     includeHtmlBlock: prefs.includeHtmlBlock !== false,

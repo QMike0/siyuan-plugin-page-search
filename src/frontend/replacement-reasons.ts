@@ -1,4 +1,4 @@
-import {DIAGRAM_CODE_LANGUAGE_SET} from "../shared/code-block-language";
+import {DIAGRAM_CODE_LANGUAGE_SET, isCodeLanguageUnit} from "../shared/code-block-language";
 import {isRendererUnitId} from "../shared/renderer-units";
 import {ZERO_WIDTH_RE} from "../shared/constants";
 import type {SearchMatch} from "./dom-types";
@@ -6,7 +6,7 @@ import type {SearchMatch} from "./dom-types";
 export type ReplacementSkipReason =
     | "docTitle" | "embed" | "database" | "math" | "inlineMath" | "html" | "custom"
     | "mermaid" | "flowchart" | "graphviz" | "plantuml" | "chart" | "mindmap" | "abc"
-    | "tabsTitle" | "richCell" | "cellEditing" | "tablePending" | "marker" | "preview" | "readonly" | "complex";
+    | "codeLanguage" | "tabsTitle" | "richCell" | "cellEditing" | "tablePending" | "marker" | "preview" | "readonly" | "complex";
 
 /** Describe an already rejected match; never decide or broaden writability.
  * Cached metadata works offscreen. Ancestor-only fallback is cached per node;
@@ -16,6 +16,7 @@ export function createReplacementReasonReader(): (match: SearchMatch) => Replace
     return (match) => {
         if (match.blockId === "__doc-title__" || match.blockType === "doc-title" || match.unitId === "doc-title") return "docTitle";
         if (match.unitId?.startsWith("embed:") || match.blockType === "NodeBlockQueryEmbed") return "embed";
+        if (isCodeLanguageUnit(match)) return "codeLanguage";
         if (match.blockType === "NodeAttributeView") return "database";
         if (match.blockType === "NodeCustomBlock" || match.blockTypes?.includes("custom")) return "custom";
         if (match.highlightKind === "inline-math" || match.blockType === "inline-math" || match.unitId?.startsWith("inline-math:")) return "inlineMath";

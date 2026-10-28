@@ -101,8 +101,10 @@ export interface PluginPrefs {
     includeMathBlock: boolean;
     /** 是否匹配嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
     includeEmbedBlock: boolean;
-    /** 是否匹配普通代码块；默认 true。不含 Mermaid、flowchart。 */
+    /** 是否匹配普通代码块正文；默认 true。不含 Mermaid、flowchart。 */
     includeCodeBlock: boolean;
+    /** Whether to search ordinary code-block language labels; read-only. */
+    includeCodeLanguage: boolean;
     /** 是否匹配 Mermaid 图；默认 true。不受代码块开关影响。 */
     includeMermaid: boolean;
     /** 是否匹配 flowchart 图；默认 true。不受代码块开关影响。 */
@@ -177,6 +179,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeMathBlock: true,
     includeEmbedBlock: true,
     includeCodeBlock: true,
+    includeCodeLanguage: true,
     includeMermaid: true,
     includeFlowchart: true,
     includeHtmlBlock: true,
@@ -221,6 +224,7 @@ export function coercePluginPrefs(
         includeMathBlock: base.includeMathBlock !== false,
         includeEmbedBlock: base.includeEmbedBlock !== false,
         includeCodeBlock: base.includeCodeBlock !== false,
+        includeCodeLanguage: (raw?.includeCodeLanguage ?? raw?.includeCodeBlock) !== false,
         includeMermaid: base.includeMermaid !== false,
         includeFlowchart: base.includeFlowchart !== false,
         includeHtmlBlock: base.includeHtmlBlock !== false,
@@ -311,6 +315,9 @@ export function mergePrefs(
         includeCodeBlock: patch.includeCodeBlock !== undefined ?
             patch.includeCodeBlock :
             base.includeCodeBlock,
+        includeCodeLanguage: patch.includeCodeLanguage !== undefined ?
+            patch.includeCodeLanguage :
+            base.includeCodeLanguage,
         includeMermaid: patch.includeMermaid !== undefined ?
             patch.includeMermaid :
             base.includeMermaid,

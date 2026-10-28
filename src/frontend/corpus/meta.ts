@@ -33,6 +33,7 @@ export interface BlockIncludeFlags extends BlockAncestorIncludeFlags {
     includeMathBlock?: boolean;
     includeEmbedBlock?: boolean;
     includeCodeBlock?: boolean;
+    includeCodeLanguage?: boolean;
     includeMermaid?: boolean;
     includeFlowchart?: boolean;
     includeHtmlBlock?: boolean;

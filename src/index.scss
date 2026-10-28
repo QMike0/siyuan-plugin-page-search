@@ -675,6 +675,33 @@ body.page-search-resizing * {
     cursor: ew-resize !important;
 }
 
+.protyle-content.page-search-code-language-host {
+    position: relative;
+}
+
+.protyle-content > .page-search-code-language-layer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 0;
+    height: 0;
+    overflow: visible;
+    pointer-events: none;
+    z-index: 2;
+}
+
+.page-search-code-language-frame {
+    position: absolute;
+    box-sizing: border-box;
+    border: 2px solid rgb(235 205 5);
+    border-radius: 4px;
+    pointer-events: none;
+}
+
+.page-search-code-language-frame.is-focus {
+    border-color: rgb(255 150 50);
+}
+
 ::highlight(page-search-results) {
     background-color: rgb(235 235 5);
     color: rgb(0, 0, 0);

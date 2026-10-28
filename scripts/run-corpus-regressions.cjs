@@ -315,6 +315,84 @@ async function main() {
         return result;
     };
     try {
+        const codeDom = (body = "print(1)", language = "python") =>
+            '<div class="code-block" data-node-id="b" data-type="NodeCodeBlock" data-subtype="' + language + '">' +
+            '<div class="protyle-action" style="opacity:0"><span class="protyle-action__language" contenteditable="false">' + language +
+            '</span><span></span></div><div class="hljs"><div class="protyle-linenumber__rows" contenteditable="false">1</div>' +
+            '<div contenteditable="true">' + body + '</div></div></div>';
+        for (const mounted of [false, true]) for (const regex of [false, true]) {
+            reset();
+            add("b", "c", "print(1)", "python");
+            doms.b = codeDom();
+            if (mounted) wysiwyg.innerHTML = doms.b;
+            for (const prefix of ["", "\n", "\r\n"]) {
+                db.prepare("UPDATE blocks SET markdown = ? WHERE id = 'b'").run(prefix + "```python\nprint(1)\n```");
+                const options = {regex, includeCodeBlock: false, includeCodeLanguage: true};
+                const found = await search(regex ? "py(?:thon)" : "ython", options);
+                full(found);
+                assert.equal(found.matches.length, 1, "code label is a SQL candidate even when absent from body");
+                const match = found.matches[0];
+                assert.equal(match.highlightKind, "code-language");
+                assert.equal(match.replaceable, false);
+                assert.equal(match.replaceReason, "codeLanguage");
+                assert.equal(Boolean(match.range), mounted, "only mounted blocks have a frame Range");
+                assert.equal((await search("print", options)).matches.length, 0, "language-only does not collect body");
+                const bodyOnly = await search("print", {...options, includeCodeBlock: true, includeCodeLanguage: false});
+                full(bodyOnly);
+                assert.equal(bodyOnly.matches.length, 1);
+                assert.equal(bodyOnly.matches[0].replaceable, true, "body remains writable");
+                assert.equal((await search("python", {...options, includeCodeBlock: true, includeCodeLanguage: false})).matches.length, 0);
+                assert.equal((await search("python", {includeCodeBlock: false})).matches.length, 0, "old code-off callers keep their meaning");
+            }
+            reset();
+            add("b", "c", "python", "python");
+            doms.b = codeDom("python");
+            if (mounted) wysiwyg.innerHTML = doms.b;
+            const sameWord = await search("ython");
+            full(sameWord);
+            assert.deepEqual(sameWord.matches.map(m => [m.highlightKind, m.start, m.replaceable]),
+                [["code-language", 1, false], ["text", 1, true]], "language and body do not merge; label sorts first");
+        }
+        reset();
+        add("b", "c", "print(1)", "python");
+        doms.b = codeDom();
+        for (const regex of [false, true]) {
+            const options = {regex, includeCodeLanguage: false, includeImageTitle: false};
+            assert.equal((await search("python", options)).matches.length, 0);
+            assert.equal(domCalls, 0, "disabled language labels cannot cause unrelated cold DOM reads");
+        }
+        assert.equal((await search("python", {includeCodeLanguage: true})).matches.length, 1,
+            "turning labels on cannot reuse the label-disabled candidate cache");
+        for (const regex of [false, true]) {
+            reset();
+            const longLabel = "x".repeat(300) + "python";
+            add("b", "c", "print(1)", longLabel);
+            doms.b = codeDom("print(1)", longLabel);
+            assert.equal((await search("python", {regex})).matches.length, 1,
+                "bounded SQL prefix retains unusually long code language labels");
+        }
+        reset();
+        add("b", "c", "print(1)", "python");
+        wysiwyg.innerHTML = codeDom("print(1)", "matlab");
+        const unsavedLanguage = await search("matlab", {includeCodeBlock: false, includeCodeLanguage: true});
+        full(unsavedLanguage);
+        assert.equal(unsavedLanguage.matches.length, 1, "live language change is not hidden by stale SQL fence");
+        assert.equal(unsavedLanguage.matches[0].replaceable, false);
+        reset();
+        add("a", "h", "heading", "", "r", 'fold="1"');
+        add("b", "c", "print(1)", "python");
+        doms.b = codeDom();
+        assert.equal((await search("python", {includeFoldedBlocks: false})).matches.length, 0);
+        assert.equal((await search("python", {includeFoldedBlocks: true})).matches.length, 1);
+        reset();
+        add("b", "c", "print(1)", "python");
+        wysiwyg.innerHTML = '<div data-node-id="tabs" data-type="NodeTabs"><div class="tab-item" data-node-id="item" data-tabs-hidden="true" style="display:none">' + codeDom() + '</div></div>';
+        const inactive = await search("python");
+        full(inactive);
+        assert.equal(inactive.matches.length, 1, "inactive tabs retain code language identity");
+        assert.equal(inactive.matches[0].range, undefined);
+        assert.equal(inactive.matches[0].replaceable, false);
+        console.log("Code language: literal/regex cold/live SQL, leading newlines, independent gates, cache, ordering, folds, inactive tabs and readonly OK");
         for (const mounted of ["none", "partial", "full", "folded"]) {
             reset();
             add("a", "h", "A", "", "r", mounted === "folded" ? 'fold="1"' : "");

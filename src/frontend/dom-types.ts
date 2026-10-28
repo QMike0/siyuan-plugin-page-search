@@ -26,7 +26,7 @@ export interface SearchableBlock {
      * - inline-math：优先 KaTeX `.katex-html` 字形，冷态失败时源码单元独立标识且无 Range
      * Range 优先按 textNodes 偏移；备注对准宿主 span。
      */
-    matchSource?: "text" | "inline-memo" | "inline-math" | "projection";
+    matchSource?: "text" | "inline-memo" | "inline-math" | "projection" | "code-language";
     /**
      * 块内排序锚点。行内备注的 start 是备注正文里的偏移，
      * 这里记宿主 span 在块文本中的位置，跳转才按出现顺序。
@@ -86,7 +86,7 @@ export interface SearchMatch {
     anchorEnd?: number;
     range?: Range;
     /** 高亮样式：备注虚线；公式与正文同走 CSS Highlight（有渲染 Text 时按偏移，否则回退宿主） */
-    highlightKind?: "text" | "inline-memo" | "inline-math";
+    highlightKind?: "text" | "inline-memo" | "inline-math" | "code-language";
     /**
      * 行内公式在所属块里的序号，和 mathUnitText 一起用。
      * unitId 是全文采集序号，只采集改过的块时会从 0 重计，不能用来补高亮。

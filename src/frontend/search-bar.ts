@@ -1,3 +1,4 @@
+import {applyCodeLanguageVisual, clearCodeLanguageVisual, codeLanguageFrameHost} from "./code-language-visual";
 import type {
     IMenu,
     Plugin,
@@ -438,6 +439,8 @@ export interface SearchBarI18n {
     settingsIncludeEmbedBlock: string;
     settingsIncludeCodeBlock: string;
     settingsIncludePlainCodeBlock: string;
+    settingsIncludeCodeBody?: string;
+    settingsIncludeCodeLanguage?: string;
     settingsIncludeMermaid: string;
     settingsIncludeMermaidHint: string;
     settingsIncludeFlowchart: string;
@@ -512,6 +515,7 @@ export interface SearchBarHost {
     syncIncludeEmbedBlock?(value: boolean, source?: SearchBar): void;
     /** 将代码块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeCodeBlock?(value: boolean, source?: SearchBar): void;
+    syncIncludeCodeLanguage?(value: boolean, source?: SearchBar): void;
     /** 将 Mermaid 匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeMermaid?(value: boolean, source?: SearchBar): void;
     /** 将 flowchart 匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -727,8 +731,9 @@ export class SearchBar {
     private includeMathBlock = true;
     /** 是否匹配嵌入块；全局 prefs，默认 true */
     private includeEmbedBlock = true;
-    /** 是否匹配代码块（非 Mermaid）；全局 prefs，默认 true */
+    /** 是否匹配普通代码块正文；全局 prefs，默认 true */
     private includeCodeBlock = true;
+    private includeCodeLanguage = true;
     /** 是否匹配 Mermaid；全局 prefs，默认 true */
     private includeMermaid = true;
     private includeFlowchart = true;
@@ -924,6 +929,7 @@ export class SearchBar {
         includeEmbedBlock?: boolean;
         /** 是否匹配代码块（来自全局 prefs） */
         includeCodeBlock?: boolean;
+        includeCodeLanguage?: boolean;
         /** 是否匹配 Mermaid（来自全局 prefs）。不受代码块开关影响。 */
         includeMermaid?: boolean;
         /** 是否匹配 flowchart（来自全局 prefs）。不受代码块开关影响。 */
@@ -974,6 +980,7 @@ export class SearchBar {
         this.includeMathBlock = options.includeMathBlock !== false;
         this.includeEmbedBlock = options.includeEmbedBlock !== false;
         this.includeCodeBlock = options.includeCodeBlock !== false;
+        this.includeCodeLanguage = (options.includeCodeLanguage ?? options.includeCodeBlock) !== false;
         this.includeMermaid = options.includeMermaid !== false;
         this.includeFlowchart = options.includeFlowchart !== false;
         this.includeHtmlBlock = options.includeHtmlBlock !== false;
@@ -1911,6 +1918,7 @@ export class SearchBar {
                 includeMathBlock: this.includeMathBlock,
                 includeEmbedBlock: this.includeEmbedBlock,
                 includeCodeBlock: this.includeCodeBlock,
+                includeCodeLanguage: this.includeCodeLanguage,
                 includeMermaid: this.includeMermaid,
                 includeFlowchart: this.includeFlowchart,
                 includeHtmlBlock: this.includeHtmlBlock,
@@ -1956,6 +1964,7 @@ export class SearchBar {
             includeMathBlock: this.includeMathBlock,
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
+            includeCodeLanguage: this.includeCodeLanguage,
             includeMermaid: this.includeMermaid,
             includeFlowchart: this.includeFlowchart,
             includeHtmlBlock: this.includeHtmlBlock,
@@ -2007,6 +2016,7 @@ export class SearchBar {
                     includeMathBlock: this.includeMathBlock,
                     includeEmbedBlock: this.includeEmbedBlock,
                     includeCodeBlock: this.includeCodeBlock,
+                    includeCodeLanguage: this.includeCodeLanguage,
                     includeMermaid: this.includeMermaid,
                     includeFlowchart: this.includeFlowchart,
                     includeHtmlBlock: this.includeHtmlBlock,
@@ -2889,6 +2899,7 @@ export class SearchBar {
             includeMathBlock: this.includeMathBlock,
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
+            includeCodeLanguage: this.includeCodeLanguage,
             includeMermaid: this.includeMermaid,
             includeFlowchart: this.includeFlowchart,
             includeHtmlBlock: this.includeHtmlBlock,
@@ -3002,9 +3013,9 @@ export class SearchBar {
             this.scrollIntoRanges(this.resultIndex - 1, false);
         } else if (Date.now() < this.indexResetPausedUntil) {
             const current = this.getCurrentMatch();
-            if (current?.range && current.highlightKind !== "inline-memo") {
+            if (current?.range && current.highlightKind !== "inline-memo" && current.highlightKind !== "code-language") {
                 this.applyFocusHighlight(current.range);
-            } else if (current?.highlightKind === "inline-memo") {
+            } else if (current?.highlightKind === "inline-memo" || current?.highlightKind === "code-language") {
                 this.clearSearchFocus();
             }
         }
@@ -3045,17 +3056,27 @@ export class SearchBar {
         this.highlightEditorOwner = null;
         this.teardownMemoUnderlineLayoutSync();
         clearMemoUnderlineVisual(this.edit);
+        clearCodeLanguageVisual(this.edit);
     }
 
     /** 备注命中：黄/橙虚线下划线（叠加层，不打开浮层、不污染内容 DOM） */
     private syncMemoUnderlineVisual() {
         const memoRanges: Range[] = [];
+        const codeRanges: Range[] = [];
         for (const match of this.resultMatches) {
             if (match.highlightKind === "inline-memo" && match.range && rangeBelongsToEditor(match.range, this.edit)) {
                 memoRanges.push(match.range);
+            } else if (match.highlightKind === "code-language" && match.range && rangeBelongsToEditor(match.range, this.edit)) {
+                codeRanges.push(match.range);
             }
         }
-        if (!memoRanges.length) {
+        const codeFocus = this.getCurrentMatch();
+        try {
+            applyCodeLanguageVisual(this.edit, codeRanges, codeFocus?.highlightKind === "code-language" ? codeFocus.range : null);
+        } catch (error) {
+            console.warn("[page-search] code language highlight failed", error);
+        }
+        if (!memoRanges.length && !codeRanges.length) {
             this.teardownMemoUnderlineLayoutSync();
             clearMemoUnderlineVisual(this.edit);
             return;
@@ -3085,25 +3106,11 @@ export class SearchBar {
             }
             this.memoUnderlineLayoutRaf = window.requestAnimationFrame(() => {
                 this.memoUnderlineLayoutRaf = 0;
-                if (!this.resultMatches.some((m) => m.highlightKind === "inline-memo" && m.range)) {
+                if (!this.resultMatches.some((m) => (m.highlightKind === "inline-memo" || m.highlightKind === "code-language") && m.range)) {
                     return;
                 }
-                // 只重绘，不重建监听，避免滚动时反复 add/remove
-                const memoRanges: Range[] = [];
-                for (const match of this.resultMatches) {
-                    if (match.highlightKind === "inline-memo" && match.range) {
-                        memoRanges.push(match.range);
-                    }
-                }
-                const focusMatch = this.getCurrentMatch();
-                const focusRange = focusMatch?.highlightKind === "inline-memo" ?
-                    (focusMatch.range ?? null) :
-                    null;
-                try {
-                    applyMemoUnderlineVisual(this.edit, memoRanges, focusRange);
-                } catch (error) {
-                    console.warn("[page-search] memo underline relayout failed", error);
-                }
+                // Reuse the same frame-coalesced scroll/resize subscription for special highlights.
+                this.syncMemoUnderlineVisual();
             });
         };
 
@@ -4048,7 +4055,7 @@ export class SearchBar {
         if (!current?.range) {
             return false;
         }
-        if (current.highlightKind !== "inline-memo") {
+        if (current.highlightKind !== "inline-memo" && current.highlightKind !== "code-language") {
             this.applyFocusHighlight(current.range);
         }
         return true;
@@ -4121,6 +4128,7 @@ export class SearchBar {
             includeMathBlock: this.includeMathBlock,
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
+            includeCodeLanguage: this.includeCodeLanguage,
             includeMermaid: this.includeMermaid,
             includeFlowchart: this.includeFlowchart,
             includeHtmlBlock: this.includeHtmlBlock,
@@ -4152,7 +4160,7 @@ export class SearchBar {
         for (let index = 0; index < matches.length; index++) {
             if (!current()) return false;
             const match = matches[index];
-            if (match.range && rangeStillPainted(match, this.edit) && match.highlightKind !== "inline-memo") {
+            if (match.range && rangeStillPainted(match, this.edit) && match.highlightKind !== "inline-memo" && match.highlightKind !== "code-language") {
                 for (const range of [match.range, mirrorTabsTitleRange(match.range)]) {
                     if (!range || (range !== match.range && !rangeBelongsToEditor(range, this.edit))) continue;
                     count++;
@@ -4170,7 +4178,7 @@ export class SearchBar {
         this.getComponentHighlights().setResults(nextHighlight && count ? nextHighlight : null);
         this.resultHighlightPending = false;
         const focused = this.getCurrentMatch();
-        if (focused?.range && focused.highlightKind !== "inline-memo") this.applyFocusHighlight(focused.range);
+        if (focused?.range && focused.highlightKind !== "inline-memo" && focused.highlightKind !== "code-language") this.applyFocusHighlight(focused.range);
         else this.clearSearchFocus();
         this.syncMemoUnderlineVisual();
         return true;
@@ -4190,7 +4198,7 @@ export class SearchBar {
     private appendResultHighlight(match: SearchMatch): boolean {
         if (
             !this.canPaintHighlights() || !match.range || !rangeStillPainted(match, this.edit) ||
-            match.highlightKind === "inline-memo"
+            (match.highlightKind === "inline-memo" || match.highlightKind === "code-language")
         ) {
             return false;
         }
@@ -4782,7 +4790,7 @@ export class SearchBar {
             this.revealUnloadedMatch(index, match, scroll, allowNativeAvLocate);
             return;
         }
-        if (immediate && match.highlightKind !== "inline-memo") {
+        if (immediate && match.highlightKind !== "inline-memo" && match.highlightKind !== "code-language") {
             this.applyFocusHighlight(range);
         }
 
@@ -4830,22 +4838,26 @@ export class SearchBar {
             if (ancestorElement?.closest(".mindmap-view")) {
                 panMindmapIntoView(range);
             } else if (ancestorElement) {
+                // A language hit represents the toolbar at the block's top.
+                // Centering the entire Range would land halfway through a tall code block.
+                const languageHost = match.highlightKind === "code-language" ?
+                    codeLanguageFrameHost(range) ?? undefined : undefined;
                 const scrollContainers = findScrollContainers(ancestorElement);
                 scrollContainers.forEach((container) => {
-                    scrollContainerToRange(range, container);
+                    scrollContainerToRange(range, container, languageHost);
                 });
                 if (scrollContainers.length === 0) {
                     const docContentElement = this.edit.querySelector(
                         ":scope > .protyle:not(.fn__none) :is(.protyle-content:not(.fn__none), .protyle-preview:not(.fn__none))",
                     ) as HTMLElement | null;
                     if (docContentElement) {
-                        scrollContainerToRange(range, docContentElement);
+                        scrollContainerToRange(range, docContentElement, languageHost);
                     }
                 }
             }
         }
 
-        if (match.highlightKind !== "inline-memo") {
+        if (match.highlightKind !== "inline-memo" && match.highlightKind !== "code-language") {
             this.applyFocusHighlight(range);
         } else {
             this.clearSearchFocus();
@@ -5052,6 +5064,7 @@ export class SearchBar {
             custom: this.i18n.settingsIncludeCustomBlock || "custom blocks",
             mermaid: "Mermaid", flowchart: "flowchart", graphviz: "Graphviz", plantuml: "PlantUML",
             chart: "ECharts", mindmap: "mindmap", abc: "ABC",
+            codeLanguage: this.i18n.settingsIncludeCodeLanguage || "code-block language labels",
             tabsTitle: this.i18n.replaceReasonTabsTitle || "tab titles",
             richCell: this.i18n.replaceReasonRichCell || "unsupported rich-cell formatting",
             cellEditing: this.i18n.replaceReasonCellEditing || "cells being edited",
@@ -6093,11 +6106,18 @@ export class SearchBar {
                 this.buildMatchSwitchMenuItem({
                     id: "page-search-include-plain-code-block",
                     icon: "iconCode",
-                    label: this.i18n.settingsIncludePlainCodeBlock,
+                    label: this.i18n.settingsIncludeCodeBody || "Plain code: body",
                     checked: this.includeCodeBlock,
                     onChange: (checked) => {
                         void this.setIncludeCodeBlock(checked);
                     },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-code-language",
+                    icon: "iconCode",
+                    label: this.i18n.settingsIncludeCodeLanguage || "Plain code: language",
+                    checked: this.includeCodeLanguage,
+                    onChange: (checked) => { void this.setIncludeCodeLanguage(checked); },
                 }),
                 this.buildMatchSwitchMenuItem({
                     id: "page-search-include-mermaid",
@@ -6128,6 +6148,7 @@ export class SearchBar {
             return;
         }
         this.setOpenMenuSwitch("page-search-include-plain-code-block", this.includeCodeBlock);
+        this.setOpenMenuSwitch("page-search-include-code-language", this.includeCodeLanguage);
         this.setOpenMenuSwitch("page-search-include-mermaid", this.includeMermaid);
         this.setOpenMenuSwitch("page-search-include-flowchart", this.includeFlowchart);
     }
@@ -6424,6 +6445,17 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setIncludeCodeLanguage(value: boolean) {
+        if (this.includeCodeLanguage === value) {
+            return;
+        }
+        this.includeCodeLanguage = value;
+        await rpcSetPrefs(this.plugin, {includeCodeLanguage: value});
+        this.plugin.syncIncludeCodeLanguage?.(value, this);
+        this.syncCodeFamilyMenu();
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeMermaid(value: boolean) {
         if (this.includeMermaid === value) {
             return;
@@ -6657,6 +6689,14 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    applyIncludeCodeLanguage(value: boolean) {
+        if (this.includeCodeLanguage === value) {
+            return;
+        }
+        this.includeCodeLanguage = value;
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     applyIncludeMermaid(value: boolean) {
         if (this.includeMermaid === value) {
             return;
@@ -6879,8 +6919,13 @@ function findScrollContainers(element: Element): HTMLElement[] {
     return containers;
 }
 
-function scrollContainerToRange(range: Range, container: HTMLElement) {
-    const rangeRect = range.getBoundingClientRect();
+function scrollContainerToRange(
+    range: Range, container: HTMLElement, blockStart?: HTMLElement,
+) {
+    const blockRect = blockStart?.getBoundingClientRect();
+    const rangeRect = blockRect && blockRect.height > 0 ?
+        {left: blockRect.left, right: blockRect.right, top: blockRect.top,
+            bottom: blockRect.top + Math.min(blockRect.height, 32)} : range.getBoundingClientRect();
     const containerRect = container.getBoundingClientRect();
     const containerStyle = window.getComputedStyle(container);
     const rangeCenterX = (rangeRect.left + rangeRect.right) / 2;

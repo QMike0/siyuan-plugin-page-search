@@ -1,3 +1,4 @@
+import {codeLanguageSearchEnabled} from "../shared/code-block-language";
 import type {RestrictInlineType} from "../shared";
 import {collectSearchableBlocks} from "./blocks";
 import {createRangeFromBlockOffsets} from "./ranges";
@@ -1065,6 +1066,7 @@ export function captureSelectionScopeWithKind(
         includeMathBlock?: boolean;
         includeEmbedBlock?: boolean;
         includeCodeBlock?: boolean;
+        includeCodeLanguage?: boolean;
         includeMermaid?: boolean;
         includeFlowchart?: boolean;
         includeHtmlBlock?: boolean;
@@ -1105,6 +1107,7 @@ export function captureSelectionScopeWithKind(
         includeMathBlock: options?.includeMathBlock !== false,
         includeEmbedBlock: options?.includeEmbedBlock !== false,
         includeCodeBlock: options?.includeCodeBlock !== false,
+        includeCodeLanguage: codeLanguageSearchEnabled(options ?? {}),
         includeMermaid: options?.includeMermaid !== false,
         includeFlowchart: options?.includeFlowchart !== false,
         includeHtmlBlock: options?.includeHtmlBlock !== false,

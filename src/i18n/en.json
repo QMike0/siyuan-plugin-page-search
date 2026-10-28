@@ -108,6 +108,8 @@
   "settingsIncludeEmbedBlock": "Embed block",
   "settingsIncludeCodeBlock": "Code blocks",
   "settingsIncludePlainCodeBlock": "Plain code blocks",
+  "settingsIncludeCodeBody": "Plain code: body",
+  "settingsIncludeCodeLanguage": "Plain code: language",
   "settingsIncludeMermaid": "Mermaid",
   "settingsIncludeMermaidHint": "Match visible text rendered in Mermaid diagrams; fall back to source when not rendered",
   "settingsIncludeFlowchart": "flowchart",

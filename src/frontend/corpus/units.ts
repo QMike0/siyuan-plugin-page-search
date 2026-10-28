@@ -1,3 +1,4 @@
+import {isCodeLanguageUnit} from "../../shared/code-block-language";
 import {
     INLINE_MATH_TYPE,
     INLINE_MEMO_TYPE,
@@ -60,7 +61,7 @@ export interface CachedUnit {
 }
 
 function nonReplaceable(block: SearchableBlock): boolean {
-    return block.blockType === "NodeMathBlock" ||
+    return isCodeLanguageUnit(block) || block.blockType === "NodeMathBlock" ||
         block.blockType === "NodeHTMLBlock" ||
         block.blockType === "NodeCustomBlock" ||
         Boolean(block.element.closest('[data-type="NodeCustomBlock"]')) ||
@@ -179,7 +180,9 @@ export function freezeBlock(
     const replaceLock = richCell ? richCell.replaceLock :
         block.blockType === "NodeTable" ? tableCellReplaceLock(block.element) : undefined;
     let highlightKind: CachedUnit["highlightKind"] = "text";
-    if (isInlineMemoSearchUnit(block)) {
+    if (isCodeLanguageUnit(block)) {
+        highlightKind = "code-language";
+    } else if (isInlineMemoSearchUnit(block)) {
         highlightKind = "inline-memo";
     } else if (isInlineMathSearchUnit(block)) {
         highlightKind = "inline-math";

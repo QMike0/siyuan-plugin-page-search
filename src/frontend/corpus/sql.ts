@@ -13,6 +13,14 @@ import {
 } from "./api";
 import {isContainerType} from "./meta";
 
+// Fence info is outside blocks.content. Normalize only a bounded prefix;
+// an unusually long fence/leading whitespace stays a candidate, avoiding false negatives.
+const CODE_FENCE_SQL = "ltrim(substr(markdown, 1, 256), char(10) || char(13))";
+
+function codeLanguageCandidatePredicate(predicate: string): string {
+    return `(type = 'c' AND (instr(${CODE_FENCE_SQL}, char(10)) = 0 OR ${predicate}))`;
+}
+
 const CONTAINER_SQL = ["d", "l", "i", "b", "s", "mindmap", "mindmap_item"].map((type) => `'${type}'`).join(", ");
 
 const INTERNAL_MARKER_CODES = [0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF];
@@ -106,6 +114,7 @@ export async function fetchContentCandidateIds(
     needle: string,
     caseSensitive: boolean,
     signal?: AbortSignal,
+    includeCodeLanguage = true,
 ): Promise<string[] | null> {
     if (!caseSensitive && !searchNormalizeFoldIsSuperset(needle)) {
         return queryScopedCandidates(
@@ -115,10 +124,12 @@ export async function fetchContentCandidateIds(
         );
     }
     const predicate = literalCandidatePredicate("content", needle, caseSensitive);
+    const codeLanguage = includeCodeLanguage ?
+        ` OR ${codeLanguageCandidatePredicate(literalCandidatePredicate(CODE_FENCE_SQL, needle, caseSensitive))}` : "";
     return queryLiteralCandidates(
         rootId,
         `AND type NOT IN (${CONTAINER_SQL}) `,
-        `(${predicate} OR type IN ('query_embed', 'm') OR instr(markdown, 'inline-math') > 0 OR instr(markdown, '$') > 0)`,
+        `(${predicate}${codeLanguage} OR type IN ('query_embed', 'm') OR instr(markdown, 'inline-math') > 0 OR instr(markdown, '$') > 0)`,
         signal,
     );
 }
@@ -196,6 +207,7 @@ export async function fetchLiteralGroupCandidateIds(
     caseSensitive: boolean,
     kind: "content" | "memo" | "imageTitle",
     signal?: AbortSignal,
+    includeCodeLanguage = true,
 ): Promise<string[] | null> {
     if (kind === "memo") {
         // 正则的必现字面量同样不能安全地在带 HTML 的 Memo 原文上预筛。
@@ -216,6 +228,9 @@ export async function fetchLiteralGroupCandidateIds(
         extra = "";
     }
     const predicate = literalGroupPredicate(groups, rawColumn, caseSensitive);
+    if (kind === "content" && includeCodeLanguage) {
+        extra += ` OR ${codeLanguageCandidatePredicate(literalGroupPredicate(groups, CODE_FENCE_SQL, caseSensitive))}`;
+    }
     const rows = await querySqlAll<{id: string;}>((afterId, limit) => {
         const after = afterId ? `AND id > '${escSql(afterId)}' ` : "";
         return `SELECT id FROM blocks WHERE root_id = '${root}' ` +

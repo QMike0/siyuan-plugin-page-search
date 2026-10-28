@@ -1,3 +1,4 @@
+import {CODE_LANGUAGE_UNIT_ID, codeLanguageSearchEnabled} from "../shared/code-block-language";
 import {
     logicalTableRows,
     normalizeRestrictInlineTypes,
@@ -104,7 +105,7 @@ function rendererEnabled(
  * @see https://github.com/KaTeX/KaTeX/blob/v0.16.9/src/buildTree.js
  */
 const TEXT_NODE_EXCLUDED_CLOSEST =
-    '.protyle-attr, svg, style, script, .katex, .katex-html, .katex-display, .katex-mathml, math, annotation, span[data-type~="inline-math"], .tabs-header, .mindmap-view, [data-type="NodeListItem"] > .protyle-action';
+    '.protyle-attr, svg, style, script, .katex, .katex-html, .katex-display, .katex-mathml, math, annotation, span[data-type~="inline-math"], .tabs-header, .mindmap-view, .protyle-action__language, [data-type="NodeListItem"] > .protyle-action';
 /** 图片标题可见字（官方 imgTitle / `.protyle-action__title`） */
 const IMAGE_TITLE_TEXT_CLOSEST = ".img .protyle-action__title";
 /** 行内备注 unitId 前缀；text 来自 data-inline-memo-content */
@@ -312,8 +313,10 @@ export interface CollectSearchableBlocksOptions {
     includeMathBlock?: boolean;
     /** 是否采集嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
     includeEmbedBlock?: boolean;
-    /** 是否采集普通代码块；默认 true。不含 Mermaid、flowchart。 */
+    /** 是否采集普通代码块正文；默认 true。不含 Mermaid、flowchart。 */
     includeCodeBlock?: boolean;
+    /** 是否采集普通代码块的只读语言标签；默认随正文开关。 */
+    includeCodeLanguage?: boolean;
     /** 是否采集 Mermaid 图；默认 true。不受代码块开关影响。 */
     includeMermaid?: boolean;
     /** 是否采集 flowchart 图；默认 true。不受代码块开关影响。 */
@@ -637,8 +640,23 @@ export function collectSearchableBlocks(
             return;
         }
 
-        // 普通代码块由 includeCodeBlock 控制
-        if (blockType === CODE_BLOCK_TYPE && !includeCodeBlock) {
+        if (blockType === CODE_BLOCK_TYPE) {
+            if (codeLanguageSearchEnabled(options) &&
+                (!isAuthorCssHiddenElement(element) || isInactiveTabSourceElement(element)) &&
+                !element.closest('.fn__none, [hidden], [aria-hidden="true"]')) {
+                const label = element.querySelector<HTMLElement>(":scope > .protyle-action > .protyle-action__language");
+                const language = label?.textContent?.trim() ?? "";
+                if (language) blocks.push({
+                    blockId, blockType, blockIndex, element, text: language, textNodes: [],
+                    unitId: CODE_LANGUAGE_UNIT_ID, matchSource: "code-language",
+                });
+            }
+            if (includeCodeBlock) {
+                const body = element.querySelector<HTMLElement>(":scope > .hljs [contenteditable=\"true\"]") ??
+                    element.querySelector<HTMLElement>(":scope > .hljs") ?? element;
+                blocks.push(...unitsFromTextNodes({blockId, blockType, blockIndex, element},
+                    collectTextNodes(body, element, includeImageTitle)));
+            }
             return;
         }
 

@@ -39,7 +39,7 @@ The **Include in search** menu controls which block types are searched:
 
 * document titles, image titles, and inline memos;
 * paragraph blocks, heading blocks H1–H6, and unordered/ordered/task list blocks;
-* math blocks, plain code blocks, Mermaid, and flowchart;
+* math blocks, plain code bodies, code language labels, Mermaid, and flowchart;
 * table blocks, database blocks, blockquotes, callouts, super blocks, tabs, and mind maps;
 * embed blocks, HTML blocks, and custom blocks.
 
@@ -103,6 +103,7 @@ Searchable and highlightable but unsupported by replacement include:
 * formulas, rendered Mermaid, and rendered HTML-block text;
 * plugin-rendered custom blocks;
 * tab titles inside tabs blocks;
+* plain-code language labels (such as Python or MATLAB); matching blocks have a yellow frame, with an orange frame for the current result;
 * matches spanning complex marks, read-only regions, or content whose original source cannot be confirmed.
 
 **Replace all** reports these skipped items in its confirmation and result message.

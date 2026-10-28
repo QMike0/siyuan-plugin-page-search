@@ -1,3 +1,4 @@
+import {codeLanguageSearchEnabled, isCodeLanguageUnit} from "../../shared/code-block-language";
 import {resolveRichCellCapabilities, type RichCellSearchInfo} from "../rich-table-cell";
 import {getAllEditor} from "siyuan";
 import type {Plugin} from "siyuan";
@@ -416,6 +417,7 @@ function collectionScope(options: SearchPipelineOptions): string {
         options.includeMathBlock !== false,
         options.includeEmbedBlock !== false,
         options.includeCodeBlock !== false,
+        codeLanguageSearchEnabled(options),
         options.includeMermaid !== false,
         options.includeFlowchart !== false,
         options.includeHtmlBlock !== false,
@@ -873,6 +875,7 @@ function collectOptions(options: SearchPipelineOptions) {
         includeMathBlock: options.includeMathBlock !== false,
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
+        includeCodeLanguage: codeLanguageSearchEnabled(options),
         includeMermaid: options.includeMermaid !== false,
         includeFlowchart: options.includeFlowchart !== false,
         includeHtmlBlock: options.includeHtmlBlock !== false,
@@ -1874,6 +1877,7 @@ function beginCandidateQuery(input: {
     caseSensitive: boolean;
     regex: boolean;
     needContentCandidates: boolean;
+    includeCodeLanguage: boolean;
     collectMemo: boolean;
     needImageTitleCandidates: boolean;
     memoOnlyRestriction: boolean;
@@ -1902,7 +1906,7 @@ function beginCandidateQuery(input: {
                 input.needContentCandidates ?
                     memoizedIds(
                         input.rootId,
-                        queryMemoKey(input.rootId, "rg-content", `${input.caseSensitive}:${detail}`),
+                        queryMemoKey(input.rootId, "rg-content", `${input.caseSensitive}:${input.includeCodeLanguage}:${detail}`),
                         input.signature,
                         () =>
                             fetchLiteralGroupCandidateIds(
@@ -1911,6 +1915,7 @@ function beginCandidateQuery(input: {
                                 input.caseSensitive,
                                 "content",
                                 input.signal,
+                                input.includeCodeLanguage,
                             ),
                     ) :
                     Promise.resolve([] as string[]),
@@ -1945,7 +1950,7 @@ function beginCandidateQuery(input: {
                     queryMemoKey(
                         input.rootId,
                         "content",
-                        `${input.caseSensitive}:${candidateKeyword}`,
+                        `${input.caseSensitive}:${input.includeCodeLanguage}:${candidateKeyword}`,
                     ),
                     input.signature,
                     () =>
@@ -1954,6 +1959,7 @@ function beginCandidateQuery(input: {
                             candidateKeyword,
                             input.caseSensitive,
                             input.signal,
+                            input.includeCodeLanguage,
                         ),
                 ) :
                 Promise.resolve([] as string[]),
@@ -2208,6 +2214,7 @@ async function searchCurrentDocumentImpl(
         caseSensitive,
         regex: options.regex === true,
         needContentCandidates,
+        includeCodeLanguage: codeLanguageSearchEnabled(options),
         collectMemo,
         needImageTitleCandidates,
         memoOnlyRestriction,
@@ -3589,7 +3596,7 @@ async function searchCurrentDocumentImpl(
         if (!unit || !passesRestrict(unit, hit.start, hit.end, options)) {
             continue;
         }
-        const nonReplaceable = hit.blockId === "__doc-title__" ||
+        const nonReplaceable = isCodeLanguageUnit(unit) || hit.blockId === "__doc-title__" ||
             mountedTabsTitleIds.has(hit.blockId) ||
             unloadedTabsTitleIds.has(hit.blockId) ||
             hit.unitId === "doc-title" ||
@@ -3625,7 +3632,7 @@ async function searchCurrentDocumentImpl(
             blockIndex: orderIndex.get(hit.blockId) ?? (hit.blockId === "__doc-title__" ? -1 : hit.blockIndex),
             unitId: hit.unitId,
             unitSeq: navSeq(unit, hit.start),
-            replaceReason: mountedTabsTitleIds.has(hit.blockId) || unloadedTabsTitleIds.has(hit.blockId) ? "tabsTitle" :
+            replaceReason: isCodeLanguageUnit(unit) ? "codeLanguage" : mountedTabsTitleIds.has(hit.blockId) || unloadedTabsTitleIds.has(hit.blockId) ? "tabsTitle" :
                 unit.matchSource === "projection" && !projectionSourceBacked.has(hit.blockId) ? "preview" :
                 tablePending ? "tablePending" : richSpanBlocked ? "richCell" : undefined,
             embeddedPosition: embeddedPositionAt(unit.embeddedOrder, hit.start),
@@ -3703,6 +3710,9 @@ function compareMatchOrder(left: SearchMatch, right: SearchMatch): number {
     }
     const embedded = compareEmbeddedPositions(left, right);
     if (embedded !== undefined && embedded !== 0) return embedded;
+    if (isCodeLanguageUnit(left) !== isCodeLanguageUnit(right)) {
+        return isCodeLanguageUnit(left) ? -1 : 1;
+    }
     if (
         sameStructuralBlock(left, right) &&
         left.unitSeq !== undefined &&
