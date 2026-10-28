@@ -836,6 +836,12 @@ body.page-search-resizing * {
     pointer-events: none;
 }
 
+/* 图片 OCR 项较长，给文字和开关保留固定间距。 */
+.b3-menu [data-id="page-search-include-image-ocr"] > .b3-switch {
+    margin-inline-start: 12px;
+    flex-shrink: 0;
+}
+
 /* 查询范围菜单：说明问号（含子菜单；菜单挂在 document） */
 .b3-menu[data-name="page-search-settings"] .page-search-menu-help,
 .b3-menu .b3-menu__submenu .page-search-menu-help {

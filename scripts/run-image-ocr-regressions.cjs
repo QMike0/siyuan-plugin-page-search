@@ -94,6 +94,13 @@ async function main() {
     assert.equal((await calculateSearchMatches({}, edit, "OCRn[a-z]+", {regex: true})).matches.length, 6);
     assert.equal((await calculateSearchMatches({}, edit, "ocrneedle", {caseSensitive: true})).matches.length, 0);
     assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {includeParagraph: false})).matches.length, 0);
+    const beforeOff = calls.length;
+    const withoutOCR = await calculateSearchMatches({}, edit, "OCRneedle", {includeImageOCR: false});
+    assert.equal(withoutOCR.matches.length, 1, "OCR off preserves ordinary body matches");
+    assert.equal(withoutOCR.matches[0].replaceable, true);
+    assert.equal(calls.length, beforeOff, "OCR off never reads recognition text");
+    assert.equal(project.projectRanges(edit, images, {includeImageOCR: false}).filter(hit => hit.range).length, 0,
+        "disabled OCR cannot rebind old image frames");
     const selectedBlock = wysiwyg.children[0];
     selectedBlock.classList.add("protyle-wysiwyg--select");
     const selectionScope = source("frontend/selection").getSelectionScope(edit, collectSearchableBlocks(edit));
@@ -110,6 +117,7 @@ async function main() {
     assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {selectionOnly:true})).matches.length,1);
     assert.equal(calls.filter(([url])=>url.includes("getImageOCRText")).length,0,"text-only selection never includes adjacent picture OCR");
     window.getSelection().removeAllRanges();
+    assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {selectionOnly:true, selectionScope, includeImageOCR:false})).matches.length,1);
     calls = [];
     assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {restrictInlineTypes: ["strong"]})).matches.length, 0);
     assert.equal(calls.filter(([url]) => url.includes("getImageOCRText")).length, 0, "inline-only query does not request OCR");
@@ -153,12 +161,14 @@ async function main() {
     assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {includeFoldedBlocks:true})).matches.length,2);
     assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {includeFoldedBlocks:false})).matches.length,0);
     assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {includeCallout:false})).matches.length,0);
+    assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {includeFoldedBlocks:true, includeImageOCR:false})).matches.length,0);
     wysiwyg.innerHTML = '<div data-type="NodeBlockQueryEmbed" data-node-id="embed" class="render-node">' +
         imageParagraph + '</div>';
     const embedded = await calculateSearchMatches({}, edit, "OCRneedle");
     assert.equal(embedded.matches.length,2);
     assert.ok(embedded.matches.every(h=>h.unitId.startsWith("embed:") && !h.replaceable));
     assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {includeEmbedBlock:false})).matches.length,0);
+    assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {includeImageOCR:false})).matches.length,0);
 
     // Ordinary native table: OCR must not collapse cell text or change the virtual-table overlay.
     wysiwyg.innerHTML = lute.Md2BlockDOM("| image | text |\n| --- | --- |\n| ![](assets/one.png) | ordinary |");
@@ -168,6 +178,7 @@ async function main() {
     const tableFound = await calculateSearchMatches({}, edit, "OCRneedle");
     assert.equal(tableFound.matches.length, 2);
     assert.ok(tableFound.matches.every(h => h.range && !h.replaceable));
+    assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {includeImageOCR:false})).matches.length,0);
     const frozen = tableUnits.map(u => freezeBlock(u));
     const textCell = frozen.find(u => u.text === "ordinary");
     const state = new Map([[textCell.blockId, {shownKeys: new Set(["1:1"]), liveByKey: new Map([["1:1", {...textCell, text:"edited"}]]), unstable:false}]]);
@@ -207,6 +218,13 @@ async function main() {
     assert.equal(cold.matches.length, 3);
     assert.equal(cold.degraded, false);
     assert.ok(cold.matches.every(h => !h.range && !h.replaceable));
+    invalidateImageOCRCache();
+    calls = [];
+    const disabledCold = await search("OCRneedle", {includeImageOCR:false});
+    assert.equal(disabledCold.matches.length,0,"OCR off also excludes unloaded/folded image hosts");
+    assert.equal(disabledCold.partial,false,"disabled OCR does not make coverage incomplete");
+    assert.equal(calls.filter(([url])=>url.includes("getImageOCRText")).length,0);
+    assert.equal((await search("OCRneedle")).matches.length,3,"re-enabling OCR does not reuse the disabled collection cache");
     assert.equal((await search("OCRneedle", {includeFoldedBlocks:false})).matches.length, 0);
     ocrText.set("assets/one.png", "brandNewOCR");
     invalidateImageOCRCache(); // native siyuan-image-ocr / databaseIndexCommit notification
@@ -256,6 +274,56 @@ async function main() {
     await mindmapFrameMotionRegressions();
     await cacheRegressions(wrap);
     await notificationRegressions(wrap);
+    await imageMenuRegressions();
+}
+
+async function imageMenuRegressions() {
+    const {DEFAULT_PREFS, coercePluginPrefs, mergePrefs} = source("shared/rpc-types");
+    assert.equal(coercePluginPrefs({includeImageTitle:false}).includeImageOCR,true,"old prefs retain OCR search by default");
+    let stored = DEFAULT_PREFS;
+    const plugin = new (source("index").default)();
+    const patches = [];
+    plugin.kernel = {state:{code:2},rpc:{call:{"prefs.set":async patch=>{
+        patches.push(patch); stored=mergePrefs(stored,patch); return stored;
+    }}}};
+    const createBar = () => {
+        const bar = Object.create(SearchBar.prototype);
+        Object.assign(bar,{edit,plugin,includeImageTitle:true,includeImageOCR:true,searchText:"OCRneedle",
+            buildMatchSwitchMenuItem: options=>options,highlightHitResult:async()=>{}});
+        return bar;
+    };
+    const bar = createBar(), other = createBar();
+    plugin.searchBars.set(edit,bar); plugin.searchBars.set(document.createElement("div"),other);
+    for (const lang of ["zh-CN","en"]) {
+        plugin.i18n = JSON.parse(fs.readFileSync(path.resolve(__dirname,"../src/i18n",lang+".json"),"utf8"));
+        bar.i18n = plugin.getSearchI18n();
+        const menu = bar.buildImageMenuItem();
+        assert.equal(menu.label,plugin.i18n.settingsIncludeImage);
+        assert.equal(menu.type,"submenu");
+        assert.deepEqual(menu.submenu.map(item=>item.label),[plugin.i18n.settingsIncludeImageTitle,plugin.i18n.settingsIncludeImageOCR]);
+        assert.deepEqual(menu.submenu.map(item=>item.checked),[true,true]);
+    }
+    await bar.setIncludeImageOCR(false);
+    assert.equal(stored.includeImageOCR,false,"OCR preference is saved");
+    assert.equal(other.includeImageOCR,false,"other panels follow the OCR switch");
+    assert.equal(stored.includeImageTitle,true,"OCR switch leaves title preference unchanged");
+    await bar.setIncludeImageOCR(false);
+    assert.equal(patches.length,1,"an unchanged switch does not save or refresh again");
+    await bar.setIncludeImageTitle(false);
+    assert.equal(stored.includeImageOCR,false,"unrelated preference changes preserve OCR off");
+    assert.equal(other.includeImageTitle,false);
+    assert.equal(coercePluginPrefs(JSON.parse(JSON.stringify(stored))).includeImageOCR,false,"OCR choice survives preference reload");
+    await bar.setIncludeImageOCR(true);
+    assert.equal(other.includeImageOCR,true);
+    assert.equal(other.includeImageTitle,false,"switches remain independent");
+    plugin.searchBars.clear();
+    editors=[]; responder=readOCR; invalidateImageOCRCache();
+    ocrText.set("assets/one.png","OCRneedle twice OCRneedle");
+    wysiwyg.innerHTML=lute.Md2BlockDOM('![](assets/one.png "captionOCR")');
+    assert.equal((await calculateSearchMatches({},edit,"captionOCR",{includeImageOCR:false})).matches.length,1,"OCR off preserves image titles");
+    assert.equal((await calculateSearchMatches({},edit,"OCRneedle",{includeImageTitle:false})).matches.length,2,"title off preserves OCR");
+    assert.equal((await calculateSearchMatches({},edit,"captionOCR",{includeImageTitle:false})).matches.length,0);
+    console.log("Image menu: independent title/OCR switches, legacy defaults, persistence, panel sync and body isolation OK");
 }
 
 async function scopeAndProjectionRegressions() {
@@ -289,6 +357,7 @@ async function scopeAndProjectionRegressions() {
         assert.ok(wysiwyg.querySelector("img"));
         const cold = await calculateSearchMatches({}, edit, "OCRneedle");
         assert.equal(cold.matches.length, 2, "native raw rich preview includes the image");
+        assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {includeImageOCR:false})).matches.length,0);
         assert.equal((await calculateSearchMatches({}, edit, "OCRneedle", {[option]:false})).matches.length, 0, option + " gates raw preview");
         const cell = wysiwyg.querySelector("[data-sy-table-cell-rich]");
         cell.innerHTML = '<div class="table__cell-rich">' + lute.Md2BlockDOM(md) + '</div>';
@@ -356,11 +425,12 @@ async function scopeAndProjectionRegressions() {
         if(url==="/api/block/getBlockDOMs") return {code:0,data:Object.fromEntries(body.ids.map(id=>[id,doms[id]??""]))};
         return readOCR(url,body,...rest);
     };
-    const search = () => corpus.searchCurrentDocument({},edit,"OCRneedle",{includeAttributeView:false,includeFoldedBlocks:true});
+    const search = (options={}) => corpus.searchCurrentDocument({},edit,"OCRneedle",{includeAttributeView:false,includeFoldedBlocks:true,...options});
     corpus.invalidateDocumentSearchCaches();
     const mounted = await search();
     assert.equal(mounted.matches.length,2);
     assert.equal(mounted.partial,false);
+    assert.equal((await search({includeImageOCR:false})).matches.length,0,"OCR off excludes native mindmap projections");
     wysiwyg.innerHTML += ["one", "two"].map(id =>
         '<div data-type="NodeBlockQueryEmbed" data-node-id="embed-' + id + '" class="render-node">' + mapDOM + '</div>').join("");
     for (const id of ["one", "two"])
@@ -385,6 +455,7 @@ async function scopeAndProjectionRegressions() {
     found = await search();
     assert.equal(found.matches.length,2,"unloaded raw rich table remains a candidate even without indexed OCR");
     assert.equal(found.partial,false);
+    assert.equal((await search({includeImageOCR:false})).matches.length,0,"OCR off excludes unloaded rich table images");
     wysiwyg.innerHTML = richDOM;
     const restored = project.fillLiveRanges(found.matches,collectSearchableBlocks(edit),true);
     assert.ok(restored.every(h=>h.range && !h.replaceable));
@@ -569,6 +640,10 @@ async function notificationRegressions(wrap) {
     assert.equal((await resolveImageOCRUnits([path])).units[0].text,"third");
     bar.replaceBusy=true;plugin.onImageOCRChanged(event);
     assert.equal(bar.replaceRefreshPending,true,"OCR update defers refresh during replacement");
+    bar.includeImageOCR=false;
+    const beforeDisabledEvent=aborts;
+    plugin.onImageOCRChanged(event);
+    assert.equal(aborts,beforeDisabledEvent,"OCR notifications do not restart searches when OCR is off");
     plugin.searchComponentCallbacks.clear();
     Object.assign(plugin,{eventBus:{on:()=>{},off:()=>{}},startCleanupTimer:()=>{},stopCleanupTimer:()=>{},closeSearchDialog:()=>{}});
     const beforeOpen = calls.length;

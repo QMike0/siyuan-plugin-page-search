@@ -528,6 +528,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 "Controls which block-level types (and inline memos) may be searched",
             settingsIncludeDocTitle: t.settingsIncludeDocTitle || "Document title",
             settingsIncludeImageTitle: t.settingsIncludeImageTitle || "Image title",
+            settingsIncludeImage: t.settingsIncludeImage || "Images",
+            settingsIncludeImageOCR: t.settingsIncludeImageOCR || "Image OCR text",
             settingsIncludeAttributeView: t.settingsIncludeAttributeView || "Database block",
             settingsIncludeTable: t.settingsIncludeTable || "Table block",
             settingsIncludeBlockquote: t.settingsIncludeBlockquote || "Blockquote",
@@ -612,6 +614,12 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeImageTitle(value);
+        });
+    }
+
+    syncIncludeImageOCR(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar !== source) bar.applyIncludeImageOCR(value);
         });
     }
 
@@ -1096,6 +1104,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     replaceVisible: replaceVisibleOnCreate,
                     includeDocTitle: prefs.includeDocTitle !== false,
                     includeImageTitle: prefs.includeImageTitle !== false,
+                    includeImageOCR: prefs.includeImageOCR !== false,
                     includeAttributeView: prefs.includeAttributeView !== false,
                     includeTable: prefs.includeTable !== false,
                     includeBlockquote: prefs.includeBlockquote !== false,

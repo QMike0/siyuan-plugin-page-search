@@ -39,7 +39,7 @@ Other options:
 
 The **Include in search** menu controls which block types are searched:
 
-* document titles, image titles, and inline memos;
+* document titles, images (image titles and image OCR text), and inline memos;
 * paragraph blocks, heading blocks H1–H6, and unordered/ordered/task list blocks;
 * math blocks, plain code bodies, code language labels, Mermaid, and flowchart;
 * table blocks, database blocks, blockquotes, callouts, super blocks, tabs, and mind maps;

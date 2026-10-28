@@ -416,7 +416,9 @@ export interface SearchBarI18n {
     settingsIncludeScope: string;
     settingsIncludeScopeHint: string;
     settingsIncludeDocTitle: string;
+    settingsIncludeImage: string;
     settingsIncludeImageTitle: string;
+    settingsIncludeImageOCR: string;
     settingsIncludeAttributeView: string;
     settingsIncludeTable: string;
     settingsIncludeBlockquote: string;
@@ -488,6 +490,7 @@ export interface SearchBarHost {
     syncIncludeDocTitle?(value: boolean, source?: SearchBar): void;
     /** 将图片标题匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeImageTitle?(value: boolean, source?: SearchBar): void;
+    syncIncludeImageOCR?(value: boolean, source?: SearchBar): void;
     /** 将数据库匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeAttributeView?(value: boolean, source?: SearchBar): void;
     /** 将表格匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -702,6 +705,8 @@ export class SearchBar {
     private includeDocTitle = true;
     /** 是否匹配图片标题；全局 prefs，默认 true */
     private includeImageTitle = true;
+    /** 是否搜索思源已有的图片 OCR 文本；全局 prefs，默认 true */
+    private includeImageOCR = true;
     /** 是否匹配数据库；全局 prefs，默认 true */
     private includeAttributeView = true;
     /** 是否匹配表格块；全局 prefs，默认 true */
@@ -899,6 +904,7 @@ export class SearchBar {
         includeDocTitle?: boolean;
         /** 是否匹配图片标题（来自全局 prefs） */
         includeImageTitle?: boolean;
+        includeImageOCR?: boolean;
         /** 是否匹配数据库（来自全局 prefs） */
         includeAttributeView?: boolean;
         /** 是否匹配表格块（来自全局 prefs） */
@@ -964,6 +970,7 @@ export class SearchBar {
         this.regex = options.useRegex === true;
         this.includeDocTitle = options.includeDocTitle !== false;
         this.includeImageTitle = options.includeImageTitle !== false;
+        this.includeImageOCR = options.includeImageOCR !== false;
         this.includeAttributeView = options.includeAttributeView !== false;
         this.includeTable = options.includeTable !== false;
         this.includeBlockquote = options.includeBlockquote !== false;
@@ -1902,6 +1909,7 @@ export class SearchBar {
             {
                 includeDocTitle: this.includeDocTitle,
                 includeImageTitle: this.includeImageTitle,
+                includeImageOCR: this.includeImageOCR,
                 includeAttributeView: this.includeAttributeView,
                 includeTable: this.includeTable,
                 includeBlockquote: this.includeBlockquote,
@@ -1948,6 +1956,7 @@ export class SearchBar {
         const blocks = collectSearchableBlocks(this.edit, {
             includeDocTitle: this.includeDocTitle,
             includeImageTitle: this.includeImageTitle,
+            includeImageOCR: this.includeImageOCR,
             includeAttributeView: this.includeAttributeView,
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
@@ -2000,6 +2009,7 @@ export class SearchBar {
                 {
                     includeDocTitle: this.includeDocTitle,
                     includeImageTitle: this.includeImageTitle,
+                    includeImageOCR: this.includeImageOCR,
                     includeAttributeView: this.includeAttributeView,
                     includeTable: this.includeTable,
                     includeBlockquote: this.includeBlockquote,
@@ -2883,6 +2893,7 @@ export class SearchBar {
             selectionOnly: this.selectionOnly,
             includeDocTitle: this.includeDocTitle,
             includeImageTitle: this.includeImageTitle,
+            includeImageOCR: this.includeImageOCR,
             includeAttributeView: this.includeAttributeView,
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
@@ -3177,6 +3188,7 @@ export class SearchBar {
 
         const indexCommit = event.detail?.cmd === "databaseIndexCommit";
         const imageOCRChanged = event.type === "siyuan-image-ocr";
+        if (imageOCRChanged && this.includeImageOCR === false) return;
         if (indexCommit) {
             const rootId = this.rememberCurrentRootId();
             const data = event.detail?.data;
@@ -4118,6 +4130,7 @@ export class SearchBar {
         return {
             includeDocTitle: this.includeDocTitle,
             includeImageTitle: this.includeImageTitle,
+            includeImageOCR: this.includeImageOCR,
             includeAttributeView: this.includeAttributeView,
             includeTable: this.includeTable,
             includeBlockquote: this.includeBlockquote,
@@ -5703,15 +5716,7 @@ export class SearchBar {
                         void this.setIncludeDocTitle(checked);
                     },
                 }),
-                this.buildMatchSwitchMenuItem({
-                    id: "page-search-include-image-title",
-                    icon: "iconImage",
-                    label: this.i18n.settingsIncludeImageTitle,
-                    checked: this.includeImageTitle,
-                    onChange: (checked) => {
-                        void this.setIncludeImageTitle(checked);
-                    },
-                }),
+                this.buildImageMenuItem(),
                 this.buildMatchSwitchMenuItem({
                     id: "page-search-include-inline-memo",
                     icon: "iconM",
@@ -6106,6 +6111,37 @@ export class SearchBar {
         });
     }
 
+    private buildImageMenuItem(): IMenu {
+        return {
+            id: "page-search-include-image",
+            icon: "iconImage",
+            label: this.i18n.settingsIncludeImage,
+            type: "submenu",
+            submenu: [
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-image-title",
+                    icon: "iconImage",
+                    label: this.i18n.settingsIncludeImageTitle,
+                    checked: this.includeImageTitle,
+                    onChange: (checked) => { void this.setIncludeImageTitle(checked); },
+                }),
+                this.buildMatchSwitchMenuItem({
+                    id: "page-search-include-image-ocr",
+                    icon: "iconImage",
+                    label: this.i18n.settingsIncludeImageOCR,
+                    checked: this.includeImageOCR,
+                    onChange: (checked) => { void this.setIncludeImageOCR(checked); },
+                }),
+            ],
+        };
+    }
+
+    private syncImageMenu() {
+        if (!this.getOpenSettingsMenuElement()) return;
+        this.setOpenMenuSwitch("page-search-include-image-title", this.includeImageTitle);
+        this.setOpenMenuSwitch("page-search-include-image-ocr", this.includeImageOCR);
+    }
+
     /** 代码块只是分组。普通代码块、Mermaid、flowchart 各自开关。 */
     private buildCodeBlockMenuItem(): IMenu {
         return {
@@ -6301,6 +6337,16 @@ export class SearchBar {
         this.includeImageTitle = value;
         await rpcSetPrefs(this.plugin, {includeImageTitle: value});
         this.plugin.syncIncludeImageTitle?.(value, this);
+        this.syncImageMenu();
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    private async setIncludeImageOCR(value: boolean) {
+        if (this.includeImageOCR === value) return;
+        this.includeImageOCR = value;
+        await rpcSetPrefs(this.plugin, {includeImageOCR: value});
+        this.plugin.syncIncludeImageOCR?.(value, this);
+        this.syncImageMenu();
         void this.highlightHitResult(this.searchText, true);
     }
 
@@ -6576,6 +6622,14 @@ export class SearchBar {
             return;
         }
         this.includeImageTitle = value;
+        this.syncImageMenu();
+        void this.highlightHitResult(this.searchText, true);
+    }
+
+    applyIncludeImageOCR(value: boolean) {
+        if (this.includeImageOCR === value) return;
+        this.includeImageOCR = value;
+        this.syncImageMenu();
         void this.highlightHitResult(this.searchText, true);
     }
 

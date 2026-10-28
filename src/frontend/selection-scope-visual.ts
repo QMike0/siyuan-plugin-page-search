@@ -1046,6 +1046,7 @@ export function captureSelectionScopeWithKind(
     options?: {
         includeDocTitle?: boolean;
         includeImageTitle?: boolean;
+        includeImageOCR?: boolean;
         includeAttributeView?: boolean;
         includeTable?: boolean;
         includeBlockquote?: boolean;
@@ -1087,6 +1088,7 @@ export function captureSelectionScopeWithKind(
     const blocks = collectSearchableBlocks(edit, {
         includeDocTitle: options?.includeDocTitle !== false,
         includeImageTitle: options?.includeImageTitle !== false,
+        includeImageOCR: options?.includeImageOCR !== false,
         includeAttributeView: options?.includeAttributeView !== false,
         includeTable: options?.includeTable !== false,
         includeBlockquote: options?.includeBlockquote !== false,

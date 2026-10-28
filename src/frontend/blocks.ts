@@ -34,6 +34,7 @@ import {
     type RendererAdapterKind,
 } from "./renderer-adapters";
 import {splitTextNodesAtBarriers} from "./text-runs";
+import {isHiddenTabContent} from "./tabs-visibility";
 import {createDomBlockTypeReader} from "./result-block-types";
 import {AV_FIELD_NAME_PREFIX} from "../shared/av-live";
 import {beginRichCellSnapshot, isSupportedRichCell, richCellHasActiveEditor, richCellSearchRuns, richCellMathBlocks, richCellCodeBlocks} from "./rich-table-cell";
@@ -41,6 +42,7 @@ import {
     beginTextCollection,
     isCollectedTextHidden,
     isAuthorCssHiddenElement,
+    isHiddenOnlyByInactiveTab,
     omitAuthorCssHiddenText,
 } from "./visibility";
 
@@ -267,6 +269,8 @@ export interface CollectSearchableBlocksOptions {
     includeDocTitle?: boolean;
     /** 是否采集图片标题（`.img .protyle-action__title`）；默认 true */
     includeImageTitle?: boolean;
+    /** 是否采集图片 OCR 搜索单元；默认 true；不触发识别。 */
+    includeImageOCR?: boolean;
     /** 是否采集数据库（Attribute View）；默认 true */
     includeAttributeView?: boolean;
     /** 是否采集表格块（NodeTable）；默认 true */
@@ -400,6 +404,7 @@ export function collectSearchableBlocks(
     }
 
     const includeGates: IncludeGates = {
+        includeImageOCR: options.includeImageOCR !== false,
         includeAttributeView,
         includeTable,
         includeBlockquote,
@@ -649,7 +654,7 @@ export function collectSearchableBlocks(
 
         if (blockType === CODE_BLOCK_TYPE) {
             if (codeLanguageSearchEnabled(options) &&
-                (!isAuthorCssHiddenElement(element) || isInactiveTabSourceElement(element)) &&
+                (!isAuthorCssHiddenElement(element) || isHiddenOnlyByInactiveTab(element)) &&
                 !element.closest('.fn__none, [hidden], [aria-hidden="true"]')) {
                 blocks.push(...codeLanguageUnits(element, {blockId, blockType, blockIndex}));
             }
@@ -748,6 +753,7 @@ function collectImageOCRSearchUnits(
     gates?: IncludeGates,
 ): SearchableBlock[] {
     const {blockType} = base;
+    if (gates?.includeImageOCR === false) return [];
     if (![PARAGRAPH_TYPE, HEADING_TYPE, TABLE_TYPE, CALLOUT_TYPE].includes(blockType) ||
         element.closest('[data-type="NodeAttributeView"], [data-type="NodeCustomBlock"], [data-type="NodeHTMLBlock"]')) return [];
     if (gates?.includeTabs === false && element.closest('[data-type="NodeTabs"]')) return [];
@@ -785,7 +791,7 @@ function collectImageOCRSearchUnits(
         // Assign identity before scope/visibility filters, so toggles cannot rebind another picture.
         if (gates && (shouldSkipAttributeUnitByIncludeGates(image, gates) ||
             (cell && shouldSkipRichPreviewByInclude(image, cell, gates)))) continue;
-        if (isAuthorCssHiddenElement(image) && !isInactiveTabSourceElement(image)) continue;
+        if (isAuthorCssHiddenElement(image) && !isHiddenOnlyByInactiveTab(image)) continue;
         const path = (image.getAttribute("data-src") || image.getAttribute("src"))?.trim();
         if (!path) continue;
         units.push({...base, element: image, text: path, textNodes: [], tableSlot,
@@ -908,6 +914,7 @@ function filterFoldedSearchableBlocks(
 
 /** 「是否查找」块级门闩：备注 / 行内公式独立采集时也须遵守 */
 interface IncludeGates {
+    includeImageOCR?: boolean;
     includeTabs?: boolean;
     includeAttributeView: boolean;
     includeTable: boolean;
@@ -2109,15 +2116,14 @@ function hiddenTabsTitleCoveredByLabel(element: HTMLElement): boolean {
 }
 
 /**
- * 页签渲染器保留所有源块，只给非活动项加 data-tabs-hidden="true"，
- * 再由 CSS 把面板隐藏。这个隐藏状态不代表内容不属于文档语料；搜索和
- * 替换都应使用源块，而不是仅依赖当前显示的面板。
+ * 页签渲染器保留所有源块。非活动状态（含尚未渲染的页签）不代表内容
+ * 不属于文档语料；搜索和替换都应使用源块，而不是只采集当前显示的面板。
  */
 export function isInactiveTabSourceElement(element: Element | null): boolean {
     if (!element || element.closest(".tabs-header")) {
         return false;
     }
-    return Boolean(element.closest('.tab-item[data-tabs-hidden="true"]'));
+    return isHiddenTabContent(element);
 }
 
 /**
@@ -2141,22 +2147,7 @@ export function isTabsTitleSearchUnit(block: Pick<SearchableBlock, "element">): 
 }
 
 function shouldKeepHiddenSourceText(node: Text): boolean {
-    const parent = node.parentElement;
-    if (!parent || !isInactiveTabSourceElement(parent)) {
-        return false;
-    }
-    // 不放宽真正的 fn__none/hidden 壳；只放宽 tabsRender 的面板隐藏 CSS。
-    let current: Element | null = parent;
-    while (current && current !== document.body) {
-        if (
-            current.classList.contains("fn__none") || current.hasAttribute("hidden") ||
-            current.getAttribute("aria-hidden") === "true"
-        ) {
-            return false;
-        }
-        current = current.parentElement;
-    }
-    return true;
+    return isHiddenOnlyByInactiveTab(node.parentElement);
 }
 
 /** 把可见的页签标题标签记到原标题块上，高亮才能画在导航栏里。 */

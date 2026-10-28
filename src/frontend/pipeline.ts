@@ -86,6 +86,8 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeDocTitle?: boolean;
     /** 是否匹配图片标题；默认 true；可走块 transaction 替换 */
     includeImageTitle?: boolean;
+    /** 是否匹配思源已有的图片 OCR 文本；默认 true；不可替换。 */
+    includeImageOCR?: boolean;
     /** 是否匹配数据库；默认 true */
     includeAttributeView?: boolean;
     /** 是否匹配表格块；默认 true */
@@ -388,6 +390,7 @@ async function calculateLoadedDomMatches(
                 selectionScope: options.selectionScope,
                 includeDocTitle,
                 includeImageTitle: options.includeImageTitle,
+                includeImageOCR: options.includeImageOCR,
                 includeAttributeView: options.includeAttributeView,
                 includeTable: options.includeTable,
                 includeBlockquote: options.includeBlockquote,
@@ -424,6 +427,7 @@ async function calculateLoadedDomMatches(
     let blocks = collectSearchableBlocks(edit, {
         includeDocTitle,
         includeImageTitle: options.includeImageTitle !== false,
+        includeImageOCR: options.includeImageOCR !== false,
         includeAttributeView: options.includeAttributeView !== false,
         includeTable: options.includeTable !== false,
         includeBlockquote: options.includeBlockquote !== false,

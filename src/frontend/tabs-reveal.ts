@@ -1,7 +1,8 @@
+import {isHiddenTabPanel} from "./tabs-visibility";
+
 /**
- * 思源页签块：未选中的 .tab-item 带 data-tabs-hidden="true"，CSS 为 display:none。
- * 块仍在 DOM 里，高度为 0。跳转若把它当成已显示，就不会切换页签。
- * 只改 tabs-active-id，让页签渲染器自己刷新。不写回属性，避免触发文档事务把橙色高亮冲掉。
+ * 按与搜索相同的判据，由外向内展开非活动页签，兼容隐藏属性尚未生成的状态。
+ * 只改本地页签显示状态，让页签渲染器自己刷新。不写回属性，避免触发文档事务把橙色高亮冲掉。
  * 不点击页签按钮，避免把光标挪到页签开头。
  */
 export function revealHiddenTabs(target: Element | null): boolean {
@@ -13,7 +14,7 @@ export function revealHiddenTabs(target: Element | null): boolean {
     let item = target.closest<HTMLElement>(".tab-item");
     while (item && !seen.has(item)) {
         seen.add(item);
-        if (item.getAttribute("data-tabs-hidden") === "true") {
+        if (isHiddenTabPanel(item)) {
             hidden.push(item);
         }
         item = item.parentElement?.closest<HTMLElement>(".tab-item") ?? null;

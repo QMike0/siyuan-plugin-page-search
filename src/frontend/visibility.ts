@@ -1,5 +1,6 @@
 import {parentElementCrossingShadow} from "./dom-parent";
 import {isUnderNonHeadingCssFold} from "./fold-dom";
+import {isHiddenTabContent, isHiddenTabPanel} from "./tabs-visibility";
 
 interface TextStyle {
     display: string;
@@ -169,6 +170,33 @@ export function isAuthorCssHiddenElement(element: Element | null): boolean {
         current = parentElementCrossingShadow(current);
     }
     return false;
+}
+
+function isNativeInactiveTabDisplayBoundary(element: Element): boolean {
+    const panel = element.classList.contains("tab-item") ? element :
+        element.classList.contains("tab-item-info") ? element.parentElement : null;
+    if (!panel?.classList.contains("tab-item") || !panel.parentElement?.classList.contains("tabs") ||
+        !isHiddenTabPanel(panel) || (element as HTMLElement).style?.display === "none") return false;
+    // SiYuan hides both inactive panels and their source title rows after render.
+    return element === panel || (panel.hasAttribute("data-tabs-hidden") &&
+        panel.getAttribute("data-tabs-editing") !== "true");
+}
+
+/** 只豁免思源隐藏的非活动页签面板，不放宽正文自身或其他祖先的隐藏样式。 */
+export function isHiddenOnlyByInactiveTab(element: Element | null): boolean {
+    if (!element || element.closest(".tabs-header") || !isHiddenTabContent(element) ||
+        (!collectAllowsFoldedHidden && isUnderNonHeadingCssFold(element))) return false;
+    // visibility 会继承；页签渲染器只用 display 隐藏面板。
+    if (textStyle(element).visibilityHidden) return false;
+    let current: Element | null = element;
+    while (current && current !== document.body) {
+        if (current.hasAttribute("data-page-search-offscreen")) break;
+        if (current.classList.contains("fn__none") || current.hasAttribute("hidden") ||
+            current.getAttribute("aria-hidden") === "true") return false;
+        if (textStyle(current).displayHidden && !isNativeInactiveTabDisplayBoundary(current)) return false;
+        current = parentElementCrossingShadow(current);
+    }
+    return true;
 }
 
 /** A mounted hidden block must not be reintroduced via detached kernel DOM. */

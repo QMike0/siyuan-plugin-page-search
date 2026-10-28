@@ -386,13 +386,143 @@ async function main() {
         assert.equal((await search("python", {includeFoldedBlocks: true})).matches.length, 1);
         reset();
         add("b", "c", "print(1)", "python");
-        wysiwyg.innerHTML = '<div data-node-id="tabs" data-type="NodeTabs"><div class="tab-item" data-node-id="item" data-tabs-hidden="true" style="display:none">' + codeDom() + '</div></div>';
-        const inactive = await search("python");
-        full(inactive);
-        assert.equal(inactive.matches.length, 1, "inactive tabs retain code language identity");
-        assert.equal(inactive.matches[0].range, undefined);
-        assert.equal(inactive.matches[0].replaceable, false);
+        const inactiveStyle = document.createElement("style");
+        inactiveStyle.textContent = '.tabs > .tab-item[data-tabs-hidden="true"] {display:none}';
+        document.head.append(inactiveStyle);
+        try {
+            wysiwyg.innerHTML = '<div class="tabs" data-node-id="tabs" data-type="NodeTabs"><div class="tab-item" data-node-id="item" data-tabs-hidden="true">' + codeDom() + '</div></div>';
+            const inactive = await search("python");
+            full(inactive);
+            assert.equal(inactive.matches.length, 1, "inactive tabs retain code language identity");
+            assert.equal(inactive.matches[0].range, undefined);
+            assert.equal(inactive.matches[0].replaceable, false);
+        } finally {
+            inactiveStyle.remove();
+        }
         console.log("Code language: literal/regex cold/live SQL, leading newlines, independent gates, cache, ordering, folds, inactive tabs and readonly OK");
+        {
+            const {isInactiveTabSourceElement, collectSearchableBlocks} = source("frontend/blocks");
+            const {revealHiddenTabs} = source("frontend/tabs-reveal");
+            const panel = (id, content, hidden = "") =>
+                `<div class="tab-item" data-node-id="${id}" data-type="NodeTabItem" ${hidden}>` +
+                `<div class="tab-item-content">${content}</div></div>`;
+            const tabs = (id, active, content, extra = "") =>
+                `<div class="tabs" data-node-id="${id}" data-type="NodeTabs" tabs-active-id="${active}" ${extra}>${content}</div>`;
+            const paragraph = (id) =>
+                `<div data-node-id="${id}" data-type="NodeParagraph"><div contenteditable="true">needle</div></div>`;
+            for (const [active, markers, expected] of [
+                ["y", ["", ""], [true, false]],
+                ["missing", ["", ""], [false, true]],
+                ["", ["", ""], [false, true]],
+                ["y", ['data-tabs-hidden="false"', 'data-tabs-hidden="true"'], [false, true]],
+            ]) {
+                reset();
+                wysiwyg.innerHTML = tabs("tabs", active, panel("x", paragraph("a"), markers[0]) + panel("y", paragraph("b"), markers[1]));
+                assert.deepEqual(["a", "b"].map(id => isInactiveTabSourceElement(wysiwyg.querySelector(`[data-node-id="${id}"]`))),
+                    expected, "native panel state: " + active + "/" + markers);
+                const before = wysiwyg.innerHTML;
+                assert.equal(collectSearchableBlocks(edit).filter(unit => unit.text === "needle").length, 2);
+                assert.equal(wysiwyg.innerHTML, before, "collection never switches tabs or creates runtime attributes");
+            }
+            wysiwyg.innerHTML = tabs("outer", "x", panel("x", "") + panel("y",
+                tabs("inner", "i", panel("i", "", 'data-tabs-hidden="false"') + panel("j", paragraph("b")))));
+            const innerActive = wysiwyg.querySelector('[data-node-id="i"]');
+            assert.equal(isInactiveTabSourceElement(innerActive), true, "rendered inner active panel still checks unrendered outer state");
+            const nestedTarget = wysiwyg.querySelector('[data-node-id="b"]');
+            assert.equal(revealHiddenTabs(nestedTarget), true);
+            assert.equal(isInactiveTabSourceElement(nestedTarget), false);
+            // No persistent visibility cache: both rendered markers and raw selection can change in place.
+            wysiwyg.querySelector('[data-node-id="y"]').removeAttribute("data-tabs-hidden");
+            wysiwyg.querySelector('[data-node-id="outer"]').setAttribute("tabs-active-id", "x");
+            assert.equal(isInactiveTabSourceElement(nestedTarget), true);
+            const style = document.createElement("style");
+            style.textContent = '.tabs > .tab-item[data-tabs-hidden="true"], .tabs[fold="1"] > .tab-item, .fn__none {display:none}' +
+                '.tab-item[data-tabs-hidden]:not([data-tabs-editing="true"]) > .tab-item-info, .author-hide {display:none}';
+            document.head.append(style);
+            try {
+                for (const rendered of [false, true]) {
+                    reset();
+                    const marker = rendered ? 'data-tabs-hidden="true"' : '';
+                    wysiwyg.innerHTML = tabs("tabs", "x", panel("x", paragraph("a"), rendered ? 'data-tabs-hidden="false"' : '') +
+                        panel("y", '<div class="tab-item-info"><div data-node-id="title" data-type="NodeParagraph" tabs-title="true">title-token</div></div>' +
+                            '<div class="tab-item-content"><div data-node-id="b" data-type="NodeParagraph"><div contenteditable="true">' +
+                            'body-token <span style="display:none">inline-hidden</span>' +
+                            '<span class="author-hide"><span>ancestor-hidden</span></span>' +
+                            '<span style="visibility:hidden">visibility-hidden</span>' +
+                            '<span class="fn__none" style="display:none">shell-hidden</span>' +
+                            '<span class="img"><img src="visible.png"></span>' +
+                            '<span style="display:none" class="img"><img src="hidden.png"></span>' +
+                            '</div></div><div data-node-id="code" data-type="NodeCodeBlock" data-subtype="python" style="display:none"></div>' +
+                            '<div data-node-id="shown-code" data-type="NodeCodeBlock" data-subtype="matlab"></div></div>', marker));
+                    const units = collectSearchableBlocks(edit);
+                    const texts = units.map(unit => unit.text);
+                    assert.ok(texts.includes("body-token "), "inactive tab body remains searchable: " + rendered);
+                    assert.ok(texts.includes("title-token"), "native hidden tab title source remains searchable: " + rendered);
+                    for (const hidden of ["inline-hidden", "ancestor-hidden", "visibility-hidden", "shell-hidden", "python", "hidden.png"]) {
+                        assert.ok(!texts.includes(hidden), "author-hidden inactive tab content stays excluded: " + rendered + "/" + hidden);
+                    }
+                    assert.ok(texts.includes("matlab"), "visible code language in inactive tab remains searchable: " + rendered);
+                    assert.ok(texts.includes("visible.png"), "visible image OCR source in inactive tab remains searchable: " + rendered);
+                    const scope = new Map(units.map(unit => [source("frontend/selection").unitKeyOf(unit),
+                        [{start: 0, end: unit.text.length}]]));
+                    const hiddenHit = await source("frontend/pipeline").calculateSearchMatches({}, edit, "inline-hidden", {
+                        selectionOnly: true, selectionScope: scope, includeFoldedBlocks: true,
+                    });
+                    assert.equal(hiddenHit.matches.length, 0, "hidden text cannot become a replaceable result: " + rendered);
+                }
+                for (const mounted of [false, true]) for (const folded of [false, true]) {
+                    reset();
+                    add("tabs", "tabs", "", "", "r", folded ? 'fold="1"' : "");
+                    add("x", "tab_item", "", "", "tabs");
+                    add("y", "tab_item", "", "", "tabs");
+                    add("a", "p", "needle", "", "x");
+                    add("inner", "tabs", "", "", "y");
+                    add("i", "tab_item", "", "", "inner");
+                    add("j", "tab_item", "", "", "inner");
+                    add("b", "p", "needle", "", "i");
+                    add("c", "p", "needle", "", "j");
+                    doms.a = paragraph("a"); doms.b = paragraph("b"); doms.c = paragraph("c");
+                    const html = tabs("tabs", "x", panel("x", doms.a, 'data-tabs-hidden="false"') +
+                        panel("y", tabs("inner", "missing", panel("i", doms.b) + panel("j", doms.c)), 'data-tabs-hidden="true"'),
+                    folded ? 'fold="1"' : "");
+                    if (mounted) wysiwyg.innerHTML = html;
+                    const result = await search("needle");
+                    full(result);
+                    assert.equal(result.matches.length, 3, "all panels indexed: " + mounted + "/" + folded);
+                    const filtered = await search("needle", {includeFoldedBlocks: false});
+                    full(filtered);
+                    assert.equal(filtered.matches.length, folded ? 0 : 3, "inactive and folded gates stay distinct");
+                    assert.equal((await search("needle", {includeTabs: false})).matches.length, 0);
+                    if (!mounted) continue;
+                    const units = collectSearchableBlocks(edit);
+                    const selectionScope = new Map(units.map(unit => [source("frontend/selection").unitKeyOf(unit), [{start: 0, end: unit.text.length}]]));
+                    const fallback = await source("frontend/pipeline").calculateSearchMatches({}, edit, "needle", {
+                        selectionOnly: true, selectionScope, includeFoldedBlocks: true,
+                    });
+                    assert.equal(fallback.matches.length, 3, "loaded-only pipeline retains inactive source matches");
+                    const target = wysiwyg.querySelector('[data-node-id="c"]');
+                    assert.equal(isInactiveTabSourceElement(target), true, "outer inactive panel hides inner descendants");
+                    const reads = domCalls;
+                    const observer = new MutationObserver(() => {});
+                    observer.observe(wysiwyg, {subtree: true, attributes: true, childList: true, characterData: true});
+                    assert.equal(revealHiddenTabs(target), true, "navigation reveals both outer and unrendered inner panels");
+                    assert.equal(wysiwyg.querySelector('[data-node-id="tabs"]').getAttribute("tabs-active-id"), "y");
+                    assert.equal(wysiwyg.querySelector('[data-node-id="inner"]').getAttribute("tabs-active-id"), "j");
+                    assert.equal(isInactiveTabSourceElement(target), false);
+                    const changes = observer.takeRecords();
+                    observer.disconnect();
+                    assert.ok(changes.every(change => change.type === "attributes" &&
+                        ["tabs-active-id", "data-tabs-hidden"].includes(change.attributeName)), "reveal only updates native tab display state");
+                    assert.equal(changes[0].target.getAttribute("data-node-id"), "tabs", "outer panel activates first");
+                    assert.equal(revealHiddenTabs(target), false, "already active navigation is a no-op");
+                    assert.equal(domCalls, reads, "reveal requires no kernel reads");
+                    assert.equal(target.textContent, "needle");
+                }
+            } finally {
+                style.remove();
+            }
+            console.log("Tabs: unrendered/invalid selection, rendered precedence, nested reveal, full/cold coverage and folded gates OK");
+        }
         for (const mounted of ["none", "partial", "full", "folded"]) {
             reset();
             add("a", "h", "A", "", "r", mounted === "folded" ? 'fold="1"' : "");

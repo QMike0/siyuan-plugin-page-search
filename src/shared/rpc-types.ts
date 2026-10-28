@@ -50,6 +50,8 @@ export interface PluginPrefs {
      * 可替换：写回可见标题并同步思源的 img[data-title]，走块 transaction，可 Ctrl+Z。
      */
     includeImageTitle: boolean;
+    /** 是否搜索思源已有的图片 OCR 文本；默认 true；只读。 */
+    includeImageOCR: boolean;
     /** 是否匹配文档内数据库（Attribute View）；默认 true */
     includeAttributeView: boolean;
     /** 是否匹配表格块（NodeTable）；默认 true */
@@ -159,6 +161,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     lastQuery: "",
     includeDocTitle: true,
     includeImageTitle: true,
+    includeImageOCR: true,
     includeAttributeView: true,
     includeTable: true,
     includeBlockquote: true,
@@ -204,6 +207,7 @@ export function coercePluginPrefs(
         lastQuery: typeof base.lastQuery === "string" ? base.lastQuery : "",
         includeDocTitle: base.includeDocTitle !== false,
         includeImageTitle: base.includeImageTitle !== false,
+        includeImageOCR: base.includeImageOCR !== false,
         includeAttributeView: base.includeAttributeView !== false,
         includeTable: base.includeTable !== false,
         includeBlockquote: base.includeBlockquote !== false,
@@ -255,6 +259,9 @@ export function mergePrefs(
         includeImageTitle: patch.includeImageTitle !== undefined ?
             patch.includeImageTitle :
             base.includeImageTitle,
+        includeImageOCR: patch.includeImageOCR !== undefined ?
+            patch.includeImageOCR :
+            base.includeImageOCR,
         includeAttributeView: patch.includeAttributeView !== undefined ?
             patch.includeAttributeView :
             base.includeAttributeView,

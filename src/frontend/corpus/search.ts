@@ -403,6 +403,7 @@ export function invalidateDocumentStructureCaches(rootId?: string, sources?: unk
 function collectionScope(options: SearchPipelineOptions): string {
     const include = [
         options.includeImageTitle !== false,
+        options.includeImageOCR !== false,
         options.includeAttributeView !== false,
         options.includeTable !== false,
         options.includeBlockquote !== false,
@@ -861,6 +862,7 @@ function collectOptions(options: SearchPipelineOptions) {
     return {
         includeDocTitle: options.includeDocTitle !== false,
         includeImageTitle: options.includeImageTitle !== false,
+        includeImageOCR: options.includeImageOCR !== false,
         includeAttributeView: false as const,
         includeTable: options.includeTable !== false,
         includeBlockquote: options.includeBlockquote !== false,
@@ -2224,7 +2226,7 @@ async function searchCurrentDocumentImpl(
         memoOnlyRestriction,
         signal: options.signal,
     });
-    const imageCandidatesPromise = !keepRestrict ?
+    const imageCandidatesPromise = !keepRestrict && options.includeImageOCR !== false ?
         memoizedIds(context.rootId, queryMemoKey(context.rootId, "image-hosts"), meta.signature,
             () => fetchImageCandidateIds(context.rootId, options.signal)).catch((): null => null) :
         Promise.resolve([] as string[]);

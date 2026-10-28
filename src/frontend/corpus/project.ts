@@ -208,6 +208,7 @@ function createRangeProjection(
         skipEmbeddedOrder: true,
         includeDocTitle: options.includeDocTitle !== false,
         includeImageTitle: options.includeImageTitle !== false,
+        includeImageOCR: options.includeImageOCR !== false,
         includeAttributeView: false,
         includeTable: options.includeTable !== false,
         includeBlockquote: options.includeBlockquote !== false,
