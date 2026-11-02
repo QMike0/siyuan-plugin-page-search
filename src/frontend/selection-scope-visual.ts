@@ -1065,6 +1065,7 @@ export function captureSelectionScopeWithKind(
         includeHeadingH5?: boolean;
         includeHeadingH6?: boolean;
         includeMathBlock?: boolean;
+        searchMathSource?: boolean;
         includeEmbedBlock?: boolean;
         includeCodeBlock?: boolean;
         includeCodeLanguage?: boolean;
@@ -1107,6 +1108,7 @@ export function captureSelectionScopeWithKind(
         includeHeadingH5: options?.includeHeadingH5 !== false,
         includeHeadingH6: options?.includeHeadingH6 !== false,
         includeMathBlock: options?.includeMathBlock !== false,
+        searchMathSource: options?.searchMathSource === true,
         includeEmbedBlock: options?.includeEmbedBlock !== false,
         includeCodeBlock: options?.includeCodeBlock !== false,
         includeCodeLanguage: codeLanguageSearchEnabled(options ?? {}),

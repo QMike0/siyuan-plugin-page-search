@@ -1,5 +1,6 @@
 import {isFrameHighlight, isImageOCRUnit} from "../shared/image-ocr";
-import {applyCodeLanguageVisual, clearCodeLanguageVisual, codeLanguageFrameHost} from "./code-language-visual";
+import {isTableMathSourceUnit} from "../shared/math-search";
+import {applyCodeLanguageVisual, clearCodeLanguageVisual, codeLanguageFrameHost, focusedFrameHost, frameHighlightHost, mathSourceFrameHost, pulseFrameFocus} from "./code-language-visual";
 import type {
     IMenu,
     Plugin,
@@ -42,7 +43,6 @@ import {
 } from "./av-watch";
 import {
     collectSearchableBlocks,
-    collectMindmapPreviewUnits,
     resolveDocRoot,
     findDocumentBlock,
     TABLE_TYPE,
@@ -153,6 +153,7 @@ import {
 } from "./search-history";
 import {
     cloneSelectionScope,
+    remapMathSelectionScope,
     getSelectionScope,
     mergeSelectionScopes,
     refreshWholeAttributeViewSelectionScope,
@@ -439,6 +440,8 @@ export interface SearchBarI18n {
     settingsIncludeHeadingH5: string;
     settingsIncludeHeadingH6: string;
     settingsIncludeMathBlock: string;
+    settingsSearchMathSource: string;
+    settingsSearchMathSourceHint: string;
     settingsIncludeEmbedBlock: string;
     settingsIncludeCodeBlock: string;
     settingsIncludePlainCodeBlock: string;
@@ -517,6 +520,7 @@ export interface SearchBarHost {
     syncIncludeHeadingLevel?(level: HeadingIncludeLevel, value: boolean, source?: SearchBar): void;
     /** 将公式块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeMathBlock?(value: boolean, source?: SearchBar): void;
+    syncSearchMathSource?(value: boolean, source?: SearchBar): void;
     /** 将嵌入块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
     syncIncludeEmbedBlock?(value: boolean, source?: SearchBar): void;
     /** 将代码块匹配开关同步到其它已打开的搜索面板（不写 prefs） */
@@ -738,6 +742,7 @@ export class SearchBar {
     private includeHeadingH6 = true;
     /** 是否匹配公式块；全局 prefs，默认 true（不含行内公式） */
     private includeMathBlock = true;
+    private searchMathSource = false;
     /** 是否匹配嵌入块；全局 prefs，默认 true */
     private includeEmbedBlock = true;
     /** 是否匹配普通代码块正文；全局 prefs，默认 true */
@@ -829,6 +834,7 @@ export class SearchBar {
     /** 备注虚线下划线几何同步（叠加层随滚动重绘） */
     private stopMemoUnderlineLayoutSync: (() => void) | null = null;
     private memoUnderlineLayoutRaf = 0;
+    private pendingFrameFocusPulse: {host: HTMLElement; matchId: string; generation: number;} | null = null;
     /** 当前打开的齿轮设置菜单（关闭搜索窗时一并关掉） */
     private settingsMenu: Menu | null = null;
     /** 关键字 / 正则表达式方法菜单（对齐官方搜索 method 菜单） */
@@ -935,6 +941,7 @@ export class SearchBar {
         includeHeadingH6?: boolean;
         /** 是否匹配公式块（来自全局 prefs；不含行内公式） */
         includeMathBlock?: boolean;
+        searchMathSource?: boolean;
         /** 是否匹配嵌入块（来自全局 prefs） */
         includeEmbedBlock?: boolean;
         /** 是否匹配代码块（来自全局 prefs） */
@@ -989,6 +996,7 @@ export class SearchBar {
         this.includeHeadingH5 = options.includeHeadingH5 !== false;
         this.includeHeadingH6 = options.includeHeadingH6 !== false;
         this.includeMathBlock = options.includeMathBlock !== false;
+        this.searchMathSource = options.searchMathSource === true;
         this.includeEmbedBlock = options.includeEmbedBlock !== false;
         this.includeCodeBlock = options.includeCodeBlock !== false;
         this.includeCodeLanguage = (options.includeCodeLanguage ?? options.includeCodeBlock) !== false;
@@ -1928,6 +1936,7 @@ export class SearchBar {
                 includeHeadingH5: this.includeHeadingH5,
                 includeHeadingH6: this.includeHeadingH6,
                 includeMathBlock: this.includeMathBlock,
+                searchMathSource: this.searchMathSource,
                 includeEmbedBlock: this.includeEmbedBlock,
                 includeCodeBlock: this.includeCodeBlock,
                 includeCodeLanguage: this.includeCodeLanguage,
@@ -1975,6 +1984,7 @@ export class SearchBar {
             includeHeadingH5: this.includeHeadingH5,
             includeHeadingH6: this.includeHeadingH6,
             includeMathBlock: this.includeMathBlock,
+            searchMathSource: this.searchMathSource,
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
             includeCodeLanguage: this.includeCodeLanguage,
@@ -2028,6 +2038,7 @@ export class SearchBar {
                     includeHeadingH5: this.includeHeadingH5,
                     includeHeadingH6: this.includeHeadingH6,
                     includeMathBlock: this.includeMathBlock,
+                    searchMathSource: this.searchMathSource,
                     includeEmbedBlock: this.includeEmbedBlock,
                     includeCodeBlock: this.includeCodeBlock,
                     includeCodeLanguage: this.includeCodeLanguage,
@@ -2371,12 +2382,7 @@ export class SearchBar {
         const previous = this.getCurrentMatch();
         this.resultIndex = index + 1;
         this.updateCountLabel(false);
-        const next = this.resultMatches[index];
-        this.scrollIntoRanges(
-            index,
-            true,
-            shouldPulseMemoFocusOnNavigate(previous, next),
-        );
+        this.navigateToMatch(index, previous);
     }
 
     private onResultsPanelClick(event: MouseEvent) {
@@ -2912,6 +2918,7 @@ export class SearchBar {
             includeHeadingH5: this.includeHeadingH5,
             includeHeadingH6: this.includeHeadingH6,
             includeMathBlock: this.includeMathBlock,
+            searchMathSource: this.searchMathSource,
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
             includeCodeLanguage: this.includeCodeLanguage,
@@ -3070,6 +3077,7 @@ export class SearchBar {
     }
 
     private clearHighlight() {
+        this.pendingFrameFocusPulse = null;
         this.resultHighlightPending = false;
         this.highlightPaintGeneration = (this.highlightPaintGeneration ?? 0) + 1;
         this.componentHighlights?.clear();
@@ -3093,6 +3101,23 @@ export class SearchBar {
         const codeFocus = this.getCurrentMatch();
         try {
             applyCodeLanguageVisual(this.edit, codeRanges, (codeFocus && isFrameHighlight(codeFocus)) ? codeFocus.range : null);
+            const pending = this.pendingFrameFocusPulse;
+            if (pending) {
+                if (
+                    this.destroyed || pending.generation !== this.searchGeneration ||
+                    codeFocus?.id !== pending.matchId || !isFrameHighlight(codeFocus) ||
+                    !pending.host.isConnected || !this.edit.contains(pending.host)
+                ) {
+                    this.pendingFrameFocusPulse = null;
+                } else if (codeFocus?.range) {
+                    const host = frameHighlightHost(codeFocus.range);
+                    // Wait for binding and a visible frame. All existing locate/repair
+                    // paths reach this draw, without extra polling or requests.
+                    if (host && (host !== pending.host || pulseFrameFocus(this.edit))) {
+                        this.pendingFrameFocusPulse = null;
+                    }
+                }
+            }
         } catch (error) {
             console.warn("[page-search] block frame highlight failed", error);
         }
@@ -3407,6 +3432,10 @@ export class SearchBar {
     private logicalRowOfMatch(match: SearchMatch): number | null {
         if (match.blockType !== TABLE_TYPE) {
             return null;
+        }
+        if (isTableMathSourceUnit(match) && match.tableSlot) {
+            const row = match.tableSlot.row;
+            return Number.isInteger(row) && row >= 0 ? row : null;
         }
         const position = tableCellPosition(match.unitId);
         if (!position) {
@@ -3731,7 +3760,7 @@ export class SearchBar {
                 ?.scrollIntoView({block: "center", inline: "nearest"});
             return;
         }
-        if (shown && existing && match.blockType === TABLE_TYPE && tableCellPosition(match.unitId)) {
+        if (shown && existing && this.logicalRowOfMatch(match) !== null) {
             const serial = ++this.tableRevealSerial;
             void this.revealVirtualTableMatch(index, match, existing, serial);
             return;
@@ -4023,7 +4052,15 @@ export class SearchBar {
         if (!match?.blockId || !(this.edit instanceof HTMLElement) || !this.edit.querySelector(".mindmap-view")) {
             return false;
         }
-        const units = collectMindmapPreviewUnits([this.edit]).filter((unit) => unit.blockId === match.blockId);
+        // Both formula modes need independent units and current include gates,
+        // matching full collection rather than generic canvas text runs.
+        const units = collectSearchableBlocks(this.edit, {
+            ...this.searchCollectOptions(),
+            includeDocTitle: false,
+            scopeRoots: Array.from(this.edit.querySelectorAll<HTMLElement>(".mindmap-view"))
+                .filter(view => !view.parentElement?.closest(".mindmap-view")),
+            skipEmbeddedOrder: true,
+        }).filter((unit) => unit.blockId === match.blockId);
         if (!units.length) {
             return false;
         }
@@ -4149,6 +4186,7 @@ export class SearchBar {
             includeHeadingH5: this.includeHeadingH5,
             includeHeadingH6: this.includeHeadingH6,
             includeMathBlock: this.includeMathBlock,
+            searchMathSource: this.searchMathSource,
             includeEmbedBlock: this.includeEmbedBlock,
             includeCodeBlock: this.includeCodeBlock,
             includeCodeLanguage: this.includeCodeLanguage,
@@ -4606,8 +4644,23 @@ export class SearchBar {
         }, 0);
     }
 
-    private scrollIntoRanges(index: number, scroll: boolean = true, pulseMemoFocus = false) {
-        void this.scrollIntoRangesAsync(index, scroll, pulseMemoFocus);
+    /** Remember the last drawn host while asynchronous locating binds the next hit. */
+    private navigateToMatch(index: number, previous: SearchMatch | null | undefined) {
+        const next = this.resultMatches[index];
+        let host: HTMLElement | null = null;
+        if (previous && next && isFrameHighlight(previous) &&
+            previous.highlightKind === next.highlightKind && previous.id !== next.id) {
+            const pending = this.pendingFrameFocusPulse;
+            host = focusedFrameHost(this.edit) ?? (previous.range ? frameHighlightHost(previous.range) : null) ??
+                (pending && pending.generation === this.searchGeneration ? pending.host : null);
+        }
+        this.pendingFrameFocusPulse = host?.isConnected && this.edit.contains(host) ?
+            {host, matchId: next.id, generation: this.searchGeneration} : null;
+        this.scrollIntoRanges(index, true, shouldPulseMemoFocusOnNavigate(previous, next));
+    }
+
+    private scrollIntoRanges(index: number, scroll: boolean = true, pulseHostFocus = false) {
+        void this.scrollIntoRangesAsync(index, scroll, pulseHostFocus);
     }
 
     /**
@@ -4619,7 +4672,7 @@ export class SearchBar {
         const blockId = match.blockId;
         let node: Node;
         try {
-            node = range.startContainer;
+            node = match.highlightKind === "math-source" ? mathSourceFrameHost(range) ?? range.startContainer : range.startContainer;
             if (!node?.isConnected) {
                 return false;
             }
@@ -4654,7 +4707,7 @@ export class SearchBar {
     }
 
     /** 重搜一遍再跳到当前序号。重搜期间用户继续翻页时，以最后的序号为准。 */
-    private async refreshStaleMatch(pulseMemoFocus: boolean) {
+    private async refreshStaleMatch(pulseHostFocus: boolean) {
         if (this.staleRefreshPending) {
             return;
         }
@@ -4665,7 +4718,7 @@ export class SearchBar {
             this.staleRefreshPending = false;
         }
         if (this.resultIndex >= 1 && this.resultIndex <= this.resultMatches.length) {
-            await this.scrollIntoRangesAsync(this.resultIndex - 1, true, pulseMemoFocus, false, false);
+            await this.scrollIntoRangesAsync(this.resultIndex - 1, true, pulseHostFocus, false, false);
         }
     }
 
@@ -4755,7 +4808,7 @@ export class SearchBar {
     private async scrollIntoRangesAsync(
         index: number,
         scroll: boolean = true,
-        pulseMemoFocus = false,
+        pulseHostFocus = false,
         immediate = false,
         refreshStale = true,
         allowNativeAvLocate = true,
@@ -4802,7 +4855,7 @@ export class SearchBar {
                 this.matchBlockShown(match) &&
                 !this.tableMatchRowVirtualizedAway(match)
             ) {
-                await this.refreshStaleMatch(pulseMemoFocus);
+                await this.refreshStaleMatch(pulseHostFocus);
                 return;
             }
         }
@@ -4891,7 +4944,7 @@ export class SearchBar {
         this.syncMemoUnderlineVisual();
         // 异步展开折叠后索引可能已变；仅当仍停在本次目标命中时才脉冲
         if (
-            pulseMemoFocus &&
+            pulseHostFocus &&
             match.highlightKind === "inline-memo" &&
             this.getCurrentMatch()?.id === match.id
         ) {
@@ -4922,12 +4975,7 @@ export class SearchBar {
             this.resultIndex = this.resultCount;
         }
         this.updateCountLabel(true);
-        const nextMatch = this.resultMatches[this.resultIndex - 1];
-        this.scrollIntoRanges(
-            this.resultIndex - 1,
-            true,
-            shouldPulseMemoFocusOnNavigate(prevMatch, nextMatch),
-        );
+        this.navigateToMatch(this.resultIndex - 1, prevMatch);
     }
 
     private clickNext() {
@@ -4941,12 +4989,7 @@ export class SearchBar {
             this.resultIndex = 1;
         }
         this.updateCountLabel(true);
-        const nextMatch = this.resultMatches[this.resultIndex - 1];
-        this.scrollIntoRanges(
-            this.resultIndex - 1,
-            true,
-            shouldPulseMemoFocusOnNavigate(prevMatch, nextMatch),
-        );
+        this.navigateToMatch(this.resultIndex - 1, prevMatch);
     }
 
     private clickClose() {
@@ -5907,6 +5950,14 @@ export class SearchBar {
             },
         });
         menu.addItem(this.buildMatchSwitchMenuItem({
+            id: "page-search-math-source",
+            icon: "iconMath",
+            label: this.i18n.settingsSearchMathSource,
+            checked: this.searchMathSource,
+            helpTip: this.i18n.settingsSearchMathSourceHint,
+            onChange: (checked) => { void this.setSearchMathSource(checked); },
+        }));
+        menu.addItem(this.buildMatchSwitchMenuItem({
             id: "page-search-include-folded-blocks",
             icon: "iconContract",
             label: this.i18n.settingsIncludeFoldedBlocks,
@@ -6471,6 +6522,29 @@ export class SearchBar {
         void this.highlightHitResult(this.searchText, true);
     }
 
+    private async setSearchMathSource(value: boolean) {
+        if (this.searchMathSource === value) return;
+        this.applySearchMathSource(value);
+        this.plugin.syncSearchMathSource?.(value, this);
+        await rpcSetPrefs(this.plugin, {searchMathSource: value});
+    }
+
+    applySearchMathSource(value: boolean) {
+        if (this.searchMathSource === value) return;
+        const before = this.selectionOnly ? collectSearchableBlocks(this.edit, this.searchOptions()) : [];
+        const scope = this.selectionOnly ? this.resolveScopeForSearch() : undefined;
+        this.searchMathSource = value;
+        if (scope) {
+            this.rememberedSelectionScope = remapMathSelectionScope(
+                before, collectSearchableBlocks(this.edit, this.searchOptions()), scope,
+                {edit: this.edit, includeImageTitle: this.includeImageTitle},
+            );
+        }
+        this.setOpenMenuSwitch("page-search-math-source", value);
+        // Start now: this also aborts the older matcher before it can paint stale offsets.
+        void this.highlightHitResult(this.searchText, true);
+    }
+
     private async setIncludeMathBlock(value: boolean) {
         if (this.includeMathBlock === value) {
             return;
@@ -6930,8 +7004,7 @@ function escapeAttr(value: string): string {
 }
 
 /**
- * 同一行内备注宿主上、不同属性偏移命中之间导航时，虚线焦点色不变，需短脉冲提示。
- * 仅看 highlightKind + unitId（或 Range 边界）；不碰内容 DOM。
+ * 同一备注宿主内切换命中时，短脉冲提示索引已变；不碰内容 DOM。
  */
 function shouldPulseMemoFocusOnNavigate(
     prev: SearchMatch | null | undefined,

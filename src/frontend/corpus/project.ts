@@ -1,4 +1,5 @@
 import {isImageOCRUnit} from "../../shared/image-ocr";
+import {isTableMathSourceUnit} from "../../shared/math-search";
 import {codeLanguageSearchEnabled} from "../../shared/code-block-language";
 import type {RestrictInlineType} from "../../shared";
 import {avApiUnitId} from "../../shared/av-live";
@@ -227,6 +228,7 @@ function createRangeProjection(
         includeHeadingH5: options.includeHeadingH5 !== false,
         includeHeadingH6: options.includeHeadingH6 !== false,
         includeMathBlock: options.includeMathBlock !== false,
+        searchMathSource: options.searchMathSource === true,
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeCodeLanguage: codeLanguageSearchEnabled(options),
@@ -278,10 +280,11 @@ function createRangeProjection(
     const resolve = (match: SearchMatch): SearchableBlock | undefined => {
         if (isRendererSourceFallbackUnitId(match.unitId)) return undefined;
         let block: SearchableBlock | undefined;
-        // 行级公式的 unitId 是全文采集序号；局部补绑（例如标题展开后）会从 0
+        // 表格源码用稳定的行列标识；其余行级公式的 unitId 是全文采集序号，局部补绑会从 0
         // 重新编号。优先使用所属块内序号和可见文字，避免碰巧相同的 unitId 指向另一条公式。
         if (
-            !match.unitId?.startsWith("embed:") && match.highlightKind === "inline-math" &&
+            !match.unitId?.startsWith("embed:") && (match.highlightKind === "inline-math" || match.highlightKind === "math-source") &&
+            !(match.highlightKind === "math-source" && avApiUnitId(match.unitId)) && !isTableMathSourceUnit(match) &&
             match.mathOrdinal !== undefined &&
             match.mathUnitText !== undefined
         ) {
@@ -483,7 +486,7 @@ const EMBED_BLOCK_SELECTOR = '[data-type="NodeBlockQueryEmbed"]';
  * DOM 重建后按原偏移补 Range。只认偏移处的文字和命中文字一样的格子或块。
  * 文字变了（输入、撤销）不补，保留失效 Range，跳转时仍走重搜。原来亮着的这类命中计入 textChanged。
  * 块已经不在画面上、或文字对上了但不可见的，清掉失效 Range，按未装载命中处理。
- * 行内公式按块内序号和整段可见文字对上，行内备注按宿主位置对上。二者的 unitId 是全文序号，
+ * 除表格源码用稳定行列标识外，行内公式按块内序号和整段可见文字对上，备注按宿主位置对上。二者的 unitId 是全文序号，
  * 只采集改过的那一块时会从 0 重计，直接拿 unitId 会补到别的公式上。
  */
 export function rebindChangedRanges(
@@ -654,7 +657,8 @@ function rankedLiveUnits(
     if (isRendererSourceFallbackUnitId(match.unitId)) return [];
     let list: SearchableBlock[] | undefined;
     if (
-        !match.unitId?.startsWith("embed:") && match.highlightKind === "inline-math" &&
+        !match.unitId?.startsWith("embed:") && (match.highlightKind === "inline-math" || match.highlightKind === "math-source") &&
+        !(match.highlightKind === "math-source" && avApiUnitId(match.unitId)) && !isTableMathSourceUnit(match) &&
         match.mathOrdinal !== undefined &&
         match.mathUnitText !== undefined
     ) {

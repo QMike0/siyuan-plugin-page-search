@@ -1,5 +1,6 @@
 import {isImageOCRUnit} from "../shared/image-ocr";
 import {CODE_LANGUAGE_UNIT_ID, codeLanguageSearchEnabled, isDiagramCodeLanguage} from "../shared/code-block-language";
+import {isMathSourceUnit} from "../shared/math-search";
 import {
     logicalTableRows,
     normalizeRestrictInlineTypes,
@@ -29,6 +30,7 @@ import {
 } from "./fold-dom";
 import {
     collectRendererSearchUnits,
+    diagramSourceText,
     mathSourceFallbackText,
     rendererAdapterKind,
     type RendererAdapterKind,
@@ -316,6 +318,7 @@ export interface CollectSearchableBlocksOptions {
     includeHeadingH6?: boolean;
     /** 是否采集公式块（NodeMathBlock）；默认 true；不含行内公式 */
     includeMathBlock?: boolean;
+    searchMathSource?: boolean;
     /** 是否采集嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
     includeEmbedBlock?: boolean;
     /** 是否采集普通代码块正文；默认 true。不含 Mermaid、flowchart。 */
@@ -422,6 +425,7 @@ export function collectSearchableBlocks(
         includeHeadingH5,
         includeHeadingH6,
         includeMathBlock,
+        searchMathSource: options.searchMathSource === true,
         includeEmbedBlock,
         includeCodeBlock,
         includeCodeLanguage: codeLanguageSearchEnabled(options),
@@ -468,7 +472,7 @@ export function collectSearchableBlocks(
         }
         if (collectMath) {
             blocks.push(...filterAttributeUnitsByIncludeGates(
-                collectInlineMathSearchUnits(docRoot, restrictInlineTypes.length === 0),
+                collectInlineMathSearchUnits(docRoot, restrictInlineTypes.length === 0, options.searchMathSource === true),
                 includeGates,
             ));
         }
@@ -648,7 +652,7 @@ export function collectSearchableBlocks(
                 blockId,
                 blockType,
                 blockIndex,
-            }, rendererKind));
+            }, rendererKind, undefined, options.searchMathSource === true));
             return;
         }
 
@@ -694,7 +698,18 @@ export function collectSearchableBlocks(
         blocks.push(...collectTabsTitleUnits(attributeRoots));
     }
     if (includeMindmap && collectBodyText) {
-        blocks.push(...collectMindmapPreviewUnits(attributeRoots, includeGates, restrictInlineTypes.length === 0, includeImageTitle));
+        const previews = collectMindmapPreviewUnits(attributeRoots, includeGates, restrictInlineTypes.length === 0, includeImageTitle);
+        if (previews.length) {
+            // Body runs and independent formulas must share the source block's
+            // position, even though only the canvas has paintable text.
+            const indexes = new Map<string, number>();
+            blockElements.forEach((element, index) => {
+                const id = element.dataset.nodeId;
+                if (id && !indexes.has(id)) indexes.set(id, index);
+            });
+            for (const unit of previews) unit.blockIndex = indexes.get(unit.blockId) ?? unit.blockIndex;
+        }
+        blocks.push(...previews);
     }
     if (collectMemo) {
         attributeRoots.forEach((root) => {
@@ -707,7 +722,7 @@ export function collectSearchableBlocks(
     if (collectMath) {
         attributeRoots.forEach((root) => {
             blocks.push(...filterAttributeUnitsByIncludeGates(
-                collectInlineMathSearchUnits(root, restrictInlineTypes.length === 0),
+                collectInlineMathSearchUnits(root, restrictInlineTypes.length === 0, options.searchMathSource === true),
                 includeGates,
             ));
         });
@@ -715,8 +730,9 @@ export function collectSearchableBlocks(
 
     // 备注、行内公式、页签标题等独立单元不会经过上面的 blockElements 循环，
     // 因而在统一出口按其实际元素再过滤一次。
+    const ordered = options.searchMathSource ? orderAttributeViewSourceUnits(blocks) : blocks;
     return finishSearchableBlocks(
-        includeCustomBlock ? blocks : blocks.filter((block) =>
+        includeCustomBlock ? ordered : ordered.filter((block) =>
             !block.element.closest(`[data-type="${CUSTOM_BLOCK_TYPE}"]`)),
         includeFoldedBlocks,
         options.preserveEmbedSourceIds === true,
@@ -733,7 +749,7 @@ export function ownEmbeddedSearchUnit(block: SearchableBlock, ownerId: string): 
         isInlineMathSearchUnit(block) && block.blockType !== ATTRIBUTE_VIEW_TYPE &&
         !isRendererSourceFallbackUnitId(block.unitId)
     ) {
-        sourceUnit = `inline-math:${inlineMathIdentityText(block.text)}:${block.mathOrdinal ?? 0}`;
+        sourceUnit = `inline-math:${isMathSourceUnit(block) ? "source:" : ""}${inlineMathIdentityText(block.text)}:${block.mathOrdinal ?? 0}`;
     } else if (isInlineMemoSearchUnit(block)) {
         sourceUnit = `inline-memo:${block.anchorOffset ?? 0}`;
     }
@@ -817,16 +833,20 @@ function shouldSkipRichPreviewByInclude(element: Element, cell: HTMLElement, gat
     return !gates.includeBlockquote && Boolean(element.closest("blockquote"));
 }
 
-/** Only image-containing source blocks/cells need an additional order snapshot.
- * Reuse the bounded target-tree reader: OCR offsets are local to the picture, not body offsets.
+/** Only image/source-math-containing blocks need an additional order snapshot.
+ * Their match offsets are local to the picture/formula, not the surrounding body.
+ * Table cells share this snapshot for body, inline and block formulas;
+ * AV source formulas keep their own cell-order snapshots.
  */
-function recordImageHostOrder(blocks: readonly SearchableBlock[]): void {
+function recordImageAndMathHostOrder(blocks: readonly SearchableBlock[]): void {
     const groups = new Map<HTMLElement, {units: SearchableBlock[]; slot?: TableSlot;}>();
     const hostOf = (block: SearchableBlock) => block.blockType === TABLE_TYPE ?
         block.element.closest<HTMLElement>(TABLE_CELL_SELECTOR) :
         block.element.closest<HTMLElement>('.mindmap-view [data-mindmap-source-id]') ?? getOwnerBlock(block.element);
     for (const block of blocks) {
-        if (!isImageOCRUnit(block) || embeddedOwner(block.element)) continue;
+        const sourceMath = isMathSourceUnit(block) && block.blockType !== ATTRIBUTE_VIEW_TYPE &&
+            (isInlineMathSearchUnit(block) || block.blockType === TABLE_TYPE);
+        if ((!isImageOCRUnit(block) && !sourceMath) || embeddedOwner(block.element)) continue;
         const host = hostOf(block);
         if (host) groups.set(host, {units: [], slot: block.tableSlot});
     }
@@ -856,7 +876,7 @@ function finishSearchableBlocks(
     skipEmbeddedOrder = false,
 ): SearchableBlock[] {
     const filtered = filterFoldedSearchableBlocks(blocks, includeFoldedBlocks);
-    if (!skipEmbeddedOrder) recordImageHostOrder(filtered);
+    if (!skipEmbeddedOrder) recordImageAndMathHostOrder(filtered);
     const readTypes = createDomBlockTypeReader();
     const embedded = new Map<HTMLElement, SearchableBlock[]>();
     const owners = new Map<SearchableBlock, HTMLElement>();
@@ -932,6 +952,7 @@ interface IncludeGates {
     includeHeadingH5: boolean;
     includeHeadingH6: boolean;
     includeMathBlock: boolean;
+    searchMathSource?: boolean;
     includeEmbedBlock: boolean;
     includeCodeBlock: boolean;
     includeCodeLanguage?: boolean;
@@ -950,7 +971,7 @@ type HeadingIncludeGates = Pick<
     | "includeHeadingH4"
     | "includeHeadingH5"
     | "includeHeadingH6"
-> & {includeMathBlock?: boolean; includeCodeBlock?: boolean; includeCodeLanguage?: boolean;};
+> & {searchMathSource?: boolean; includeMathBlock?: boolean; includeCodeBlock?: boolean; includeCodeLanguage?: boolean;};
 
 /** Runtime content coverage must use the same container/type gates as text collection. */
 export function createRendererElementFilter(
@@ -1112,6 +1133,9 @@ export function shouldSkipElementByListInclude(
  * 关表格 / 引述 / 提示 / 嵌入 / 数据库等时，须在此过滤其内部的属性 unit。
  */
 function shouldSkipAttributeUnitByIncludeGates(element: Element, gates: IncludeGates, ignoreCodeBody = false): boolean {
+    if (gates.includeTabs === false && element.closest('[data-type="NodeTabs"]')) {
+        return true;
+    }
     if (!gates.includeCustomBlock && element.closest(`[data-type="${CUSTOM_BLOCK_TYPE}"]`)) {
         return true;
     }
@@ -1198,7 +1222,11 @@ function filterAttributeUnitsByIncludeGates(
     units: SearchableBlock[],
     gates: IncludeGates,
 ): SearchableBlock[] {
-    return units.filter((unit) => !shouldSkipAttributeUnitByIncludeGates(unit.element, gates));
+    return units.filter((unit) => {
+        if (shouldSkipAttributeUnitByIncludeGates(unit.element, gates)) return false;
+        const cell = isInlineMathSearchUnit(unit) ? unit.element.closest<HTMLElement>(RICH_TABLE_CELL_SELECTOR) : null;
+        return !cell || !shouldSkipRichPreviewByInclude(unit.element, cell, gates);
+    });
 }
 
 function isInsideEmbedBlock(element: Element): boolean {
@@ -1542,8 +1570,9 @@ function pushTableCellUnit(
     }
     if (headingGates?.includeMathBlock !== false) {
         for (const [index, math] of richCellMathBlocks(cell).entries()) {
-            if (headingGates && shouldSkipElementByHeadingInclude(math.element, headingGates)) continue;
-            for (const unit of collectRendererSearchUnits(math.element, {blockId, blockType: TABLE_TYPE, blockIndex}, "math", math.source)) {
+            if (headingGates && (shouldSkipAttributeUnitByIncludeGates(math.element, headingGates) ||
+                shouldSkipRichPreviewByInclude(math.element, cell, headingGates))) continue;
+            for (const unit of collectRendererSearchUnits(math.element, {blockId, blockType: TABLE_TYPE, blockIndex}, "math", math.source, headingGates?.searchMathSource === true)) {
                 // Body runs already use stable rich-source coordinates. Keep
                 // math at the same boundary, ahead of the following body run.
                 units.push({...unit, unitId: `${unit.unitId}:${unitId}:${index}#run-${math.offset}`,
@@ -1738,7 +1767,7 @@ function collectAttributeViewSearchUnits(
             avBlock,
             includeImageTitle,
             headingGates,
-            separateInlineMath,
+            separateInlineMath || headingGates?.searchMathSource === true,
         );
         let visible = omitAuthorCssHiddenText(textNodes);
         const fieldName = unitId.startsWith(AV_FIELD_NAME_PREFIX);
@@ -1753,6 +1782,16 @@ function collectAttributeViewSearchUnits(
             element: container,
             unitId,
         };
+        if (headingGates?.searchMathSource && headingGates.includeMathBlock !== false) {
+            container.querySelectorAll<HTMLElement>('div[data-subtype="math"], div.language-math')
+                .forEach((math, ordinal) => {
+                    let hidden = math.closest(".fn__none");
+                    if (hidden && hidden === foldedAttributeViewGroupBody(math)) hidden = hidden.parentElement?.closest(".fn__none") ?? null;
+                    if (hidden || (isAuthorCssHiddenElement(math) && !isHiddenOnlyByInactiveTab(math))) return;
+                    const text = math.hasAttribute("data-content") ? diagramSourceText(math) : math.textContent ?? "";
+                    if (text) units.push({...base, element: math, text, textNodes: [], unitId: `${unitId}:block-math:source:${ordinal}`});
+                });
+        }
         // Preserve mounted-cell coverage even when its text is empty or hidden.
         // Otherwise API values would reintroduce the filtered text.
         if (!text) {
@@ -2044,6 +2083,9 @@ function collectTextNodesInContainer(
             if (!parentElement || parentElement.closest(AV_EXCLUDED_CLOSEST)) {
                 return NodeFilter.FILTER_REJECT;
             }
+            if (headingGates?.searchMathSource && parentElement.closest('div[data-subtype="math"], div.language-math')) {
+                return NodeFilter.FILTER_REJECT;
+            }
             const math = parentElement.closest<HTMLElement>('span[data-type~="inline-math"]');
             if (math) {
                 if (separateInlineMath) return NodeFilter.FILTER_REJECT;
@@ -2079,6 +2121,54 @@ function collectTextNodesInContainer(
 
 /** Detached, inert AV template HTML uses the same exclusions and text runs as live cells. */
 export function attributeViewHtmlTexts(html: string): string[] {
+    return attributeViewHtmlSearchContent(html).texts;
+}
+
+/** Rank only requested anchors in one cell walk, without repeated DOM comparisons or layout reads. */
+function orderCellAnchors<T extends {node: Node;}>(cell: HTMLElement, entries: T[]): T[] {
+    const pending = new Set(entries.map(entry => entry.node));
+    const ranks = new Map<Node, number>();
+    const walker = cell.ownerDocument.createTreeWalker(cell, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let node: Node | null = cell;
+    let rank = 0;
+    while (node && pending.size) {
+        if (pending.delete(node)) ranks.set(node, rank++);
+        node = walker.nextNode();
+    }
+    return entries.sort((a, b) => (ranks.get(a.node) ?? Infinity) - (ranks.get(b.node) ?? Infinity));
+}
+
+/** Independent formula units join their own cell's body runs before navigation ranks are captured. */
+function orderAttributeViewSourceUnits(blocks: SearchableBlock[]): SearchableBlock[] {
+    const cells = new Map<HTMLElement, Array<{node: Node; block: SearchableBlock;}>>();
+    const cellOf = (block: SearchableBlock) => block.element.closest<HTMLElement>(".av__cell, .av__calendar-field");
+    for (const block of blocks) {
+        if (block.blockType !== ATTRIBUTE_VIEW_TYPE || !isMathSourceUnit(block)) continue;
+        const cell = cellOf(block);
+        if (cell && !cells.has(cell)) cells.set(cell, []);
+    }
+    if (!cells.size) return blocks;
+    for (const block of blocks) {
+        if (block.blockType !== ATTRIBUTE_VIEW_TYPE) continue;
+        const cell = cellOf(block);
+        if (cell) cells.get(cell)?.push({node: block.textNodes[0] ?? block.element, block});
+    }
+    const replacements = new Map<SearchableBlock, SearchableBlock[]>();
+    const grouped = new Set<SearchableBlock>();
+    for (const [cell, entries] of cells) {
+        const first = entries[0]?.block;
+        if (!first) continue;
+        entries.forEach(entry => grouped.add(entry.block));
+        replacements.set(first, orderCellAnchors(cell, entries).map(entry => entry.block));
+    }
+    return blocks.flatMap(block => replacements.get(block) ?? (grouped.has(block) ? [] : [block]));
+}
+
+/** Source math remains separate from writable/body coordinates, even in API previews. */
+export function attributeViewHtmlSearchContent(html: string, searchMathSource = false): {
+    texts: string[];
+    sourceUnits?: Array<{text: string; suffix: string; matchSource?: "inline-math";}>;
+} {
     const template = document.createElement("template");
     template.innerHTML = html;
     // Stay in the template's inert document: no custom-element upgrades, scripts or resource loads.
@@ -2086,8 +2176,29 @@ export function attributeViewHtmlTexts(html: string): string[] {
     cell.append(template.content);
     cell.querySelectorAll("textarea, noscript, title, head, template, noembed, noframes, iframe, object, canvas")
         .forEach(element => element.remove());
-    const nodes = omitAuthorCssHiddenText(collectTextNodesInContainer(cell, cell));
-    return splitTextNodesAtBarriers(nodes).map(joinTextNodes).filter(Boolean);
+    let nodes = omitAuthorCssHiddenText(collectTextNodesInContainer(cell, cell, true, undefined, searchMathSource));
+    if (searchMathSource) nodes = nodes.filter(node => !node.parentElement?.closest('div[data-subtype="math"], div.language-math'));
+    const mathSources: Array<{node: Node; text: string; suffix: string; matchSource?: "inline-math";}> = [];
+    if (searchMathSource) {
+        cell.querySelectorAll<HTMLElement>('span[data-type~="inline-math"]').forEach((span, ordinal) => {
+            if (span.closest('.protyle-attr, .fn__none') || isAuthorCssHiddenElement(span)) return;
+            const text = diagramSourceText(span);
+            if (text) mathSources.push({node: span, text, suffix: `:inline-math:source:${ordinal}`, matchSource: "inline-math"});
+        });
+        cell.querySelectorAll<HTMLElement>('div[data-subtype="math"], div.language-math').forEach((math, ordinal) => {
+            if (math.closest('.protyle-attr, .fn__none') || isAuthorCssHiddenElement(math)) return;
+            const text = math.hasAttribute("data-content") ? diagramSourceText(math) : math.textContent ?? "";
+            if (text) mathSources.push({node: math, text, suffix: `:block-math:source:${ordinal}`});
+        });
+    }
+    const runs = splitTextNodesAtBarriers(nodes);
+    const texts = runs.map(joinTextNodes).filter(Boolean);
+    const sourceUnits = mathSources.length ? orderCellAnchors(cell, [
+        ...runs.map((run, index) => ({node: run[0] as Node, text: joinTextNodes(run),
+            suffix: texts.length > 1 ? `#run-${index}` : ""})),
+        ...mathSources,
+    ]).map(({node: _node, ...unit}) => unit) : undefined;
+    return {texts, sourceUnits};
 }
 
 function elementHasBox(element: HTMLElement): boolean {
@@ -2331,9 +2442,10 @@ export function collectMindmapPreviewUnits(roots: HTMLElement[], gates?: Include
             if (!blockId || seen.has(blockId) || preview.closest(".mindmap-view") !== view || preview.closest("[hidden]")) {
                 return;
             }
-            if (!elementHasBox(preview)) {
+            if (!elementHasBox(preview) && !(gates?.searchMathSource && isHiddenOnlyByInactiveTab(preview))) {
                 return;
             }
+            if (gates && shouldSkipAttributeUnitByIncludeGates(preview, gates, true)) return;
             seen.add(blockId);
             const base = {
                 blockId,
@@ -2341,8 +2453,13 @@ export function collectMindmapPreviewUnits(roots: HTMLElement[], gates?: Include
                 blockIndex: 0,
                 element: preview,
             };
+            if (base.blockType === MATH_BLOCK_TYPE) {
+                if (gates?.includeMathBlock !== false) {
+                    units.push(...collectRendererSearchUnits(preview, base, "math", undefined, gates?.searchMathSource === true));
+                }
+                return;
+            }
             if (base.blockType === TABLE_TYPE) {
-                if (gates && shouldSkipAttributeUnitByIncludeGates(preview, gates)) return;
                 const fallback = (unitId: string): string => {
                     const source = sourceBlock(view, blockId);
                     if (!source) return "";
@@ -2361,7 +2478,6 @@ export function collectMindmapPreviewUnits(roots: HTMLElement[], gates?: Include
                 return;
             }
             if (base.blockType === CODE_BLOCK_TYPE && !rendererAdapterKind(preview)) {
-                if (gates && shouldSkipAttributeUnitByIncludeGates(preview, gates, true)) return;
                 if (codeLanguageSearchEnabled(gates ?? {})) {
                     let language = codeLanguageText(preview);
                     if (!language) {
@@ -2399,6 +2515,11 @@ function collectMindmapOwnTextNodes(preview: HTMLElement): Text[] {
                 return NodeFilter.FILTER_REJECT;
             }
             if (parent.closest("[data-mindmap-source-id]") !== preview) {
+                return NodeFilter.FILTER_REJECT;
+            }
+            // Both formula modes have independent units. Their rendered glyphs and
+            // MathML must not leak back into the ordinary canvas text runs.
+            if (parent.closest('span[data-type~="inline-math"], .katex, .katex-html, .katex-mathml, math, annotation')) {
                 return NodeFilter.FILTER_REJECT;
             }
             return NodeFilter.FILTER_ACCEPT;
@@ -2526,10 +2647,11 @@ export function searchOwnerBlock(element: Element): HTMLElement | null {
 interface TableSlotCache {
     rows: Map<HTMLElement, Map<Element, number>>;
     cellText: Map<HTMLElement, Text[]>;
+    cellPositions?: Map<HTMLElement, {index: number; offset: number;}>;
 }
 
-function createTableSlotCache(): TableSlotCache {
-    return {rows: new Map(), cellText: new Map()};
+function createTableSlotCache(inDocumentOrder = false): TableSlotCache {
+    return {rows: new Map(), cellText: new Map(), cellPositions: inDocumentOrder ? new Map() : undefined};
 }
 
 /** 和 collectTableSearchUnits 同一套逻辑行号。占位行不进入这张表。 */
@@ -2579,8 +2701,12 @@ function tableSlotOf(host: HTMLElement, table: HTMLElement, cache: TableSlotCach
         nodes = collectDescendantTextNodes(tableCellTextRoot(cell));
         cache.cellText.set(cell, nodes);
     }
-    let offset = 0;
-    let index = 0;
+    // Frozen memo verification visits hosts in querySelectorAll document order.
+    // Keep only the prefix before the host; leading zero-width descendants may
+    // precede a nested host and must not advance this shared cursor past it.
+    const previous = cache.cellPositions?.get(cell);
+    let offset = previous?.offset ?? 0;
+    let index = previous?.index ?? 0;
     for (; index < nodes.length; index += 1) {
         const node = nodes[index];
         if (host.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_PRECEDING) {
@@ -2589,6 +2715,7 @@ function tableSlotOf(host: HTMLElement, table: HTMLElement, cache: TableSlotCach
         }
         break;
     }
+    cache.cellPositions?.set(cell, {index, offset});
     for (; index < nodes.length; index += 1) {
         const node = nodes[index];
         if (!host.contains(node)) {
@@ -2614,6 +2741,21 @@ export function isPreviewSyntheticBlock(block: SearchableBlock): boolean {
     return isPreviewSyntheticBlockId(block.blockId);
 }
 
+/** Validate frozen memo keys against mounted hosts even while their search gate is off.
+ * Keep the full-document ordinal/embedded ownership rules, but never create body units,
+ * render content or fetch unloaded blocks. Only mode switching calls this fallback. */
+export function collectFrozenMemoSelectionUnits(
+    edit: Element, keys: ReadonlySet<string>, includeImageTitle = true,
+): SearchableBlock[] {
+    const root = resolveDocRoot(edit);
+    if (!root || !keys.size) return [];
+    const ownerIds = new Set(Array.from(keys, key => key.slice(0, key.indexOf("::"))));
+    beginTextCollection(true);
+    return finishSearchableBlocks(
+        collectInlineMemoSearchUnits(root, includeImageTitle, ownerIds), true, false, [], [root], true,
+    ).filter(block => keys.has(`${block.blockId}::${block.unitId ?? ""}`));
+}
+
 /**
  * 采集行内备注：备注正文在 data-inline-memo-content，不在 Text 节点。
  * 每个 span 一个独立单元；高亮时对准宿主 span。
@@ -2621,12 +2763,23 @@ export function isPreviewSyntheticBlock(block: SearchableBlock): boolean {
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/toolbar/InlineMemo.ts
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/block/popover.ts
  */
-function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = true): SearchableBlock[] {
+function collectInlineMemoSearchUnits(
+    docRoot: HTMLElement, includeImageTitle = true, ownerIds?: ReadonlySet<string>,
+): SearchableBlock[] {
     const units: SearchableBlock[] = [];
     // ~= 匹配 data-type 空格分隔 token，避免扫全站 span
     const spans = Array.from(
         docRoot.querySelectorAll<HTMLElement>('span[data-type~="inline-memo"]'),
     );
+    // Keep the full span list for native/global ordinals, but compute text
+    // anchors and table slots only for owners referenced by the frozen scope.
+    const includePreview = ownerIds && Array.from(ownerIds).some(id => id.startsWith(`${PREVIEW_BLOCK_ID}-memo-`));
+    const selectedSpans = ownerIds ? new Set(spans.filter(span => {
+        const owner = embeddedOwner(span) ?? searchOwnerBlock(span);
+        const id = owner?.dataset.nodeId?.trim();
+        return id ? ownerIds.has(id) : includePreview;
+    })) : undefined;
+    if (selectedSpans && !selectedSpans.size) return [];
     const ownerIndexById = new Map<string, number>();
     Array.from(docRoot.querySelectorAll<HTMLElement>("[data-node-id][data-type]")).forEach((el, index) => {
         const id = el.dataset.nodeId?.trim();
@@ -2635,8 +2788,8 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
         }
     });
     const textNodesByOwner = new Map<HTMLElement, Text[]>();
-    const slotCache = createTableSlotCache();
-    const hostSpans = memoHostSpansByOwner(spans, includeImageTitle);
+    const slotCache = createTableSlotCache(Boolean(ownerIds));
+    const hostSpans = memoHostSpansByOwner(selectedSpans ? Array.from(selectedSpans) : spans, includeImageTitle);
     let memoIndex = 0;
 
     for (const span of spans) {
@@ -2649,14 +2802,16 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
         if (!text) {
             continue;
         }
+        const ordinal = memoIndex++;
+        if (selectedSpans && !selectedSpans.has(span)) continue;
 
         const owner = searchOwnerBlock(span);
         const blockId = owner?.dataset.nodeId?.trim() ||
-            `${PREVIEW_BLOCK_ID}-memo-${memoIndex}`;
+            `${PREVIEW_BLOCK_ID}-memo-${ordinal}`;
         const blockType = owner?.dataset.type?.trim() || INLINE_MEMO_BLOCK_TYPE;
         const blockIndex = owner?.dataset.nodeId ?
-            (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? memoIndex) :
-            memoIndex;
+            (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? ordinal) :
+            ordinal;
         const tableSlot = blockType === TABLE_TYPE && owner ? tableSlotOf(span, owner, slotCache) : undefined;
         const hostSpan = owner ?
             (hostSpans.get(owner)?.get(span) ?? memoHostSpan(owner, span, includeImageTitle, textNodesByOwner)) :
@@ -2664,7 +2819,7 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
         // 表格备注用逻辑行列加格内偏移。全文序号在内核整表和画面已挂出行之间对不上。
         const unitId = tableSlot ?
             `table-memo:${tableSlot.row}:${tableSlot.column}:${tableSlot.offset}` :
-            `${INLINE_MEMO_UNIT_PREFIX}${memoIndex}`;
+            `${INLINE_MEMO_UNIT_PREFIX}${ordinal}`;
 
         units.push({
             blockId,
@@ -2679,7 +2834,6 @@ function collectInlineMemoSearchUnits(docRoot: HTMLElement, includeImageTitle = 
             anchorEnd: hostSpan.end,
             tableSlot,
         });
-        memoIndex += 1;
     }
 
     return units;
@@ -2815,7 +2969,7 @@ export function isInlineMemoSearchUnit(block: Pick<SearchableBlock, "matchSource
 }
 
 /**
- * 采集行内公式：优先匹配 KaTeX 渲染字形；离屏/折叠且没有字形时兜底源码。
+ * 采集行内公式：源码模式读 data-content；默认匹配 KaTeX 字形，离屏/折叠无字形时兜底源码。
  * 两种来源使用不同 unitId，源码偏移不能绑定到字形或参与替换。
  * 正文/表格 TreeWalker 仍排除整段 inline-math，避免与独立 unit 重复计数；
  * 表内 / 引述 / 提示等内的公式靠本函数扫到，再由 include* 门闩过滤。
@@ -2823,7 +2977,7 @@ export function isInlineMemoSearchUnit(block: Pick<SearchableBlock, "matchSource
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/render/mathRender.ts
  *   `output: "html"` → 可见在 `.katex-html`；`.katex-mathml` 含源码 annotation，必须排除
  */
-function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews = false): SearchableBlock[] {
+function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews = false, searchMathSource = false): SearchableBlock[] {
     const units: SearchableBlock[] = [];
     const spans = Array.from(
         docRoot.querySelectorAll<HTMLElement>('span[data-type~="inline-math"]'),
@@ -2839,17 +2993,38 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
     const ordinals = new Map<HTMLElement, Map<string, number>>();
     const embeddedOrdinals = new Map<HTMLElement, number>();
     const avCellOrdinals = new Map<HTMLElement, number>();
+    const tableCellOrdinals = new Map<HTMLElement, {root: HTMLElement; next: number;}>();
     let mathIndex = 0;
 
     for (const span of spans) {
-        const owner = searchOwnerBlock(span);
+        // Native canvas clones retain source IDs under another attribute.
+        // Rich-cell descendants still belong to the enclosing table, as in
+        // the source DOM; never assign their formulas to the mindmap container.
+        const preview = span.closest<HTMLElement>('.mindmap-view [data-mindmap-source-id][data-type]');
+        const owner = preview ? preview.closest<HTMLElement>(`[data-type="${TABLE_TYPE}"][data-mindmap-source-id]`) ?? preview :
+            searchOwnerBlock(span);
+        const ownerId = (preview ? owner?.dataset.mindmapSourceId : owner?.dataset.nodeId)?.trim();
         const inAv = owner?.dataset.type === ATTRIBUTE_VIEW_TYPE;
         // Default searches already collect the formula as a cell run.
         // Restricted searches still need an independent attribute unit.
-        if (inAv && skipAttributeViews) continue;
+        if (inAv && skipAttributeViews && !searchMathSource) continue;
         const avCell = inAv ? span.closest<HTMLElement>(".av__cell, .av__calendar-field") : null;
         const avOrdinal = avCell ? avCellOrdinals.get(avCell) ?? 0 : 0;
         if (avCell) avCellOrdinals.set(avCell, avOrdinal + 1);
+        const tableCell = searchMathSource && owner?.dataset.type === TABLE_TYPE ?
+            span.closest<HTMLElement>(TABLE_CELL_SELECTOR) : null;
+        let tableOrdinal: number | undefined;
+        if (tableCell) {
+            let state = tableCellOrdinals.get(tableCell);
+            if (!state) {
+                state = {root: tableCellTextRoot(tableCell), next: 0};
+                tableCellOrdinals.set(tableCell, state);
+            }
+            // An active rich-cell editor replaces its preview as the source.
+            if (!state.root.contains(span)) continue;
+            // Include hidden formulas so visibility gates cannot renumber siblings.
+            tableOrdinal = state.next++;
+        }
         let embeddedOrdinal: number | undefined;
         if (owner && span.closest('[data-type="NodeBlockQueryEmbed"]')) {
             // Include pending/hidden spans in copied formula identity. Completing
@@ -2861,23 +3036,24 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
         if (hidden && hidden === foldedAttributeViewGroupBody(span)) {
             hidden = hidden.parentElement?.closest(".fn__none") ?? null;
         }
-        if (span.closest(".protyle-attr") || hidden || isAuthorCssHiddenElement(span)) {
+        if (span.closest(".protyle-attr") || hidden || (isAuthorCssHiddenElement(span) &&
+            !(searchMathSource && isHiddenOnlyByInactiveTab(span)))) {
             continue;
         }
 
-        const textNodes = omitAuthorCssHiddenText(collectKatexGlyphTextNodes(span));
-        const source = mathSourceFallbackText(span);
+        const textNodes = searchMathSource ? [] : omitAuthorCssHiddenText(collectKatexGlyphTextNodes(span));
+        const source = searchMathSource ? diagramSourceText(span) : mathSourceFallbackText(span);
         const text = source ?? textNodes.map((node) => node.nodeValue ?? "").join("");
         // 仅零宽占位则跳过（思源在公式旁插入 ZWSP）
         if (!text.replace(ZERO_WIDTH_RE, "").length) {
             continue;
         }
 
-        const blockId = owner?.dataset.nodeId?.trim() ||
+        const blockId = ownerId ||
             `${PREVIEW_BLOCK_ID}-math-${mathIndex}`;
         const blockType = owner?.dataset.type?.trim() || INLINE_MATH_BLOCK_TYPE;
-        const blockIndex = owner?.dataset.nodeId ?
-            (ownerIndexById.get(owner.dataset.nodeId.trim()) ?? mathIndex) :
+        const blockIndex = ownerId ?
+            (ownerIndexById.get(ownerId) ?? mathIndex) :
             mathIndex;
         let mathOrdinal = embeddedOrdinal;
         if (owner && embeddedOrdinal === undefined) {
@@ -2891,7 +3067,10 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
             seen.set(visible, mathOrdinal + 1);
         }
 
-        let unitId = source !== null ?
+        const tableSlot = blockType === TABLE_TYPE && owner ? tableSlotOf(span, owner, slotCache) : undefined;
+        let unitId = searchMathSource && tableSlot ?
+            `${INLINE_MATH_UNIT_PREFIX}source:table-cell:${tableSlot.row}:${tableSlot.column}:${tableOrdinal}` :
+            searchMathSource ? `${INLINE_MATH_UNIT_PREFIX}source:${mathIndex}` : source !== null ?
             rendererUnitId("source-fallback", "inline-math", embeddedOrdinal ?? mathIndex) :
             `${INLINE_MATH_UNIT_PREFIX}${mathIndex}`;
         if (avCell) {
@@ -2899,7 +3078,7 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
             const row = avCell.closest<HTMLElement>(".av__row, .av__gallery-item, .av__calendar-item")?.dataset.id;
             const col = avCell.dataset.colId || avCell.dataset.fieldId || avCell.dataset.keyId ||
                 avCell.dataset.avKeyId;
-            if (row && col) unitId = `cell:${group}:${row}:${col}:inline-math:${avOrdinal}`;
+            if (row && col) unitId = `cell:${group}:${row}:${col}:inline-math:${searchMathSource ? "source:" : ""}${avOrdinal}`;
         }
         units.push({
             blockId,
@@ -2910,7 +3089,7 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
             textNodes,
             unitId,
             matchSource: "inline-math",
-            tableSlot: blockType === TABLE_TYPE && owner ? tableSlotOf(span, owner, slotCache) : undefined,
+            tableSlot,
             mathOrdinal,
         });
         mathIndex += 1;

@@ -292,6 +292,7 @@ export async function renderOffscreenBlocks(
     shouldContinue: () => boolean = () => true,
     forceDiagramRender = false,
     acceptsMath: (element: HTMLElement) => boolean = () => true,
+    searchMathSource = false,
 ): Promise<OffscreenMathRecovery | undefined> {
     if (mode === "none" || !shouldContinue()) {
         return;
@@ -302,7 +303,7 @@ export async function renderOffscreenBlocks(
     prepareOffscreenMath(wysiwyg);
     // 只让本次搜索允许的公式进入原生 renderer，避免关闭公式/宿主类型后仍加载 KaTeX。
     const skippedMath = Array.from(wysiwyg.querySelectorAll<HTMLElement>('[data-subtype="math"]'))
-        .filter((element) => !acceptsMath(element));
+        .filter((element) => searchMathSource || !acceptsMath(element));
     skippedMath.forEach((element) => element.removeAttribute("data-subtype"));
     try {
         const state = callRenders(wysiwyg, mode);
@@ -311,7 +312,7 @@ export async function renderOffscreenBlocks(
         });
         const pendingDiagramRenderer = hasDiagram && hasPendingDiagramRenderer(wysiwyg);
         const hasHtml = Boolean(wysiwyg.querySelector("[data-type='NodeHTMLBlock'], protyle-html"));
-        const hasMath = Boolean(wysiwyg.querySelector('[data-subtype="math"], [data-type="NodeMathBlock"]'));
+        const hasMath = !searchMathSource && Boolean(wysiwyg.querySelector('[data-subtype="math"], [data-type="NodeMathBlock"]'));
         // 公式加载有界等待；缺失/失败时立即采源码，避免每批白耗 4 秒。
         // HTML/其余图表仍保持原来的等待预算。
         const timeout = pendingDiagramRenderer ? 2500 : (hasHtml ? 4000 : (hasMath ? MATH_RENDER_TIMEOUT_MS : 0));

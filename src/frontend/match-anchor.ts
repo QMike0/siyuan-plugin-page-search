@@ -1,4 +1,5 @@
 import {avApiUnitId} from "../shared/av-live";
+import {isTableMathSourceUnit} from "../shared/math-search";
 import {containsNodeCrossingShadow} from "./dom-parent";
 import type {SearchMatch} from "./dom-types";
 
@@ -185,10 +186,11 @@ function sameAnchorUnit(match: SearchMatch, previous: SearchMatch, avAlias?: str
     if (match.blockId !== previous.blockId) return false;
     if (previous.embeddedAvViewId !== undefined && match.embeddedAvViewId !== previous.embeddedAvViewId) return false;
     if (
-        !previous.unitId?.startsWith("embed:") && previous.highlightKind === "inline-math" &&
+        !previous.unitId?.startsWith("embed:") && (previous.highlightKind === "inline-math" || previous.highlightKind === "math-source") &&
+        !(previous.highlightKind === "math-source" && avApiUnitId(previous.unitId)) && !isTableMathSourceUnit(previous) &&
         previous.mathOrdinal !== undefined && previous.mathUnitText !== undefined
     ) {
-        return match.highlightKind === "inline-math" && match.mathOrdinal === previous.mathOrdinal &&
+        return (match.highlightKind === "inline-math" || match.highlightKind === "math-source") && match.mathOrdinal === previous.mathOrdinal &&
             match.mathUnitText === previous.mathUnitText && !match.unitId?.startsWith("embed:");
     }
     if (

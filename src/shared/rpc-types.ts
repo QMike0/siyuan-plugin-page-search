@@ -101,6 +101,8 @@ export interface PluginPrefs {
     includeHeadingH6: boolean;
     /** 是否匹配公式块（NodeMathBlock）；默认 true；不含行内公式 */
     includeMathBlock: boolean;
+    /** Search saved TeX instead of rendered math text; read-only, default false. */
+    searchMathSource: boolean;
     /** 是否匹配嵌入块（NodeBlockQueryEmbed）及其内部渲染内容；默认 true */
     includeEmbedBlock: boolean;
     /** 是否匹配普通代码块正文；默认 true。不含 Mermaid、flowchart。 */
@@ -180,6 +182,7 @@ export const DEFAULT_PREFS: PluginPrefs = {
     includeHeadingH5: true,
     includeHeadingH6: true,
     includeMathBlock: true,
+    searchMathSource: false,
     includeEmbedBlock: true,
     includeCodeBlock: true,
     includeCodeLanguage: true,
@@ -226,6 +229,7 @@ export function coercePluginPrefs(
         includeHeadingH5: base.includeHeadingH5 !== false,
         includeHeadingH6: base.includeHeadingH6 !== false,
         includeMathBlock: base.includeMathBlock !== false,
+        searchMathSource: base.searchMathSource === true,
         includeEmbedBlock: base.includeEmbedBlock !== false,
         includeCodeBlock: base.includeCodeBlock !== false,
         includeCodeLanguage: (raw?.includeCodeLanguage ?? raw?.includeCodeBlock) !== false,
@@ -316,6 +320,7 @@ export function mergePrefs(
         includeMathBlock: patch.includeMathBlock !== undefined ?
             patch.includeMathBlock :
             base.includeMathBlock,
+        searchMathSource: patch.searchMathSource !== undefined ? patch.searchMathSource : base.searchMathSource,
         includeEmbedBlock: patch.includeEmbedBlock !== undefined ?
             patch.includeEmbedBlock :
             base.includeEmbedBlock,

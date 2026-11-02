@@ -53,6 +53,8 @@ Here:
 
 **Limit search** temporarily narrows the search to selected inline types, such as links, bold text, code, inline math, or inline memos. Counts, navigation, and replacement scope follow the filter. When an inline type is selected and the search box is empty, the plugin can preview all keywords of that type. These limits reset when the search window closes.
 
+**Search formula source** is off by default, so formulas are searched by their rendered text. Turn it on to search the LaTeX source of inline and block math, excluding outer `$` / `$$` delimiters, such as `\alpha`. Source matches frame the formula in yellow, or orange for the current result. Formulas cannot be replaced.
+
 **Folded block content** controls whether hidden content inside non-heading folded blocks is searched. When enabled, matching content inside folded mind-map child nodes can still be found; when disabled, hidden content is excluded.
 
 For content that is unloaded, folded, or simply outside the viewport, the plugin uses SiYuan source data when available instead of requiring the whole document to be scrolled into view. If the current environment cannot query part of the unloaded content, the search state reports incomplete coverage.

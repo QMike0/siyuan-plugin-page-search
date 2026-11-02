@@ -70,6 +70,8 @@ export interface SearchMatch {
     unitId?: string;
     /** 同一块内的跳转顺序。表格先按格子再按格内位置，数据库先行后列。 */
     unitSeq?: number;
+    /** Formula-source target in an ordinary table, including virtualized rows. */
+    tableSlot?: TableSlot;
     /** 嵌入宿主内部的结构位置；优先于不同子单元各自从零起算的偏移。 */
     embeddedPosition?: readonly number[];
     /** View used by a cold embedded AV snapshot; prevents alias binding after a view switch. */
@@ -85,11 +87,11 @@ export interface SearchMatch {
     /** 行内备注宿主在块文本中的结束位置，不含终点。和 anchorOffset 一起判断正文是否落在这段宿主里。 */
     anchorEnd?: number;
     range?: Range;
-    /** 高亮样式：备注虚线；公式与正文同走 CSS Highlight（有渲染 Text 时按偏移，否则回退宿主） */
-    highlightKind?: "text" | "inline-memo" | "inline-math" | "code-language" | "image-ocr";
+    /** 高亮样式：备注虚线；渲染公式按字形高亮；公式源码、语言标签与 OCR 用宿主外框。 */
+    highlightKind?: "text" | "inline-memo" | "inline-math" | "math-source" | "code-language" | "image-ocr";
     /**
      * 行内公式在所属块里的序号，和 mathUnitText 一起用。
-     * unitId 是全文采集序号，只采集改过的块时会从 0 重计，不能用来补高亮。
+     * 除表格源码的稳定行列标识外，unitId 是全文采集序号，局部采集会从 0 重计。
      */
     mathOrdinal?: number;
     /** 行内公式整段可见文字（去掉零宽字符），与采集 mathOrdinal 时的口径一致。 */

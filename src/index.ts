@@ -550,6 +550,8 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsIncludeHeadingH5: t.settingsIncludeHeadingH5 || "Heading 5 block",
             settingsIncludeHeadingH6: t.settingsIncludeHeadingH6 || "Heading 6 block",
             settingsIncludeMathBlock: t.settingsIncludeMathBlock || "Math block",
+            settingsSearchMathSource: t.settingsSearchMathSource || "Search formula source",
+            settingsSearchMathSourceHint: t.settingsSearchMathSourceHint || "Off: rendered text. On: LaTeX source. Applies to inline and block math; search only.",
             settingsIncludeEmbedBlock: t.settingsIncludeEmbedBlock || "Embed block",
             settingsIncludeCodeBlock: t.settingsIncludeCodeBlock || "Code blocks",
             settingsIncludePlainCodeBlock: t.settingsIncludePlainCodeBlock || "Plain code blocks",
@@ -587,7 +589,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
             settingsRestrictTag: t.settingsRestrictTag || "Tag",
             settingsRestrictInlineMath: t.settingsRestrictInlineMath || "Inline math",
             settingsRestrictInlineMathHint: t.settingsRestrictInlineMathHint ||
-                "Match visible rendered formula text rather than LaTeX source",
+                "Match formula text using the formula search mode in the gear menu",
             settingsRestrictInlineMemo: t.settingsRestrictInlineMemo || "Inline memo",
             settingsRestrictInlineMemoHint: t.settingsRestrictInlineMemoHint ||
                 "Turn on Include in search → Inline memos first",
@@ -740,6 +742,13 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                 return;
             }
             bar.applyIncludeHeadingLevel(level, value);
+        });
+    }
+
+    /** 将公式搜索模式同步到其它已打开面板 */
+    syncSearchMathSource(value: boolean, source?: SearchBar) {
+        this.searchBars.forEach((bar) => {
+            if (bar !== source) bar.applySearchMathSource(value);
         });
     }
 
@@ -1123,6 +1132,7 @@ export default class PluginPageSearch extends Plugin implements SearchBarHost {
                     includeHeadingH5: prefs.includeHeadingH5 !== false,
                     includeHeadingH6: prefs.includeHeadingH6 !== false,
                     includeMathBlock: prefs.includeMathBlock !== false,
+                    searchMathSource: prefs.searchMathSource === true,
                     includeEmbedBlock: prefs.includeEmbedBlock !== false,
                     includeCodeBlock: prefs.includeCodeBlock !== false,
                     includeCodeLanguage: prefs.includeCodeLanguage !== false,

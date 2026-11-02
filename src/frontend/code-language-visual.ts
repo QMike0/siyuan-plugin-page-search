@@ -1,6 +1,8 @@
 /** Frames live outside note content; neither transactions nor undo serialize them. */
 const layers = new WeakMap<Element, HTMLElement>();
 const LAYER = "page-search-code-language-layer";
+const FOCUS_PULSE_MS = 180;
+const focusStates = new WeakMap<Element, {host: HTMLElement | null; pulseStarted?: number;}>();
 const motions = new WeakMap<Element, {
     targets: Set<Element>; observer: MutationObserver; redraw: () => void; raf: number;
 }>();
@@ -44,6 +46,7 @@ function syncMindmapMotion(edit: Element, hosts: Set<HTMLElement>, redraw: () =>
 
 export function clearCodeLanguageVisual(edit: Element): void {
     clearMotionSync(edit);
+    focusStates.delete(edit);
     const layer = layers.get(edit);
     layer?.parentElement?.classList.remove("page-search-code-language-host");
     layer?.remove();
@@ -64,8 +67,34 @@ export function imageOCRFrameHost(range: Range): HTMLElement | null {
     return selected instanceof HTMLElement && selected.tagName === "IMG" ? selected : null;
 }
 
-function frameHost(range: Range): HTMLElement | null {
-    return imageOCRFrameHost(range) ?? codeLanguageFrameHost(range);
+export function mathSourceFrameHost(range: Range): HTMLElement | null {
+    const selected = range.startContainer === range.endContainer && range.endOffset === range.startOffset + 1 ?
+        range.startContainer.childNodes[range.startOffset] : null;
+    const math = selected instanceof HTMLElement && selected.matches(
+        'span[data-type~="inline-math"], div[data-subtype="math"], [data-type="NodeMathBlock"], div.language-math');
+    return math ? selected : null;
+}
+
+export function frameHighlightHost(range: Range): HTMLElement | null {
+    return mathSourceFrameHost(range) ?? imageOCRFrameHost(range) ?? codeLanguageFrameHost(range);
+}
+
+export function focusedFrameHost(edit: Element): HTMLElement | null {
+    return focusStates.get(edit)?.host ?? null;
+}
+
+/** Restart feedback on the current overlay only, without forcing note layout. */
+export function pulseFrameFocus(edit: Element): boolean {
+    const state = focusStates.get(edit);
+    const frame = layers.get(edit)?.querySelector<HTMLElement>(".page-search-code-language-frame.is-focus");
+    if (!state?.host?.isConnected || !edit.contains(state.host) || !frame) return false;
+    state.pulseStarted = window.performance.now();
+    // A fresh overlay node restarts CSS animation even for rapid repeated clicks.
+    const next = frame.cloneNode(false) as HTMLElement;
+    next.classList.add("is-focus-pulse");
+    next.style.animationDelay = "0ms";
+    frame.replaceWith(next);
+    return true;
 }
 
 /** Overlay frames must obey the host's own scrollports, not just the editor viewport.
@@ -104,7 +133,7 @@ function frameClipReader(content: HTMLElement, origin: DOMRect) {
 export function applyCodeLanguageVisual(edit: Element, ranges: readonly Range[], focus?: Range | null): void {
     const hosts = new Set<HTMLElement>();
     for (const range of ranges) {
-        const host = frameHost(range);
+        const host = frameHighlightHost(range);
         if (host?.isConnected && edit.contains(host)) hosts.add(host);
     }
     if (!hosts.size) { clearCodeLanguageVisual(edit); return; }
@@ -125,7 +154,14 @@ export function applyCodeLanguageVisual(edit: Element, ranges: readonly Range[],
     const scaleX = content.offsetWidth > 0 ? origin.width / content.offsetWidth : 1;
     const scaleY = content.offsetHeight > 0 ? origin.height / content.offsetHeight : 1;
     if (!(scaleX > 0 && scaleY > 0)) { layer.replaceChildren(); return; }
-    const focused = focus ? frameHost(focus) : null;
+    const focused = focus ? frameHighlightHost(focus) : null;
+    let state = focusStates.get(edit);
+    if (!state || state.host !== focused) {
+        state = {host: focused};
+        focusStates.set(edit, state);
+    }
+    const elapsed = state.pulseStarted === undefined ? 0 : Math.max(0, window.performance.now() - state.pulseStarted);
+    if (elapsed >= FOCUS_PULSE_MS) delete state.pulseStarted;
     syncMindmapMotion(edit, hosts, () => applyCodeLanguageVisual(edit, ranges, focus));
     const readClip = frameClipReader(content, origin);
     const fragment = content.ownerDocument.createDocumentFragment();
@@ -137,6 +173,12 @@ export function applyCodeLanguageVisual(edit: Element, ranges: readonly Range[],
             rect.right <= clip.left || rect.left >= clip.right || rect.bottom <= clip.top || rect.top >= clip.bottom)) continue;
         const frame = content.ownerDocument.createElement("div");
         frame.className = `page-search-code-language-frame${host === focused ? " is-focus" : ""}`;
+        if (host === focused && state.pulseStarted !== undefined) {
+            frame.classList.add("is-focus-pulse");
+            // Scroll/zoom redraws replace frames. Resume the same pulse instead
+            // of extending it or letting a redraw erase the navigation feedback.
+            frame.style.animationDelay = `${-elapsed}ms`;
+        }
         frame.style.left = `${(rect.left - origin.left) / scaleX + content.scrollLeft - content.clientLeft}px`;
         frame.style.top = `${(rect.top - origin.top) / scaleY + content.scrollTop - content.clientTop}px`;
         frame.style.width = `${rect.width / scaleX}px`;

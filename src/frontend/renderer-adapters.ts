@@ -10,6 +10,7 @@ import {isUnderNonHeadingCssFold} from "./fold-dom";
 import {splitTextNodesAtBarriers} from "./text-runs";
 import {
     isAuthorCssHiddenElement,
+    isHiddenOnlyByInactiveTab,
     omitAuthorCssHiddenText,
 } from "./visibility";
 
@@ -69,11 +70,18 @@ export function collectRendererSearchUnits(
     context: RendererContext,
     kind: RendererAdapterKind | null = rendererAdapterKind(element),
     mathSource?: string,
+    searchMathSource = false,
 ): SearchableBlock[] {
     if (!kind) {
         return [];
     }
     if (kind === "math") {
+        if (searchMathSource) {
+            const text = mathSource ?? diagramSourceText(element);
+            return text && (!isAuthorCssHiddenElement(element) || isHiddenOnlyByInactiveTab(element)) ? [{
+                ...context, element, text, textNodes: [], unitId: rendererUnitId("source", "math"),
+            }] : [];
+        }
         return collectMathUnits(element, context, mathSource);
     }
     if (kind === "html") {

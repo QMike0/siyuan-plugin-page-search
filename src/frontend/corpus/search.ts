@@ -1,3 +1,4 @@
+import {isMathSourceUnit, isTableMathSourceUnit} from "../../shared/math-search";
 import {invalidateImageOCRCache, resolveImageOCRUnits} from "../image-ocr";
 import {isImageOCRUnit} from "../../shared/image-ocr";
 import {codeLanguageSearchEnabled, isCodeLanguageUnit} from "../../shared/code-block-language";
@@ -435,7 +436,7 @@ function collectionScope(options: SearchPipelineOptions): string {
     const restrict = normalizeRestrictInlineTypes(options.restrictInlineTypes, {
         includeInlineMemo: options.includeInlineMemo === true,
     }).join(",");
-    return `${include}|${restrict}`;
+    return `${include}|${restrict}|math:${options.searchMathSource === true ? "source" : "rendered"}`;
 }
 
 function cacheKey(rootId: string, blockId: string, scope: string): string {
@@ -879,6 +880,7 @@ function collectOptions(options: SearchPipelineOptions) {
         includeHeadingH5: options.includeHeadingH5 !== false,
         includeHeadingH6: options.includeHeadingH6 !== false,
         includeMathBlock: options.includeMathBlock !== false,
+        searchMathSource: options.searchMathSource === true,
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeCodeLanguage: codeLanguageSearchEnabled(options),
@@ -2509,6 +2511,7 @@ async function searchCurrentDocumentImpl(
                 return {element, index, key: JSON.stringify([sourceId, inline ? "inline-math" : "block", ordinal])};
             })
             .filter(({element}) =>
+                !(options.searchMathSource && (element.matches('span[data-type~="inline-math"]') || rendererAdapterKind(element) === "math")) &&
                 acceptsRenderer(element) && (
                     element.matches('span[data-type~="inline-math"]') ?
                         Boolean(element.getAttribute("data-content")) && !element.querySelector(".katex-html") :
@@ -2901,7 +2904,7 @@ async function searchCurrentDocumentImpl(
                 if (!id || !liveIds.has(id) || !acceptsRenderer(span)) return;
                 liveInlineMathIds.add(id);
                 if (
-                    !refreshedEmbedIds.has(id) && span.getAttribute("data-content") &&
+                    !options.searchMathSource && !refreshedEmbedIds.has(id) && span.getAttribute("data-content") &&
                     !span.querySelector(".katex-html") && mathSourceFallbackText(span) === null
                 ) {
                     incompleteLive.add(id);
@@ -3329,7 +3332,8 @@ async function searchCurrentDocumentImpl(
                 ...ref,
                 query: readAvSearchQuery(element),
                 ...avDisplayPageSizes(element),
-            } : ref;
+                searchMathSource: options.searchMathSource === true,
+            } : {...ref, searchMathSource: options.searchMathSource === true};
         });
         const avDom = collectAvDomCoverage(liveAll.filter((unit) => mountedAvIds.has(unit.blockId)));
         const usedRowLabels = new Map<string, Set<string>>();
@@ -3347,11 +3351,12 @@ async function searchCurrentDocumentImpl(
         const embeddedCarriers = units.filter((unit) => unit.embeddedAvRef).map(carrier => {
             const sourceId = carrier.unitId?.startsWith("embed:") ? carrier.unitId.split(":")[1] : "";
             const element = mountedEmbeddedAvs.get(`${carrier.blockId}\0${sourceId}`);
-            if (!element) return carrier;
+            if (!element) return {...carrier, embeddedAvRef: {...carrier.embeddedAvRef!, searchMathSource: options.searchMathSource === true}};
             return {
                 ...carrier,
                 embeddedAvRef: {
                     ...carrier.embeddedAvRef!,
+                    searchMathSource: options.searchMathSource === true,
                     query: readAvSearchQuery(element),
                     ...avDisplayPageSizes(element),
                 },
@@ -3397,7 +3402,8 @@ async function searchCurrentDocumentImpl(
             const rank = avLiveRanks.get(block.blockId) ?? 0;
             avLiveRanks.set(block.blockId, rank + 1);
             avNavigationOrder.set(`${block.blockId}\0${block.unitId ?? ""}`, rank);
-            const id = avApiUnitId(block.unitId?.replace(/#run-\d+$/, "").replace(/^group-counter:/, "group-title:"));
+            const alias = avApiUnitId(block.unitId?.replace(/#run-\d+$/, "").replace(/^group-counter:/, "group-title:"));
+            const id = alias && options.searchMathSource ? avSourceCellKey(alias) : alias;
             if (!id) continue;
             const bounds = avBounds.get(block.blockId) ?? new Map();
             const old = bounds.get(id);
@@ -3415,9 +3421,9 @@ async function searchCurrentDocumentImpl(
         }
         for (const [blockId, api] of apiByBlock) {
             const bounds = avBounds.get(blockId)!;
-            const ranks = avApiNavigationRanks(api, bounds);
+            const ranks = avApiNavigationRanks(api, bounds, options.searchMathSource === true);
             api.forEach((unit, index) => {
-                const bound = bounds.get(unit.unitId ?? "");
+                const bound = bounds.get(options.searchMathSource ? avSourceCellKey(unit.unitId ?? "") : unit.unitId ?? "");
                 const rank = ranks[index] ?? index;
                 avNavigationOrder.set(
                     `${blockId}\0${unit.unitId ?? ""}`,
@@ -3477,9 +3483,10 @@ async function searchCurrentDocumentImpl(
             // rank alone would put every API row before every painted row.
             const bounds = new Map<string, {first: number; last: number;}>();
             for (const block of shown) {
-                const id = avApiUnitId(
+                const alias = avApiUnitId(
                     block.unitId?.replace(/#run-\d+$/, "").replace(/^group-counter:/, "group-title:"),
                 );
+                const id = alias && options.searchMathSource ? avSourceCellKey(alias) : alias;
                 const paths = block.embeddedOrder;
                 if (!id || !paths?.length) continue;
                 const first = paths[0].path[0];
@@ -3487,7 +3494,7 @@ async function searchCurrentDocumentImpl(
                 const old = bounds.get(id);
                 bounds.set(id, {first: Math.min(first, old?.first ?? first), last: Math.max(last, old?.last ?? last)});
             }
-            const ranks = avApiNavigationRanks(cached.units, bounds);
+            const ranks = avApiNavigationRanks(cached.units, bounds, options.searchMathSource === true);
             cached.units.forEach((unit, index) => {
                 if (
                     coverage && (
@@ -3543,6 +3550,9 @@ async function searchCurrentDocumentImpl(
     }
 
     if (options.includeAttributeView === false) releaseAvCacheOwner(context.rootId, edit);
+    if (options.searchMathSource && options.includeMathBlock === false) {
+        units = units.filter(unit => !/:block-math:source:\d+$/.test(unit.unitId ?? ""));
+    }
     let tableStale = new Set<string>();
     if (virtualTables.size > 0) {
         const merged = mergeVirtualTableUnits(units, virtualTables);
@@ -3585,7 +3595,7 @@ async function searchCurrentDocumentImpl(
     }
 
     const byKey = new Map<string, CachedUnit>();
-    const navSeq = structuralNavSeq(units, new Set(virtualTables.keys()), avNavigationOrder);
+    const navSeq = structuralNavSeq(units, new Set(virtualTables.keys()), avNavigationOrder, options.searchMathSource === true);
     for (const unit of units) {
         byKey.set(`${unit.blockId}\u0000${unit.unitId ?? ""}`, unit);
     }
@@ -3669,6 +3679,7 @@ async function searchCurrentDocumentImpl(
             blockIndex: orderIndex.get(hit.blockId) ?? (hit.blockId === "__doc-title__" ? -1 : hit.blockIndex),
             unitId: hit.unitId,
             unitSeq: navSeq(unit, hit.start),
+            tableSlot: isTableMathSourceUnit(unit) ? unit.tableSlot : undefined,
             replaceReason: isImageOCRUnit(unit) ? "imageOCR" : isCodeLanguageUnit(unit) ? "codeLanguage" : mountedTabsTitleIds.has(hit.blockId) || unloadedTabsTitleIds.has(hit.blockId) ? "tabsTitle" :
                 unit.matchSource === "projection" && !projectionSourceBacked.has(hit.blockId) ? "preview" :
                 tablePending ? "tablePending" : richSpanBlocked ? "richCell" : undefined,
@@ -3687,7 +3698,7 @@ async function searchCurrentDocumentImpl(
                 hit.replaceable,
             replaceLock,
             highlightKind: unit.highlightKind,
-            ...(unit.highlightKind === "inline-math" && unit.mathOrdinal !== undefined ?
+            ...((unit.highlightKind === "inline-math" || unit.highlightKind === "math-source") && unit.mathOrdinal !== undefined ?
                 {
                     mathOrdinal: unit.mathOrdinal,
                     mathUnitText: inlineMathIdentityText(unit.text),
@@ -3821,6 +3832,7 @@ function structuralNavSeq(
     units: CachedUnit[],
     indexRankedTables: ReadonlySet<string>,
     avNavigationOrder: ReadonlyMap<string, number>,
+    searchMathSource = false,
 ): (unit: CachedUnit, start: number) => number | undefined {
     const seq = new Map<string, number>();
     const rowRank = new Map<string, number>();
@@ -3863,6 +3875,12 @@ function structuralNavSeq(
             return;
         }
         if (avNavigationOrder.has(key)) return;
+        if (searchMathSource) {
+            // API drafts already interleave source formulas and body runs in
+            // native reading order. Keep that order when the whole AV is cold.
+            seq.set(key, index);
+            return;
+        }
         const pos = avMatchPosition(unit.unitId);
         if (!pos) {
             const cursor = nextRow.get(unit.blockId) ?? 0;
@@ -3990,17 +4008,25 @@ function sameStructuralBlock(left: SearchMatch, right: SearchMatch): boolean {
 
 /** Keep missing AV cells inside their own group's DOM interval. Bounds are
  * inserted in DOM order; icon-only titles still have a counter anchor. */
+function avSourceCellKey(unitId: string): string {
+    return unitId.replace(/:(?:inline|block)-math:source:\d+$/, "").replace(/#run-\d+$/, "");
+}
+
 function avApiNavigationRanks(
     api: ReadonlyArray<{unitId?: string;}>,
     bounds: ReadonlyMap<string, {first: number; last: number;}>,
+    searchMathSource = false,
 ): Array<number | undefined> {
     if (!bounds.size) return [];
-    const groups = api.map((unit) => /^(?:av-group|group-title):([^:]+)/.exec(
-        (unit.unitId ?? "").replace(/^field-name:/, ""),
+    // Formula and body units share one cell interval. An API-only row belongs
+    // before the next cell's first run, never between that cell's formulas.
+    const ids = api.map(unit => searchMathSource ? avSourceCellKey(unit.unitId ?? "") : unit.unitId ?? "");
+    const groups = ids.map(id => /^(?:av-group|group-title):([^:]+)/.exec(
+        id.replace(/^field-name:/, ""),
     )?.[1] ?? "");
     const anchoredGroups = new Set<string>();
-    api.forEach((unit, index) => {
-        if (bounds.has(unit.unitId ?? "")) anchoredGroups.add(groups[index]);
+    ids.forEach((id, index) => {
+        if (bounds.has(id)) anchoredGroups.add(groups[index]);
     });
     const nextTitle = new Map<string, number>();
     let lastGroup: string | undefined;
@@ -4020,7 +4046,7 @@ function avApiNavigationRanks(
         // order relative to neighbouring mounted groups instead.
         following[index] = nextByGroup.get(group) ?? nextTitle.get(group) ??
             (!group || !anchoredGroups.has(group) ? next : undefined);
-        const bound = bounds.get(api[index].unitId ?? "");
+        const bound = bounds.get(ids[index]);
         if (bound) {
             nextByGroup.set(group, bound.first);
             next = bound.first;
@@ -4028,9 +4054,9 @@ function avApiNavigationRanks(
     }
     const previousByGroup = new Map<string, number>();
     let last: number | undefined;
-    return api.map((unit, index) => {
+    return ids.map((id, index) => {
         const group = groups[index];
-        const bound = bounds.get(unit.unitId ?? "");
+        const bound = bounds.get(id);
         const groupTitle = group ? bounds.get(`group-title:${group}`) : undefined;
         if (bound) last = bound.last;
         let previous = bound?.last ?? previousByGroup.get(group) ??
@@ -4092,7 +4118,8 @@ function avToCached(
         blockIndex: orderIndex.get(unit.blockId) ?? 0,
         text: unit.text,
         unitId: unit.unitId,
-        highlightKind: "text",
+        highlightKind: isMathSourceUnit(unit) ? "math-source" : "text",
+        matchSource: unit.matchSource,
         restrictSpans: [],
         snippet: unit.snippet,
     };
@@ -4102,9 +4129,9 @@ function dedupeMathUnits(units: CachedUnit[]): CachedUnit[] {
     const seen = new Set<string>();
     const kept: CachedUnit[] = [];
     for (const unit of units) {
-        const isMath = unit.blockType === "NodeMathBlock" ||
+        const isMath = !isMathSourceUnit(unit) && (unit.blockType === "NodeMathBlock" ||
             unit.highlightKind === "inline-math" ||
-            Boolean(unit.unitId?.startsWith("inline-math:"));
+            Boolean(unit.unitId?.startsWith("inline-math:")));
         if (!isMath) {
             kept.push(unit);
             continue;

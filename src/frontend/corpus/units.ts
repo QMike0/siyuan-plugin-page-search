@@ -1,3 +1,4 @@
+import {isMathSourceUnit} from "../../shared/math-search";
 import {isImageOCRUnit} from "../../shared/image-ocr";
 import {isCodeLanguageUnit} from "../../shared/code-block-language";
 import {
@@ -182,7 +183,9 @@ export function freezeBlock(
     const replaceLock = richCell ? richCell.replaceLock :
         tableText ? tableCellReplaceLock(block.element) : undefined;
     let highlightKind: CachedUnit["highlightKind"] = "text";
-    if (isImageOCRUnit(block)) {
+    if (isMathSourceUnit(block)) {
+        highlightKind = "math-source";
+    } else if (isImageOCRUnit(block)) {
         highlightKind = "image-ocr";
     } else if (isCodeLanguageUnit(block)) {
         highlightKind = "code-language";

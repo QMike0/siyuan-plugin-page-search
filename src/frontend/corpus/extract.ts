@@ -170,10 +170,11 @@ function markUnrenderedSpecial(
     inspectInlineMath = true,
     acceptsElement: (element: HTMLElement) => boolean = () => true,
     element = root.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(ownerId)}"]`),
+    searchMathSource = false,
 ): SearchableBlock[] {
     const expectedDiagram = Boolean(expectedDiagramLanguage && DIAGRAM_SUBTYPE_SET.has(expectedDiagramLanguage));
     const failedOutput = Boolean(element?.querySelector(".ft__error"));
-    if (element && rendererAdapterKind(element) === "math" && mathSourceFallbackText(element) !== null) {
+    if (element && rendererAdapterKind(element) === "math" && (searchMathSource || mathSourceFallbackText(element) !== null)) {
         return blocks;
     }
     if (
@@ -197,7 +198,7 @@ function markUnrenderedSpecial(
         }
     }
     if (
-        inspectInlineMath && element &&
+        inspectInlineMath && !searchMathSource && element &&
         Array.from(element.querySelectorAll<HTMLElement>('span[data-type~="inline-math"]')).some((span) =>
             Boolean(span.getAttribute("data-content")) && !span.querySelector(".katex-html") &&
             mathSourceFallbackText(span) === null &&
@@ -320,6 +321,7 @@ export async function extractUnitsFromDoms(
                 shouldContinue,
                 forceDiagramRender,
                 acceptsElement,
+                options.searchMathSource === true,
             );
             if (embedIds.size > 0 && mode === "light" && shouldContinue()) {
                 for (const id of ids) {
@@ -400,6 +402,7 @@ export async function extractUnitsFromDoms(
                         shouldCollectInlineMathUnits(options.restrictInlineTypes),
                         acceptsElement,
                         child,
+                        options.searchMathSource === true,
                     ));
                     owned.forEach((block) => {
                         if (!kept.has(block)) {
@@ -440,6 +443,8 @@ export async function extractUnitsFromDoms(
                 language,
                 mode !== "none" && shouldCollectInlineMathUnits(options.restrictInlineTypes),
                 acceptsElement,
+                owner,
+                options.searchMathSource === true,
             );
             for (const block of rewritten) {
                 const text = block.text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");

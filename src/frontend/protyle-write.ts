@@ -5,6 +5,7 @@ import type {
     Protyle,
 } from "siyuan";
 import {errorDetails, logDebug, logError, logWarning} from "../shared/logger";
+import {isMathSourceUnit} from "../shared/math-search";
 import {
     fetchSyncPost,
     getAllEditor,
@@ -264,7 +265,7 @@ export function countWritableMatches(edit: Element, matches: readonly SearchMatc
 export function isMatchContentWritable(
     match: Pick<SearchMatch, "replaceable" | "blockType" | "blockId" | "unitId">,
 ): boolean {
-    if (!match.replaceable || isImageOCRUnit(match) || isCodeLanguageUnit(match) || match.unitId?.startsWith("embed:") || isDocTitleMatch(match)) {
+    if (!match.replaceable || isMathSourceUnit(match) || isImageOCRUnit(match) || isCodeLanguageUnit(match) || match.unitId?.startsWith("embed:") || isDocTitleMatch(match)) {
         return false;
     }
     if (match.blockType === ATTRIBUTE_VIEW_TYPE || match.blockType === "NodeCustomBlock") {

@@ -5,6 +5,7 @@ import type {
     SearchMatch,
 } from "./dom-types";
 import {locateTextPoint} from "./ranges";
+import {searchableTextLengths} from "./text-runs";
 
 /** Rank the target/ancestor tree only; unrelated SVG subtrees never enter the traversal. */
 export function createEmbeddedPositionReader(
@@ -83,9 +84,10 @@ export function recordEmbeddedOrder(
     const positionOf = createEmbeddedPositionReader(root, targets);
     for (const block of blocks) {
         const order: EmbeddedOrderSegment[] = [];
+        const lengths = block.textStartOffset === undefined ? undefined : searchableTextLengths(block);
         let offset = 0;
-        for (const node of block.textNodes) {
-            const length = node.nodeValue?.length ?? 0;
+        for (const [index, node] of block.textNodes.entries()) {
+            const length = lengths?.[index] ?? node.nodeValue?.length ?? 0;
             if (!length) continue;
             const path = positionOf(node);
             if (path) order.push({start: offset, path});
@@ -159,6 +161,7 @@ export function embeddedOwner(element: Element): HTMLElement | null {
 export function createEmbeddedSourceReader(): (element: Element, sourceId?: string) => string | undefined {
     const sources = new WeakMap<Element, string>();
     const scanned = new WeakSet<HTMLElement>();
+    const previewSources = new WeakMap<Element, Map<string, string>>();
     return (element, sourceId) => {
         const owner = embeddedOwner(element);
         if (!owner || owner === element) return sourceId ?? element.getAttribute("data-node-id") ?? undefined;
@@ -180,6 +183,26 @@ export function createEmbeddedSourceReader(): (element: Element, sourceId?: stri
         const source = sourceId ?
             element.closest(`[data-node-id="${CSS.escape(sourceId)}"][data-type]`) :
             element.closest("[data-node-id][data-type]");
+        const identity = source && sources.get(source);
+        if (identity) return identity;
+        // Native mindmap clones strip data-node-id. Resolve them inside their
+        // own source container, keeping repeated query results distinct. Reuse
+        // the owner's ordinals and cache each container once, not per formula.
+        const preview = sourceId ?
+            element.closest(`[data-mindmap-source-id="${CSS.escape(sourceId)}"][data-type]`) : null;
+        const container = preview?.closest(".mindmap-view")?.closest("[data-node-id][data-type]");
+        if (container && embeddedOwner(container) === owner) {
+            let ids = previewSources.get(container);
+            if (!ids) {
+                ids = new Map();
+                for (const block of container.querySelectorAll<HTMLElement>("[data-node-id][data-type]")) {
+                    const identity = sources.get(block);
+                    if (identity && !ids.has(block.dataset.nodeId!)) ids.set(block.dataset.nodeId!, identity);
+                }
+                previewSources.set(container, ids);
+            }
+            return ids.get(sourceId!) ?? sourceId;
+        }
         return source ? sources.get(source) ?? sourceId : sourceId;
     };
 }

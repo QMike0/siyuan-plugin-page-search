@@ -1,6 +1,6 @@
 import type {SearchableUnit} from "../../shared";
 import {AV_FIELD_NAME_PREFIX, avCellUnitId} from "../../shared/av-live";
-import {attributeViewHtmlTexts} from "../blocks";
+import {attributeViewHtmlSearchContent} from "../blocks";
 import {
     fetchSearchBlockDoms,
     postJson,
@@ -43,6 +43,7 @@ export interface AvBlockRef {
     query?: string;
     /** Current rows exposed by the mounted view. These are UI state, not AV data. */
     pageSize?: number;
+    searchMathSource?: boolean;
     groupPageSizes?: Record<string, number>;
     /** Mounted calendars expose a date grid, not a table row window. */
     calendarRange?: {start: number; end: number; timeZone: string;};
@@ -90,9 +91,11 @@ interface AvCell {
     text: string;
     snippet: string;
     texts?: string[];
+    sourceUnits?: ReturnType<typeof attributeViewHtmlSearchContent>["sourceUnits"];
 }
 
 interface AvUnitDraft {
+    matchSource?: SearchableUnit["matchSource"];
     unitId: string;
     text: string;
     snippet?: string;
@@ -641,6 +644,7 @@ function cellDisplay(
     rowId: string,
     viewName: string,
     columns: ReturnType<typeof columnInfo>,
+    searchMathSource = false,
 ): {itemId: string; keyId: string; cell: AvCell; fieldName?: string;} | null {
     const record = asRecord(cell);
     if (!record) {
@@ -654,16 +658,17 @@ function cellDisplay(
     const column = columns.get(keyId);
     if (column?.hidden) return null;
     const html = displayValueHtml(value, column);
-    const texts = html === undefined ? undefined : attributeViewHtmlTexts(html);
+    const content = html === undefined ? undefined : attributeViewHtmlSearchContent(html, searchMathSource);
+    const texts = content?.texts;
     const text = texts ? texts.join("") : displayValueText(value, column);
     const fieldName = column?.showName && (column.showEmpty || !cardFieldIsEmpty(value, column)) ?
         column.name.trim() : undefined;
-    if (!itemId || !keyId || (!text && !fieldName)) {
+    if (!itemId || !keyId || (!text && !fieldName && !content?.sourceUnits?.length)) {
         return null;
     }
     const columnName = column?.name ?? "";
     const snippet = [viewName, columnName, text].filter(Boolean).join(" · ");
-    return {itemId, keyId, cell: {text, snippet, texts}, fieldName};
+    return {itemId, keyId, cell: {text, snippet, texts, sourceUnits: content?.sourceUnits}, fieldName};
 }
 
 function rowList(view: Record<string, unknown>): unknown[] {
@@ -677,9 +682,10 @@ function absorbRows(
     viewName: string,
     columns: ReturnType<typeof columnInfo>,
     groupId = "nogroup",
+    searchMathSource = false,
 ): void {
     const put = (cell: unknown, rowId: string) => {
-        const parsed = cellDisplay(cell, rowId, viewName, columns);
+        const parsed = cellDisplay(cell, rowId, viewName, columns, searchMathSource);
         if (!parsed) {
             return;
         }
@@ -690,7 +696,7 @@ function absorbRows(
                 snippet: [viewName, parsed.fieldName].filter(Boolean).join(" · "),
             });
         }
-        if (parsed.cell.text) target.set(unitId, parsed.cell);
+        if (parsed.cell.text || parsed.cell.sourceUnits?.length) target.set(unitId, parsed.cell);
     };
     for (const row of rowList(view)) {
         const record = asRecord(row);
@@ -792,7 +798,7 @@ async function renderView(
     target: Map<string, AvCell>,
     shouldContinue: () => boolean,
     signal?: AbortSignal,
-    display?: Pick<AvBlockRef, "pageSize" | "groupPageSizes" | "calendarRange">,
+    display?: Pick<AvBlockRef, "pageSize" | "groupPageSizes" | "calendarRange" | "searchMathSource">,
 ): Promise<{hideAttrViewName: boolean;} | null> {
     if (!shouldContinue()) {
         return null;
@@ -831,7 +837,7 @@ async function renderView(
         let started = performance.now();
         for (let offset = 0; offset < rows.length; offset += PAGE_SIZE) {
             if (!shouldContinue()) return null;
-            absorbRows(target, {...firstView, rows: rows.slice(offset, offset + PAGE_SIZE)}, viewName, columns);
+            absorbRows(target, {...firstView, rows: rows.slice(offset, offset + PAGE_SIZE)}, viewName, columns, "nogroup", display?.searchMathSource);
             if (performance.now() - started >= 8) {
                 await new Promise<void>(resolve => setTimeout(resolve, 0));
                 if (!shouldContinue()) return null;
@@ -861,7 +867,7 @@ async function renderView(
                 seen: new Set(),
                 limit: groupLimit,
                 done: false,
-            }), viewName, columns, group.id);
+            }), viewName, columns, group.id, display?.searchMathSource);
             cellsByGroup.set(group.id, cells);
         }
         for (let round = 0; round < MAX_PAGES; round += 1) {
@@ -919,7 +925,7 @@ async function renderView(
                 }
                 if (requested.has(group.id)) {
                     const page = observePage(group.view, progress);
-                    absorbRows(cellsByGroup.get(group.id)!, page, viewName, columns, group.id);
+                    absorbRows(cellsByGroup.get(group.id)!, page, viewName, columns, group.id, display?.searchMathSource);
                 }
             }
             if (returned.size !== progressByGroup.size) throw new AttributeViewPageError();
@@ -934,7 +940,7 @@ async function renderView(
         seen: new Set(),
         limit,
         done: false,
-    }), viewName, columns);
+    }), viewName, columns, "nogroup", display?.searchMathSource);
     const pageCount = Number(firstView.pageCount ?? 0) || 0;
     while (!progress.done) {
         if (progress.page >= MAX_PAGES) throw new AttributeViewTruncatedError();
@@ -964,7 +970,7 @@ async function renderView(
             throw new AttributeViewPageError();
         }
         const page = observePage(view, progress);
-        absorbRows(target, page, viewName, columns);
+        absorbRows(target, page, viewName, columns, "nogroup", display?.searchMathSource);
     }
     return visibility;
 }
@@ -994,6 +1000,7 @@ function toUnits(blockId: string, drafts: AvUnitDraft[]): Array<SearchableUnit &
         text: draft.text,
         unitId: draft.unitId,
         snippet: draft.snippet,
+        matchSource: draft.matchSource,
     }));
 }
 
@@ -1007,7 +1014,7 @@ export function avSearchRefKey(ref: AvBlockRef, viewId = ref.carrierViewId): str
         JSON.stringify(ref.query ?? "")
     }:window:${
         JSON.stringify([validPageSize(ref.pageSize), groups, range ? [range.start, range.end, range.timeZone] : null])
-    }`;
+    }${ref.searchMathSource ? ":math-source" : ""}`;
 }
 
 function selectedViewId(ref: AvBlockRef, viewIds: ReadonlyMap<string, string>): string {
@@ -1206,6 +1213,14 @@ async function loadAvCarrier(
     }
     if (view?.name) drafts.push({unitId: `av-view:${view.id}`, text: view.name, snippet: view.name});
     for (const [key, cell] of cells) {
+        if (cell.sourceUnits) {
+            for (const unit of cell.sourceUnits) drafts.push({
+                unitId: key + unit.suffix, text: unit.text,
+                snippet: cell.snippet, matchSource: unit.matchSource,
+            });
+            continue;
+        }
+        if (!cell.text) continue;
         if (cell.texts && cell.texts.length > 1) {
             cell.texts.forEach((text, index) => drafts.push({unitId: `${key}#run-${index}`, text, snippet: cell.snippet}));
         } else drafts.push({unitId: key, text: cell.text, snippet: cell.snippet});

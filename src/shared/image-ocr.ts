@@ -10,5 +10,5 @@ export function isImageOCRUnit(unit: {matchSource?: string; highlightKind?: stri
 }
 
 export function isFrameHighlight(unit: {highlightKind?: string;} | undefined): boolean {
-    return unit?.highlightKind === "image-ocr" || unit?.highlightKind === "code-language";
+    return unit?.highlightKind === "image-ocr" || unit?.highlightKind === "code-language" || unit?.highlightKind === "math-source";
 }

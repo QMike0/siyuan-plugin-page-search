@@ -4,6 +4,7 @@
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/assets/scss/component/_typography.scss
  * @see https://github.com/siyuan-note/siyuan/blob/master/app/src/assets/scss/protyle/_wysiwyg.scss
  */
+import {isMathSourceUnit, isTableMathSourceUnit} from "../shared/math-search";
 import {
     INLINE_MATH_TYPE,
     ZERO_WIDTH_GLOBAL_RE,
@@ -72,6 +73,7 @@ interface EnumerateHostCandidate {
     start: number;
     end: number;
     scopeKey: string;
+    tableSlot?: SearchableBlock["tableSlot"];
 }
 
 /**
@@ -139,6 +141,7 @@ export function enumerateRestrictInlineMatches(
         includeHeadingH5,
         includeHeadingH6,
         includeMathBlock,
+        searchMathSource: options.searchMathSource === true,
         includeEmbedBlock,
         includeCodeBlock,
         includeMermaid,
@@ -327,6 +330,7 @@ export function enumerateRestrictInlineMatches(
                 unitId: block.unitId || `restrict-math:${hostSerial}`,
                 text: block.text,
                 matchSource: "inline-math",
+                tableSlot: isTableMathSourceUnit(block) ? block.tableSlot : undefined,
                 start: 0,
                 end: block.text.length,
                 scopeKey: unitKeyOf(block),
@@ -353,7 +357,8 @@ export function enumerateRestrictInlineMatches(
         let range: Range | null = null;
         try {
             range = document.createRange();
-            range.selectNodeContents(candidate.element);
+            if (isMathSourceUnit(candidate)) range.selectNode(candidate.element);
+            else range.selectNodeContents(candidate.element);
         } catch {
             range = null;
         }
@@ -368,12 +373,13 @@ export function enumerateRestrictInlineMatches(
             blockTypes: readBlockTypes({...candidate, textNodes: []}),
             blockIndex: candidate.blockIndex,
             unitId: candidate.unitId,
+            tableSlot: candidate.tableSlot,
             start: candidate.start,
             end: candidate.end,
             matchedText: candidate.text,
             replaceable: false,
             range,
-            highlightKind: candidate.matchSource === "inline-memo" ?
+            highlightKind: isMathSourceUnit(candidate) ? "math-source" : candidate.matchSource === "inline-memo" ?
                 "inline-memo" :
                 (candidate.matchSource === "inline-math" ? "inline-math" : "text"),
             ...buildListSnippet(candidate.text, candidate.start, candidate.end, candidate.text),

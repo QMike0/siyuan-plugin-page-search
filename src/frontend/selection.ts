@@ -1,5 +1,9 @@
+import {isMathSourceUnit} from "../shared/math-search";
+import {CODE_LANGUAGE_UNIT_ID} from "../shared/code-block-language";
+import {isImageOCRUnit} from "../shared/image-ocr";
 import {
     ATTRIBUTE_VIEW_TYPE,
+    collectFrozenMemoSelectionUnits,
     collectTableCellSearchTextNodes,
     isAttributeInlineSearchUnit,
     tableCellSearchRoot,
@@ -603,6 +607,131 @@ export function cloneSelectionScope(scope: SelectionScope): SelectionScope {
     return cloned;
 }
 
+/** Rebind through actual Text nodes/formula hosts when only the representation changes.
+ * Split-run IDs can move to equal text elsewhere. Node intervals keep the frozen
+ * selection exact and avoid comparing every selected formula with every cell run. */
+export function remapMathSelectionScope(
+    before: SearchableBlock[], after: SearchableBlock[], scope: SelectionScope,
+    options: {edit?: Element; includeImageTitle?: boolean;} = {},
+): SelectionScope {
+    const previous = new Map(before.map(block => [unitKeyOf(block), block]));
+    const missingMemos = new Set<string>();
+    if (options.edit) {
+        for (const key of scope.keys()) {
+            if (!previous.has(key) && /::(?:embed:[^:]+:)?(?:inline-memo:\d+|table-memo:\d+:\d+:\d+)$/.test(key)) missingMemos.add(key);
+        }
+    }
+    // Memo ordinals are not enough on their own: verify all missing keys once
+    // against the same mounted hosts/ownership used by ordinary collection.
+    const verifiedMemos = new Set(options.edit && missingMemos.size ?
+        collectFrozenMemoSelectionUnits(options.edit, missingMemos, options.includeImageTitle !== false).map(unitKeyOf) : []);
+    const next: SelectionScope = new Map();
+    const unchanged = new Set<string>();
+    for (const block of after) {
+        const key = unitKeyOf(block);
+        const old = previous.get(key);
+        if (old && old.element === block.element && old.text === block.text &&
+            old.matchSource === block.matchSource && old.textStartOffset === block.textStartOffset &&
+            old.textNodes.length === block.textNodes.length && old.textNodes.every((node, index) => node === block.textNodes[index])) {
+            unchanged.add(key);
+        }
+    }
+    const selectedNodes = new Map<Text, TextOffsetRange[]>();
+    const selectedSources = new Set<HTMLElement>();
+    const selectedMath = new Set<HTMLElement>();
+    const mathHosts = new WeakMap<Node, HTMLElement | null>();
+    const mathHostOf = (node: Node): HTMLElement | null => {
+        if (mathHosts.has(node)) return mathHosts.get(node)!;
+        const element = node instanceof Element ? node : node.parentElement;
+        const host = element?.closest<HTMLElement>(
+            'span[data-type~="inline-math"], [data-type="NodeMathBlock"], div[data-subtype="math"], div.language-math',
+        ) ?? null;
+        mathHosts.set(node, host);
+        return host;
+    };
+    for (const [key, saved] of scope) {
+        const block = previous.get(key);
+        if (!block) {
+            // Type gates and editor-window unloading can hide frozen body runs.
+            // Body runs, language labels and OCR identities exclude formula glyphs, so their saved
+            // offsets stay valid. Formula ordinals and AV cell runs do not.
+            const unitId = key.slice(key.indexOf("::") + 2);
+            const sourceId = unitId.replace(/^embed:[^:]+:/, "");
+            if (verifiedMemos.has(key) || sourceId === CODE_LANGUAGE_UNIT_ID ||
+                /^code-language:table-cell:\d+:\d+(?::[^:]+)?:\d+$/.test(sourceId) || isImageOCRUnit({unitId}) ||
+                /^(?:run-\d+|table-cell:\d+:\d+(?::[^:#]+)?(?:#run-\d+)?|callout-(?:title|owned)(?:#run-\d+)?)?$/.test(unitId)) {
+                next.set(key, saved.map(offset => ({...offset})));
+            }
+            continue;
+        }
+        if (unchanged.has(key)) {
+            next.set(key, saved.map(offset => ({...offset})));
+            continue;
+        }
+        const offsets = mergeTextOffsetRanges(saved);
+        if (!block.textNodes.length) {
+            const host = mathHostOf(block.element);
+            if (host === block.element && offsets.some(offset => offset.start < block.text.length && offset.end > 0)) {
+                selectedSources.add(host);
+                selectedMath.add(host);
+            }
+            continue;
+        }
+        let cursor = 0;
+        let first = 0;
+        for (const [index, node] of block.textNodes.entries()) {
+            const from = index === 0 ? block.textStartOffset ?? 0 : 0;
+            const length = Math.max(0, Math.min(node.length - from, block.text.length - cursor));
+            while (first < offsets.length && offsets[first].end <= cursor) first++;
+            for (let at = first; at < offsets.length && offsets[at].start < cursor + length; at++) {
+                const start = Math.max(0, offsets[at].start - cursor);
+                const end = Math.min(length, offsets[at].end - cursor);
+                if (end <= start) continue;
+                const ranges = selectedNodes.get(node) ?? [];
+                ranges.push({start: from + start, end: from + end});
+                selectedNodes.set(node, ranges);
+                const host = mathHostOf(node);
+                if (host) selectedMath.add(host);
+            }
+            cursor += length;
+        }
+    }
+    for (const [node, ranges] of selectedNodes) selectedNodes.set(node, mergeTextOffsetRanges(ranges));
+    for (const block of after) {
+        const key = unitKeyOf(block);
+        if (unchanged.has(key)) continue;
+        if (!block.textNodes.length) {
+            if (selectedMath.has(block.element) && block.text.length) next.set(key, [{start: 0, end: block.text.length}]);
+            continue;
+        }
+        const offsets: TextOffsetRange[] = [];
+        let cursor = 0;
+        for (const [index, node] of block.textNodes.entries()) {
+            const from = index === 0 ? block.textStartOffset ?? 0 : 0;
+            const length = Math.max(0, Math.min(node.length - from, block.text.length - cursor));
+            const host = mathHostOf(node);
+            const ranges = host && selectedSources.has(host) ? [{start: from, end: from + length}] : selectedNodes.get(node) ?? [];
+            // A rich preview can expose several slices of one Text. Find only
+            // the selected intervals belonging to this slice.
+            let low = 0;
+            let high = ranges.length;
+            while (low < high) {
+                const middle = (low + high) >>> 1;
+                if (ranges[middle].end <= from) low = middle + 1;
+                else high = middle;
+            }
+            for (let at = low; at < ranges.length && ranges[at].start < from + length; at++) {
+                const start = Math.max(from, ranges[at].start) - from;
+                const end = Math.min(from + length, ranges[at].end) - from;
+                if (end > start) offsets.push({start: cursor + start, end: cursor + end});
+            }
+            cursor += length;
+        }
+        if (offsets.length) next.set(key, offsets);
+    }
+    return next;
+}
+
 /** 命中 [start, end) 是否完全落在选区某一段内 */
 export function isMatchWithinSelection(
     key: string,
@@ -644,7 +773,7 @@ export function mergeTextOffsetRanges(ranges: TextOffsetRange[]): TextOffsetRang
 
 function getSelectionScopeFromTextRanges(
     blocks: SearchableBlock[],
-    selection: Selection,
+    selection: Pick<Selection, "rangeCount" | "getRangeAt">,
 ): SelectionScope {
     const scope: SelectionScope = new Map();
 
@@ -823,10 +952,10 @@ export function mergeSelectionScopes(
 
 function getSelectionRangesWithinUnit(
     block: SearchableBlock,
-    selection: Selection,
+    selection: Pick<Selection, "rangeCount" | "getRangeAt">,
 ): TextOffsetRange[] {
     // 备注 / 公式：text 在属性里，无 textNodes；选区与宿主 span 相交则整段属性文本入选
-    if (isAttributeInlineSearchUnit(block)) {
+    if (isAttributeInlineSearchUnit(block) || isMathSourceUnit(block)) {
         return getSelectionRangesForAttributeHost(block, selection);
     }
     if (!block.textNodes.length) {
@@ -856,7 +985,7 @@ function getSelectionRangesWithinUnit(
  */
 function getSelectionRangesForAttributeHost(
     block: SearchableBlock,
-    selection: Selection,
+    selection: Pick<Selection, "rangeCount" | "getRangeAt">,
 ): TextOffsetRange[] {
     if (block.text.length <= 0) {
         return [];

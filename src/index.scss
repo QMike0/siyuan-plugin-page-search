@@ -702,6 +702,21 @@ body.page-search-resizing * {
     border-color: rgb(255 150 50);
 }
 
+.page-search-code-language-frame.is-focus.is-focus-pulse {
+    animation: page-search-frame-focus-pulse 180ms ease-out;
+}
+
+@keyframes page-search-frame-focus-pulse {
+    0%,
+    35% {
+        border-color: rgb(235 205 5);
+    }
+
+    100% {
+        border-color: rgb(255 150 50);
+    }
+}
+
 ::highlight(page-search-results) {
     background-color: rgb(235 235 5);
     color: rgb(0, 0, 0);

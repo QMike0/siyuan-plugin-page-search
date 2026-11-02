@@ -1,3 +1,4 @@
+import {isMathSourceUnit, isTableMathSourceUnit} from "../shared/math-search";
 import {resolveImageOCRUnits} from "./image-ocr";
 import {isImageOCRUnit, imageOCRPath} from "../shared/image-ocr";
 import {codeLanguageSearchEnabled, isCodeLanguageUnit} from "../shared/code-block-language";
@@ -118,6 +119,7 @@ export interface SearchPipelineOptions extends MatchOptions {
     includeHeadingH6?: boolean;
     /** 是否匹配公式块；默认 true；不含行内公式 */
     includeMathBlock?: boolean;
+    searchMathSource?: boolean;
     /** 是否匹配嵌入块及其内部渲染内容；默认 true */
     includeEmbedBlock?: boolean;
     /** 是否匹配普通代码块正文；默认 true。不含 Mermaid、flowchart。 */
@@ -409,6 +411,7 @@ async function calculateLoadedDomMatches(
                 includeHeadingH5: options.includeHeadingH5,
                 includeHeadingH6: options.includeHeadingH6,
                 includeMathBlock: options.includeMathBlock,
+                searchMathSource: options.searchMathSource === true,
                 includeEmbedBlock: options.includeEmbedBlock,
                 includeCodeBlock: options.includeCodeBlock,
                 includeCodeLanguage: options.includeCodeLanguage,
@@ -446,6 +449,7 @@ async function calculateLoadedDomMatches(
         includeHeadingH5: options.includeHeadingH5 !== false,
         includeHeadingH6: options.includeHeadingH6 !== false,
         includeMathBlock: options.includeMathBlock !== false,
+        searchMathSource: options.searchMathSource === true,
         includeEmbedBlock: options.includeEmbedBlock !== false,
         includeCodeBlock: options.includeCodeBlock !== false,
         includeCodeLanguage: codeLanguageSearchEnabled(options),
@@ -626,7 +630,8 @@ function attachRangesToHits(
                         !hit.unitId?.startsWith("embed:") && hit.replaceable,
                     replaceReason: isImageOCRUnit(block) ? "imageOCR" : isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitleSearchUnit(block) ? "tabsTitle" : undefined,
                     range: undefined,
-                    highlightKind: isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : "text",
+                    highlightKind: isMathSourceUnit(block) ? "math-source" : isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : "text",
+                    tableSlot: isTableMathSourceUnit(block) ? block.tableSlot : undefined,
                     ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
                 });
             }
@@ -698,7 +703,8 @@ function attachRangesToHits(
             replaceReason: isImageOCRUnit(block) ? "imageOCR" : isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitle ? "tabsTitle" : richSpanBlocked ? "richCell" : undefined,
             replaceLock,
             range,
-            highlightKind: isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
+            highlightKind: isMathSourceUnit(block) ? "math-source" : isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),
+            tableSlot: isTableMathSourceUnit(block) ? block.tableSlot : undefined,
             anchorOffset: isMemo ? block.anchorOffset : undefined,
             anchorEnd: isMemo ? block.anchorEnd : undefined,
             ...(isMath && block.mathOrdinal !== undefined ?

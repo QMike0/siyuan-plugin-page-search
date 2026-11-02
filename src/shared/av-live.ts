@@ -36,6 +36,7 @@ export function avCellUnitId(row: string, col: string, group = "nogroup"): strin
 export const AV_FIELD_NAME_PREFIX = "field-name:";
 
 export function avApiCellPosition(unitId: string): {row: string; col: string;} | null {
+    unitId = unitId.replace(/:(?:inline|block)-math:source:\d+$/, "");
     if (unitId.startsWith(AV_FIELD_NAME_PREFIX)) unitId = unitId.slice(AV_FIELD_NAME_PREFIX.length);
     if (unitId.startsWith("av-group:")) {
         const parts = unitId.split(":");
@@ -52,6 +53,11 @@ export function avApiCellPosition(unitId: string): {row: string; col: string;} |
  * corresponding split run, never the whole cell. */
 export function avApiUnitId(unitId?: string): string | undefined {
     if (!unitId) return undefined;
+    const math = /:(?:inline|block)-math:source:\d+$/.exec(unitId)?.[0];
+    if (math) {
+        const base = avApiUnitId(unitId.slice(0, -math.length));
+        return base && avApiCellPosition(base.replace(/^embed:[^:]+:/, "")) ? base + math : undefined;
+    }
     const run = /#run-\d+$/.exec(unitId)?.[0];
     if (run) {
         const base = avApiUnitId(unitId.slice(0, -run.length));
@@ -119,7 +125,7 @@ export function avApiUnitShown(
     coverage: AvDomCoverage,
     usedRowLabels: Set<string>,
 ): boolean {
-    unitId = unitId.replace(/#run-\d+$/, "");
+    unitId = unitId.replace(/:(?:inline|block)-math:source:\d+$/, "").replace(/#run-\d+$/, "");
     if (coverage.unstable) {
         return true;
     }
@@ -159,7 +165,7 @@ export function avApiUnitInView(
     coverage: AvDomCoverage,
     viewType: string,
 ): boolean {
-    unitId = unitId.replace(/#run-\d+$/, "");
+    unitId = unitId.replace(/:(?:inline|block)-math:source:\d+$/, "").replace(/#run-\d+$/, "");
     if (coverage.unstable) {
         return true;
     }
@@ -180,7 +186,7 @@ export function avApiUnitInView(
 }
 
 function noteAvDomUnit(coverage: AvDomCoverage, unitId: string, text: string): void {
-    unitId = unitId.replace(/#run-\d+$/, "");
+    unitId = unitId.replace(/:(?:inline|block)-math:source:\d+$/, "").replace(/#run-\d+$/, "");
     if (unitId === "title") {
         coverage.title = true;
         return;
@@ -228,6 +234,7 @@ function parseShownCell(
     let row: string;
     let col: string;
     if (unitId.startsWith("cell:")) {
+        unitId = unitId.replace(/:(?:inline|block)-math:source:\d+$/, "");
         const parts = unitId.split(":");
         if (parts.length < 4) {
             return {group, row: "norow", col: "idx-", unstable: true, label: false};
@@ -238,6 +245,7 @@ function parseShownCell(
         row = header ? "header:" + parts[3] : parts[2];
         col = parts.slice(header ? 4 : 3).join(":");
     } else if (unitId.startsWith("calendar:")) {
+        unitId = unitId.replace(/:(?:inline|block)-math:source:\d+$/, "");
         const parts = unitId.split(":");
         if (parts.length < 3) {
             return {group, row: "norow", col: "idx-", unstable: true, label: false};
