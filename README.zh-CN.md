@@ -35,7 +35,7 @@
 
 ### 搜索范围
 
-![image-20261016002022803](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261016002022803.png)
+![image-20261103164630605](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261103164630605.png)
 
 - 齿轮菜单中的「是否搜索」用于控制块类型。可分别开关：
 

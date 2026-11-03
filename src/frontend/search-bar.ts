@@ -6295,13 +6295,13 @@ export class SearchBar {
             label,
             disabled: Boolean(disabled),
             bind: (element) => {
+                element.classList.add("page-search-menu-switch-item");
                 if (helpTip) {
                     this.attachMenuHelpTip(element, helpTip);
                 }
                 element.insertAdjacentHTML(
                     "beforeend",
-                    '<span class="fn__flex-1"></span>' +
-                        '<input class="b3-switch fn__flex-center" type="checkbox"' +
+                    '<input class="b3-switch fn__flex-center" type="checkbox"' +
                         `${checked ? " checked" : ""}` +
                         `${disabled ? " disabled" : ""}>`,
                 );

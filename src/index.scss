@@ -851,8 +851,8 @@ body.page-search-resizing * {
     pointer-events: none;
 }
 
-/* 图片 OCR 项较长，给文字和开关保留固定间距。 */
-.b3-menu [data-id="page-search-include-image-ocr"] > .b3-switch {
+/* 查询范围菜单：长标签或说明问号与开关之间始终保留间距，含各级子菜单。 */
+.b3-menu .page-search-menu-switch-item > .b3-switch {
     margin-inline-start: 12px;
     flex-shrink: 0;
 }

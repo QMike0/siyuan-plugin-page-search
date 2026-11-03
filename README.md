@@ -35,7 +35,7 @@ Other options:
 
 ### Search scope
 
-![image-20261016002714516](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261016002714516.png)
+![image-20261103171117858](https://cdn.jsdelivr.net/gh/QMike0/pic_bed@main/img/image-20261103171117858.png)
 
 The **Include in search** menu controls which block types are searched:
 
