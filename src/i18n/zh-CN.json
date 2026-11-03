@@ -145,5 +145,6 @@
   "settingsRestrictInlineMemoHint": "需先开启「是否搜索-行内备注」",
   "settingsRestrictInlineMemoOnHint": "需先开启「是否搜索-行内备注」",
   "invalidRegex": "正则无效：{error}",
-  "replaceRichCellUnsafe": "富文本格式或替换文字无法安全保存，已取消本次替换"
+  "replaceRichCellUnsafe": "富文本格式或替换文字无法安全保存，已取消本次替换",
+  "replaceTabsTitleUnsafe": "思源保存此页签标题时会改变文字或格式，已取消本次替换"
 }

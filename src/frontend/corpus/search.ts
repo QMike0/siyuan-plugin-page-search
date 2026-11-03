@@ -53,7 +53,6 @@ import {
     isDirectTableCell,
     inlineMathIdentityText,
     isInlineMathSearchUnit,
-    isTabsTitleSearchUnit,
     ownEmbeddedSearchUnit,
     resolveDocRoot,
 } from "../blocks";
@@ -144,7 +143,6 @@ import {
     invalidateDocMeta,
     isInMindmapBlock,
     isInTabsBlock,
-    isTabsTitleBlockMeta,
     loadDocMeta,
     noteLiveCodeLanguage,
     peekDocMeta,
@@ -2985,8 +2983,10 @@ async function searchCurrentDocumentImpl(
             return;
         }
         // Caption/memo candidate queries may also return an ancestor. Its
-        // descendants are indexed separately; never fetch the whole subtree.
-        if (isContainerType(meta.links.get(id)?.type ?? "")) {
+        // descendants are indexed separately. Only field-backed tab titles
+        // require their container DOM; extraction keeps just the owned title.
+        const type = meta.links.get(id)?.type ?? "";
+        if (isContainerType(type) && !(type === "tab" && meta.byId.has(id))) {
             return;
         }
         const item = meta.byId.get(id) ?? {
@@ -3645,12 +3645,6 @@ async function searchCurrentDocumentImpl(
     }
     const richCapabilities = await resolveRichCellCapabilities(richTargets, () => !cancelled());
     if (!richCapabilities) return {matches: [], error: "", cancelled: true};
-    const mountedTabsTitleIds = new Set(
-        liveAll.filter(isTabsTitleSearchUnit).map((unit) => unit.blockId),
-    );
-    const unloadedTabsTitleIds = new Set(
-        Array.from(meta.byId.values()).filter(isTabsTitleBlockMeta).map((item) => item.id),
-    );
     const matches: SearchMatch[] = [];
     const readBlockTypes = createResultBlockTypeReader(liveAll, meta.links, meta.byId, reliableOrder ?? []);
     const typesByUnit = new Map<CachedUnit, ReturnType<typeof readBlockTypes>>();
@@ -3667,8 +3661,6 @@ async function searchCurrentDocumentImpl(
             continue;
         }
         const nonReplaceable = isImageOCRUnit(unit) || isCodeLanguageUnit(unit) || hit.blockId === "__doc-title__" ||
-            mountedTabsTitleIds.has(hit.blockId) ||
-            unloadedTabsTitleIds.has(hit.blockId) ||
             hit.unitId === "doc-title" ||
             hit.blockType === "doc-title" ||
             hit.blockType === "NodeAttributeView" ||
@@ -3703,7 +3695,7 @@ async function searchCurrentDocumentImpl(
             unitId: hit.unitId,
             unitSeq: navSeq(unit, hit.start),
             tableSlot: isTableMathSourceUnit(unit) ? unit.tableSlot : undefined,
-            replaceReason: isImageOCRUnit(unit) ? "imageOCR" : isCodeLanguageUnit(unit) ? "codeLanguage" : mountedTabsTitleIds.has(hit.blockId) || unloadedTabsTitleIds.has(hit.blockId) ? "tabsTitle" :
+            replaceReason: isImageOCRUnit(unit) ? "imageOCR" : isCodeLanguageUnit(unit) ? "codeLanguage" :
                 unit.matchSource === "projection" && !projectionSourceBacked.has(hit.blockId) ? "preview" :
                 tablePending ? "tablePending" : richSpanBlocked ? "richCell" : undefined,
             embeddedPosition: embeddedPositionAt(unit.embeddedOrder, hit.start),

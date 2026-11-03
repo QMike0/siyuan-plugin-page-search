@@ -3,7 +3,7 @@ import {isImageOCRUnit} from "../shared/image-ocr";
 import {isInlineMemoSearchUnit, isInlineMathSearchUnit} from "./blocks";
 import {isCodeLanguageUnit} from "../shared/code-block-language";
 import {renderedMathPreviewText} from "./math-preview-cache";
-import {tabsSourceTitleLabel} from "./tabs-title";
+import {isTabsTitleTextUnit, projectTabsTitleMemoHost, projectTabsTitleTextNode, tabsSourceTitleLabel} from "./tabs-title";
 import {isRendererSourceFallbackUnitId} from "../shared/renderer-units";
 import type {SearchableBlock} from "./dom-types";
 import {isElementVisible, isHiddenOnlyByTabsTitle, type ElementVisibilityOptions} from "./visibility";
@@ -106,6 +106,11 @@ function createRangeFromInlineMemo(
   if (!isInlineMemoSearchUnit(block)) {
     return null
   }
+  if (block.element.closest(".tab-item-title") && !isElementVisible(block.element, visibility)) {
+    const host = projectTabsTitleMemoHost(block.element);
+    if (!host) return null;
+    return createRangeFromAttributeHost(block, start, end, visibility, host);
+  }
   return createRangeFromAttributeHost(block, start, end, visibility)
 }
 
@@ -129,16 +134,17 @@ function createRangeFromAttributeHost(
   start: number,
   end: number,
   visibility: ElementVisibilityOptions = {},
+  element: HTMLElement = block.element,
 ): Range | null {
   if (start < 0 || end < start || end > block.text.length) {
     return null
   }
-  if (!isElementVisible(block.element, visibility)) {
+  if (!isElementVisible(element, visibility)) {
     return null
   }
   try {
     const range = document.createRange()
-    range.selectNodeContents(block.element)
+    range.selectNodeContents(element)
     return range
   } catch {
     return null
@@ -158,6 +164,20 @@ export function createRangeFromBlockOffsets(
   existingRange?: Range,
 ): Range | null {
   if (isRendererSourceFallbackUnitId(block.unitId)) return null
+  if (isTabsTitleTextUnit(block)) {
+    const source = createTabsTitleSourceRange(block, start, end);
+    if (!source) return null;
+    if (isElementVisible(block.element, visibility)) return source;
+    const label = tabsSourceTitleLabel(block.element);
+    if (!label || !isElementVisible(label, visibility)) return null;
+    const first = projectTabsTitleTextNode(source.startContainer as Text, label);
+    const last = projectTabsTitleTextNode(source.endContainer as Text, label);
+    if (!first || !last) return null;
+    const range = label.ownerDocument.createRange();
+    range.setStart(first, source.startOffset);
+    range.setEnd(last, source.endOffset);
+    return range;
+  }
   // An unrendered formula-only title has a native "Tab" label, with no formula
   // clone. Navigate to that label without interpreting its placeholder as text.
   if (isInlineMathSearchUnit(block) && !isElementVisible(block.element, visibility)
@@ -232,6 +252,26 @@ export function createRangeFromBlockOffsets(
   } catch {
     return null
   }
+}
+
+/** Eligibility uses the source, even when the visible Range is a navigation clone. */
+export function createTabsTitleSourceRange(block: SearchableBlock, start: number, end: number): Range | null {
+  if (isInlineMemoSearchUnit(block) && block.element.closest(".tab-item-title")) {
+    if (start < 0 || end < start || end > block.text.length) return null;
+    const range = block.element.ownerDocument.createRange();
+    range.selectNodeContents(block.element);
+    return range;
+  }
+  if (!isTabsTitleTextUnit(block) || start < 0 || end < start || end > block.text.length) return null;
+  const first = locateTextPoint(block.textNodes, start + (block.textStartOffset ?? 0), "start");
+  const last = locateTextPoint(block.textNodes, end + (block.textStartOffset ?? 0), "end");
+  if (!first || !last) return null;
+  try {
+    const range = block.element.ownerDocument.createRange();
+    range.setStart(first.node, first.offset);
+    range.setEnd(last.node, last.offset);
+    return range;
+  } catch { return null; }
 }
 
 /**

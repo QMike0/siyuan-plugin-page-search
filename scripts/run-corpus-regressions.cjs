@@ -579,12 +579,11 @@ async function main() {
         assert.equal(orderIndependentSearch.matches.length, 1, "order-independent searches retain the existing fallback");
         console.log("heading type filters: full/unloaded/partial/folded scope, semantic containers, exact AND, missing-order guards and no extra DOM reads OK");
         {
-            const {createReplacementReasonReader} = source("frontend/replacement-reasons");
             const {calculateSearchMatches} = source("frontend/pipeline");
             for (const mounted of ["none", "full", "folded"]) {
                 reset();
                 add("b", "p", "needle", "", "r", 'tabs-title="true"');
-                doms.b = '<div data-node-id="b" data-type="NodeParagraph" tabs-title="true"><div contenteditable="true">needle</div></div>';
+                doms.b = '<div data-node-id="b" data-type="NodeParagraph" tabs-title="true"><div class="tab-item-title" contenteditable="true">needle</div></div>';
                 if (mounted !== "none") wysiwyg.innerHTML =
                     '<div data-node-id="tabs" data-type="NodeTabs" class="tabs"><div class="tab-item"' +
                     (mounted === "folded" ? ' data-tabs-hidden="true"' : '') + '><div class="tab-item-info">' + doms.b + '</div></div></div>';
@@ -592,9 +591,8 @@ async function main() {
                 full(result);
                 assert.equal(result.matches.length, 1, mounted + ': tab title still indexed');
                 const title = result.matches[0];
-                assert.equal(title.replaceable, false);
-                assert.equal(createReplacementReasonReader()({...title, range: undefined}), "tabsTitle",
-                    mounted + ': reason survives absent/offscreen Range');
+                assert.equal(title.replaceable, true);
+                assert.equal(title.unitId, "tabs-title", mounted + ': stable source identity survives an absent Range');
                 if (mounted !== "none") {
                     const {collectSearchableBlocks} = source("frontend/blocks");
                     const {unitKeyOf} = source("frontend/selection");
@@ -603,11 +601,10 @@ async function main() {
                         [unitKeyOf(unit), [{start: 0, end: unit.text.length}]]));
                     const fallback = await calculateSearchMatches({}, edit, "needle", {...opts, selectionOnly: true, selectionScope});
                     assert.equal(fallback.matches.length, 1);
-                    assert.equal(fallback.matches[0].replaceable, false);
-                    assert.equal(createReplacementReasonReader()({...fallback.matches[0], range: undefined}), "tabsTitle");
+                    assert.equal(fallback.matches[0].replaceable, true);
                 }
             }
-            console.log("Replacement reasons: loaded/unloaded/inactive tab titles retain type without a Range OK");
+            console.log("Source titles: loaded/unloaded/inactive text remains writable without a Range OK");
         }
         {
             // v3.8.7 custom blocks persist data-content, not arbitrary renderer DOM.

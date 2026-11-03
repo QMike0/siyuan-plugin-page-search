@@ -27,7 +27,6 @@ import {
     collectSearchableBlocks,
     isDocTitleSearchUnit,
     isInactiveTabSourceElement,
-    isTabsTitleSearchUnit,
     tableCellReplaceLock,
     inlineMathIdentityText,
     isInlineMathSearchUnit,
@@ -51,6 +50,7 @@ import {deferRichCellCapability, resolveRichCellCapabilities, type RichCellCapab
 import {searchableTextLengths} from "./text-runs";
 import {
     createRangeFromBlockOffsets,
+    createTabsTitleSourceRange,
     isRangePlainTextOnly,
 } from "./ranges";
 import type {RegexTextMatcher} from "./regex-matcher";
@@ -648,24 +648,31 @@ function attachRangesToHits(
             });
             continue;
         }
+        const titleSourceRange = createTabsTitleSourceRange(block, hit.start, hit.end);
+        if (titleSourceRange && restrictActive && !matchRangePassesRestrictInline(titleSourceRange, restrictInlineTypes,
+            {attributeKind: isInlineMemoSearchUnit(block) ? "inline-memo" : null})) continue;
         const range = createRangeFromBlockOffsets(block, hit.start, hit.end, visibility);
         if (!range) {
             // An inactive tab source is valid document text, but its panel has
             // no paintable Range until navigation activates the tab. Keep the
             // hit so counts and replacement still work in the DOM fallback.
-            if (isInactiveTabSourceElement(block.element)) {
+            if (isInactiveTabSourceElement(block.element) || titleSourceRange) {
                 acceptedEndByUnit.set(key, hit.end);
                 result.push({
                     ...hit,
                     blockTypes,
                     embeddedPosition: embeddedPositionAt(block.embeddedOrder, hit.start),
                     replaceable: !modeBlocked && !isDocTitleSearchUnit(block) &&
-                        !isTabsTitleSearchUnit(block) && !isImageOCRUnit(block) && !isCodeLanguageUnit(block) &&
+                        !isImageOCRUnit(block) && !isCodeLanguageUnit(block) &&
                         !isInlineMathSearchUnit(block) && !isRendererUnitId(hit.unitId) &&
-                        !hit.unitId?.startsWith("embed:") && hit.replaceable,
-                    replaceReason: isImageOCRUnit(block) ? "imageOCR" : isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitleSearchUnit(block) ? "tabsTitle" : undefined,
+                        !hit.unitId?.startsWith("embed:") && hit.replaceable && (!titleSourceRange ||
+                            (isDomReplaceable(titleSourceRange, hit.blockType, hit.blockId) &&
+                                (isInlineMemoSearchUnit(block) || isRangePlainTextOnly(titleSourceRange)))),
+                    replaceReason: isImageOCRUnit(block) ? "imageOCR" : isCodeLanguageUnit(block) ? "codeLanguage" : undefined,
                     range: undefined,
-                    highlightKind: isMathSourceUnit(block) ? "math-source" : isInlineMathSearchUnit(block) ? "inline-math" : isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : "text",
+                    highlightKind: isMathSourceUnit(block) ? "math-source" : isInlineMathSearchUnit(block) ? "inline-math" : isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : isInlineMemoSearchUnit(block) ? "inline-memo" : "text",
+                    anchorOffset: isInlineMemoSearchUnit(block) ? block.anchorOffset : undefined,
+                    anchorEnd: isInlineMemoSearchUnit(block) ? block.anchorEnd : undefined,
                     mathOrdinal: block.mathOrdinal,
                     mathUnitText: isInlineMathSearchUnit(block) ? inlineMathIdentityText(block.text) : undefined,
                     tableSlot: isTableMathSourceUnit(block) ? block.tableSlot : undefined,
@@ -678,12 +685,11 @@ function attachRangesToHits(
         const isMemo = isInlineMemoSearchUnit(block);
         const isMath = isInlineMathSearchUnit(block);
         const isDocTitle = isDocTitleSearchUnit(block);
-        const isTabsTitle = isTabsTitleSearchUnit(block);
         // 限制查找：块级采集之后，仅保留落在所选行内类型内的命中（OR）；与选区过滤独立叠加
         // 文档标题不是行内类型：限制激活时自然被滤掉
         if (
             restrictActive &&
-            !matchRangePassesRestrictInline(range, restrictInlineTypes, {
+            !matchRangePassesRestrictInline(titleSourceRange ?? range, restrictInlineTypes, {
                 attributeKind: isMemo ? "inline-memo" : (isMath ? "inline-math" : null),
             })
         ) {
@@ -717,13 +723,13 @@ function attachRangesToHits(
             !isRendererUnitId(hit.unitId) &&
             !hit.unitId?.startsWith("embed:") &&
             !isDocTitle &&
-            !isTabsTitle && !isImageOCRUnit(block) && !isCodeLanguageUnit(block) &&
+            !isImageOCRUnit(block) && !isCodeLanguageUnit(block) &&
             !isMath &&
             !modeBlocked &&
-            isDomReplaceable(range, hit.blockType, hit.blockId, projectionSourceBacked) &&
+            isDomReplaceable(titleSourceRange ?? range, hit.blockType, hit.blockId, projectionSourceBacked) &&
             // The projection may add presentational wrappers; the source write
             // path rechecks its own Text-node boundaries before committing.
-            (isMemo || projectionSourceBacked || isRangePlainTextOnly(range));
+            (isMemo || projectionSourceBacked || isRangePlainTextOnly(titleSourceRange ?? range));
 
         result.push({
             id: hit.id,
@@ -737,7 +743,7 @@ function attachRangesToHits(
             end: hit.end,
             matchedText: hit.matchedText,
             replaceable,
-            replaceReason: isImageOCRUnit(block) ? "imageOCR" : isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitle ? "tabsTitle" : richSpanBlocked ? "richCell" : undefined,
+            replaceReason: isImageOCRUnit(block) ? "imageOCR" : isCodeLanguageUnit(block) ? "codeLanguage" : richSpanBlocked ? "richCell" : undefined,
             replaceLock,
             range,
             highlightKind: isMathSourceUnit(block) ? "math-source" : isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : isMemo ? "inline-memo" : (isMath ? "inline-math" : "text"),

@@ -50,6 +50,7 @@ import {
     type ReplaceCommitState,
 } from "./replacement-commit";
 import {unitKey} from "./selection";
+import {fieldTabTitleCanBeSaved} from "./tabs-title";
 import {createRegexBudget, REGEX_BUDGET_ERROR, type RegexBudget} from "../shared/regex-budget";
 
 const DOC_TITLE_BLOCK_ID = "__doc-title__";
@@ -509,7 +510,8 @@ function createWriteGuard(
     const snapshots = Array.from(blockIds, (id) => {
         const element = submitIndex ? submitIndex.preferred.get(id) ?? null : resolveSubmitBlockElement(edit, id);
         const html = element?.outerHTML;
-        return {id, element, html};
+        const tabContent = element?.dataset.type === "NodeTabItem" && html ? readMountContent(html) : undefined;
+        return {id, element, html, tabContent};
     });
     return (allowUnverifiedMount = false) => {
         const conflict = checkCurrent();
@@ -538,6 +540,9 @@ function createWriteGuard(
                 return "stale-target";
             }
             if (current?.outerHTML !== snapshot.html) {
+                // Native tabsRender changes visibility/navigation state without
+                // editing the title or body. Compare saved content for items only.
+                if (current && snapshot.tabContent !== undefined && readMountContent(current.outerHTML) === snapshot.tabContent) continue;
                 return "stale-target";
             }
         }
@@ -620,6 +625,12 @@ export async function replaceCurrentMatchInEditor(
         return {replacedCount: 0, skippedCount: 1};
     }
 
+    // Field-backed titles belong to a whole tab item. Reuse the fetched batch
+    // path, including its selected-copy sync and full-content conflict checks.
+    if (match.blockType === "NodeTabItem") {
+        return replaceAllMatchesInEditor(edit, [match], replacementText, options);
+    }
+
     const checkCurrent = createPreparationGuard(edit, protyle, options.isCurrent);
     const preparationConflict = checkCurrent();
     if (preparationConflict) {
@@ -645,6 +656,7 @@ export async function replaceCurrentMatchInEditor(
         includeImageTitle: true,
         includeDocTitle: false,
         includeMindmapSourceForReplace: true,
+        includeTabsSourceForReplace: true,
         scopeRoots: [submit],
     })
         .filter((block) => !isPreviewSyntheticBlock(block));
@@ -819,6 +831,7 @@ async function prepareBlockElementUpdate(
     replaceOpts: PreparedReplaceOptions,
     checkCurrent: () => string | undefined,
     retainRichPlan = false,
+    validateTabTitle?: (clone: HTMLElement) => boolean,
 ): Promise<PreparedBlockResult> {
     const rich = await prepareRichReplacementPlan(unitsByKey, matches, replacementText, replaceOpts, checkCurrent);
     const error = checkCurrent() ?? rich.error;
@@ -847,11 +860,15 @@ async function prepareBlockElementUpdate(
     if (!keepsBlockType(blockEl, clone)) {
         return {update: null, skippedCount: matches.length};
     }
+    const newHTML = clone.outerHTML;
+    if (newHTML !== oldHTML && validateTabTitle && !validateTabTitle(clone)) {
+        return {update: null, skippedCount: matches.length, error: "tabs-title-unsafe"};
+    }
     return {
         update: {
             id: blockId,
             oldHTML,
-            newHTML: clone.outerHTML,
+            newHTML,
             appliedCount: outcome.appliedCount,
             replacementEnd: outcome.replacementEnd,
             replaceOptions: retainRichPlan ? preparedOptions : replaceOpts,
@@ -981,6 +998,7 @@ async function prepareFetchedBlockUpdates(
     checkCurrent: () => string | undefined,
     notebook = "",
     budget: RegexBudget | undefined = options.regex ? createRegexBudget() : undefined,
+    protyle?: Protyle,
 ): Promise<{updates: PreparedBlockUpdate[]; skippedCount: number; error?: string; fatal?: boolean;}> {
     const ids = Array.from(matchesById.keys());
     const totalMatches = Array.from(matchesById.values()).reduce((count, items) => count + items.length, 0);
@@ -988,6 +1006,7 @@ async function prepareFetchedBlockUpdates(
     const updates: PreparedBlockUpdate[] = [];
     let skippedCount = 0;
     let error: string | undefined;
+    const readTabContent = protyle ? createCommitContentReader(protyle, {ignoreDynamicReferenceText: true}) : undefined;
     if (ids.length === 0) {
         return {updates, skippedCount};
     }
@@ -1020,6 +1039,16 @@ async function prepareFetchedBlockUpdates(
                     error ??= "block-missing";
                     continue;
                 }
+                if (blockMatches.some(match => match.blockType === "NodeTabItem") && liveRoot instanceof Element) {
+                    const live = resolveSubmitBlockElement(liveRoot, id);
+                    if (live) {
+                        // Never overwrite pending body edits with the kernel
+                        // snapshot just to change its field-backed title. Partial
+                        // source trees also fail closed rather than losing blocks.
+                        const saved = readTabContent?.(html);
+                        if (saved === undefined || readTabContent?.(live.outerHTML) !== saved) return cancelled("stale-target");
+                    }
+                }
                 const merged = mergeKernelHtmlWithLiveTable(liveRoot, id, html);
                 if (merged.conflict) {
                     skippedCount += blockMatches.length;
@@ -1043,6 +1072,7 @@ async function prepareFetchedBlockUpdates(
                         includeImageTitle: true,
                         includeDocTitle: false,
                         includeMindmapSourceForReplace: true,
+                        includeTabsSourceForReplace: true,
                     },
                     new Set(),
                     "none",
@@ -1094,9 +1124,13 @@ async function prepareFetchedBlockUpdates(
                         replacementText,
                         preparedOptions.options,
                         checkCurrent,
+                        false,
+                        blockEl.dataset.type === "NodeTabItem" ?
+                            clone => fieldTabTitleCanBeSaved(clone, protyle?.protyle?.lute) : undefined,
                     );
                     const preparationConflict = checkCurrent();
                     if (preparationConflict) return cancelled(preparationConflict);
+                    if (prepared.error === "tabs-title-unsafe") return cancelled(prepared.error);
                     skippedCount += prepared.skippedCount;
                     if (prepared.update) {
                         prepared.update.kernelHTML = htmlById.get(id);
@@ -1186,7 +1220,7 @@ export async function replaceAllMatchesInEditor(
     for (const [blockId, blockMatches] of grouped) {
         const submit = submitIndex.preferred.get(blockId);
         // 折叠容器或缺行大表只准备内核底稿，避免同一命中重复展开、重复扣预算。
-        if (!submit || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
+        if (!submit || blockMatches.some(match => match.blockType === "NodeTabItem") || foldedContainerOmitsChildBlocks(submit) || editorTableOmitsRows(submit)) {
             unloadedMatches.set(blockId, blockMatches);
         } else {
             loadedRoots.push(submit);
@@ -1201,6 +1235,7 @@ export async function replaceAllMatchesInEditor(
             includeImageTitle: true,
             includeDocTitle: false,
             includeMindmapSourceForReplace: true,
+            includeTabsSourceForReplace: true,
             scopeRoots: replacementScopeRoots(loadedRoots),
         })
             .filter((block) => !isPreviewSyntheticBlock(block)) :
@@ -1269,6 +1304,7 @@ export async function replaceAllMatchesInEditor(
         checkCurrent,
         notebook,
         regexBudget,
+        protyle,
     );
     bodySkipped += fetched.skippedCount;
     const fetchedConflict = checkCurrent();
@@ -1326,7 +1362,8 @@ export async function replaceAllMatchesInEditor(
         const kernelCurrent = await fetchedUpdatesUnchanged(fetched.updates, checkCurrent, notebook, protyle);
         const finalConflict = guard() ?? (kernelCurrent ? undefined : "stale-target");
         if (finalConflict) return {replacedCount: 0, skippedCount: matches.length, error: finalConflict};
-        return {replacedCount: unchangedCount, skippedCount, commitState: "confirmed", unchanged: true};
+        return {replacedCount: unchangedCount, skippedCount, commitState: "confirmed", unchanged: true,
+            replacementEnd: bodyMatches.length === 1 ? ordered[0]?.replacementEnd : undefined};
     }
     const rootId = editorRootId(edit);
     const submitIndexBeforeCommit = collectSubmitBlockIndex(edit);
@@ -1359,6 +1396,7 @@ export async function replaceAllMatchesInEditor(
                 includeImageTitle: true,
                 includeDocTitle: false,
                 includeMindmapSourceForReplace: true,
+                includeTabsSourceForReplace: true,
                 scopeRoots: [selectedBlock],
             }).filter((block) => !isPreviewSyntheticBlock(block));
             const localUnits = buildUnitMap(localBlocks, selectedMatches);
@@ -1449,6 +1487,7 @@ export async function replaceAllMatchesInEditor(
         replacedCount: confirmation.replacedCount + unchangedCount,
         submittedCount: confirmation.submittedCount + unchangedCount,
         skippedCount: skippedBeforeBody + bodySkipped,
+        replacementEnd: bodyMatches.length === 1 ? ordered[0]?.replacementEnd : undefined,
     };
 }
 

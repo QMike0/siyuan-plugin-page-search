@@ -96,8 +96,10 @@ Usually writable:
 * image titles;
 * inline memos;
 * ordinary table cells and safely writable paragraphs, headings, lists, blockquotes, and plain code inside rich-text table cells;
-* writable source text in tabs and mind maps;
+* tab titles and body text, and writable source text in mind maps;
 * text in off-screen, folded, or unloaded areas when complete source data is available.
+
+Tab-title replacement is cancelled if its text and formatting cannot be safely preserved, or complete source data is unavailable.
 
 Searchable and highlightable but unsupported by replacement include:
 
@@ -107,7 +109,6 @@ Searchable and highlightable but unsupported by replacement include:
 * embedded content;
 * formulas, rendered Mermaid, and rendered HTML-block text;
 * plugin-rendered custom blocks;
-* tab titles inside tabs blocks;
 * plain-code language labels (such as Python or MATLAB);
 * matches spanning complex marks, read-only regions, or content whose original source cannot be confirmed.
 

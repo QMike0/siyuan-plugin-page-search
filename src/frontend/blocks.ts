@@ -2,7 +2,7 @@ import {isImageOCRUnit} from "../shared/image-ocr";
 import {CODE_LANGUAGE_UNIT_ID, codeLanguageSearchEnabled, isDiagramCodeLanguage} from "../shared/code-block-language";
 import {isMathSourceUnit} from "../shared/math-search";
 import {renderedMathPreviewText} from "./math-preview-cache";
-import {createTabsTitleMathReader, tabsLabelSourceBlock, tabsSourceTitleLabel} from "./tabs-title";
+import {createTabsTitleMathReader, tabTitleElement, tabsLabelSourceBlock, tabsSourceTitleLabel} from "./tabs-title";
 import {
     logicalTableRows,
     normalizeRestrictInlineTypes,
@@ -290,6 +290,8 @@ export interface CollectSearchableBlocksOptions {
     includeSuperBlock?: boolean;
     /** 是否采集页签块（NodeTabs）及其内部、页签标题；默认 true */
     includeTabs?: boolean;
+    /** Keep complete tab-item children in detached write preparations. */
+    includeTabsSourceForReplace?: boolean;
     /** Collect native CSS-hidden mindmap source blocks when preparing writes. */
     includeMindmapSourceForReplace?: boolean;
     /**
@@ -516,8 +518,8 @@ export function collectSearchableBlocks(
             return;
         }
 
-        // 页签标题的可见文字在导航标签上。有可见标签时不再采集被隐藏的原文，避免同一个词计两次。
-        if (includeTabs && hiddenTabsTitleCoveredByLabel(element)) {
+        // Titles have their own source units below. A tab item never owns its body blocks' text.
+        if (element.dataset.type === "NodeTabItem" || tabTitleElement(element)) {
             return;
         }
 
@@ -700,7 +702,7 @@ export function collectSearchableBlocks(
 
     const attributeRoots = scoped ? scopeRoots : (docRoot ? [docRoot] : []);
     if (includeTabs && collectBodyText) {
-        blocks.push(...collectTabsTitleUnits(attributeRoots, blockElements));
+        blocks.push(...collectTabsTitleUnits(blockElements, includeGates));
     }
     if (includeMindmap && collectBodyText) {
         const previews = collectMindmapPreviewUnits(attributeRoots, includeGates, restrictInlineTypes.length === 0, includeImageTitle);
@@ -2236,27 +2238,6 @@ function elementHasBox(element: HTMLElement): boolean {
         (typeof element.getClientRects === "function" && element.getClientRects().length > 0);
 }
 
-export function hiddenTabsTitleCoveredByLabel(element: HTMLElement): boolean {
-    const info = element.closest(".tab-item-info");
-    if (!info) {
-        return false;
-    }
-    const item = info.closest<HTMLElement>(".tab-item");
-    if (item?.getAttribute("data-tabs-editing") === "true") {
-        return false;
-    }
-    const tabId = item?.getAttribute("data-node-id") || "";
-    const tabs = item?.parentElement;
-    if (!tabId || !tabs?.classList.contains("tabs")) {
-        return false;
-    }
-    const label = tabs.querySelector<HTMLElement>(
-        `:scope > .tabs-header [data-tab-id="${CSS.escape(tabId)}"] .tabs-tab-label`,
-    );
-    return Boolean(label && (elementHasBox(label) || isHiddenOnlyByInactiveTab(label)) &&
-        ((label.textContent || "").length > 0 || label.querySelector('span[data-type~="inline-math"][data-content]')));
-}
-
 /**
  * 页签渲染器保留所有源块。非活动状态（含尚未渲染的页签）不代表内容
  * 不属于文档语料；搜索和替换都应使用源块，而不是只采集当前显示的面板。
@@ -2266,26 +2247,6 @@ export function isInactiveTabSourceElement(element: Element | null): boolean {
         return false;
     }
     return isHiddenTabContent(element);
-}
-
-/**
- * tabsRender 的页签标题源块与导航栏克隆都只允许搜索/跳转。
- * 导航栏是展示副本，思源没有为它提供独立的标题事务；统一识别两种
- * DOM 形态，避免替换路径把它误当成普通段落。
- */
-export function isTabsTitleSearchUnit(block: Pick<SearchableBlock, "element">): boolean {
-    const element = block.element;
-    const source = element.closest<HTMLElement>("[tabs-title=\"true\"]");
-    if (source && source.closest(".tab-item-info")) {
-        return true;
-    }
-    const sourceParagraph = element.matches("[data-node-id][data-type]") &&
-        element.closest(".tab-item-info") &&
-        Boolean(element.querySelector(":scope > .tab-item-title"));
-    if (sourceParagraph) {
-        return true;
-    }
-    return Boolean(element.closest(".tabs-header .tabs-tab-label"));
 }
 
 function shouldKeepHiddenSourceText(node: Text): boolean {
@@ -2301,83 +2262,21 @@ function createTabsLabelSourceReader(): (label: HTMLElement) => HTMLElement | nu
     };
 }
 
-/** 把可见的页签标题标签记到原标题块上，高亮才能画在导航栏里。 */
-function collectTabsTitleUnits(roots: HTMLElement[], blockElements: readonly HTMLElement[]): SearchableBlock[] {
+/** Search and write the same source runs. Range projection alone uses the label. */
+function collectTabsTitleUnits(blockElements: readonly HTMLElement[], gates: IncludeGates): SearchableBlock[] {
     const units: SearchableBlock[] = [];
-    const indexes = new Map(blockElements.map((element, index) => [element, index]));
-    const seenTabs = new Set<HTMLElement>();
-    const seenItems = new Set<HTMLElement>();
-    const consider = (tabs: HTMLElement | null) => {
-        if (!tabs || seenTabs.has(tabs) || tabs.getAttribute("data-type") !== "NodeTabs") {
-            return;
-        }
-        seenTabs.add(tabs);
-        tabs.querySelectorAll<HTMLElement>(":scope > .tabs-header [data-tab-id]").forEach((button) => {
-            const tabId = button.getAttribute("data-tab-id") || "";
-            if (!tabId) {
-                return;
-            }
-            const item = tabs.querySelector<HTMLElement>(`:scope > .tab-item[data-node-id="${CSS.escape(tabId)}"]`);
-            const titleBlock = item?.querySelector<HTMLElement>(
-                ':scope > .tab-item-info [tabs-title="true"][data-node-id], :scope > .tab-item-info .tab-item-title',
-            );
-            // The current renderer puts data-node-id/data-type/tabs-title on
-            // the source NodeParagraph. Keep a small compatibility fallback
-            // for older/variant DOM where tabs-title is absent from the
-            // wrapper but the wrapper still owns .tab-item-title. Do not use
-            // closest() on the inner title first: that can accidentally pick
-            // the NodeTabItem id and make the navigation clone appear to be
-            // the write target.
-            const directTitleBlock = Array.from(
-                item?.querySelectorAll<HTMLElement>(":scope > .tab-item-info > [data-node-id]") ?? [],
-            ).find((candidate) =>
-                candidate.hasAttribute("tabs-title") ||
-                Boolean(candidate.querySelector(":scope > .tab-item-title")),
-            );
-            const blockEl = directTitleBlock ??
-                titleBlock?.closest<HTMLElement>("[data-node-id][data-type]") ?? null;
-            const blockId = blockEl?.getAttribute("data-node-id") || "";
-            if (!item || seenItems.has(item) || !blockId || !blockEl ||
-                !roots.some(root => root.contains(blockEl) || root.contains(button))) {
-                return;
-            }
-            const editing = item.getAttribute("data-tabs-editing") === "true";
-            const label = button.querySelector<HTMLElement>(".tabs-tab-label");
-            if (editing && blockEl && elementHasBox(blockEl)) {
-                return;
-            }
-            if (!label || (!elementHasBox(label) && !isHiddenOnlyByInactiveTab(label))) {
-                return;
-            }
-            if (blockEl.querySelector('span[data-type~="inline-math"]') &&
-                !label.querySelector('span[data-type~="inline-math"]') && !collectElementTextNodes(blockEl).length) {
-                // tabsRender uses a generic label until a formula-only title
-                // gains rendered Text. That placeholder is not note content.
-                return;
-            }
-            const textNodes = collectElementTextNodes(label);
-            const text = textNodes.map((node) => node.nodeValue ?? "").join("");
-            if (!text) {
-                return;
-            }
-            seenItems.add(item);
-            units.push(...unitsFromTextNodes({
-                blockId,
-                blockType: blockEl?.getAttribute("data-type") || "NodeParagraph",
-                blockIndex: blockEl ? indexes.get(blockEl) ?? 0 : 0,
-                element: label,
-                // The tab label is a renderer clone; the source title block is elsewhere.
-                matchSource: "projection",
-            }, textNodes));
-        });
-    };
-    for (const root of roots) {
-        if (root.getAttribute("data-type") === "NodeTabs") {
-            consider(root);
-        }
-        root.querySelectorAll<HTMLElement>('[data-type="NodeTabs"]').forEach((tabs) => consider(tabs));
-        consider(root.closest<HTMLElement>('[data-type="NodeTabs"]'));
-    }
+    blockElements.forEach((block, blockIndex) => {
+        const title = tabTitleElement(block);
+        if (!title || shouldSkipAttributeUnitByIncludeGates(title, gates)) return;
+        units.push(...unitsFromTextNodes({
+            blockId: block.dataset.nodeId!,
+            blockType: block.dataset.type!,
+            blockIndex,
+            element: title,
+            unitId: "tabs-title",
+            matchSource: "text",
+        }, collectElementTextNodes(title), true));
+    });
     return units;
 }
 
@@ -2588,11 +2487,13 @@ function joinTextNodes(nodes: readonly Text[]): string {
 function unitsFromTextNodes(
     base: Omit<SearchableBlock, "text" | "textNodes">,
     textNodes: readonly Text[],
+    tabsTitle = false,
 ): SearchableBlock[] {
     // Keep inactive tab source text in the corpus. Its Range remains absent while
     // the panel is hidden; navigation can activate the tab, and replacement uses
     // the source block transaction path.
-    const visible = textNodes.filter((node) => !isCollectedTextHidden(node) || shouldKeepHiddenSourceText(node));
+    const visible = textNodes.filter((node) => !isCollectedTextHidden(node) || shouldKeepHiddenSourceText(node) ||
+        (tabsTitle && isHiddenOnlyByTabsTitle(node.parentElement)));
     const runs = splitTextNodesAtBarriers(visible).filter((run) => joinTextNodes(run).length > 0);
     if (runs.length === 0) {
         return [];
@@ -2818,9 +2719,11 @@ function collectInlineMemoSearchUnits(
 ): SearchableBlock[] {
     const units: SearchableBlock[] = [];
     // ~= 匹配 data-type 空格分隔 token，避免扫全站 span
+    // tabsRender copies the attributes without block IDs. Only saved hosts
+    // participate in identity, ordering and writes; Range projects to the copy.
     const spans = Array.from(
         docRoot.querySelectorAll<HTMLElement>('span[data-type~="inline-memo"]'),
-    );
+    ).filter(span => !span.closest(".tabs-header .tabs-tab-label"));
     // Keep the full span list for native/global ordinals, but compute text
     // anchors and table slots only for owners referenced by the frozen scope.
     const includePreview = ownerIds && Array.from(ownerIds).some(id => id.startsWith(`${PREVIEW_BLOCK_ID}-memo-`));
@@ -2843,7 +2746,8 @@ function collectInlineMemoSearchUnits(
     let memoIndex = 0;
 
     for (const span of spans) {
-        if (span.closest(".protyle-attr, .fn__none") || isAuthorCssHiddenElement(span)) {
+        if (span.closest(".protyle-attr, .fn__none") || (isAuthorCssHiddenElement(span) &&
+            !isHiddenOnlyByTabsTitle(span))) {
             continue;
         }
 
@@ -2900,7 +2804,8 @@ function memoHostSpansByOwner(
     const byOwner = new Map<HTMLElement, HTMLElement[]>();
     for (let index = 0; index < spans.length; index += 1) {
         const span = spans[index];
-        if (span.closest(".protyle-attr, .fn__none") || isAuthorCssHiddenElement(span)) {
+        if (span.closest(".protyle-attr, .fn__none") || (isAuthorCssHiddenElement(span) &&
+            !isHiddenOnlyByTabsTitle(span))) {
             continue;
         }
         const owner = searchOwnerBlock(span);
@@ -2941,7 +2846,8 @@ function memoHostSpansInOwner(
             current = walker.nextNode();
         }
     }
-    const nodes = collectTextNodes(owner, owner, includeImageTitle);
+    const title = tabTitleElement(owner);
+    const nodes = title ? collectElementTextNodes(title) : collectTextNodes(owner, owner, includeImageTitle);
     const spansOut = new Map<HTMLElement, {start: number; end: number;}>();
     const startOf = new Map<HTMLElement, number>();
     let offset = 0;
@@ -2977,7 +2883,8 @@ function memoHostSpan(
 ): {start: number; end: number;} {
     let nodes = cache.get(owner);
     if (!nodes) {
-        nodes = collectTextNodes(owner, owner, includeImageTitle);
+        const title = tabTitleElement(owner);
+        nodes = title ? collectElementTextNodes(title) : collectTextNodes(owner, owner, includeImageTitle);
         cache.set(owner, nodes);
     }
     let offset = 0;

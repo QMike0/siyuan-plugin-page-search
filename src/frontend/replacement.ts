@@ -696,6 +696,7 @@ export function applyMatchesToSubmitClone(
     let skippedCount = grouped.skippedCount + rich.skippedCount;
     let regexExpandFailedCount = rich.regexExpandFailedCount;
     let replacementEnd = matches.length === 1 ? rich.replacementEnd : undefined;
+    const prepared: Array<{unit: SearchableBlock; specs: ReplacementSpec[]; element: HTMLElement; textNodes: Text[];}> = [];
     for (const [unit, specs] of grouped.byUnit) {
         if (rich.handled.has(unit)) continue;
         if (liveSubmit !== unit.element && !liveSubmit.contains(unit.element)) {
@@ -718,7 +719,14 @@ export function applyMatchesToSubmitClone(
             skippedCount += specs.length;
             continue;
         }
+        // Clearing a memo unwraps its host and changes subsequent child paths.
+        // Bind every clone node before the first mutation, so later text/memos
+        // still target their original nodes after those nodes have been moved.
+        prepared.push({unit, specs, element: cloneUnitNode,
+            textNodes: isInlineMemoSearchUnit(unit) ? [] : mapTextNodesToClone(unit.element, cloneUnitNode, unit.textNodes)});
+    }
 
+    for (const {unit, specs, element: cloneUnitNode, textNodes: cloneTextNodes} of prepared) {
         if (isInlineMemoSearchUnit(unit)) {
             const outcome = applyReplacementsToInlineMemoElement(
                 cloneUnitNode,
@@ -733,7 +741,6 @@ export function applyMatchesToSubmitClone(
             continue;
         }
 
-        const cloneTextNodes = mapTextNodesToClone(unit.element, cloneUnitNode, unit.textNodes);
         if (!cloneTextNodes.length) {
             skippedCount += specs.length;
             continue;

@@ -49,7 +49,7 @@ async function main() {
         orders.push(id); doms[id] = el.outerHTML;
         const type = {NodeTabs: "tabs", NodeTabItem: "tab", NodeParagraph: "p", NodeMathBlock: "m"}[el.dataset.type];
         const parent = el.parentElement.closest("[data-node-id]")?.dataset.nodeId || "root";
-        db.prepare("INSERT INTO blocks VALUES(?,?,?,?,?,?,?,?,?,?)").run(id, "root", parent, type, "", "α+α", "$\\alpha+\\alpha$", "", "hash", "1");
+        db.prepare("INSERT INTO blocks VALUES(?,?,?,?,?,?,?,?,?,?)").run(id, "root", parent, type, "", "α+α", "$\\alpha+\\alpha$", el.hasAttribute("tabs-title") ? 'tabs-title="true"' : "", "hash", "1");
     });
     responder = async (url, payload) => url === "/api/query/sql" ? {code: 0, data: db.prepare(payload.stmt).all()} :
         url === "/api/block/getDocBlocksOrders" ? {code: 0, data: orders} :

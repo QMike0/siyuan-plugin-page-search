@@ -21,7 +21,7 @@ function codeLanguageCandidatePredicate(predicate: string): string {
     return `(type = 'c' AND (instr(${CODE_FENCE_SQL}, char(10)) = 0 OR ${predicate}))`;
 }
 
-const CONTAINER_SQL = ["d", "l", "i", "b", "s", "mindmap", "mindmap_item", "tabs", "tab"].map((type) => `'${type}'`).join(", ");
+const CONTAINER_SQL = ["d", "l", "i", "b", "s", "mindmap", "mindmap_item", "tabs"].map((type) => `'${type}'`).join(", ");
 
 const INTERNAL_MARKER_CODES = [0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF];
 
@@ -129,7 +129,7 @@ export async function fetchContentCandidateIds(
     return queryLiteralCandidates(
         rootId,
         `AND type NOT IN (${CONTAINER_SQL}) `,
-        `(${predicate}${codeLanguage} OR type IN ('query_embed', 'm') OR instr(markdown, 'inline-math') > 0 OR instr(markdown, '$') > 0)`,
+        `(${predicate}${codeLanguage} OR type IN ('query_embed', 'm', 'tab') OR instr(markdown, 'inline-math') > 0 OR instr(markdown, '$') > 0)`,
         signal,
     );
 }
@@ -221,7 +221,7 @@ export async function fetchLiteralGroupCandidateIds(
     let scope = `AND type NOT IN (${CONTAINER_SQL}) `;
     // ExportNodeStdMd 将行级公式导出成 $…$，不会保留 inline-math DOM 属性。
     // 公式可见字形不一定出现在 content 中（如 \\delta → δ），候选必须保留宿主。
-    let extra = " OR type IN ('query_embed', 'm') OR instr(markdown, 'inline-math') > 0 OR instr(markdown, '$') > 0";
+    let extra = " OR type IN ('query_embed', 'm', 'tab') OR instr(markdown, 'inline-math') > 0 OR instr(markdown, '$') > 0";
     if (kind === "imageTitle") {
         rawColumn = "markdown";
         scope = "AND instr(markdown, 'protyle-action__title') > 0 ";

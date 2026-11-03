@@ -372,6 +372,7 @@ export interface SearchBarI18n {
     /** 富文本单元格未通过源映射或格式保真校验 */
     replaceTableRichUnsupported: string;
     replaceRichCellUnsafe?: string;
+    replaceTabsTitleUnsafe?: string;
     /** 单元格编辑器还开着 */
     replaceTableCellEditingUnsupported: string;
     /** 同一张虚拟表里另有格子还在编辑，写回会盖掉它 */
@@ -5425,6 +5426,10 @@ export class SearchBar {
                 showMessage(this.i18n.replaceRichCellUnsafe ?? this.i18n.replaceTableRichUnsupported, 4000, "info");
                 return;
             }
+            if (result.error === "tabs-title-unsafe") {
+                showMessage(this.i18n.replaceTabsTitleUnsafe ?? this.i18n.replaceTableRichUnsupported, 4000, "info");
+                return;
+            }
             if (result.error === "title-invalid") {
                 showMessage(this.i18n.replaceDocTitleEmpty, 3000, "info");
                 this.clickNext();
@@ -5674,6 +5679,10 @@ export class SearchBar {
             }
             if (result.error === "rich-cell-unsafe") {
                 showMessage(this.i18n.replaceRichCellUnsafe ?? this.i18n.replaceTableRichUnsupported, 4000, "info");
+                return;
+            }
+            if (result.error === "tabs-title-unsafe") {
+                showMessage(this.i18n.replaceTabsTitleUnsafe ?? this.i18n.replaceTableRichUnsupported, 4000, "info");
                 return;
             }
             if (result.error === "stale-target") {

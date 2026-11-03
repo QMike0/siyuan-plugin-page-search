@@ -145,5 +145,6 @@
   "settingsRestrictInlineMemoHint": "Turn on Include in search → Inline memos first",
   "settingsRestrictInlineMemoOnHint": "Turn on Include in search → Inline memos first",
   "invalidRegex": "Invalid regex: {error}",
-  "replaceRichCellUnsafe": "The rich-text format or replacement text cannot be safely saved. No changes were submitted"
+  "replaceRichCellUnsafe": "The rich-text format or replacement text cannot be safely saved. No changes were submitted",
+  "replaceTabsTitleUnsafe": "Saving this tab title would change its text or formatting. No changes were submitted"
 }

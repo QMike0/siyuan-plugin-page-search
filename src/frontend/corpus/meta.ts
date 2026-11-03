@@ -240,9 +240,15 @@ export async function loadDocMeta(rootId: string, signal?: AbortSignal): Promise
                 ial: meta.ial,
                 hash: meta.hash,
             });
-            if (!isContainerType(type)) {
+            if (!isContainerType(type) || type === "tab") {
                 byId.set(row.id, meta);
             }
+        }
+
+        // A tab with a persistent title paragraph is searched through that
+        // paragraph. Only field-backed titles need the tab-item DOM itself.
+        for (const item of byId.values()) {
+            if (isTabsTitleBlockMeta(item) && parentById.get(item.parentId)?.type === "tab") byId.delete(item.parentId);
         }
 
         const meta: DocMeta = {

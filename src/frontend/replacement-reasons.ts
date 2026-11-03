@@ -45,7 +45,6 @@ export function createReplacementReasonReader(): (match: SearchMatch) => Replace
         if (cached) return cached;
         let reason: ReplacementSkipReason = "complex";
         if (element.closest('[data-type="NodeCustomBlock"]')) reason = "custom";
-        else if (element.closest('[tabs-title="true"], .tabs-header')) reason = "tabsTitle";
         else if (element.closest('[data-type~="inline-math"]')) reason = "inlineMath";
         else if (element.closest('[data-type="NodeMathBlock"], [data-subtype="math"]')) reason = "math";
         else if (element.closest('[data-type="NodeHTMLBlock"], protyle-html')) reason = "html";

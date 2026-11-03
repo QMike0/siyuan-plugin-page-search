@@ -300,6 +300,13 @@ export async function extractUnitsFromDoms(
                 const owner = wrap.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`);
                 if (owner) {
                     owners.set(id, owner);
+                    if (!embedIds.has(id) && owner.dataset.type === "NodeTabItem" && !options.includeTabsSourceForReplace) {
+                        // Search only the item's field title. Its persistent
+                        // title/body blocks have separate request owners; their
+                        // copies must not shadow those roots during deduplication.
+                        owner.querySelectorAll(".tab-item-info [data-node-id][data-type], .tab-item-content [data-node-id][data-type]")
+                            .forEach(child => child.remove());
+                    }
                     if (!embedIds.has(id) && owner.dataset.type === "NodeCallout") {
                         // A callout owns its title, but not its child blocks.
                         // Remove only child-block copies before global collection:
@@ -350,7 +357,9 @@ export async function extractUnitsFromDoms(
         if (!shouldContinue()) {
             return {blocks, unrenderedIds, missingIds, inlineMathIds, dispose: () => host.remove()};
         }
-        const collected = collectSearchableBlocks(host, {
+        const isolateTabWrites = options.includeTabsSourceForReplace &&
+            Array.from(owners.values()).some(owner => owner.dataset.type === "NodeTabItem");
+        const collected = isolateTabWrites ? [] : collectSearchableBlocks(host, {
             ...options,
             includeDocTitle: false,
             includeAttributeView: false,
@@ -372,7 +381,7 @@ export async function extractUnitsFromDoms(
                     .some(acceptsElement)
             ) inlineMathIds.push(id);
             // Collect each embed independently: source IDs can repeat in sibling embeds.
-            let sourceBlocks = embedIds.has(id) ?
+            let sourceBlocks = embedIds.has(id) || isolateTabWrites ?
                 collectSearchableBlocks(host, {
                     ...options,
                     scopeRoots: [owner],
@@ -462,7 +471,7 @@ export async function extractUnitsFromDoms(
                 const ordinaryText = (!block.matchSource || block.matchSource === "text") &&
                     !isRendererUnitId(block.unitId) &&
                     (block.blockType === "NodeParagraph" || block.blockType === "NodeHeading" ||
-                        block.blockType === "NodeCodeBlock" || block.blockType === "NodeTable");
+                        block.blockType === "NodeCodeBlock" || block.blockType === "NodeTable" || block.blockType === "NodeTabItem");
                 if (!block.embeddedAvRef && !(ordinaryText ? text.length : text.trim().length)) {
                     continue;
                 }

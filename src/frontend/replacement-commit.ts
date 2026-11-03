@@ -57,6 +57,18 @@ export function createCommitContentReader(
         try {
             const template = document.createElement("template");
             template.innerHTML = html;
+            // BlockDOM2Md wraps a standalone tab item in a temporary tabs node
+            // with a freshly generated ID. Supply a deterministic comparison-
+            // only wrapper; otherwise every authority read appears different.
+            const root = template.content.firstElementChild;
+            if (root?.getAttribute("data-type") === "NodeTabItem") {
+                const wrapper = document.createElement("div");
+                wrapper.setAttribute("data-type", "NodeTabs");
+                wrapper.setAttribute("data-node-id", "20261103000000-pgsrch0");
+                wrapper.className = "tabs";
+                root.replaceWith(wrapper);
+                wrapper.append(root);
+            }
             // Siyuan serializes list/mindmap blocks after removing the rendered
             // canvas and its state markers. Normalize the same derived DOM here
             // so a redraw between the preflight and final read is not mistaken
