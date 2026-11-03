@@ -21,7 +21,7 @@ function codeLanguageCandidatePredicate(predicate: string): string {
     return `(type = 'c' AND (instr(${CODE_FENCE_SQL}, char(10)) = 0 OR ${predicate}))`;
 }
 
-const CONTAINER_SQL = ["d", "l", "i", "b", "s", "mindmap", "mindmap_item"].map((type) => `'${type}'`).join(", ");
+const CONTAINER_SQL = ["d", "l", "i", "b", "s", "mindmap", "mindmap_item", "tabs", "tab"].map((type) => `'${type}'`).join(", ");
 
 const INTERNAL_MARKER_CODES = [0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF];
 

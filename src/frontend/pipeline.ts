@@ -1,5 +1,7 @@
 import {isMathSourceUnit, isTableMathSourceUnit} from "../shared/math-search";
 import {resolveImageOCRUnits} from "./image-ocr";
+import {prepareTabsMath} from "./tabs-math";
+import {createTabsTitleMathReader} from "./tabs-title";
 import {isImageOCRUnit, imageOCRPath} from "../shared/image-ocr";
 import {codeLanguageSearchEnabled, isCodeLanguageUnit} from "../shared/code-block-language";
 import type {Plugin} from "siyuan";
@@ -63,6 +65,8 @@ import {
     cloneSelectionScope,
     getSelectionScope,
     isMatchWithinSelection,
+    remapMathSelectionScope,
+    selectionScopeFromHosts,
     unitKey,
     type SelectionScope,
 } from "./selection";
@@ -83,6 +87,10 @@ export interface SearchPipelineOptions extends MatchOptions {
      * 现场为空时可传 rememberedScope 兜底（由 SearchBar 管理）。
      */
     selectionScope?: SelectionScope;
+    /** Explicit whole-block/cell selections; never inferred from full text offsets. */
+    selectionHosts?: readonly HTMLElement[];
+    /** Representation-only remapping; the owner keeps its frozen scope identity. */
+    onSelectionScopeRemapped?: (scope: SelectionScope) => void;
     /** 是否匹配文档标题；默认 true；命中可走 renameDoc 替换 */
     includeDocTitle?: boolean;
     /** 是否匹配图片标题；默认 true；可走块 transaction 替换 */
@@ -427,7 +435,7 @@ async function calculateLoadedDomMatches(
         };
     }
 
-    let blocks = collectSearchableBlocks(edit, {
+    const collectionOptions = {
         includeDocTitle,
         includeImageTitle: options.includeImageTitle !== false,
         includeImageOCR: options.includeImageOCR !== false,
@@ -460,9 +468,36 @@ async function calculateLoadedDomMatches(
         includeFoldedBlocks: options.includeFoldedBlocks === true,
         includeInlineMemo: options.includeInlineMemo === true,
         restrictInlineTypes: options.restrictInlineTypes,
-    });
+    };
     const selectionOnly = options.selectionOnly === true;
-    const selectionScope = resolveSelectionScope(edit, blocks, options);
+    const before = selectionOnly ? collectSearchableBlocks(edit, collectionOptions) : [];
+    let selectionScope = resolveSelectionScope(edit, before, options);
+    const wholeHosts = new Set((options.selectionHosts ?? []).filter(host => edit.contains(host)));
+    const titleMath = createTabsTitleMathReader();
+    const selectedMath = new Set(before.filter(block => selectionScope.has(unitKey(block.blockId, block.unitId)))
+        .map(block => titleMath(block.element)?.source ?? block.element));
+    const insideWholeHost = (element: HTMLElement): boolean => {
+        for (let current: HTMLElement | null = element; current && current !== edit; current = current.parentElement) {
+            if (wholeHosts.has(current)) return true;
+        }
+        return false;
+    };
+    const preparesMath = !options.searchMathSource && options.includeTabs !== false;
+    const prepared = preparesMath ? await prepareTabsMath(edit, collectionOptions, () => !options.signal?.aborted,
+        element => !selectionOnly || selectedMath.has(element) || insideWholeHost(element)) : undefined;
+    if (options.signal?.aborted) return {matches: [], error: "", cancelled: true};
+    let blocks = selectionOnly && prepared === undefined ? before : collectSearchableBlocks(edit, collectionOptions);
+    if (selectionOnly && prepared) {
+        selectionScope = remapMathSelectionScope(before, blocks, selectionScope, {edit, includeImageTitle: options.includeImageTitle});
+        // Only explicitly selected hosts may gain previously unrendered formulas.
+        for (const [key, ranges] of selectionScopeFromHosts(blocks, [...wholeHosts])) selectionScope.set(key, ranges);
+        for (const block of blocks) {
+            if (isInlineMathSearchUnit(block) && insideWholeHost(titleMath(block.element)?.source ?? block.element)) {
+                selectionScope.set(unitKey(block.blockId, block.unitId), [{start: 0, end: block.text.length}]);
+            }
+        }
+        options.onSelectionScopeRemapped?.(selectionScope);
+    }
     // Whole-block/cell selection can include an image. Text-only selection cannot;
     // avoid reading OCR for pictures outside the selected scope.
     const selectedBlocks = selectionOnly ? blocks.filter(block =>
@@ -630,7 +665,9 @@ function attachRangesToHits(
                         !hit.unitId?.startsWith("embed:") && hit.replaceable,
                     replaceReason: isImageOCRUnit(block) ? "imageOCR" : isCodeLanguageUnit(block) ? "codeLanguage" : isTabsTitleSearchUnit(block) ? "tabsTitle" : undefined,
                     range: undefined,
-                    highlightKind: isMathSourceUnit(block) ? "math-source" : isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : "text",
+                    highlightKind: isMathSourceUnit(block) ? "math-source" : isInlineMathSearchUnit(block) ? "inline-math" : isImageOCRUnit(block) ? "image-ocr" : isCodeLanguageUnit(block) ? "code-language" : "text",
+                    mathOrdinal: block.mathOrdinal,
+                    mathUnitText: isInlineMathSearchUnit(block) ? inlineMathIdentityText(block.text) : undefined,
                     tableSlot: isTableMathSourceUnit(block) ? block.tableSlot : undefined,
                     ...buildListSnippet(block.text, hit.start, hit.end, hit.matchedText),
                 });

@@ -6,12 +6,14 @@ import {
 import {ZERO_WIDTH_GLOBAL_RE} from "../shared/constants";
 import {rendererUnitId} from "../shared/renderer-units";
 import type {SearchableBlock} from "./dom-types";
+import {renderedMathPreviewText} from "./math-preview-cache";
 import {isUnderNonHeadingCssFold} from "./fold-dom";
 import {splitTextNodesAtBarriers} from "./text-runs";
 import {
     isAuthorCssHiddenElement,
     isHiddenOnlyByInactiveTab,
     omitAuthorCssHiddenText,
+    omitHiddenMathText,
 } from "./visibility";
 
 const CODE_BLOCK_TYPE = "NodeCodeBlock";
@@ -94,8 +96,11 @@ function collectMathUnits(element: HTMLElement, context: RendererContext, source
     // 思源 mathRender 使用 output="html"；只取可见字形层，避免 MathML/源码重复。
     const katexHtml = element.querySelector<HTMLElement>(".katex-html");
     if (!katexHtml) {
+        const preview = renderedMathPreviewText(element);
+        if (preview !== undefined) return preview && (!isAuthorCssHiddenElement(element) || isHiddenOnlyByInactiveTab(element)) ? [{...context, element, text: preview, textNodes: [],
+            unitId: rendererUnitId("rendered-text", "math")}] : [];
         const text = source ?? mathSourceFallbackText(element);
-        return text && !isAuthorCssHiddenElement(element) ?
+        return text && (!isAuthorCssHiddenElement(element) || isHiddenOnlyByInactiveTab(element)) ?
             [{
                 ...context,
                 element,
@@ -105,7 +110,7 @@ function collectMathUnits(element: HTMLElement, context: RendererContext, source
             }] :
             [];
     }
-    const textNodes = omitAuthorCssHiddenText(collectTextNodes(katexHtml, (parent) => {
+    const textNodes = omitHiddenMathText(collectTextNodes(katexHtml, (parent) => {
         return !parent.closest(".katex-mathml, math, annotation, svg, style, script");
     }));
     return singleRenderedUnit(element, context, "math", textNodes);

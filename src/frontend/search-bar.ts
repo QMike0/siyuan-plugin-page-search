@@ -43,6 +43,7 @@ import {
 } from "./av-watch";
 import {
     collectSearchableBlocks,
+    tabsLabelSourceBlock,
     resolveDocRoot,
     findDocumentBlock,
     TABLE_TYPE,
@@ -2842,11 +2843,24 @@ export class SearchBar {
     }
 
     private runSearchPipeline(value: string, signal: AbortSignal): Promise<SearchPipelineResult> {
+        const scope = this.resolveScopeForSearch();
+        const rememberedScope = this.rememberedSelectionScope;
+        const selectionHosts = !this.selectionOnly || this.searchMathSource || this.includeTabs === false ? [] : this.selectionScopeVisualKind === "block" ?
+            this.rememberedVisualBlockIds.map(id => findDocumentBlock(this.edit, id)).filter((host): host is HTMLElement => Boolean(host)) :
+            this.selectionScopeVisualKind === "table-cells" ? elementsForTableCellRefs(this.edit, this.rememberedTableCellRefs) : [];
         return calculateSearchMatches(this.plugin, this.edit, value, {
             ...this.searchOptions(),
             regexMatcher: this.regexMatcher,
             signal,
-            selectionScope: this.resolveScopeForSearch(),
+            selectionScope: scope,
+            selectionHosts,
+            onSelectionScopeRemapped: (next) => {
+                if (signal.aborted || this.destroyed || !this.selectionOnly || this.rememberedSelectionScope !== rememberedScope) return;
+                // This is the same selected content under new unit IDs. Preserve
+                // Map identity so the in-flight result remains current.
+                rememberedScope.clear();
+                for (const [key, ranges] of next) rememberedScope.set(key, ranges.map(range => ({...range})));
+            },
             onLiveUnitsCollected: (blocks) => {
                 if (signal.aborted || this.destroyed) return;
                 this.diagramSearchState.capture(
@@ -4672,7 +4686,7 @@ export class SearchBar {
         const blockId = match.blockId;
         let node: Node;
         try {
-            node = match.highlightKind === "math-source" ? mathSourceFrameHost(range) ?? range.startContainer : range.startContainer;
+            node = mathSourceFrameHost(range) ?? range.startContainer;
             if (!node?.isConnected) {
                 return false;
             }
@@ -4689,6 +4703,8 @@ export class SearchBar {
         let element: Element | null = node.nodeType === Node.ELEMENT_NODE ?
             node as Element :
             node.parentElement;
+        const label = element?.closest<HTMLElement>(".tabs-header .tabs-tab-label");
+        if (label && tabsLabelSourceBlock(label)?.dataset.nodeId === blockId) return true;
         while (element) {
             if (element.getAttribute("data-mindmap-source-id") === blockId || element.matches(selector)) {
                 return true;

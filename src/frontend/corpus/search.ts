@@ -1,4 +1,7 @@
 import {isMathSourceUnit, isTableMathSourceUnit} from "../../shared/math-search";
+import {prepareTabsMath} from "../tabs-math";
+import {renderedMathPreviewText} from "../math-preview-cache";
+import {createTabsTitleMathReader} from "../tabs-title";
 import {invalidateImageOCRCache, resolveImageOCRUnits} from "../image-ocr";
 import {isImageOCRUnit} from "../../shared/image-ocr";
 import {codeLanguageSearchEnabled, isCodeLanguageUnit} from "../../shared/code-block-language";
@@ -90,6 +93,7 @@ import {
     collectAuthorHiddenBlockIds,
     isAuthorCssHiddenElement,
     isAuthorCssHiddenText,
+    isHiddenOnlyByTabsTitle,
 } from "../visibility";
 import {
     escSql,
@@ -2097,7 +2101,7 @@ function isVisuallyInEditor(element: HTMLElement): boolean {
     // Inactive tab panels are source content hidden by tabsRender CSS. They are
     // still part of the document and must enter the corpus; Range projection
     // remains deferred until navigation activates the panel.
-    if (isInactiveTabSourceElement(element)) {
+    if (isInactiveTabSourceElement(element) || isHiddenOnlyByTabsTitle(element)) {
         return true;
     }
     // 行内公式是 inline，clientHeight 为 0，但仍然占位。用客户区矩形判断。
@@ -2289,6 +2293,8 @@ async function searchCurrentDocumentImpl(
     if (cancelled()) {
         return {matches: [], error: "", cancelled: true};
     }
+    await prepareTabsMath(edit, collectOptions(options), () => !cancelled());
+    if (cancelled()) return {matches: [], error: "", cancelled: true};
     const liveAll = collectSearchableBlocks(edit, {
         ...collectOptions(options),
         includeDocTitle: options.includeDocTitle !== false && !focusId,
@@ -2323,6 +2329,7 @@ async function searchCurrentDocumentImpl(
         liveAll.filter((unit) =>
             unit.text && (
                 isInactiveTabSourceElement(unit.element) ||
+                isHiddenOnlyByTabsTitle(unit.element) ||
                 (unit.textNodes.length ?
                     unit.textNodes.some((node) => !isAuthorCssHiddenText(node, options.includeFoldedBlocks === true)) :
                     !isAuthorCssHiddenElement(unit.element))
@@ -2474,6 +2481,11 @@ async function searchCurrentDocumentImpl(
     const recoverySelector = '[data-node-id][data-type], span[data-type~="inline-math"][data-content]';
     const recoveryAttribute = "data-page-search-recovery";
     const acceptsRenderer = createRendererElementFilter(extractionCollectOptions(options));
+    const readTabsMath = createTabsTitleMathReader();
+    const inlineMathOutput = (element: HTMLElement): HTMLElement => {
+        const title = readTabsMath(element);
+        return title?.labelMath && acceptsRenderer(title.labelMath) ? title.labelMath : element;
+    };
     const mountedEmbeds = (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>(
         '[data-type="NodeBlockQueryEmbed"][data-node-id]',
     );
@@ -2511,10 +2523,12 @@ async function searchCurrentDocumentImpl(
                 return {element, index, key: JSON.stringify([sourceId, inline ? "inline-math" : "block", ordinal])};
             })
             .filter(({element}) =>
+                (!element.closest(".tabs-header .tabs-tab-label") || Boolean(readTabsMath(element))) &&
                 !(options.searchMathSource && (element.matches('span[data-type~="inline-math"]') || rendererAdapterKind(element) === "math")) &&
                 acceptsRenderer(element) && (
                     element.matches('span[data-type~="inline-math"]') ?
-                        Boolean(element.getAttribute("data-content")) && !element.querySelector(".katex-html") :
+                        Boolean(element.getAttribute("data-content")) && !inlineMathOutput(element).querySelector(".katex-html") &&
+                            renderedMathPreviewText(inlineMathOutput(element)) === undefined :
                         Boolean(rendererAdapterKind(element)) &&
                         !supportsDiagramSourceSearch(element.dataset.subtype ?? "") && (
                             !rendererOutputCompleted(element) ||
@@ -2899,13 +2913,17 @@ async function searchCurrentDocumentImpl(
     if (collectInlineMath) {
         (resolveDocRoot(edit) ?? edit).querySelectorAll<HTMLElement>('span[data-type~="inline-math"][data-content]')
             .forEach((span) => {
+                const title = readTabsMath(span);
+                if (span.closest(".tabs-header .tabs-tab-label") && !title) return;
                 const id = (span.closest<HTMLElement>('[data-type="NodeBlockQueryEmbed"][data-node-id]') ??
+                    title?.sourceBlock ??
                     span.closest<HTMLElement>("[data-node-id][data-type]"))?.dataset.nodeId;
                 if (!id || !liveIds.has(id) || !acceptsRenderer(span)) return;
                 liveInlineMathIds.add(id);
+                const rendered = inlineMathOutput(span);
                 if (
-                    !options.searchMathSource && !refreshedEmbedIds.has(id) && span.getAttribute("data-content") &&
-                    !span.querySelector(".katex-html") && mathSourceFallbackText(span) === null
+                    !options.searchMathSource && !refreshedEmbedIds.has(id) && rendered.getAttribute("data-content") &&
+                    !rendered.querySelector(".katex-html") && renderedMathPreviewText(rendered) === undefined && mathSourceFallbackText(rendered) === null
                 ) {
                     incompleteLive.add(id);
                 }
@@ -2964,6 +2982,11 @@ async function searchCurrentDocumentImpl(
 
     const queueUnloaded = (id: string) => {
         if (queuedIds.has(id) || liveIds.has(id) || !inFocus(id)) {
+            return;
+        }
+        // Caption/memo candidate queries may also return an ancestor. Its
+        // descendants are indexed separately; never fetch the whole subtree.
+        if (isContainerType(meta.links.get(id)?.type ?? "")) {
             return;
         }
         const item = meta.byId.get(id) ?? {

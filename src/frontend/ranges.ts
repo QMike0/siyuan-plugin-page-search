@@ -2,9 +2,11 @@ import {isMathSourceUnit} from "../shared/math-search";
 import {isImageOCRUnit} from "../shared/image-ocr";
 import {isInlineMemoSearchUnit, isInlineMathSearchUnit} from "./blocks";
 import {isCodeLanguageUnit} from "../shared/code-block-language";
+import {renderedMathPreviewText} from "./math-preview-cache";
+import {tabsSourceTitleLabel} from "./tabs-title";
 import {isRendererSourceFallbackUnitId} from "../shared/renderer-units";
 import type {SearchableBlock} from "./dom-types";
-import {isElementVisible, type ElementVisibilityOptions} from "./visibility";
+import {isElementVisible, isHiddenOnlyByTabsTitle, type ElementVisibilityOptions} from "./visibility";
 
 interface TextPoint {
   node: Text
@@ -156,7 +158,27 @@ export function createRangeFromBlockOffsets(
   existingRange?: Range,
 ): Range | null {
   if (isRendererSourceFallbackUnitId(block.unitId)) return null
-  if (isMathSourceUnit(block) || isImageOCRUnit(block)) {
+  // An unrendered formula-only title has a native "Tab" label, with no formula
+  // clone. Navigate to that label without interpreting its placeholder as text.
+  if (isInlineMathSearchUnit(block) && !isElementVisible(block.element, visibility)
+    && isHiddenOnlyByTabsTitle(block.element)) {
+    if (start < 0 || end < start || end > block.text.length) return null;
+    const label = tabsSourceTitleLabel(block.element);
+    if (label && isElementVisible(label, visibility)) {
+      try {
+        const range = label.ownerDocument.createRange();
+        range.selectNode(label);
+        return range;
+      } catch { return null; }
+    }
+  }
+  // A just-activated tab may still await native mathRender. Select its empty
+  // formula host until live glyphs are available, without a collapsed Range.
+  const mathPreview = !block.textNodes.length &&
+    (isInlineMathSearchUnit(block) || block.blockType === "NodeMathBlock") &&
+    renderedMathPreviewText(block.element) === block.text;
+  if (mathPreview && (start < 0 || end < start || end > block.text.length)) return null;
+  if (isMathSourceUnit(block) || isImageOCRUnit(block) || mathPreview) {
     if (!isElementVisible(block.element, visibility)) return null
     try {
       const range = block.element.ownerDocument.createRange()

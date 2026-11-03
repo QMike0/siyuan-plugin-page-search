@@ -6,6 +6,7 @@ import type {
 } from "./dom-types";
 import {locateTextPoint} from "./ranges";
 import {searchableTextLengths} from "./text-runs";
+import {tabsLabelSourceBlock} from "./tabs-title";
 
 /** Rank the target/ancestor tree only; unrelated SVG subtrees never enter the traversal. */
 export function createEmbeddedPositionReader(
@@ -81,7 +82,36 @@ export function recordEmbeddedOrder(
         targets.add(block.element);
         block.textNodes.forEach((node) => targets.add(node));
     }
-    const positionOf = createEmbeddedPositionReader(root, targets);
+    // Navigation labels precede all tab panels in the DOM, but belong at
+    // their source title's position. Keep this projection in the shared
+    // reader so renderer recovery and cached anchors use the same order.
+    const labels = new Map<HTMLElement, {source: HTMLElement; targets: Set<Node>}>();
+    for (const target of targets) {
+        const element = target instanceof Element ? target : target.parentElement;
+        const label = element?.closest<HTMLElement>(".tabs-header .tabs-tab-label");
+        if (!label || label === root || !root.contains(label)) continue;
+        let entry = labels.get(label);
+        if (!entry) {
+            const source = tabsLabelSourceBlock(label);
+            if (!source || !root.contains(source)) continue;
+            labels.set(label, entry = {source, targets: new Set()});
+        }
+        entry.targets.add(target);
+    }
+    for (const {source} of labels.values()) targets.add(source);
+    const physicalPositionOf = createEmbeddedPositionReader(root, targets);
+    const projected = new Map<HTMLElement, {anchor: number[]; local: ReturnType<typeof createEmbeddedPositionReader>}>();
+    for (const [label, {source, targets: localTargets}] of labels) {
+        const anchor = physicalPositionOf(source);
+        if (anchor) projected.set(label, {anchor, local: createEmbeddedPositionReader(label, localTargets)});
+    }
+    const positionOf = (node: Node, after = false): number[] | undefined => {
+        const element = node instanceof Element ? node : node.parentElement;
+        const label = projected.size ? element?.closest<HTMLElement>(".tabs-header .tabs-tab-label") : null;
+        const entry = label ? projected.get(label) : undefined;
+        const local = entry?.local(node, after);
+        return local ? [...entry!.anchor, ...local] : physicalPositionOf(node, after);
+    };
     for (const block of blocks) {
         const order: EmbeddedOrderSegment[] = [];
         const lengths = block.textStartOffset === undefined ? undefined : searchableTextLengths(block);
@@ -180,9 +210,10 @@ export function createEmbeddedSourceReader(): (element: Element, sourceId?: stri
                 );
             }
         }
-        const source = sourceId ?
+        const label = element.closest<HTMLElement>(".tabs-header .tabs-tab-label");
+        const source = (label && tabsLabelSourceBlock(label)) || (sourceId ?
             element.closest(`[data-node-id="${CSS.escape(sourceId)}"][data-type]`) :
-            element.closest("[data-node-id][data-type]");
+            element.closest("[data-node-id][data-type]"));
         const identity = source && sources.get(source);
         if (identity) return identity;
         // Native mindmap clones strip data-node-id. Resolve them inside their

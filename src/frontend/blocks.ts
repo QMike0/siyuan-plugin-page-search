@@ -1,6 +1,8 @@
 import {isImageOCRUnit} from "../shared/image-ocr";
 import {CODE_LANGUAGE_UNIT_ID, codeLanguageSearchEnabled, isDiagramCodeLanguage} from "../shared/code-block-language";
 import {isMathSourceUnit} from "../shared/math-search";
+import {renderedMathPreviewText} from "./math-preview-cache";
+import {createTabsTitleMathReader, tabsLabelSourceBlock, tabsSourceTitleLabel} from "./tabs-title";
 import {
     logicalTableRows,
     normalizeRestrictInlineTypes,
@@ -45,8 +47,11 @@ import {
     isCollectedTextHidden,
     isAuthorCssHiddenElement,
     isHiddenOnlyByInactiveTab,
+    isHiddenOnlyByTabsTitle,
     omitAuthorCssHiddenText,
+    omitHiddenMathText,
 } from "./visibility";
+export {tabsLabelSourceBlock} from "./tabs-title";
 
 const ZERO_WIDTH_RE = /[\u200B-\u200D\u2060\uFEFF]/;
 const PREVIEW_BLOCK_ID = "__preview__";
@@ -695,7 +700,7 @@ export function collectSearchableBlocks(
 
     const attributeRoots = scoped ? scopeRoots : (docRoot ? [docRoot] : []);
     if (includeTabs && collectBodyText) {
-        blocks.push(...collectTabsTitleUnits(attributeRoots));
+        blocks.push(...collectTabsTitleUnits(attributeRoots, blockElements));
     }
     if (includeMindmap && collectBodyText) {
         const previews = collectMindmapPreviewUnits(attributeRoots, includeGates, restrictInlineTypes.length === 0, includeImageTitle);
@@ -720,7 +725,23 @@ export function collectSearchableBlocks(
         });
     }
     if (collectMath) {
-        attributeRoots.forEach((root) => {
+        const mathRoots = [...attributeRoots];
+        if (scoped && includeTabs) {
+            // Scoped repair starts at the source block, while tabsRender may
+            // have replaced its navigation clone outside that subtree.
+            const labels = new Set<HTMLElement>();
+            for (const root of attributeRoots) {
+                const titles = [root, ...root.querySelectorAll<HTMLElement>(
+                    '.tab-item-info [tabs-title], .tab-item-info > [data-node-id]:has(> .tab-item-title)',
+                )];
+                for (const title of titles) {
+                    const label = tabsSourceTitleLabel(title);
+                    if (label && !attributeRoots.some(scope => scope.contains(label))) labels.add(label);
+                }
+            }
+            mathRoots.push(...labels);
+        }
+        mathRoots.forEach((root) => {
             blocks.push(...filterAttributeUnitsByIncludeGates(
                 collectInlineMathSearchUnits(root, restrictInlineTypes.length === 0, options.searchMathSource === true),
                 includeGates,
@@ -842,10 +863,10 @@ function recordImageAndMathHostOrder(blocks: readonly SearchableBlock[]): void {
     const groups = new Map<HTMLElement, {units: SearchableBlock[]; slot?: TableSlot;}>();
     const hostOf = (block: SearchableBlock) => block.blockType === TABLE_TYPE ?
         block.element.closest<HTMLElement>(TABLE_CELL_SELECTOR) :
-        block.element.closest<HTMLElement>('.mindmap-view [data-mindmap-source-id]') ?? getOwnerBlock(block.element);
+        block.element.closest<HTMLElement>(".tabs-header .tabs-tab-label, .mindmap-view [data-mindmap-source-id]") ?? getOwnerBlock(block.element);
     for (const block of blocks) {
-        const sourceMath = isMathSourceUnit(block) && block.blockType !== ATTRIBUTE_VIEW_TYPE &&
-            (isInlineMathSearchUnit(block) || block.blockType === TABLE_TYPE);
+        const sourceMath = (isMathSourceUnit(block) || block.element.closest(".tabs-header .tabs-tab-label")) &&
+            block.blockType !== ATTRIBUTE_VIEW_TYPE && (isInlineMathSearchUnit(block) || block.blockType === TABLE_TYPE);
         if ((!isImageOCRUnit(block) && !sourceMath) || embeddedOwner(block.element)) continue;
         const host = hostOf(block);
         if (host) groups.set(host, {units: [], slot: block.tableSlot});
@@ -1004,17 +1025,22 @@ export function createRendererElementFilter(
     };
     const body = shouldCollectBodyTextForRestrict(options.restrictInlineTypes);
     const math = shouldCollectInlineMathUnits(options.restrictInlineTypes);
+    const titleSource = createTabsLabelSourceReader();
     return (element) => {
         const inlineMath = element.matches('span[data-type~="inline-math"]');
+        const label = element.closest<HTMLElement>(".tabs-header .tabs-tab-label");
+        const source = label ? titleSource(label) : null;
         const kind = rendererAdapterKind(element);
         const runtime = kind ?
             rendererEnabled(kind, gates) :
             element.matches(`[data-type="${ATTRIBUTE_VIEW_TYPE}"]`) && gates.includeAttributeView;
         return (inlineMath ? math : body && runtime) &&
             !shouldSkipAttributeUnitByIncludeGates(element, gates) &&
+            !(source && shouldSkipAttributeUnitByIncludeGates(source, gates)) &&
             !(options.includeTabs === false && element.closest('[data-type="NodeTabs"]')) &&
             !(options.includeFoldedBlocks === false && isUnderNonHeadingCssFold(element)) &&
-            !isAuthorCssHiddenElement(element);
+            (!isAuthorCssHiddenElement(element) || ((inlineMath || kind === "math") &&
+                (isHiddenOnlyByInactiveTab(element) || isHiddenOnlyByTabsTitle(element))));
     };
 }
 
@@ -1222,8 +1248,12 @@ function filterAttributeUnitsByIncludeGates(
     units: SearchableBlock[],
     gates: IncludeGates,
 ): SearchableBlock[] {
+    const titleSource = createTabsLabelSourceReader();
     return units.filter((unit) => {
         if (shouldSkipAttributeUnitByIncludeGates(unit.element, gates)) return false;
+        const label = unit.element.closest<HTMLElement>(".tabs-header .tabs-tab-label");
+        const source = label ? titleSource(label) : null;
+        if (source && shouldSkipAttributeUnitByIncludeGates(source, gates)) return false;
         const cell = isInlineMathSearchUnit(unit) ? unit.element.closest<HTMLElement>(RICH_TABLE_CELL_SELECTOR) : null;
         return !cell || !shouldSkipRichPreviewByInclude(unit.element, cell, gates);
     });
@@ -2206,7 +2236,7 @@ function elementHasBox(element: HTMLElement): boolean {
         (typeof element.getClientRects === "function" && element.getClientRects().length > 0);
 }
 
-function hiddenTabsTitleCoveredByLabel(element: HTMLElement): boolean {
+export function hiddenTabsTitleCoveredByLabel(element: HTMLElement): boolean {
     const info = element.closest(".tab-item-info");
     if (!info) {
         return false;
@@ -2223,7 +2253,8 @@ function hiddenTabsTitleCoveredByLabel(element: HTMLElement): boolean {
     const label = tabs.querySelector<HTMLElement>(
         `:scope > .tabs-header [data-tab-id="${CSS.escape(tabId)}"] .tabs-tab-label`,
     );
-    return Boolean(label && elementHasBox(label) && (label.textContent || "").length > 0);
+    return Boolean(label && (elementHasBox(label) || isHiddenOnlyByInactiveTab(label)) &&
+        ((label.textContent || "").length > 0 || label.querySelector('span[data-type~="inline-math"][data-content]')));
 }
 
 /**
@@ -2231,7 +2262,7 @@ function hiddenTabsTitleCoveredByLabel(element: HTMLElement): boolean {
  * 不属于文档语料；搜索和替换都应使用源块，而不是只采集当前显示的面板。
  */
 export function isInactiveTabSourceElement(element: Element | null): boolean {
-    if (!element || element.closest(".tabs-header")) {
+    if (!element) {
         return false;
     }
     return isHiddenTabContent(element);
@@ -2261,11 +2292,21 @@ function shouldKeepHiddenSourceText(node: Text): boolean {
     return isHiddenOnlyByInactiveTab(node.parentElement);
 }
 
+/** Collection-scoped: a label's formulas share one source lookup, never stale DOM. */
+function createTabsLabelSourceReader(): (label: HTMLElement) => HTMLElement | null {
+    const sources = new WeakMap<HTMLElement, HTMLElement | null>();
+    return label => {
+        if (!sources.has(label)) sources.set(label, tabsLabelSourceBlock(label));
+        return sources.get(label) ?? null;
+    };
+}
+
 /** 把可见的页签标题标签记到原标题块上，高亮才能画在导航栏里。 */
-function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
+function collectTabsTitleUnits(roots: HTMLElement[], blockElements: readonly HTMLElement[]): SearchableBlock[] {
     const units: SearchableBlock[] = [];
+    const indexes = new Map(blockElements.map((element, index) => [element, index]));
     const seenTabs = new Set<HTMLElement>();
-    const seenItems = new Set<string>();
+    const seenItems = new Set<HTMLElement>();
     const consider = (tabs: HTMLElement | null) => {
         if (!tabs || seenTabs.has(tabs) || tabs.getAttribute("data-type") !== "NodeTabs") {
             return;
@@ -2273,7 +2314,7 @@ function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
         seenTabs.add(tabs);
         tabs.querySelectorAll<HTMLElement>(":scope > .tabs-header [data-tab-id]").forEach((button) => {
             const tabId = button.getAttribute("data-tab-id") || "";
-            if (!tabId || seenItems.has(tabId)) {
+            if (!tabId) {
                 return;
             }
             const item = tabs.querySelector<HTMLElement>(`:scope > .tab-item[data-node-id="${CSS.escape(tabId)}"]`);
@@ -2296,7 +2337,8 @@ function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
             const blockEl = directTitleBlock ??
                 titleBlock?.closest<HTMLElement>("[data-node-id][data-type]") ?? null;
             const blockId = blockEl?.getAttribute("data-node-id") || "";
-            if (!item || !blockId) {
+            if (!item || seenItems.has(item) || !blockId || !blockEl ||
+                !roots.some(root => root.contains(blockEl) || root.contains(button))) {
                 return;
             }
             const editing = item.getAttribute("data-tabs-editing") === "true";
@@ -2304,7 +2346,13 @@ function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
             if (editing && blockEl && elementHasBox(blockEl)) {
                 return;
             }
-            if (!label || !elementHasBox(label)) {
+            if (!label || (!elementHasBox(label) && !isHiddenOnlyByInactiveTab(label))) {
+                return;
+            }
+            if (blockEl.querySelector('span[data-type~="inline-math"]') &&
+                !label.querySelector('span[data-type~="inline-math"]') && !collectElementTextNodes(blockEl).length) {
+                // tabsRender uses a generic label until a formula-only title
+                // gains rendered Text. That placeholder is not note content.
                 return;
             }
             const textNodes = collectElementTextNodes(label);
@@ -2312,11 +2360,11 @@ function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
             if (!text) {
                 return;
             }
-            seenItems.add(tabId);
+            seenItems.add(item);
             units.push(...unitsFromTextNodes({
                 blockId,
                 blockType: blockEl?.getAttribute("data-type") || "NodeParagraph",
-                blockIndex: 0,
+                blockIndex: blockEl ? indexes.get(blockEl) ?? 0 : 0,
                 element: label,
                 // The tab label is a renderer clone; the source title block is elsewhere.
                 matchSource: "projection",
@@ -2336,7 +2384,9 @@ function collectTabsTitleUnits(roots: HTMLElement[]): SearchableBlock[] {
 function collectElementTextNodes(root: HTMLElement): Text[] {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
-            if (!(node instanceof Text) || !node.nodeValue?.length) {
+            if (!(node instanceof Text) || !node.nodeValue?.length ||
+                node.parentElement?.closest('span[data-type~="inline-math"], .katex, math, annotation, script, style') ||
+                (isCollectedTextHidden(node) && !shouldKeepHiddenSourceText(node) && !isHiddenOnlyByTabsTitle(node.parentElement))) {
                 return NodeFilter.FILTER_REJECT;
             }
             return NodeFilter.FILTER_ACCEPT;
@@ -2994,15 +3044,21 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
     const embeddedOrdinals = new Map<HTMLElement, number>();
     const avCellOrdinals = new Map<HTMLElement, number>();
     const tableCellOrdinals = new Map<HTMLElement, {root: HTMLElement; next: number;}>();
+    const titleMath = createTabsTitleMathReader();
     let mathIndex = 0;
 
     for (const span of spans) {
         // Native canvas clones retain source IDs under another attribute.
+        const label = span.closest<HTMLElement>(".tabs-header .tabs-tab-label");
+        const titleLink = titleMath(span);
+        const titleBlock = titleLink?.sourceBlock;
+        const labelAvailable = titleLink && (elementHasBox(titleLink.label) || isHiddenOnlyByInactiveTab(titleLink.label));
+        if (label ? !titleBlock || !labelAvailable : titleLink?.labelMath && labelAvailable) continue;
         // Rich-cell descendants still belong to the enclosing table, as in
         // the source DOM; never assign their formulas to the mindmap container.
         const preview = span.closest<HTMLElement>('.mindmap-view [data-mindmap-source-id][data-type]');
-        const owner = preview ? preview.closest<HTMLElement>(`[data-type="${TABLE_TYPE}"][data-mindmap-source-id]`) ?? preview :
-            searchOwnerBlock(span);
+        const owner = titleBlock ?? (preview ? preview.closest<HTMLElement>(`[data-type="${TABLE_TYPE}"][data-mindmap-source-id]`) ?? preview :
+            searchOwnerBlock(span));
         const ownerId = (preview ? owner?.dataset.mindmapSourceId : owner?.dataset.nodeId)?.trim();
         const inAv = owner?.dataset.type === ATTRIBUTE_VIEW_TYPE;
         // Default searches already collect the formula as a cell run.
@@ -3037,13 +3093,14 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
             hidden = hidden.parentElement?.closest(".fn__none") ?? null;
         }
         if (span.closest(".protyle-attr") || hidden || (isAuthorCssHiddenElement(span) &&
-            !(searchMathSource && isHiddenOnlyByInactiveTab(span)))) {
+            !isHiddenOnlyByInactiveTab(span) && !isHiddenOnlyByTabsTitle(span))) {
             continue;
         }
 
-        const textNodes = searchMathSource ? [] : omitAuthorCssHiddenText(collectKatexGlyphTextNodes(span));
-        const source = searchMathSource ? diagramSourceText(span) : mathSourceFallbackText(span);
-        const text = source ?? textNodes.map((node) => node.nodeValue ?? "").join("");
+        const textNodes = searchMathSource ? [] : omitHiddenMathText(collectKatexGlyphTextNodes(span));
+        const previewText = !searchMathSource && !span.querySelector(".katex-html") ? renderedMathPreviewText(span) : undefined;
+        const source = searchMathSource ? diagramSourceText(span) : previewText === undefined ? mathSourceFallbackText(span) : null;
+        const text = source ?? previewText ?? textNodes.map((node) => node.nodeValue ?? "").join("");
         // 仅零宽占位则跳过（思源在公式旁插入 ZWSP）
         if (!text.replace(ZERO_WIDTH_RE, "").length) {
             continue;
@@ -3103,7 +3160,7 @@ function collectInlineMathSearchUnits(docRoot: HTMLElement, skipAttributeViews =
  * 同一行若被拆成内容相同的多个 .base，只留一份，避免行级公式把同一个词计两次。
  * 不走正文排除列表，否则 .katex 会被整段丢掉。
  */
-function collectKatexGlyphTextNodes(spanOrHtml: HTMLElement): Text[] {
+export function collectKatexGlyphTextNodes(spanOrHtml: HTMLElement): Text[] {
     const htmlRoot = spanOrHtml.classList.contains("katex-html") ?
         spanOrHtml :
         spanOrHtml.querySelector<HTMLElement>(".katex-html");

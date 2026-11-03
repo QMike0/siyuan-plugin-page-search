@@ -172,11 +172,14 @@ export function isAuthorCssHiddenElement(element: Element | null): boolean {
     return false;
 }
 
-function isNativeInactiveTabDisplayBoundary(element: Element): boolean {
+function isNativeInactiveTabDisplayBoundary(element: Element, allowTitle: boolean): boolean {
     const panel = element.classList.contains("tab-item") ? element :
         element.classList.contains("tab-item-info") ? element.parentElement : null;
     if (!panel?.classList.contains("tab-item") || !panel.parentElement?.classList.contains("tabs") ||
-        !isHiddenTabPanel(panel) || (element as HTMLElement).style?.display === "none") return false;
+        (element as HTMLElement).style?.display === "none") return false;
+    if (allowTitle && element !== panel && panel.parentElement.getAttribute("data-tabs-ready") === "true" &&
+        panel.getAttribute("data-tabs-editing") !== "true") return true;
+    if (!isHiddenTabPanel(panel)) return false;
     // SiYuan hides both inactive panels and their source title rows after render.
     return element === panel || (panel.hasAttribute("data-tabs-hidden") &&
         panel.getAttribute("data-tabs-editing") !== "true");
@@ -184,7 +187,17 @@ function isNativeInactiveTabDisplayBoundary(element: Element): boolean {
 
 /** 只豁免思源隐藏的非活动页签面板，不放宽正文自身或其他祖先的隐藏样式。 */
 export function isHiddenOnlyByInactiveTab(element: Element | null): boolean {
-    if (!element || element.closest(".tabs-header") || !isHiddenTabContent(element) ||
+    return isHiddenOnlyByNativeTabs(element, false);
+}
+
+/** The active panel's source title is also hidden by tabsRender once ready. */
+export function isHiddenOnlyByTabsTitle(element: Element | null): boolean {
+    if (!element?.closest(".tab-item-info")) return false;
+    return isHiddenOnlyByNativeTabs(element, true);
+}
+
+function isHiddenOnlyByNativeTabs(element: Element | null, allowTitle: boolean): boolean {
+    if (!element || (!allowTitle && !isHiddenTabContent(element)) ||
         (!collectAllowsFoldedHidden && isUnderNonHeadingCssFold(element))) return false;
     // visibility 会继承；页签渲染器只用 display 隐藏面板。
     if (textStyle(element).visibilityHidden) return false;
@@ -192,8 +205,8 @@ export function isHiddenOnlyByInactiveTab(element: Element | null): boolean {
     while (current && current !== document.body) {
         if (current.hasAttribute("data-page-search-offscreen")) break;
         if (current.classList.contains("fn__none") || current.hasAttribute("hidden") ||
-            current.getAttribute("aria-hidden") === "true") return false;
-        if (textStyle(current).displayHidden && !isNativeInactiveTabDisplayBoundary(current)) return false;
+            isSearchBlockingAriaHidden(current as HTMLElement)) return false;
+        if (textStyle(current).displayHidden && !isNativeInactiveTabDisplayBoundary(current, allowTitle)) return false;
         current = parentElementCrossingShadow(current);
     }
     return true;
@@ -211,7 +224,8 @@ export function collectAuthorHiddenBlockIds(root: ParentNode): Set<string> {
         }
         const id = element.dataset.mindmapSourceId || element.dataset.nodeId;
         if (id) {
-            (isAuthorCssHiddenExceptMindmapSource(element) ? hidden : visible).add(id);
+            (isAuthorCssHiddenExceptMindmapSource(element) && !isHiddenOnlyByInactiveTab(element) &&
+                !isHiddenOnlyByTabsTitle(element) ? hidden : visible).add(id);
         }
     });
     visible.forEach((id) => hidden.delete(id));
@@ -223,6 +237,14 @@ export function omitAuthorCssHiddenText(nodes: readonly Text[]): Text[] {
         return [];
     }
     return nodes.filter((node) => !isAuthorCssHiddenText(node, collectAllowsFoldedHidden));
+}
+
+/** Nonactive native panels still belong to the document; author hiding stays excluded. */
+export function omitHiddenMathText(nodes: readonly Text[]): Text[] {
+    // fn__none inside KaTeX is authored content, not a native collapsed UI shell.
+    return nodes.filter((node) => !node.parentElement?.closest(".katex-html .fn__none") &&
+        (!isAuthorCssHiddenText(node, collectAllowsFoldedHidden) ||
+            isHiddenOnlyByInactiveTab(node.parentElement) || isHiddenOnlyByTabsTitle(node.parentElement)));
 }
 
 export interface ElementVisibilityOptions {

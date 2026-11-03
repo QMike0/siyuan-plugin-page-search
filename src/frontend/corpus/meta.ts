@@ -317,7 +317,7 @@ function buildFallbackOrder(
 
 export function isContainerType(type: string): boolean {
     return type === "d" || type === "l" || type === "i" || type === "b" || type === "s" ||
-        type === "mindmap" || type === "mindmap_item";
+        type === "mindmap" || type === "mindmap_item" || type === "tabs" || type === "tab";
 }
 
 export function codeBlockLanguagesNeeded(options: BlockIncludeFlags): boolean {

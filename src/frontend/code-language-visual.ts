@@ -70,8 +70,10 @@ export function imageOCRFrameHost(range: Range): HTMLElement | null {
 export function mathSourceFrameHost(range: Range): HTMLElement | null {
     const selected = range.startContainer === range.endContainer && range.endOffset === range.startOffset + 1 ?
         range.startContainer.childNodes[range.startOffset] : null;
+    // Only fallback formula ranges select a whole tab label; ordinary title
+    // matches use Text offsets. No source-tree lookup per matching occurrence.
     const math = selected instanceof HTMLElement && selected.matches(
-        'span[data-type~="inline-math"], div[data-subtype="math"], [data-type="NodeMathBlock"], div.language-math');
+        'span[data-type~="inline-math"], div[data-subtype="math"], [data-type="NodeMathBlock"], div.language-math, .tabs-header .tabs-tab-label');
     return math ? selected : null;
 }
 

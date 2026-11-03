@@ -11,6 +11,7 @@ import {
 } from "../blocks";
 import type {CollectSearchableBlocksOptions} from "../blocks";
 import type {SearchableBlock} from "../dom-types";
+import {containsNodeCrossingShadow} from "../dom-parent";
 import {
     createEmbeddedSourceReader,
     recordEmbeddedOrder,
@@ -90,9 +91,9 @@ async function fetchBlockDoms(
     }
     return {doms, unresolvedEmbedIds, absentIds};
 }
-function keepOwnedUnits(blocks: SearchableBlock[], ownerId: string, embed: boolean): SearchableBlock[] {
+function keepOwnedUnits(blocks: SearchableBlock[], ownerId: string, embed: boolean, owner: HTMLElement): SearchableBlock[] {
     if (!embed) {
-        return blocks.filter((block) => block.blockId === ownerId);
+        return blocks.filter((block) => block.blockId === ownerId && containsNodeCrossingShadow(owner, block.element));
     }
     return blocks.map((block) => ownEmbeddedSearchUnit(block, ownerId));
 }
@@ -284,6 +285,7 @@ export async function extractUnitsFromDoms(
     const acceptsElement = (element: HTMLElement) =>
         acceptsRenderer(element) &&
         (!recoveryAttribute || element.hasAttribute(recoveryAttribute));
+    const owners = new Map<string, HTMLElement>();
     try {
         for (const id of ids) {
             const html = doms[id];
@@ -295,6 +297,16 @@ export async function extractUnitsFromDoms(
             wrap.innerHTML = html;
             const node = wrap.firstElementChild;
             if (node) {
+                const owner = wrap.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`);
+                if (owner) {
+                    owners.set(id, owner);
+                    if (!embedIds.has(id) && owner.dataset.type === "NodeCallout") {
+                        // A callout owns its title, but not its child blocks.
+                        // Remove only child-block copies before global collection:
+                        // they would shadow the separately requested source roots.
+                        owner.querySelectorAll(":scope > .callout-content [data-node-id][data-type]").forEach(child => child.remove());
+                    }
+                }
                 const language = codeLanguages?.get(id);
                 // blocks.subtype 不保存代码语言。即使搜索元数据已经识别出 Mermaid，
                 // getBlockDOMs 返回的根 DOM 在部分路径中仍可能没有 data-subtype；
@@ -328,7 +340,7 @@ export async function extractUnitsFromDoms(
                     if (!embedIds.has(id) || !shouldContinue()) {
                         continue;
                     }
-                    const owner = wysiwyg.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`);
+                    const owner = owners.get(id);
                     if (owner) {
                         await renderEmbeddedDiagrams(owner, acceptsElement, shouldContinue, forceDiagramRender);
                     }
@@ -349,7 +361,7 @@ export async function extractUnitsFromDoms(
             if (unrendered.has(id)) {
                 continue;
             }
-            const owner = wysiwyg.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`);
+            const owner = owners.get(id);
             if (!owner) {
                 missingIds.push(id);
                 unrendered.add(id);
@@ -415,7 +427,7 @@ export async function extractUnitsFromDoms(
                     unrendered.add(id);
                 }
             }
-            let owned = keepOwnedUnits(sourceBlocks, id, embedIds.has(id));
+            let owned = keepOwnedUnits(sourceBlocks, id, embedIds.has(id), owner);
             const language = codeLanguages?.get(id);
             // 某些内核版本返回的代码块 DOM 没有 data-subtype。上面已尽量补到
             // 克隆节点，但若结构异常导致采集器仍看不到它，直接按已确认的围栏
@@ -424,9 +436,7 @@ export async function extractUnitsFromDoms(
                 language && DIAGRAM_SUBTYPE_SET.has(language) &&
                 !owned.some((block) => isRendererUnitId(block.unitId))
             ) {
-                const element = wysiwyg.querySelector<HTMLElement>(
-                    `[data-node-id="${CSS.escape(id)}"]`,
-                );
+                const element = owner;
                 if (element) {
                     owned = owned.concat(collectRendererSearchUnits(element, {
                         blockId: id,
