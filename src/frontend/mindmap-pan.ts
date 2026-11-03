@@ -3,7 +3,7 @@
  * 位移和思源 revealNode 相同，但通过视口上的滚轮处理函数提交，
  * 这样节点和 canvas 连线一起重画。不改缩放，不展开折叠。
  *
- * @see https://github.com/siyuan-note/siyuan/blob/v3.8.7-alpha.5/app/src/protyle/render/listMindmap/view.ts
+ * @see https://github.com/siyuan-note/siyuan/blob/v3.8.9/app/src/protyle/render/listMindmap/view.ts
  */
 const PAN_MARGIN = 16;
 
@@ -28,24 +28,46 @@ export function panMindmapIntoView(range: Range): void {
         return;
     }
     frame.scrollIntoView({block: "center", inline: "nearest"});
-    for (let index = views.length - 1; index >= 0; index--) {
-        panView(views[index], range);
+    // 先把命中移回内层视口，外层再按最终位置平移，避免内层随后把命中移出外层。
+    for (const view of views) {
+        panView(view, range);
     }
 }
 
 function panView(view: HTMLElement, range: Range): void {
     const viewport = view.querySelector<HTMLElement>(":scope > .mindmap-view__viewport");
-    if (!viewport) {
+    if (!viewport || view.classList.contains("mindmap-view--locked")) {
         return;
     }
     const horizontal = panDelta(viewport, range, "x");
-    if (horizontal) {
-        // shift 只改水平偏移。垂直被边界挡住时，思源会整次放弃，所以分开送。
-        dispatchWheel(viewport, -horizontal, 0, true);
-    }
     const vertical = panDelta(viewport, range, "y");
-    if (vertical) {
-        dispatchWheel(viewport, 0, -vertical, false);
+    if (!horizontal && !vertical) {
+        return;
+    }
+    const wasActive = view.classList.contains("mindmap-view--active");
+    // 搜索框持有焦点时原生 wheel 会忽略平移。只点击 host 本身来临时激活，
+    // 不发 pointerdown、不点击节点/控件，也不调用 focus，保留搜索输入与节点选择。
+    if (!wasActive) {
+        view.dispatchEvent(new MouseEvent("click", {bubbles: false}));
+    }
+    try {
+        if (horizontal) {
+            // 分轴提交，避免原生边界约束将另一轴的一次平移挡住。
+            dispatchWheel(viewport, -horizontal, 0, true);
+        }
+        const nextVertical = horizontal ? panDelta(viewport, range, "y") : vertical;
+        if (nextVertical) {
+            dispatchWheel(viewport, 0, -nextVertical, false);
+        }
+    } finally {
+        if (!wasActive && view.classList.contains("mindmap-view--active")) {
+            // 复用原生失焦收尾；仅通知状态，不移动实际焦点，不遗留滚轮接管状态。
+            const active = view.ownerDocument.activeElement;
+            view.dispatchEvent(new FocusEvent("focusout", {
+                bubbles: false,
+                relatedTarget: active && !view.contains(active) ? active : view.ownerDocument.body,
+            }));
+        }
     }
 }
 
@@ -55,20 +77,24 @@ function panDelta(viewport: HTMLElement, range: Range, axis: "x" | "y"): number 
     if (!target || !viewRect.width || !viewRect.height) {
         return 0;
     }
+    // 原生 wheel 的像素量是局部坐标，Rect 则已包含编辑器 zoom / 外层导图缩放。
+    const scale = axis === "x" ? viewRect.width / (viewport.offsetWidth || viewRect.width) :
+        viewRect.height / (viewport.offsetHeight || viewRect.height);
+    const margin = PAN_MARGIN * scale;
     if (axis === "x") {
-        if (target.left < viewRect.left + PAN_MARGIN) {
-            return viewRect.left + PAN_MARGIN - target.left;
+        if (target.left < viewRect.left + margin) {
+            return (viewRect.left + margin - target.left) / scale;
         }
-        if (target.right > viewRect.right - PAN_MARGIN) {
-            return viewRect.right - PAN_MARGIN - target.right;
+        if (target.right > viewRect.right - margin) {
+            return (viewRect.right - margin - target.right) / scale;
         }
         return 0;
     }
-    if (target.top < viewRect.top + PAN_MARGIN) {
-        return viewRect.top + PAN_MARGIN - target.top;
+    if (target.top < viewRect.top + margin) {
+        return (viewRect.top + margin - target.top) / scale;
     }
-    if (target.bottom > viewRect.bottom - PAN_MARGIN) {
-        return viewRect.bottom - PAN_MARGIN - target.bottom;
+    if (target.bottom > viewRect.bottom - margin) {
+        return (viewRect.bottom - margin - target.bottom) / scale;
     }
     return 0;
 }
