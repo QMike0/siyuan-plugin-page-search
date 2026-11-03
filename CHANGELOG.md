@@ -1,3 +1,20 @@
+## v2.1.3 2026-11-03
+
+- 🇨🇳 实现对行级公式、公式块的公式源码搜索
+- 🇨🇳 实现页签块的页签标题文本的替换/全部替换，并优化页签标题行级备注的搜索与替换
+- 🇨🇳 优化同一个行级公式、公式块、代码语言标签或图片 OCR 对象内切换不同命中时的匹配动画，外框会快速完成一次 橙色 → 黄色 → 橙色，持续约 180 毫秒
+- 🇨🇳 优化齿轮菜单在英文模式下的显示
+- 🇨🇳 修复页签块中的数学公式搜索时存在的重复计数、跳转顺序混乱等问题
+- 🇨🇳 修复思维导图块的显示区域不随关键词跳转进行滚动的问题
+- 🇨🇳 更新icon.png
+- 🇺🇸 Implemented source-code search for inline formulas and formula blocks
+- 🇺🇸 Implemented replace/replace-all for tab block tab titles, and optimized search & replace for inline remarks on tab titles
+- 🇺🇸 Optimized the match animation when switching between different hits within the same inline formula, formula block, code language label, or image OCR object — the outline quickly completes one orange → yellow → orange cycle, lasting about 180 ms
+- 🇺🇸 Optimized the display of the gear menu in English mode
+- 🇺🇸 Fixed issues in math formula search within tab blocks, including duplicate counting and disordered jump order
+- 🇺🇸 Fixed an issue where the mind map block's display area did not scroll along with keyword jumps
+- 🇺🇸 Updated icon.png
+
 ## v2.1.2 2026-10-29
 
 - 🇨🇳 优化插件对代码块语言标签的搜索匹配，实现搜索到语言标签时高亮代码块外框、禁止替换语言标签、实现独立开关项、离屏搜索
