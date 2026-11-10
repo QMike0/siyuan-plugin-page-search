@@ -1,4 +1,5 @@
 import type {ICommand} from "siyuan";
+import {resolveDocRoot} from "./blocks";
 
 type Intent = "find" | "replace";
 
@@ -58,7 +59,7 @@ export function getSearchProtyle(edit: Element): Element | null {
     const candidates = edit.matches(".protyle") ? [edit] : Array.from(edit.children);
     return candidates.find(child => {
         if (!child.matches(".protyle:not([data-page-search-offscreen])") || isHidden(child)) return false;
-        const root = child.querySelector(".protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography");
+        const root = resolveDocRoot(child);
         return root && !isHidden(root);
     }) ?? null;
 }

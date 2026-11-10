@@ -20,6 +20,7 @@ import {
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
     isInsideParagraphBlock,
+    resolveDocRoot,
     searchOwnerBlock,
     shouldSkipElementByHeadingInclude,
     shouldSkipElementByListInclude,
@@ -170,11 +171,11 @@ export function enumerateRestrictInlineMatches(
         }
     }
 
-    const docRoots = collectEnumerateRoots(edit);
+    const titleBlock = blockByKey.get(unitKey("__doc-title__", "doc-title"));
+    const docRoots = collectEnumerateRoots(edit, titleBlock?.element);
     const seenHosts = new Set<Element>();
     const candidates: EnumerateHostCandidate[] = [];
     let hostSerial = 0;
-    const titleBlock = blockByKey.get(unitKey("__doc-title__", "doc-title"));
 
     const textTokens = rangeRestrictTokens(restrictTypes);
     for (const root of docRoots) {
@@ -410,22 +411,14 @@ function resolveEnumerateSelectionScope(
         new Map();
 }
 
-function collectEnumerateRoots(edit: Element): HTMLElement[] {
+function collectEnumerateRoots(edit: Element, titleInput?: HTMLElement): HTMLElement[] {
     const roots: HTMLElement[] = [];
-    const docRoot = edit.querySelector<HTMLElement>(
-        ":scope > .protyle:not(.fn__none) :is(.protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography)",
-    ) ?? edit.querySelector<HTMLElement>(
-        ".protyle:not(.fn__none) :is(.protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography)",
-    );
+    const docRoot = resolveDocRoot(edit);
     if (docRoot) {
         roots.push(docRoot);
     }
 
-    const titleInput = edit.querySelector<HTMLElement>(
-        ":scope > .protyle:not(.fn__none) .protyle-title .protyle-title__input",
-    ) ?? edit.querySelector<HTMLElement>(
-        ".protyle:not(.fn__none) .protyle-title .protyle-title__input",
-    );
+    // 只枚举已通过标题开关和当前搜索范围采集的标题，不将内部编辑器重新当作正文。
     if (titleInput && !roots.some((root) => root.contains(titleInput))) {
         roots.push(titleInput);
     }

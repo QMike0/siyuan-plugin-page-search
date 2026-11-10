@@ -5077,11 +5077,12 @@ export class SearchBar {
             }
         }
 
-        const wysiwyg = this.edit.querySelector<HTMLElement>(
-            ':scope > .protyle:not(.fn__none) .protyle-wysiwyg[contenteditable="true"], ' +
-                '.protyle:not(.fn__none) .protyle-wysiwyg[contenteditable="true"]',
-        ) ?? this.edit.querySelector<HTMLElement>('[contenteditable="true"]');
-        wysiwyg?.focus({preventScroll: true});
+        // 无有效位置时只回到当前正文，避免聚焦富文本标题或预览下隐藏的编辑区。
+        const docRoot = resolveDocRoot(this.edit);
+        if (!docRoot?.matches(".protyle-wysiwyg")) return;
+        const editable = docRoot.matches('[contenteditable="true"]') ?
+            docRoot : docRoot.querySelector<HTMLElement>('[contenteditable="true"]');
+        editable?.focus({preventScroll: true});
     }
 
     /** 已跳转到某条匹配时优先落在该匹配；否则用打开前快照 */

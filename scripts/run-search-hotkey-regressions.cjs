@@ -131,6 +131,14 @@ async function main() {
     edit.querySelector(".protyle-content").classList.add("fn__none");
     edit.querySelector(".protyle").insertAdjacentHTML("beforeend", '<div class="protyle-preview"><div class="b3-typography">preview</div></div>');
     press(document.body);
+    edit.querySelector(".protyle-content").insertAdjacentHTML("afterbegin",
+        '<div class="protyle-top"><div class="protyle-title"><div class="protyle" data-protyle-lite="true">' +
+        '<div class="protyle-content"><div class="protyle-wysiwyg" contenteditable="true">rich title</div></div>' +
+        "</div></div></div>");
+    press(document.body);
+    const preview = edit.querySelector(":scope > .protyle > .protyle-preview");
+    press(preview, {key: "h", keyCode: 72});
+    assert.equal(calls.at(-1).target, edit, "preview shortcuts ignore the hidden rich title editor");
     const pane = document.createElement("div");
     pane.className = "layout__wnd";
     pane.innerHTML = editor("second");
