@@ -170,18 +170,15 @@ export function resolveDocRoot(edit: Element): HTMLElement | null {
         return offscreen.querySelector(".protyle-wysiwyg");
     }
 
-    const protyleSelector = ".protyle:not(.fn__none):not([data-page-search-offscreen])";
-    let docRoot = edit.querySelector(
-        `:scope > ${protyleSelector} :is(.protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography)`,
-    ) as HTMLElement | null;
-
-    if (!docRoot) {
-        docRoot = edit.querySelector(
-            `${protyleSelector} :is(.protyle-content:not(.fn__none) .protyle-wysiwyg, .protyle-preview:not(.fn__none) .b3-typography)`,
-        ) as HTMLElement | null;
-    }
-
-    return docRoot;
+    const protyleSelector = '.protyle:not(.fn__none):not([data-page-search-offscreen]):not([data-protyle-lite="true"])';
+    const protyle = edit.matches(protyleSelector) ? edit :
+        edit.querySelector(`:scope > ${protyleSelector}`) ?? edit.querySelector(protyleSelector);
+    // v3.8.10 的富文本标题在 protyle-top 内先挂载一个 lite Protyle。
+    // 按 initUI 的直属结构查正文，避免把标题 / 单元格的内部编辑器当成整篇正文。
+    return protyle?.querySelector<HTMLElement>(
+        ":scope > .protyle-content:not(.fn__none) > .protyle-wysiwyg, " +
+            ":scope > .protyle-preview:not(.fn__none) .b3-typography",
+    ) ?? null;
 }
 
 /** 块标按钮也带 data-node-id；导航只认当前正文，不能把界面控件或嵌入源副本当成目标块。 */
