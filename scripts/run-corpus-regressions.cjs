@@ -3501,6 +3501,51 @@ async function main() {
                 },
             },
         });
+        // v3.8.10 keeps all table headers but replaces off-screen data columns
+        // with spacers. API coverage must remain complete across column windows.
+        for (const embedded of [false, true]) {
+            reset();
+            const shell = embedded ? avShell() : avShell().replace('data-node-id="source-av"', 'data-node-id="b"');
+            add("b", embedded ? "query_embed" : "av", embedded ? "select * from blocks" : shell);
+            doms.b = embedded ? embedShell("b") : shell;
+            if (embedded) embedResponder = async () => ({code: 0, data: {blocks: [{block: {id: "source-av", content: shell}}]}});
+            let reads = 0;
+            avResponder = async url => {
+                if (url.endsWith("getAttributeView")) return {code: 0, data: avRaw};
+                reads++;
+                return {code: 0, data: {view: {type: "table", rowCount: 2,
+                    columns: [0, 1, 2, 3].map(index => ({id: "col" + index, name: "field", type: "text", hidden: index === 3})),
+                    rows: [0, 1].map(index => ({id: "row" + index, cells: [0, 1, 2, 3].map(col => ({keyID: "col" + col,
+                        value: {type: "text", text: {content: "columnKeyword"}}}))}))}}};
+            };
+            corpus.retainBackgroundCorpusRoot("r");
+            try {
+                for (const mounted of [0, 2]) {
+                    const content = '<div class="av__body"><div class="av__row av__row--header">' +
+                        [0, 1, 2].map(index => '<div class="av__cell" data-col-id="col' + index + '">field</div>').join("") +
+                        "</div>" + [0, 1].map(index => '<div class="av__row" data-id="row' + index +
+                            '"><div class="av__column-spacer"></div><div class="av__cell" data-col-id="col' + mounted +
+                            '">columnKeyword</div><div class="av__column-spacer"></div></div>').join("") + "</div>";
+                    wysiwyg.innerHTML = (embedded ? '<div data-node-id="b" data-type="NodeBlockQueryEmbed">' : "") +
+                        shell.replace("<div></div>", content) + (embedded ? "</div>" : "");
+                    const result = await settle("columnKeyword", {includeAttributeView: true});
+                    full(result);
+                    assert.equal(result.matches.length, 6, "virtual columns neither lose nor duplicate hits; hidden fields stay excluded");
+                    assert.equal(result.matches.filter(match => match.range).length, 2, "only mounted cells own live ranges");
+                    if (embedded) assert.ok(result.matches.every(match => !match.replaceable));
+                }
+                assert.equal(reads, 1, "changing column windows reuses the complete API snapshot");
+                wysiwyg.querySelector('.av__row[data-id="row0"] .av__cell').textContent = "localKeyword";
+                const edited = await search("columnKeyword", {includeAttributeView: true});
+                full(edited);
+                assert.equal(edited.matches.length, 5, "a live edit still overrides the API snapshot");
+                assert.equal((await search("localKeyword", {includeAttributeView: true})).matches.length, 1);
+            } finally {
+                avModule.releaseAvCacheOwner("r", edit);
+                corpus.releaseBackgroundCorpusRoot("r");
+            }
+        }
+        console.log("ordinary/embedded AV virtual columns: complete counts, mounted ranges, hidden fields, cache and live edits OK");
         // The native render response includes hidden values; only its field metadata
         // determines what the selected view actually displays, even before mounting.
         for (const embedded of [false, true]) {

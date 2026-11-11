@@ -111,6 +111,7 @@ import {isEditorReplaceModeBlocked} from "./editor-mode";
 import {EmbedSearchState} from "./embed-search-state";
 import {createEmbeddedSourceReader} from "./embedded-order";
 import {AV_FIELD_NAME_PREFIX, avApiCellPosition} from "../shared/av-live";
+import {revealVirtualAvColumn, virtualAvColumnMissing} from "./av-column-window";
 import {
     clearNonHeadingFoldLocally,
     collectNonHeadingFoldedAncestorIds,
@@ -281,6 +282,7 @@ const RESULTS_OVERSCAN = 5;
 
 interface AttributeViewLocateTarget {
     itemId: string;
+    columnId: string;
     groupId?: string;
 }
 
@@ -288,7 +290,8 @@ interface AttributeViewLocateTarget {
  * Search units use two spellings for an AV cell: the live DOM form
  * (`cell:group:row:column`) and the API form (`av-group:group:row:column` /
  * `av:row:column`).  The native SiYuan locate protocol needs the row ID and,
- * for grouped views, the group ID.  Keep this parser deliberately narrow so
+ * for grouped views, the group ID. Retain the column for virtual-column reveal.
+ * Keep this parser deliberately narrow so
  * titles, counters and other AV chrome never trigger a row locate request.
  */
 function attributeViewLocateTarget(unitId: string | undefined): AttributeViewLocateTarget | null {
@@ -300,19 +303,20 @@ function attributeViewLocateTarget(unitId: string | undefined): AttributeViewLoc
         (sourceEnd >= 0 ? embeddedLocal.slice(sourceEnd + 1) : "") :
         embeddedLocal;
     if (local.startsWith(AV_FIELD_NAME_PREFIX)) local = local.slice(AV_FIELD_NAME_PREFIX.length);
+    local = local.replace(/:(?:inline|block)-math:source:\d+$/, "").replace(/#run-\d+$/, "");
     if (local.startsWith("cell:")) {
         const parts = local.split(":");
-        if (parts.length !== 4 || !parts[2] || parts[2].startsWith("header:")) return null;
-        return parts[1] === "nogroup" ? {itemId: parts[2]} : {itemId: parts[2], groupId: parts[1]};
+        if (parts.length !== 4 || !parts[2] || !parts[3] || parts[2].startsWith("header:")) return null;
+        return {itemId: parts[2], columnId: parts[3], ...(parts[1] === "nogroup" ? {} : {groupId: parts[1]})};
     }
     const position = avApiCellPosition(local);
     if (!position || position.row.startsWith("header:")) return null;
     if (position.row.startsWith("group:")) {
         const parts = position.row.split(":");
         if (parts.length !== 3 || !parts[1] || !parts[2]) return null;
-        return {itemId: parts[2], groupId: parts[1]};
+        return {itemId: parts[2], columnId: position.col, groupId: parts[1]};
     }
-    return position.row ? {itemId: position.row} : null;
+    return position.row && position.col ? {itemId: position.row, columnId: position.col} : null;
 }
 
 function validSiYuanNodeId(value: string | undefined): value is string {
@@ -3665,16 +3669,16 @@ export class SearchBar {
      * If SiYuan has already mounted the target row, scroll it locally instead
      * of rebuilding the database. Unmounted rows still take the native path.
      */
-    private revealMountedAttributeViewMatch(match: SearchMatch | undefined): boolean {
+    private mountedAttributeViewRow(match: SearchMatch | undefined): HTMLElement | null {
         if (!match) {
-            return false;
+            return null;
         }
         const target = attributeViewLocateTarget(match.unitId);
         if (!target || !validSiYuanNodeId(target.itemId)) {
-            return false;
+            return null;
         }
         const host = findDocumentBlock(this.edit, match.blockId);
-        if (!host) return false;
+        if (!host) return null;
 
         let sourceId = "";
         const local = match.unitId?.startsWith("embed:") ? match.unitId.slice(6) : "";
@@ -3704,10 +3708,17 @@ export class SearchBar {
             if (!row || row.closest(".fn__none")) {
                 continue;
             }
-            row.scrollIntoView({block: "center", inline: "nearest"});
-            return true;
+            return row;
         }
-        return false;
+        return null;
+    }
+
+    private revealMountedAttributeViewMatch(match: SearchMatch | undefined, scrollRow = true): boolean {
+        const row = this.mountedAttributeViewRow(match);
+        if (!row) return false;
+        if (scrollRow) row.scrollIntoView({block: "center", inline: "nearest"});
+        revealVirtualAvColumn(row, attributeViewLocateTarget(match!.unitId)!.columnId);
+        return true;
     }
 
     /** A live Range can still be outside every relevant viewport. Grouped AV
@@ -3753,6 +3764,15 @@ export class SearchBar {
             if (this.tryBindUnfoldedMatch(index + 1, true)) {
                 if (!this.appendResultHighlight(this.resultMatches[index])) this.applyResultHighlights();
                 void this.scrollIntoRangesAsync(index, true, false, false, false, false);
+            } else if (virtualAvColumnMissing(
+                this.mountedAttributeViewRow(match), attributeViewLocateTarget(match.unitId)!.columnId,
+            )) {
+                const generation = this.searchGeneration;
+                void this.waitForLocatedMatchRange(index + 1, match.id, true).then(bound => {
+                    if (!bound || this.destroyed || generation !== this.searchGeneration ||
+                        this.getCurrentMatch()?.id !== match.id) return;
+                    void this.scrollIntoRangesAsync(index, true, false, false, false, false);
+                });
             }
             return;
         }
@@ -3952,7 +3972,12 @@ export class SearchBar {
         };
         const tryBind = (): boolean => {
             if (!canBindCurrent()) return false;
-            if (revealAvGroup) this.unfoldAttributeViewGroup(this.resultMatches[index - 1]);
+            if (revealAvGroup) {
+                this.unfoldAttributeViewGroup(this.resultMatches[index - 1]);
+                // Native row locating can mount a row with its target column
+                // still detached. Scroll once it exists, before trying to bind.
+                this.revealMountedAttributeViewMatch(this.resultMatches[index - 1], false);
+            }
             if (!this.tryBindUnfoldedMatch(index, true)) {
                 return false;
             }
@@ -4872,12 +4897,16 @@ export class SearchBar {
         if (range && match && !this.rangeStillInMatchBlock(range, match)) {
             match.range = undefined;
             range = undefined;
+            const avTarget = attributeViewLocateTarget(match.unitId);
             // 块还在画面上，只是块内 DOM 被重建，格内文字也可能改过，旧偏移不能再用来补 Range。
             // 大表只是把这一行收进占位行，文字没变。直接挂出分段，不整篇重搜。
             if (
                 scroll &&
                 refreshStale &&
                 this.matchBlockShown(match) &&
+                !(avTarget && virtualAvColumnMissing(
+                    this.mountedAttributeViewRow(match), avTarget.columnId,
+                )) &&
                 !this.tableMatchRowVirtualizedAway(match)
             ) {
                 await this.refreshStaleMatch(pulseHostFocus);
@@ -7154,7 +7183,26 @@ function scrollContainerToRange(
 
     if (canScrollX) {
         const rangeCenterXInContent = rangeCenterX - containerRect.left + container.scrollLeft;
-        const targetScrollLeft = rangeCenterXInContent - container.clientWidth / 2;
+        let targetScrollLeft = rangeCenterXInContent - container.clientWidth / 2;
+        // A wide frozen prefix can cover the default horizontal center. Center
+        // table hits in the uncovered part, preserving CSS transform scale.
+        const start = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement :
+            range.startContainer as Element;
+        const row = start?.closest<HTMLElement>(".av__row");
+        if (container.matches(".av__scroll") && row?.closest(".av__scroll") === container &&
+            row.closest('.av[data-av-type="table"]')) {
+            const sticky = row.closest(".av__body--unfreeze") ? null :
+                row.querySelector<HTMLElement>(":scope > .av__colsticky");
+            // Frozen cells already stay visible; scrolling would move other fields.
+            if (sticky?.contains(range.startContainer)) return;
+            const scale = containerRect.width / container.offsetWidth;
+            if (Number.isFinite(scale) && scale > 0) {
+                const left = Math.max(containerRect.left + container.clientLeft * scale,
+                    sticky?.getBoundingClientRect().right ?? -Infinity);
+                const right = containerRect.left + (container.clientLeft + container.clientWidth) * scale;
+                if (right > left) targetScrollLeft = container.scrollLeft + (rangeCenterX - (left + right) / 2) / scale;
+            }
+        }
         const maxScrollLeft = container.scrollWidth - container.clientWidth;
         container.scrollLeft = Math.max(0, Math.min(targetScrollLeft, maxScrollLeft));
     }

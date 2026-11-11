@@ -809,32 +809,43 @@ async function embeddedAvMountRegressions() {
     const row = id =>
         '<div class="av__row" data-id="row' + id + '"><div class="av__cell" data-col-id="col">foo</div></div>';
     try {
-        for (const mode of ["full", "groups", "degraded", "selection"]) {
-            const fullCoverage = mode === "full" || mode === "groups";
+        for (const mode of ["full", "groups", "degraded", "selection", "columns", "columns-degraded", "columns-selection",
+            "columns-reuse", "columns-reuse-degraded", "columns-reuse-selection"]) {
+            const columns = mode.startsWith("columns");
+            const reuseSpacers = mode.startsWith("columns-reuse");
+            const fullCoverage = ["full", "groups", "columns", "columns-reuse"].includes(mode);
             const mountedBody = () =>
                 mode === "groups" ?
                     '<div class="av__items">' + [0, 1, 2].map(index =>
                         '<div class="av__body" data-group-id="g' + index + '">' +
                         (index === 0 ? row(0) : "") + "</div>"
                     ).join("") + "</div>" :
-                    '<div class="av__body">' + row(0) + "</div>";
+                    columns ? '<div class="av__body"><div class="av__row av__row--header">' +
+                        [0, 1, 2].map(index => '<div class="av__cell" data-col-id="col' + index + '">field</div>').join("") +
+                        '</div><div class="av__row" data-id="row0"><div class="av__cell" data-col-id="col0">foo</div>' +
+                        '<div class="av__column-spacer"></div></div></div>' :
+                        '<div class="av__body">' + row(0) + "</div>";
             const bar = pipelineFixture("embed-av-mount-" + mode);
             bar.avWatchPausedUntil = 0;
             bar.restrictInlineTypes = [];
             bar.includeAttributeView = true;
-            bar.selectionOnly = mode === "selection";
+            bar.selectionOnly = mode.endsWith("selection");
             bar.resolveScopeForSearch = () => new Map();
             const root = bar.edit.querySelector(".protyle-wysiwyg");
             root.innerHTML = '<div data-node-id="embed" data-type="NodeBlockQueryEmbed">' +
-                '<div data-node-id="source-av" data-type="NodeAttributeView" data-av-id="av-id">' +
+                '<div class="av" data-node-id="source-av" data-type="NodeAttributeView" data-av-id="av-id" data-av-type="table">' +
                 '<div class="av__title">database</div>' + mountedBody() + "</div></div>";
             const body = root.querySelector(mode === "groups" ? ".av__items" : ".av__body");
+            if (reuseSpacers) body.querySelector(".av__row[data-id]").insertAdjacentHTML("afterbegin",
+                '<div class="av__column-spacer"></div>');
+            const originalSpacers = [...body.querySelectorAll(".av__column-spacer")];
             const fullMatches = [0, 1, 2].map(index => ({
                 ...textMatches(
                     "foo",
                     "embed",
                     mode === "groups" ?
                         "embed:source-av:av-group:g" + index + ":row0:col" :
+                        columns ? "embed:source-av:av:row0:col" + index :
                         "embed:source-av:av:row" + index + ":col",
                 )[0],
                 blockType: "NodeBlockQueryEmbed",
@@ -858,7 +869,7 @@ async function embeddedAvMountRegressions() {
                             live,
                         ),
                     error: "",
-                    degraded: mode === "degraded",
+                    degraded: mode.endsWith("degraded"),
                 };
             };
             let searches = 0;
@@ -882,11 +893,31 @@ async function embeddedAvMountRegressions() {
                         group.innerHTML = '<div class="av__spacer"></div>' +
                             (groupIndex === index ? row(0).replace(">foo<", "><") : "");
                     });
+                } else if (columns) {
+                    const item = body.querySelector(".av__row[data-id]");
+                    item.querySelector(".av__cell").remove();
+                    if (reuseSpacers) {
+                        // Native applyRow can retain both spacer nodes, changing
+                        // only their widths while replacing the cells between them.
+                        item.firstElementChild.style.width = index * 200 + "px";
+                        item.lastElementChild.style.width = (3 - index) * 200 + "px";
+                        item.lastElementChild.insertAdjacentHTML("beforebegin", '<div class="av__cell" data-col-id="col' + index + '"></div>');
+                    } else {
+                        item.querySelector(".av__column-spacer").remove();
+                        item.insertAdjacentHTML("beforeend", '<div class="av__cell" data-col-id="col' + index +
+                            '"></div><div class="av__column-spacer"></div>');
+                    }
                 } else {
                     body.innerHTML = '<div class="av__spacer"></div>' + row(index).replace(">foo<", "><");
                 }
-                body.querySelector(".av__cell").insertAdjacentHTML("beforeend", '<span class="av__rich">foo</span>');
+                body.querySelector(".av__row[data-id] .av__cell").insertAdjacentHTML("beforeend", '<span class="av__rich">foo</span>');
                 await settle();
+                if (reuseSpacers) {
+                    const spacers = [...body.querySelectorAll(".av__column-spacer")];
+                    assert.ok(spacers.length === originalSpacers.length &&
+                        spacers.every((node, index) => node === originalSpacers[index]),
+                    "column shifts retain the native spacer nodes in place");
+                }
                 assert.equal(
                     searches,
                     fullCoverage ? 1 : index + 1,
@@ -903,14 +934,22 @@ async function embeddedAvMountRegressions() {
             }
             const beforeMixed = searches;
             body.querySelector(".av__rich").firstChild.data = "changed";
-            const additional = mode === "groups" ? body.querySelector('[data-group-id="g1"]') : body;
-            additional.insertAdjacentHTML("beforeend", row(mode === "groups" ? 0 : 1));
+            const additional = reuseSpacers ? body.querySelector(".av__row[data-id]") :
+                mode === "groups" ? body.querySelector('[data-group-id="g1"]') : body;
+            additional.insertAdjacentHTML("beforeend", reuseSpacers ?
+                '<div class="av__cell" data-col-id="col1">foo</div>' : row(mode === "groups" ? 0 : 1));
             await settle();
             assert.equal(searches, beforeMixed + 1, "mixed virtual mounts and retained-row edits still refresh");
             const beforeTextEdit = searches;
             body.querySelector(".av__rich").firstChild.data = "bar";
             await settle();
             assert.equal(searches, beforeTextEdit + 1, "real cell text edits still refresh during navigation pause");
+            if (reuseSpacers) {
+                const beforeHeaderEdit = searches;
+                body.querySelector(".av__row--header .av__cell").textContent = "changed field";
+                await settle();
+                assert.equal(searches, beforeHeaderEdit + 1, "header edits remain semantic when data rows have column spacers");
+            }
             const beforeTitleEdit = searches;
             root.querySelector(".av__title").firstChild.data = "changed";
             await settle();
@@ -1139,6 +1178,126 @@ async function attributeViewLocateRegressions() {
         window.openFileByURL = originalBridge;
     }
     console.log("AV off-screen navigation: bounded native locate, mounted layouts, fallback and cancellation OK");
+}
+
+async function attributeViewColumnRegressions() {
+    const originalRect = window.Range.prototype.getBoundingClientRect;
+    const originalBridge = window.openFileByURL;
+    const blockId = "20260101000000-aaaaaaa";
+    const rowId = "20260101000001-aaaaaaa";
+    const settle = () => new Promise(resolve => window.setTimeout(resolve, 65));
+    try {
+        for (const mode of ["mounted", "stale-range", "native", "embedded", "grouped", "scaled", "unfrozen", "wide-frozen", "cancel"]) {
+            const bar = fixture("av-column-" + mode);
+            last = bar.root;
+            bar.includeAttributeView = true;
+            bar.syncReplaceButtons = () => {};
+            bar.highlightHitResult = () => assert.fail("column mounts must not reindex the document");
+            const root = bar.edit.querySelector(".protyle-wysiwyg");
+            root.innerHTML = '<div class="av" data-node-id="' + blockId +
+                '" data-type="NodeAttributeView" data-av-type="table"><div class="av__scroll">' +
+                '<div class="av__body" data-group-id="g"><div class="av__row av__row--header">' +
+                '<div class="av__colsticky"></div><div class="av__cell" data-col-id="late">late field</div></div>' +
+                '<div class="av__row" data-id="' + rowId + '"><div class="av__colsticky"></div>' +
+                '<div class="av__cell" data-col-id="first">other</div><div class="av__column-spacer"></div></div>' +
+                "</div></div></div>";
+            const av = root.firstElementChild;
+            const scroller = av.querySelector(".av__scroll");
+            const body = av.querySelector(".av__body");
+            const row = body.querySelector(".av__row[data-id]");
+            const header = body.querySelector(".av__row--header");
+            if (mode !== "grouped") body.removeAttribute("data-group-id");
+            const col = header.querySelector(".av__cell");
+            const cell = document.createElement("div");
+            cell.className = "av__cell";
+            cell.dataset.colId = "late";
+            cell.textContent = "foo";
+            const scale = mode === "scaled" ? 0.75 : 1;
+            const frozenWidth = mode === "wide-frozen" ? 300 : 80;
+            const rect = (left, width) => ({left: left * scale, right: (left + width) * scale,
+                top: 100, bottom: 120, width: width * scale, height: 20});
+            Object.defineProperty(av, "clientHeight", {value: 100});
+            Object.defineProperties(scroller, {offsetWidth: {value: 400}, clientWidth: {value: 400},
+                scrollWidth: {value: 2000}});
+            Object.defineProperty(header, "offsetWidth", {value: 2000});
+            scroller.getBoundingClientRect = () => rect(0, 400);
+            header.getBoundingClientRect = () => rect(-scroller.scrollLeft, 2000);
+            header.firstElementChild.getBoundingClientRect = () => rect(0, frozenWidth);
+            row.firstElementChild.getBoundingClientRect = () => rect(0, frozenWidth);
+            col.getBoundingClientRect = () => rect(1400 - scroller.scrollLeft, 200);
+            window.Range.prototype.getBoundingClientRect = () => rect(1400 - scroller.scrollLeft, 50);
+            row.scrollIntoView = () => {};
+            if (mode === "unfrozen") body.classList.add("av__body--unfreeze");
+            if (mode === "wide-frozen") scroller.style.overflowX = "auto";
+            if (mode === "grouped") {
+                const other = body.cloneNode(true);
+                other.dataset.groupId = "other";
+                other.querySelector(".av__row[data-id]").scrollIntoView = () => assert.fail("wrong group");
+                body.before(other);
+            }
+            let range;
+            if (mode === "stale-range") {
+                row.append(cell);
+                range = document.createRange();
+                range.selectNodeContents(cell);
+                cell.remove();
+            }
+            const grouped = mode === "grouped";
+            const unitId = grouped ? "av-group:g:" + rowId + ":late" : "av:" + rowId + ":late";
+            bar.resultMatches = [{...textMatches("foo", blockId, unitId)[0], blockType: "NodeAttributeView", range}];
+            if (mode === "embedded") {
+                const embed = document.createElement("div");
+                embed.dataset.nodeId = "embed";
+                embed.dataset.type = "NodeBlockQueryEmbed";
+                av.replaceWith(embed);
+                embed.append(av);
+                Object.assign(bar.resultMatches[0], {blockId: "embed", blockType: "NodeBlockQueryEmbed",
+                    unitId: "embed:" + blockId + ":" + unitId});
+            }
+            let queued = false;
+            const updateColumns = () => {
+                if (queued) return;
+                queued = true;
+                window.requestAnimationFrame(() => {
+                    queued = false;
+                    if (1400 - scroller.scrollLeft >= 400 || !row.isConnected) return;
+                    row.querySelector(".av__column-spacer")?.replaceWith(cell);
+                });
+            };
+            // Model the native scroll event and next-frame column window update.
+            let left = 0;
+            Object.defineProperty(scroller, "scrollLeft", {get: () => left, set: value => {
+                left = value;
+                updateColumns();
+            }});
+            scroller.addEventListener("scroll", updateColumns);
+            let nativeCalls = 0;
+            window.openFileByURL = () => {
+                nativeCalls++;
+                assert.equal(mode, "native", "mounted rows must not rebuild the database");
+                window.setTimeout(() => body.append(row), 5);
+                return true;
+            };
+            if (mode === "native") row.remove();
+            await bar.scrollIntoRangesAsync(0, true);
+            if (mode === "cancel") bar.searchGeneration++;
+            await settle();
+            assert.equal(nativeCalls, mode === "native" ? 1 : 0);
+            assert.equal(scroller.scrollLeft, mode === "unfrozen" ? 1400 : mode === "wide-frozen" ? 1075 : 1320,
+                mode + " reveals the target column behind frozen fields");
+            if (mode === "cancel") assert.ok(!bar.resultMatches[0].range, "stale navigation cannot bind or focus after a new query");
+            else {
+                assert.equal(bar.resultMatches[0].range?.toString(), "foo", mode + " binds the asynchronously remounted column");
+                assert.equal(bar.resultCount, 1);
+                assert.equal(bar.resultIndex, 1);
+            }
+            bar.destroy();
+        }
+    } finally {
+        window.Range.prototype.getBoundingClientRect = originalRect;
+        window.openFileByURL = originalBridge;
+    }
+    console.log("AV virtual columns: mounted/cold rows, groups, embeds, frozen fields, scale and cancellation OK");
 }
 
 async function firstBlockNavigationRegressions() {
@@ -2416,6 +2575,7 @@ async function main() {
     await avFoldCacheRegressions();
     await avDeferredRefreshRegressions();
     await attributeViewLocateRegressions();
+    await attributeViewColumnRegressions();
     await firstBlockNavigationRegressions();
     await afterVirtualDatabaseNavigationRegressions();
     await galleryNavigationRegressions();

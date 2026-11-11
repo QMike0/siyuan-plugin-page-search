@@ -24,7 +24,7 @@ export interface EditorDomChange {
     diagramBlocks: ReadonlySet<HTMLElement> | null;
     /** 嵌入内容变化的宿主；与新增块数量无关，也覆盖删除和属性文字。 */
     embedBlocks: ReadonlySet<HTMLElement> | null;
-    /** Direct data-row/spacer mounts in AV bodies; full API coverage needs only Range repair. */
+    /** Data-row/column window mounts; full API coverage needs only Range repair. */
     virtualAvEmbeds?: ReadonlySet<HTMLElement> | null;
 }
 
@@ -114,6 +114,22 @@ export function watchEditorDom(
     const observer = new MutationObserver((records) => {
         let relevant = false;
         const virtualAvRows = new WeakSet<Element>();
+        // v3.8.10 may reuse its spacers in place and only mount/unmount cells.
+        // Mark those data rows for this batch, including text filled into new
+        // cells. EmbedSearchState still compares retained cells for mixed edits.
+        for (const record of records) {
+            if (record.type !== "childList" || !(record.target instanceof Element) ||
+                virtualAvRows.has(record.target) ||
+                !record.target.matches(AV_VIRTUAL_ROW_SELECTOR) ||
+                !record.target.closest('.av[data-type="NodeAttributeView"][data-av-type="table"]')) continue;
+            const nodes = [...record.addedNodes, ...record.removedNodes];
+            if (nodes.some(node => node instanceof Element && node.classList.contains("av__column-spacer")) ||
+                (nodes.length > 0 && nodes.every(node => node instanceof HTMLElement &&
+                    node.matches(".av__cell[data-col-id]") && node.dataset.colId?.trim()) &&
+                    record.target.querySelector(":scope > .av__column-spacer"))) {
+                virtualAvRows.add(record.target);
+            }
+        }
         for (const record of records) {
             const target = record.target.nodeType === Node.ELEMENT_NODE ?
                 record.target as Element :
