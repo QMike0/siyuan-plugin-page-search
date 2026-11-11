@@ -1,3 +1,12 @@
+## v2.1.4 2026-11-11
+
+- 🇨🇳 实现对富文本文档标题的搜索
+- 🇨🇳 适配思源笔记 v3.8.10 对宽数据库列的虚拟化
+- 🇨🇳 修复思源笔记 v3.8.10 新增内部编辑器造成的普通关键词能计数，却无法高亮和跳转的问题，以及其他潜在搜索问题
+- 🇺🇸 Implement search for titles of rich-text documents
+- 🇺🇸 Adapt to the virtualization of wide database columns in SiYuan v3.8.10
+- 🇺🇸 Fix the issue caused by the new internal editor in SiYuan v3.8.10 where ordinary keywords can be counted but cannot be highlighted or jumped to, as well as other potential search issues
+
 ## v2.1.3 2026-11-03
 
 - 🇨🇳 实现对行级公式、公式块的公式源码搜索
