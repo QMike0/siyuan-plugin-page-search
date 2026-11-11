@@ -42,7 +42,9 @@ import {
     watchAttributeViewDom,
 } from "./av-watch";
 import {
+    collectDocTitleUnits,
     collectSearchableBlocks,
+    isDocTitleSearchUnit,
     tabsLabelSourceBlock,
     resolveDocRoot,
     findDocumentBlock,
@@ -821,6 +823,7 @@ export class SearchBar {
     private readonly diagramSearchState = new DiagramSearchState();
     private readonly embedSearchState = new EmbedSearchState();
     private diagramRefreshPending = false;
+    private docTitleChangeSerial = 0;
     private diagramRefreshTimer: number | undefined;
     /** fold 属性变更专用刷新：不等 savedoc，也不复用输入的 400ms 防抖。 */
     private foldRefreshTimer: number | undefined;
@@ -2845,6 +2848,7 @@ export class SearchBar {
 
     private runSearchPipeline(value: string, signal: AbortSignal): Promise<SearchPipelineResult> {
         const scope = this.resolveScopeForSearch();
+        const titleChangeSerial = this.docTitleChangeSerial;
         const rememberedScope = this.rememberedSelectionScope;
         const selectionHosts = !this.selectionOnly || this.searchMathSource || this.includeTabs === false ? [] : this.selectionScopeVisualKind === "block" ?
             this.rememberedVisualBlockIds.map(id => findDocumentBlock(this.edit, id)).filter((host): host is HTMLElement => Boolean(host)) :
@@ -2874,7 +2878,9 @@ export class SearchBar {
                     Boolean(this.restrictInlineTypes?.length),
                 );
                 // 采集前的变化已包含在新搜索中；采集后的变化仍由 settled 保留。
-                this.diagramRefreshPending = false;
+                // OCR/formula preparation may yield after reading the title. A newer
+                // title mutation must survive this callback and get one merged search.
+                this.diagramRefreshPending = this.docTitleChangeSerial !== titleChangeSerial;
                 window.clearTimeout(this.diagramRefreshTimer);
                 this.diagramRefreshTimer = undefined;
             },
@@ -4287,6 +4293,8 @@ export class SearchBar {
     private onEditorDomSettled(change: EditorDomChange) {
         this.noteAddedBlocks(change);
         if ((this.effectiveQuery() || this.isRestrictEnumerateMode()) && this.canPaintHighlights()) {
+            const titleChanged = change.docTitleChanged && this.includeDocTitle && !editorFocusId(this.edit);
+            if (titleChanged) this.docTitleChangeSerial += 1;
             const options = this.isRestrictEnumerateMode() ?
                 {...this.searchCollectOptions(), restrictInlineTypes: []} :
                 this.searchCollectOptions();
@@ -4301,7 +4309,7 @@ export class SearchBar {
                 options,
                 !this.selectionOnly && !this.searchCoverageIncomplete ? virtualEmbeds ?? undefined : undefined,
             );
-            if (diagramChanged || embedChanged) {
+            if (titleChanged || diagramChanged || embedChanged) {
                 this.diagramRefreshPending = true;
                 window.clearTimeout(this.diagramRefreshTimer);
                 this.diagramRefreshTimer = undefined;
@@ -4332,7 +4340,7 @@ export class SearchBar {
         this.diagramRefreshTimer = undefined;
     }
 
-    /** 图表/嵌入异步渲染不发 savedoc。只在搜索文本改变时合并重搜，忙碌时保留请求。 */
+    /** 标题/图表/嵌入渲染可能不发 savedoc。合并重搜，忙碌时保留到现有完成回调，不轮询。 */
     private scheduleDiagramRefresh() {
         if (
             !this.diagramRefreshPending || (!this.effectiveQuery() && !this.isRestrictEnumerateMode()) ||
@@ -4874,6 +4882,22 @@ export class SearchBar {
             ) {
                 await this.refreshStaleMatch(pulseHostFocus);
                 return;
+            }
+        }
+        // Viewport projection drops offscreen title Ranges. Its synthetic ID
+        // cannot use block loading; bind only this mounted title target to scroll.
+        if (!range && scroll && match && isDocTitleSearchUnit(match) &&
+            this.includeDocTitle && !editorFocusId(this.edit) && this.canPaintHighlights()) {
+            const units = collectDocTitleUnits(this.edit, {...this.searchCollectOptions(), skipEmbeddedOrder: true});
+            const rebound = fillLiveRanges([match], units, this.includeFoldedBlocks)[0];
+            if (rebound.range) {
+                this.viewportRangeAbort?.abort();
+                this.repairRangeAbort?.abort();
+                this.highlightPaintGeneration = (this.highlightPaintGeneration ?? 0) + 1;
+                this.resultMatches[index] = rebound;
+                range = rebound.range;
+                if (rebound.highlightKind !== "inline-memo" && !isFrameHighlight(rebound) &&
+                    !this.appendResultHighlight(rebound)) this.applyResultHighlights();
             }
         }
         if (!range) {

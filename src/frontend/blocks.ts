@@ -228,27 +228,44 @@ export function resolveDocTitleInput(edit: Element): HTMLElement | null {
     return titleInput;
 }
 
-function collectDocTitleUnit(edit: Element): SearchableBlock | null {
+/** Read only the mounted title, including its independent inline search units. */
+export function collectDocTitleUnits(
+    edit: Element,
+    options: CollectSearchableBlocksOptions = {},
+): SearchableBlock[] {
+    if (options.includeDocTitle === false) return [];
     const titleInput = resolveDocTitleInput(edit);
-    if (!titleInput) {
-        return null;
-    }
-
-    const textNodes = collectDescendantTextNodes(titleInput);
-    const text = textNodes.map((node) => node.nodeValue ?? "").join("");
-    if (!text.trim()) {
-        return null;
-    }
-
-    return {
+    if (!titleInput) return [];
+    beginTextCollection(options.includeFoldedBlocks !== false);
+    const includeInlineMemo = options.includeInlineMemo === true;
+    const restrictTypes = normalizeRestrictInlineTypes(options.restrictInlineTypes, {includeInlineMemo});
+    const collectBody = shouldCollectBodyTextForRestrict(restrictTypes);
+    const collectMemo = shouldCollectInlineMemoUnits({includeInlineMemo, restrictTypes});
+    const collectMath = shouldCollectInlineMathUnits(restrictTypes);
+    // v3.8.10 DocumentTitleEditor renders getDocTitle.blockDOM as a single
+    // inline paragraph. Read its live draft, never the lossy text summary or
+    // temporary paragraph ID. Reuse body semantics without body block gates.
+    const base = {
         blockId: DOC_TITLE_BLOCK_ID,
         blockType: DOC_TITLE_BLOCK_TYPE,
         blockIndex: -1,
         element: titleInput,
-        text,
-        textNodes,
         unitId: DOC_TITLE_UNIT_ID,
     };
+    const units = collectBody ? unitsFromTextNodes(base, collectTextNodes(titleInput, null, options.includeImageTitle !== false))
+        .filter(unit => unit.text.trim()) : [];
+    if (collectMemo) units.push(...collectInlineMemoSearchUnits(titleInput, options.includeImageTitle !== false));
+    if (collectMath) units.push(...collectInlineMathSearchUnits(titleInput, false, options.searchMathSource === true));
+    if (collectBody && options.includeImageOCR !== false) units.push(...collectImageOCRSearchUnits(titleInput, base));
+    for (const unit of units) {
+        unit.blockId = DOC_TITLE_BLOCK_ID;
+        unit.blockType = DOC_TITLE_BLOCK_TYPE;
+        unit.blockIndex = -1;
+    }
+    // Formula/source and memo offsets are local to their own unit. Keep their
+    // navigation position among the title's text runs even without a live Range.
+    if (units.length > 1 && !options.skipEmbeddedOrder) recordEmbeddedOrder(titleInput, units);
+    return units;
 }
 
 /** 是否为文档标题合成搜索单元 */
@@ -441,11 +458,8 @@ export function collectSearchableBlocks(
     };
 
     const blocks: SearchableBlock[] = [];
-    if (!scoped && collectBodyText && includeDocTitle) {
-        const titleUnit = collectDocTitleUnit(edit);
-        if (titleUnit) {
-            blocks.push(titleUnit);
-        }
+    if (!scoped && includeDocTitle) {
+        blocks.push(...collectDocTitleUnits(edit, options));
     }
 
     // 关嵌入时在去重阶段即排除嵌入 DOM，避免同 id 只保留嵌入副本而漏掉正文
@@ -790,7 +804,7 @@ function collectImageOCRSearchUnits(
 ): SearchableBlock[] {
     const {blockType} = base;
     if (gates?.includeImageOCR === false) return [];
-    if (![PARAGRAPH_TYPE, HEADING_TYPE, TABLE_TYPE, CALLOUT_TYPE].includes(blockType) ||
+    if (![PARAGRAPH_TYPE, HEADING_TYPE, TABLE_TYPE, CALLOUT_TYPE, DOC_TITLE_BLOCK_TYPE].includes(blockType) ||
         element.closest('[data-type="NodeAttributeView"], [data-type="NodeCustomBlock"], [data-type="NodeHTMLBlock"]')) return [];
     if (gates?.includeTabs === false && element.closest('[data-type="NodeTabs"]')) return [];
     if (blockType === TABLE_TYPE && gates?.includeTable === false) return [];
@@ -821,7 +835,10 @@ function collectImageOCRSearchUnits(
             prefix = `table-cell:${logicalRow}:${column}:`;
             tableSlot = {row: logicalRow, column, offset: 0};
         } else {
-            if ((projection ? image.closest('[data-mindmap-source-id]') : getOwnerBlock(image)) !== element) continue;
+            // Rich titles use a synthetic owner, independent of their temporary paragraph ID.
+            const owner = blockType === DOC_TITLE_BLOCK_TYPE ? image.closest(".protyle-title__input") :
+                projection ? image.closest('[data-mindmap-source-id]') : getOwnerBlock(image);
+            if (owner !== element) continue;
             ordinal = sourceOrdinal++;
         }
         // Assign identity before scope/visibility filters, so toggles cannot rebind another picture.

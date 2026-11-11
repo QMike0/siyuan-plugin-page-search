@@ -47,6 +47,7 @@ The **Include in search** menu controls which block types are searched:
 
 Here:
 
+* Rich document titles in SiYuan v3.8.10 are searchable. Formulas in titles follow **Search formula source**. Document titles cannot be replaced.
 * **Image title** means the caption text below an image. It does not mean a SiYuan window title or a document title in the document tab bar.
 * Tabs search both opened and unopened tab panels. When a match is inside an unopened panel, the plugin activates that panel before locating the match.
 * Database search follows the number of rows currently displayed. Rows beyond the current page are not counted; clicking **Load more** refreshes the index so newly displayed rows can be searched.

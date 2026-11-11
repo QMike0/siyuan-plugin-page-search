@@ -1,11 +1,13 @@
 import {
     collectKatexGlyphTextNodes,
     createRendererElementFilter,
+    resolveDocTitleInput,
     type CollectSearchableBlocksOptions,
 } from "./blocks";
 import {createOffscreenHost, offscreenWysiwyg, renderOffscreenBlocks} from "./corpus/offscreen";
 import {mathPreviewStamp, needsMathPreview, rememberMathPreview} from "./math-preview-cache";
 import {createTabsTitleMathReader} from "./tabs-title";
+import {shouldCollectInlineMathUnits} from "../shared";
 import {beginTextCollection, isAuthorCssHiddenElement, isHiddenOnlyByInactiveTab, isHiddenOnlyByTabsTitle, omitHiddenMathText} from "./visibility";
 
 /** Native mathRender defers inactive panels. Render only missing formulas in copies.
@@ -16,19 +18,24 @@ export async function prepareTabsMath(
     shouldContinue: () => boolean,
     acceptsScope: (element: HTMLElement) => boolean = () => true,
 ): Promise<boolean | undefined> {
-    if (options.searchMathSource || options.includeTabs === false || !shouldContinue()) return;
+    if (options.searchMathSource || !shouldContinue()) return;
     beginTextCollection(options.includeFoldedBlocks === true);
     const accepts = createRendererElementFilter(options);
     const titleMath = createTabsTitleMathReader();
-    const pending = Array.from(edit.querySelectorAll<HTMLElement>(
+    const docTitle = options.includeDocTitle !== false && !options.scopeRoots?.length &&
+        shouldCollectInlineMathUnits(options.restrictInlineTypes ?? []) ? resolveDocTitleInput(edit) : null;
+    const candidates = options.includeTabs === false ? [] : Array.from(edit.querySelectorAll<HTMLElement>(
         '[data-type="NodeTabs"] span[data-type~="inline-math"][data-content], ' +
         '[data-type="NodeTabs"] [data-type="NodeMathBlock"][data-content]',
-    )).filter(element => {
+    ));
+    if (docTitle) candidates.push(...docTitle.querySelectorAll<HTMLElement>('span[data-type~="inline-math"][data-content]'));
+    const pending = candidates.filter(element => {
+        const inDocTitle = docTitle?.contains(element);
         const title = titleMath(element);
         if (!acceptsScope(title?.source ?? element)) return false;
         if (element.closest(".tabs-header .tabs-tab-label") ? !title : title?.labelMath && accepts(title.labelMath)) return false;
         if (element.querySelector(".katex-html") || !needsMathPreview(element) ||
-            !accepts(element)) return false;
+            (!inDocTitle && !accepts(element))) return false;
         return !isAuthorCssHiddenElement(element) || isHiddenOnlyByInactiveTab(element) || isHiddenOnlyByTabsTitle(element);
     });
     if (!pending.length) return;

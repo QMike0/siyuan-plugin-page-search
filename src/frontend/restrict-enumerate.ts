@@ -16,6 +16,7 @@ import {
 } from "../shared";
 import {
     collectSearchableBlocks,
+    isDocTitleSearchUnit,
     isInsideMindmapBlock,
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
@@ -159,11 +160,6 @@ export function enumerateRestrictInlineMatches(
         return [];
     }
 
-    const blockByKey = new Map<string, SearchableBlock>();
-    for (const block of scopeBlocks) {
-        blockByKey.set(unitKeyOf(block), block);
-    }
-
     const ownerIndexById = new Map<string, number>();
     for (const block of scopeBlocks) {
         if (!block.unitId && block.blockId && !ownerIndexById.has(block.blockId)) {
@@ -171,8 +167,9 @@ export function enumerateRestrictInlineMatches(
         }
     }
 
-    const titleBlock = blockByKey.get(unitKey("__doc-title__", "doc-title"));
-    const docRoots = collectEnumerateRoots(edit, titleBlock?.element);
+    const titleBlock = scopeBlocks.find(isDocTitleSearchUnit);
+    const titleInput = titleBlock?.element.closest<HTMLElement>(".protyle-title__input") ?? titleBlock?.element;
+    const docRoots = collectEnumerateRoots(edit, titleInput);
     const seenHosts = new Set<Element>();
     const candidates: EnumerateHostCandidate[] = [];
     let hostSerial = 0;
@@ -187,10 +184,15 @@ export function enumerateRestrictInlineMatches(
                 if (seenHosts.has(span)) {
                     continue;
                 }
+                // A native span can carry both strong/emphasis and inline-math.
+                // Let the formula unit choose source/visible text instead of consuming its glyph DOM here.
+                if (restrictTypes.includes(INLINE_MATH_TYPE) && span.matches('span[data-type~="inline-math"]')) {
+                    continue;
+                }
                 if (span.closest(HOST_EXCLUDED_CLOSEST)) {
                     continue;
                 }
-                if (
+                if (!titleInput?.contains(span) &&
                     shouldSkipHostByIncludeGates(span, {
                         includeAttributeView,
                         includeTable,
@@ -589,6 +591,7 @@ function findDeepestOwningBlock(
         if (block.matchSource === "inline-memo" || block.matchSource === "inline-math") {
             continue;
         }
+        if (isDocTitleSearchUnit(block) && !block.textNodes.some(node => host.contains(node))) continue;
         if (block.element !== host && !block.element.contains(host)) {
             continue;
         }

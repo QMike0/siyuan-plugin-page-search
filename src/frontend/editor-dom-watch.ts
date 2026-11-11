@@ -7,13 +7,15 @@
  * - 打开、关闭表格单元格编辑器（replaceChildren / renderTableCellRich），不产生事务
  * - 代码高亮、公式渲染、块引用锚文本回填、嵌入块渲染、大表虚拟滚动，不产生事务
  *
- * 只看 `.protyle-wysiwyg` 里面的变化。高亮层、选区竖线、搜索面板都挂在外面。
+ * 只看 `.protyle-wysiwyg` 和文档标题的变化。高亮层、选区竖线、搜索面板都挂在外面。
  * 属性只观察 fold 和搜索语义源；块选中、悬停等 class 抖动不会触发。
  */
 
 import {SOURCE_DIAGRAM_SELECTOR} from "./diagram-search-state";
 
 export interface EditorDomChange {
+    /** v3.8.10 标题草稿或整个行内编辑器被更新；不依赖正文 savedoc。 */
+    docTitleChanged?: boolean;
     /** 插入了节点的块 id：插入点的各级祖先块，以及插入节点自身和里面的块。太多时为 null。 */
     addedInBlocks: ReadonlySet<string> | null;
     /** 折叠属性改变；它不一定伴随保存或块节点增删。 */
@@ -48,6 +50,7 @@ export function watchEditorDom(
     let pendingSince = 0;
     let touched: Set<string> | null = new Set();
     let foldChanged = false;
+    let docTitleChanged = false;
     let diagramBlocks: Set<HTMLElement> | null = new Set();
     let scannedDiagramTrees = new WeakSet<Element>();
     let embedBlocks: Set<HTMLElement> | null = new Set();
@@ -89,6 +92,7 @@ export function watchEditorDom(
 
     const flush = () => {
         const change: EditorDomChange = {
+            docTitleChanged,
             addedInBlocks: touched,
             foldChanged,
             diagramBlocks,
@@ -97,6 +101,7 @@ export function watchEditorDom(
         };
         touched = new Set();
         foldChanged = false;
+        docTitleChanged = false;
         diagramBlocks = new Set();
         scannedDiagramTrees = new WeakSet();
         embedBlocks = new Set();
@@ -113,10 +118,14 @@ export function watchEditorDom(
             const target = record.target.nodeType === Node.ELEMENT_NODE ?
                 record.target as Element :
                 record.target.parentElement;
-            if (!target || !target.closest(".protyle-wysiwyg")) {
+            if (!target || !target.closest(".protyle-wysiwyg, .protyle-title")) {
                 continue;
             }
             relevant = true;
+            if (target.closest(".protyle-title") && (target.closest(".protyle-title__input") ||
+                (record.type === "childList" && [...record.addedNodes, ...record.removedNodes].some(node =>
+                    node instanceof Element && (node.matches(".protyle-title__input, .protyle-title__rich") ||
+                        node.querySelector(".protyle-title__input")))))) docTitleChanged = true;
             const virtualRow = target.closest(AV_VIRTUAL_ROW_SELECTOR);
             const virtualAv = isVirtualAvMount(record, target) || Boolean(virtualRow && virtualAvRows.has(virtualRow));
             if (virtualAv && virtualAvEmbeds) {

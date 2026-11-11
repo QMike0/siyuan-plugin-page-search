@@ -2291,7 +2291,7 @@ async function searchCurrentDocumentImpl(
     if (cancelled()) {
         return {matches: [], error: "", cancelled: true};
     }
-    await prepareTabsMath(edit, collectOptions(options), () => !cancelled());
+    await prepareTabsMath(edit, {...collectOptions(options), includeDocTitle: options.includeDocTitle !== false && !focusId}, () => !cancelled());
     if (cancelled()) return {matches: [], error: "", cancelled: true};
     const liveAll = collectSearchableBlocks(edit, {
         ...collectOptions(options),

@@ -7,6 +7,7 @@ import {isRendererSourceFallbackUnitId} from "../../shared/renderer-units";
 import {
     collectSearchableBlocks,
     inlineMathIdentityText,
+    isDocTitleSearchUnit,
     isInlineMathSearchUnit,
     isInlineMemoSearchUnit,
 } from "../blocks";
@@ -292,7 +293,7 @@ function createRangeProjection(
                 `${match.blockId}\0${match.mathOrdinal}\0${match.mathUnitText}`,
             )?.[0];
         } else if (
-            !match.unitId?.startsWith("embed:") && !match.unitId?.startsWith("table-memo:") &&
+            !isDocTitleSearchUnit(match) && !match.unitId?.startsWith("embed:") && !match.unitId?.startsWith("table-memo:") &&
             match.highlightKind === "inline-memo" && match.anchorOffset !== undefined
         ) {
             block = memoByKey.get(`${match.blockId}\0${match.anchorOffset}`);
@@ -663,7 +664,8 @@ function rankedLiveUnits(
         match.mathUnitText !== undefined
     ) {
         list = mathByKey.get(`${match.blockId}\0${match.mathOrdinal}\0${match.mathUnitText}`);
-    } else if (match.highlightKind === "inline-memo" && match.unitId?.startsWith("table-memo:")) {
+    } else if (match.highlightKind === "inline-memo" && (isDocTitleSearchUnit(match) || match.unitId?.startsWith("table-memo:"))) {
+        // 标题单独采集，备注序号不受正文局部采集影响；公式备注的正文锚点可能相同。
         // 表格备注的 unitId 是逻辑行列加格内偏移，不随全文序号变化。
         list = byKey.get(unitKey(match.blockId, match.unitId));
     } else if (

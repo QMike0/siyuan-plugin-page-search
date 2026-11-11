@@ -482,7 +482,7 @@ async function calculateLoadedDomMatches(
         }
         return false;
     };
-    const preparesMath = !options.searchMathSource && options.includeTabs !== false;
+    const preparesMath = !options.searchMathSource;
     const prepared = preparesMath ? await prepareTabsMath(edit, collectionOptions, () => !options.signal?.aborted,
         element => !selectionOnly || selectedMath.has(element) || insideWholeHost(element)) : undefined;
     if (options.signal?.aborted) return {matches: [], error: "", cancelled: true};

@@ -3,6 +3,7 @@ import {CODE_LANGUAGE_UNIT_ID} from "../shared/code-block-language";
 import {isImageOCRUnit} from "../shared/image-ocr";
 import {
     ATTRIBUTE_VIEW_TYPE,
+    collectDocTitleUnits,
     collectFrozenMemoSelectionUnits,
     collectTableCellSearchTextNodes,
     isAttributeInlineSearchUnit,
@@ -616,15 +617,24 @@ export function remapMathSelectionScope(
 ): SelectionScope {
     const previous = new Map(before.map(block => [unitKeyOf(block), block]));
     const missingMemos = new Set<string>();
+    const missingTitleText = new Set<string>();
     if (options.edit) {
         for (const key of scope.keys()) {
             if (!previous.has(key) && /::(?:embed:[^:]+:)?(?:inline-memo:\d+|table-memo:\d+:\d+:\d+)$/.test(key)) missingMemos.add(key);
+            if (!previous.has(key) && /^__doc-title__::doc-title(?:#run-\d+)?$/.test(key)) missingTitleText.add(key);
         }
     }
     // Memo ordinals are not enough on their own: verify all missing keys once
     // against the same mounted hosts/ownership used by ordinary collection.
     const verifiedMemos = new Set(options.edit && missingMemos.size ?
         collectFrozenMemoSelectionUnits(options.edit, missingMemos, options.includeImageTitle !== false).map(unitKeyOf) : []);
+    // Type/title gates may hide frozen text runs while the formula mode changes.
+    // Verify only those title keys and their bounds; never read OCR or scan the body.
+    const titleTextLengths = new Map(options.edit && missingTitleText.size ?
+        collectDocTitleUnits(options.edit, {includeImageTitle: options.includeImageTitle,
+            includeImageOCR: false, searchMathSource: true, skipEmbeddedOrder: true})
+            .filter(block => missingTitleText.has(unitKeyOf(block)) && block.textNodes.length > 0)
+            .map(block => [unitKeyOf(block), block.text.length] as const) : []);
     const next: SelectionScope = new Map();
     const unchanged = new Set<string>();
     for (const block of after) {
@@ -657,7 +667,10 @@ export function remapMathSelectionScope(
             // offsets stay valid. Formula ordinals and AV cell runs do not.
             const unitId = key.slice(key.indexOf("::") + 2);
             const sourceId = unitId.replace(/^embed:[^:]+:/, "");
-            if (verifiedMemos.has(key) || sourceId === CODE_LANGUAGE_UNIT_ID ||
+            const titleLength = titleTextLengths.get(key);
+            const verifiedTitle = titleLength !== undefined && saved.every(offset =>
+                offset.start >= 0 && offset.end > offset.start && offset.end <= titleLength);
+            if (verifiedTitle || verifiedMemos.has(key) || sourceId === CODE_LANGUAGE_UNIT_ID ||
                 /^code-language:table-cell:\d+:\d+(?::[^:]+)?:\d+$/.test(sourceId) || isImageOCRUnit({unitId}) ||
                 /^(?:run-\d+|table-cell:\d+:\d+(?::[^:#]+)?(?:#run-\d+)?|callout-(?:title|owned)(?:#run-\d+)?)?$/.test(unitId)) {
                 next.set(key, saved.map(offset => ({...offset})));
